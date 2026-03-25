@@ -6,19 +6,26 @@
 ///
 /// Device sends (TX):
 ///   Field 1, Payload = Error (payload: error code byte)
-///   Field 2, Varint  = Pong
+///   Field 2, Varint  = Pong (also used as ACK for WriteFs chunks)
 ///
 /// Device receives (RX):
 ///   Field 1, Varint  = Ping
 ///   Field 2, Payload = Execute (payload: program bytecode)
 ///   Field 3, Varint  = Restart
-///   Field 4, Payload = WriteFs (payload: flash filesystem image)
+///   Field 4, Payload = WriteFs header (8B: total_size u32 LE + chunk_size u32 LE)
+///   Field 5, Payload = WriteChunk (chunk data bytes)
 
 use crate::flash::Flash;
 use crate::usart::Usart;
 
 /// Maximum program bytecode size received via USART
 const MAX_PROGRAM_SIZE: usize = 1024;
+
+/// Sector buffer size for flash writes (4KB = 1 erase sector)
+const FS_SECTOR_SIZE: usize = 4096;
+
+/// Static 4KB sector buffer — used only during WriteFs operation.
+static mut FS_SECTOR_BUF: [u8; FS_SECTOR_SIZE] = [0; FS_SECTOR_SIZE];
 
 // --- RX State Machine ---
 
@@ -39,57 +46,112 @@ enum RxState {
     },
 }
 
-// --- FS Writer (streaming flash write) ---
+// --- FS Writer (chunked flash write with 4KB sector buffer) ---
 
 struct FsWriter {
+    /// Current flash write address
     addr: u32,
-    page_buf: [u8; 256],
-    page_pos: u16,
+    /// Position within FS_SECTOR_BUF
+    buf_pos: u16,
+    /// Total bytes expected (from header)
+    total_size: u32,
+    /// Total bytes received so far
+    received: u32,
+    /// Header collection buffer (8 bytes: total_size + chunk_size)
+    header_buf: [u8; 8],
+    /// Bytes collected into header_buf
+    header_pos: u8,
 }
 
 impl FsWriter {
     const fn new() -> Self {
         Self {
             addr: 0,
-            page_buf: [0; 256],
-            page_pos: 0,
+            buf_pos: 0,
+            total_size: 0,
+            received: 0,
+            header_buf: [0; 8],
+            header_pos: 0,
         }
     }
 
-    fn reset(&mut self) {
+    /// Reset state for a new WriteFs header.
+    fn reset_header(&mut self) {
+        self.header_pos = 0;
+    }
+
+    /// Feed a header byte. Returns true when all 8 bytes are collected.
+    fn feed_header(&mut self, byte: u8) -> bool {
+        if (self.header_pos as usize) < 8 {
+            self.header_buf[self.header_pos as usize] = byte;
+            self.header_pos += 1;
+        }
+        self.header_pos >= 8
+    }
+
+    /// Parse the collected header and prepare for chunk reception.
+    fn parse_header(&mut self) {
+        let b = &self.header_buf;
+        self.total_size =
+            (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24);
+        // chunk_size at b[4..8] — informational only, device doesn't need it
         self.addr = 0;
-        self.page_pos = 0;
+        self.buf_pos = 0;
+        self.received = 0;
     }
 
+    /// Write a single data byte into the sector buffer.
+    /// Flushes a full 4KB sector to flash when the buffer is full.
     fn write_byte(&mut self, byte: u8, flash: &Flash) {
-        self.page_buf[self.page_pos as usize] = byte;
-        self.page_pos += 1;
+        unsafe {
+            FS_SECTOR_BUF[self.buf_pos as usize] = byte;
+        }
+        self.buf_pos += 1;
+        self.received += 1;
 
-        if self.page_pos == 256 {
-            self.flush_page(flash);
+        if self.buf_pos as usize == FS_SECTOR_SIZE {
+            self.flush_sector(flash);
         }
     }
 
-    fn flush_page(&mut self, flash: &Flash) {
-        let len = self.page_pos as usize;
+    /// Erase sector and write the full 4KB buffer to flash.
+    fn flush_sector(&mut self, flash: &Flash) {
+        flash.erase_sector(self.addr);
+        // Write in 256-byte pages
+        let buf = unsafe { &*(&raw const FS_SECTOR_BUF) };
+        let mut offset: usize = 0;
+        while offset < FS_SECTOR_SIZE {
+            flash.write(self.addr + offset as u32, &buf[offset..offset + 256]);
+            offset += 256;
+        }
+        self.addr += FS_SECTOR_SIZE as u32;
+        self.buf_pos = 0;
+    }
+
+    /// Flush any remaining bytes in the buffer (partial sector at end).
+    fn flush(&mut self, flash: &Flash) {
+        let len = self.buf_pos as usize;
         if len == 0 {
             return;
         }
 
-        // Erase sector at 4KB boundary
-        if self.addr & 0xFFF == 0 {
-            flash.erase_sector(self.addr);
-        }
+        // Erase sector at current address
+        flash.erase_sector(self.addr);
 
-        flash.write(self.addr, &self.page_buf[..len]);
-        self.addr += len as u32;
-        self.page_pos = 0;
+        // Write remaining bytes in 256-byte pages
+        let buf = unsafe { &*(&raw const FS_SECTOR_BUF) };
+        let mut offset: usize = 0;
+        while offset < len {
+            let page_len = (len - offset).min(256);
+            flash.write(self.addr + offset as u32, &buf[offset..offset + page_len]);
+            offset += page_len;
+        }
+        self.buf_pos = 0;
     }
 
-    fn flush(&mut self, flash: &Flash) {
-        if self.page_pos > 0 {
-            self.flush_page(flash);
-        }
+    /// Returns true when all expected bytes have been received.
+    fn is_complete(&self) -> bool {
+        self.received >= self.total_size
     }
 }
 
@@ -101,6 +163,11 @@ pub enum RxEvent {
     Ping,
     Restart,
     ProgramReady,
+    /// WriteFs header parsed — device is ready for chunks (send pong ACK)
+    FsReady,
+    /// Chunk received and written — ready for next chunk (send pong ACK)
+    FsChunkDone,
+    /// All chunks received, flash write complete (send pong ACK, then restart)
     FsWriteComplete,
 }
 
@@ -156,10 +223,18 @@ impl Protocol {
                                 };
                             }
                             4 => {
-                                // WriteFs — read length, then flash image
-                                self.fs_writer.reset();
+                                // WriteFs header — read length, then 8-byte header
+                                self.fs_writer.reset_header();
                                 self.state = RxState::Length {
                                     field: 4,
+                                    value: 0,
+                                    shift: 0,
+                                };
+                            }
+                            5 => {
+                                // WriteChunk — read length, then chunk data
+                                self.state = RxState::Length {
+                                    field: 5,
                                     value: 0,
                                     shift: 0,
                                 };
@@ -189,7 +264,15 @@ impl Protocol {
                         // Zero-length payload — message complete immediately
                         match f {
                             2 => RxEvent::ProgramReady,
-                            4 => RxEvent::FsWriteComplete,
+                            4 => RxEvent::FsReady,
+                            5 => {
+                                if self.fs_writer.is_complete() {
+                                    self.fs_writer.flush(flash);
+                                    RxEvent::FsWriteComplete
+                                } else {
+                                    RxEvent::FsChunkDone
+                                }
+                            }
                             _ => RxEvent::None,
                         }
                     } else {
@@ -222,7 +305,11 @@ impl Protocol {
                         }
                     }
                     4 => {
-                        // FS image → stream to flash
+                        // WriteFs header bytes → collect
+                        self.fs_writer.feed_header(byte);
+                    }
+                    5 => {
+                        // WriteChunk data → sector buffer
                         self.fs_writer.write_byte(byte, flash);
                     }
                     _ => {}
@@ -234,8 +321,18 @@ impl Protocol {
                     match field {
                         2 => RxEvent::ProgramReady,
                         4 => {
-                            self.fs_writer.flush(flash);
-                            RxEvent::FsWriteComplete
+                            // Header complete — parse and prepare for chunks
+                            self.fs_writer.parse_header();
+                            RxEvent::FsReady
+                        }
+                        5 => {
+                            // Chunk complete — check if all data received
+                            if self.fs_writer.is_complete() {
+                                self.fs_writer.flush(flash);
+                                RxEvent::FsWriteComplete
+                            } else {
+                                RxEvent::FsChunkDone
+                            }
                         }
                         _ => RxEvent::None,
                     }

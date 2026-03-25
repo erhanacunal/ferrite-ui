@@ -59,12 +59,12 @@ impl Gpio {
             let bop = (GPIOA_BASE + GPIO_BOP_OFFSET) as *mut u32;
             core::ptr::write_volatile(bop, 1 << LCD_CLK_PIN);
 
-            spin(3);
+            spin(2);
 
             let bc = (GPIOA_BASE + GPIO_BC_OFFSET) as *mut u32;
             core::ptr::write_volatile(bc, 1 << LCD_CLK_PIN);
 
-            spin(3);
+            spin(2);
         }
     }
 }

@@ -71,13 +71,145 @@ const ERR_PROGRAM_ERROR: u8 = 6;
 
 const MAX_CODE_SIZE: usize = 1024;
 
-/// Initialize all GPIO ports, AFIO, TIMER2 PWM and flash wait state.
-fn init_ports() {
+// === RCU registers ===
+
+const RCU_BASE: u32 = 0x4002_1000;
+const RCU_CTL: u32 = RCU_BASE + 0x00;
+const RCU_CFG0: u32 = RCU_BASE + 0x04;
+const RCU_INT: u32 = RCU_BASE + 0x08;
+
+// RCU_CTL bits
+const CTL_IRC8MEN: u32 = 1 << 0;
+const CTL_IRC8MSTB: u32 = 1 << 1;
+const CTL_HXTALEN: u32 = 1 << 16;
+const CTL_HXTALBPS: u32 = 1 << 18;
+const CTL_CKMEN: u32 = 1 << 19;
+const CTL_PLLEN: u32 = 1 << 24;
+const CTL_PLLSTB: u32 = 1 << 25;
+
+// RCU_CFG0 bits/masks
+const CFG0_SCS: u32 = 0x03;           // System clock switch [1:0]
+const CFG0_SCSS: u32 = 0x0C;          // System clock switch status [3:2]
+const CFG0_AHBPSC: u32 = 0xF0;        // AHB prescaler [7:4]
+const CFG0_APB1PSC: u32 = 0x700;      // APB1 prescaler [10:8]
+const CFG0_APB2PSC: u32 = 0x3800;     // APB2 prescaler [13:11]
+const CFG0_ADCPSC: u32 = 0xC000;      // ADC prescaler [15:14]
+const CFG0_PLLSEL: u32 = 1 << 16;
+const CFG0_PREDV0: u32 = 1 << 17;
+const CFG0_PLLMF: u32 = 0xF << 18;   // PLL multiplier [21:18]
+const CFG0_USBDPSC: u32 = 0x3 << 22;
+const CFG0_CKOUT0SEL: u32 = 0x7 << 24;
+const CFG0_PLLMF_4: u32 = 1 << 27;   // PLL multiplier bit 4
+const CFG0_ADCPSC_2: u32 = 1 << 28;
+
+// PLL source = IRC8M/2, multiply by 27 → (4MHz × 27) = 108MHz
+// PLLMF_4=1, PLLMF[3:0]=10 → extended multiplier = 10 + 17 = 27
+const PLL_MUL27: u32 = CFG0_PLLMF_4 | (0xA << 18);
+
+// APB1 = AHB/2 (max 54MHz for APB1)
+const APB1_DIV2: u32 = 0x4 << 8;
+
+// System clock source = PLL
+const CKSYSSRC_PLL: u32 = 0x02;
+// System clock switch status = PLL
+const SCSS_PLL: u32 = 0x02 << 2;
+
+const IRC8M_STARTUP_TIMEOUT: u32 = 0x0500;
+
+/// System clock initialization: IRC8M → PLL × 27 → 108MHz SYSCLK.
+/// Must be called before any peripheral init.
+///
+/// Clock tree after init:
+///   IRC8M (8MHz) → /2 → PLL ×27 → SYSCLK (108MHz)
+///   AHB  = SYSCLK / 1  = 108MHz
+///   APB2 = AHB / 1     = 108MHz  (GPIO, SPI0, USART0, TIMER0)
+///   APB1 = AHB / 2     = 54MHz   (TIMER2)
+fn system_init() {
     unsafe {
-        // Flash wait state = 2 (required for 108MHz)
+        // --- Flash wait state = 2 (must be set BEFORE increasing clock) ---
         let val = core::ptr::read_volatile(FMC_WS as *const u32);
         core::ptr::write_volatile(FMC_WS as *mut u32, (val & !0x7) | 2);
 
+        // --- Reset RCU to default state ---
+
+        // Enable IRC8M
+        let val = core::ptr::read_volatile(RCU_CTL as *const u32);
+        core::ptr::write_volatile(RCU_CTL as *mut u32, val | CTL_IRC8MEN);
+
+        // Wait for IRC8M stable
+        while core::ptr::read_volatile(RCU_CTL as *const u32) & CTL_IRC8MSTB == 0 {}
+
+        // Switch system clock to IRC8M (SCS = 00)
+        let val = core::ptr::read_volatile(RCU_CFG0 as *const u32);
+        core::ptr::write_volatile(RCU_CFG0 as *mut u32, val & !CFG0_SCS);
+
+        // Reset HXTALEN, CKMEN, PLLEN
+        let val = core::ptr::read_volatile(RCU_CTL as *const u32);
+        core::ptr::write_volatile(RCU_CTL as *mut u32, val & !(CTL_HXTALEN | CTL_CKMEN | CTL_PLLEN));
+
+        // Reset CFG0: prescalers, clock source, PLL config
+        let val = core::ptr::read_volatile(RCU_CFG0 as *const u32);
+        core::ptr::write_volatile(
+            RCU_CFG0 as *mut u32,
+            val & !(CFG0_SCS | CFG0_AHBPSC | CFG0_APB1PSC | CFG0_APB2PSC
+                | CFG0_ADCPSC | CFG0_ADCPSC_2 | CFG0_CKOUT0SEL
+                | CFG0_PLLSEL | CFG0_PREDV0 | CFG0_PLLMF | CFG0_USBDPSC | CFG0_PLLMF_4),
+        );
+
+        // Reset HXTALBPS
+        let val = core::ptr::read_volatile(RCU_CTL as *const u32);
+        core::ptr::write_volatile(RCU_CTL as *mut u32, val & !CTL_HXTALBPS);
+
+        // Disable all RCU interrupts
+        core::ptr::write_volatile(RCU_INT as *mut u32, 0x009F_0000);
+
+        // --- Configure 108MHz from IRC8M ---
+
+        // Enable IRC8M (should already be enabled, but ensure)
+        let val = core::ptr::read_volatile(RCU_CTL as *const u32);
+        core::ptr::write_volatile(RCU_CTL as *mut u32, val | CTL_IRC8MEN);
+
+        // Wait for IRC8M stable with timeout
+        let mut timeout: u32 = 0;
+        while core::ptr::read_volatile(RCU_CTL as *const u32) & CTL_IRC8MSTB == 0 {
+            timeout += 1;
+            if timeout >= IRC8M_STARTUP_TIMEOUT {
+                // IRC8M failed — hang (should never happen)
+                loop {
+                    cortex_m::asm::nop();
+                }
+            }
+        }
+
+        // AHB = SYSCLK / 1 (bits already cleared above)
+        // APB2 = AHB / 1 (bits already cleared above)
+        // APB1 = AHB / 2
+        let val = core::ptr::read_volatile(RCU_CFG0 as *const u32);
+        core::ptr::write_volatile(RCU_CFG0 as *mut u32, val | APB1_DIV2);
+
+        // PLL = IRC8M/2 × 27 = 108MHz (PLLSEL=0 selects IRC8M/2)
+        let val = core::ptr::read_volatile(RCU_CFG0 as *const u32);
+        core::ptr::write_volatile(RCU_CFG0 as *mut u32, (val & !(CFG0_PLLMF | CFG0_PLLMF_4)) | PLL_MUL27);
+
+        // Enable PLL
+        let val = core::ptr::read_volatile(RCU_CTL as *const u32);
+        core::ptr::write_volatile(RCU_CTL as *mut u32, val | CTL_PLLEN);
+
+        // Wait for PLL stable
+        while core::ptr::read_volatile(RCU_CTL as *const u32) & CTL_PLLSTB == 0 {}
+
+        // Switch system clock to PLL
+        let val = core::ptr::read_volatile(RCU_CFG0 as *const u32);
+        core::ptr::write_volatile(RCU_CFG0 as *mut u32, (val & !CFG0_SCS) | CKSYSSRC_PLL);
+
+        // Wait until PLL is selected as system clock
+        while (core::ptr::read_volatile(RCU_CFG0 as *const u32) & CFG0_SCSS) != SCSS_PLL {}
+    }
+}
+
+/// Initialize all GPIO ports, AFIO, TIMER2 PWM.
+fn init_ports() {
+    unsafe {
         // RCU: Peripheral clock enable
         // AFEN(0) | PAEN(2) | PBEN(3) | PCEN(4) | PDEN(5) | SPI0EN(12) | USART0EN(14)
         let val = core::ptr::read_volatile(RCU_APB2EN as *const u32);
@@ -97,8 +229,8 @@ fn init_ports() {
         // GPIOA CTL1 (PA8-PA15)
         let ctl1 = (GPIOA + 0x04) as *mut u32;
         let mut val = core::ptr::read_volatile(ctl1);
-        val &= !(0xF << 0);  // PA8:  AF PP 50MHz (TIMER0_CH0 — backlight PWM)
-        val |= 0xB << 0;
+        val &= !(0xF << 0);  // PA8:  PP output 50MHz (backlight off until timer init)
+        val |= 0x3 << 0;
         val &= !(0xF << 4);  // PA9:  AF PP 50MHz (USART0 TX)
         val |= 0xB << 4;
         val &= !(0xF << 8);  // PA10: floating input (USART0 RX)
@@ -267,6 +399,9 @@ fn run_callback(
 
 #[entry]
 fn main() -> ! {
+    // --- System clock: IRC8M → PLL ×27 → 108MHz ---
+    system_init();
+
     // --- Peripheral init ---
     init_ports();
 
@@ -293,7 +428,7 @@ fn main() -> ! {
     // === STARTUP SEQUENCE ===
 
     // 1. Backlight 50%
-    backlight.set_brightness(50);
+    backlight.set_brightness(100);
 
     // 2. Black screen
     lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
@@ -393,6 +528,9 @@ fn main() -> ! {
             );
         }
 
+        // Full initial render
+        render::render_all(&mut tree, &lcd, &flash, &fonts, &images);
+
         // Start main VM
         vm.state = VmState::Running;
     }
@@ -453,7 +591,17 @@ fn main() -> ! {
                     error_code = 0;
                 }
 
+                RxEvent::FsReady => {
+                    protocol::send_pong(&usart);
+                }
+
+                RxEvent::FsChunkDone => {
+                    protocol::send_pong(&usart);
+                }
+
                 RxEvent::FsWriteComplete => {
+                    protocol::send_pong(&usart);
+                    usart.flush();
                     cortex_m::peripheral::SCB::sys_reset();
                 }
             }
@@ -511,6 +659,11 @@ fn main() -> ! {
                     }
                 }
             }
+        }
+
+        // --- Render any dirty widgets (from VM, callbacks, or other state changes) ---
+        if error_code == 0 {
+            render::render_dirty(&mut tree, &lcd, &flash, &fonts, &images);
         }
     }
 }
