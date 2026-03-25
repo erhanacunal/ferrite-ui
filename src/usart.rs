@@ -1,0 +1,192 @@
+/// USART0 serial driver — GD32F103 (APB2)
+///
+/// Pin ataması (Nextion donanımı):
+///   PA9  = TX (AF push-pull, 50MHz)
+///   PA10 = RX (floating input)
+///
+/// 115200 baud, 8N1, no flow control.
+/// GPIO ve clock konfigürasyonu init_ports() tarafından yapılır.
+///
+/// RX interrupt: RBNE → ring buffer'a yazar, `rx_has_data()` flag set eder.
+/// Main loop'ta `rx_read_byte()` ile okunur.
+
+use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+// --- Donanım adresleri ---
+
+const USART0_BASE: u32 = 0x4001_3800;
+const USART_STAT: u32 = USART0_BASE + 0x00;
+const USART_DATA: u32 = USART0_BASE + 0x04;
+const USART_BAUD: u32 = USART0_BASE + 0x08;
+const USART_CTL0: u32 = USART0_BASE + 0x0C;
+const USART_CTL1: u32 = USART0_BASE + 0x10;
+const USART_CTL2: u32 = USART0_BASE + 0x14;
+
+// NVIC
+const NVIC_ISER1: u32 = 0xE000_E104; // IRQ 32–63 enable
+
+// USART_STAT bitleri
+const STAT_TBE: u32 = 1 << 7;  // Transmit data buffer empty
+const STAT_TC: u32 = 1 << 6;   // Transmission complete
+const STAT_RBNE: u32 = 1 << 5; // Read data buffer not empty
+
+// USART_CTL0 bitleri
+const CTL0_UEN: u32 = 1 << 13;   // USART enable
+const CTL0_TE: u32 = 1 << 3;     // Transmitter enable
+const CTL0_RE: u32 = 1 << 2;     // Receiver enable
+const CTL0_RBNEIE: u32 = 1 << 5; // RBNE interrupt enable
+
+// --- RX Ring Buffer ---
+// ISR yazar (head), main okur (tail). SPSC — lock gerekmez.
+
+const RX_BUF_SIZE: usize = 128;
+const RX_BUF_MASK: u8 = (RX_BUF_SIZE - 1) as u8;
+
+static mut RX_BUF: [u8; RX_BUF_SIZE] = [0; RX_BUF_SIZE];
+static mut RX_HEAD: u8 = 0; // sonraki yazma pozisyonu (sadece ISR yazar)
+static mut RX_TAIL: u8 = 0; // sonraki okuma pozisyonu (sadece main yazar)
+static RX_READY: AtomicBool = AtomicBool::new(false);
+
+// --- USART0 ISR ---
+
+/// USART0 interrupt handler — RBNE tetikler.
+/// Ring buffer'a byte yazar, taşma durumunda eski veriyi ezer (head ilerler).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn USART0() {
+    unsafe {
+        let stat = read_volatile(USART_STAT as *const u32);
+
+        if stat & STAT_RBNE != 0 {
+            let byte = read_volatile(USART_DATA as *const u32) as u8;
+
+            let head = read_volatile(&raw const RX_HEAD);
+            write_volatile(&raw mut RX_BUF[head as usize], byte);
+
+            let new_head = (head.wrapping_add(1)) & RX_BUF_MASK;
+            write_volatile(&raw mut RX_HEAD, new_head);
+
+            // Taşma: tail'i ilerlet (en eski byte kaybolur)
+            let tail = read_volatile(&raw const RX_TAIL);
+            if new_head == tail {
+                write_volatile(&raw mut RX_TAIL, (tail.wrapping_add(1)) & RX_BUF_MASK);
+            }
+
+            RX_READY.store(true, Ordering::Release);
+        }
+    }
+}
+
+// --- Usart driver ---
+
+pub struct Usart {
+    _private: (),
+}
+
+impl Usart {
+    /// USART0 başlat: 115200 8N1, RX interrupt aktif.
+    /// GPIO ve clock init_ports()'ta yapıldı.
+    pub fn init() -> Self {
+        unsafe {
+            // USART0 devre dışı bırak (temiz başlangıç)
+            write_volatile(USART_CTL0 as *mut u32, 0);
+
+            // Baud rate: 115200 @ 108MHz APB2
+            // USARTDIV = 108_000_000 / (16 × 115200) = 58.59375
+            // Register = round(58.59375 × 16) = 938 = 0x3AA
+            write_volatile(USART_BAUD as *mut u32, 0x3AA);
+
+            // CTL1: 1 stop bit (00), varsayılan
+            write_volatile(USART_CTL1 as *mut u32, 0);
+
+            // CTL2: flow control yok, varsayılan
+            write_volatile(USART_CTL2 as *mut u32, 0);
+
+            // CTL0: 8N1, TX + RX enable, RBNE interrupt enable, USART enable
+            write_volatile(
+                USART_CTL0 as *mut u32,
+                CTL0_UEN | CTL0_TE | CTL0_RE | CTL0_RBNEIE,
+            );
+
+            // NVIC: USART0 = IRQ 37 → ISER1 bit 5
+            let val = read_volatile(NVIC_ISER1 as *const u32);
+            write_volatile(NVIC_ISER1 as *mut u32, val | (1 << 5));
+        }
+
+        Usart { _private: () }
+    }
+
+    /// Tek byte gönder (bloklayıcı — TBE bekler).
+    pub fn write_byte(&self, byte: u8) {
+        unsafe {
+            while read_volatile(USART_STAT as *const u32) & STAT_TBE == 0 {}
+            write_volatile(USART_DATA as *mut u32, byte as u32);
+        }
+    }
+
+    /// Byte dizisi gönder.
+    pub fn write(&self, data: &[u8]) {
+        for &b in data {
+            self.write_byte(b);
+        }
+    }
+
+    /// Transmission complete bekle.
+    pub fn flush(&self) {
+        unsafe {
+            while read_volatile(USART_STAT as *const u32) & STAT_TC == 0 {}
+        }
+    }
+}
+
+// --- RX public API (main loop'tan çağrılır) ---
+
+/// Ring buffer'da okunacak veri var mı?
+pub fn rx_has_data() -> bool {
+    RX_READY.load(Ordering::Acquire)
+}
+
+/// Ring buffer'dan tek byte oku. Boşsa None döner.
+/// Buffer tamamen boşalınca ready flag otomatik temizlenir.
+pub fn rx_read_byte() -> Option<u8> {
+    unsafe {
+        let tail = read_volatile(&raw const RX_TAIL);
+        let head = read_volatile(&raw const RX_HEAD);
+
+        if tail == head {
+            RX_READY.store(false, Ordering::Release);
+            return None;
+        }
+
+        let byte = read_volatile(&raw const RX_BUF[tail as usize]);
+        let new_tail = (tail.wrapping_add(1)) & RX_BUF_MASK;
+        write_volatile(&raw mut RX_TAIL, new_tail);
+
+        // Buffer boşaldıysa flag'i temizle
+        if new_tail == read_volatile(&raw const RX_HEAD) {
+            RX_READY.store(false, Ordering::Release);
+        }
+
+        Some(byte)
+    }
+}
+
+/// Ring buffer'daki mevcut byte sayısı.
+pub fn rx_len() -> u8 {
+    unsafe {
+        let head = read_volatile(&raw const RX_HEAD);
+        let tail = read_volatile(&raw const RX_TAIL);
+        (head.wrapping_sub(tail)) & RX_BUF_MASK
+    }
+}
+
+/// Ring buffer'ı sıfırla.
+pub fn rx_clear() {
+    unsafe {
+        cortex_m::interrupt::free(|_| {
+            write_volatile(&raw mut RX_HEAD, 0);
+            write_volatile(&raw mut RX_TAIL, 0);
+            RX_READY.store(false, Ordering::Release);
+        });
+    }
+}

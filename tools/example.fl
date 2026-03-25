@@ -1,0 +1,78 @@
+// ferrite-ui language example
+// VM: 16 var slot — main + fn paylasimli
+
+// --- Fonksiyonlar ---
+
+fn rgb565(r, g, b) {
+    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
+}
+
+fn clamp(val, lo, hi) {
+    if (val < lo) { return lo; }
+    if (val > hi) { return hi; }
+    return val;
+}
+
+// --- Ana program ---
+
+// Root: tam ekran siyah
+var root = alloc();
+target(root);
+set(size, 800, 480);
+set(bg_color, 0x0000);
+
+// Panel: mavi, beyaz border
+var panel = alloc();
+target(panel);
+set(location, 150, 100);
+set(size, 500, 280);
+set(bg_color, 0x001F);
+set(border, 3, 3, 3, 3);
+set(border_color, 0xFFFF);
+parent(root);
+
+// Btn1 ve Btn2
+var btn1 = alloc();
+target(btn1);
+set(location, 20, 20);
+set(size, 100, 60);
+set(bg_color, 0xF800);
+set(clickable, 1);
+parent(panel);
+
+var btn2 = alloc();
+target(btn2);
+set(location, 140, 20);
+set(size, 100, 60);
+set(bg_color, 0x07E0);
+set(clickable, 1);
+parent(panel);
+
+// Renk paleti
+var colors[4] = [0xF800, 0x07E0, 0x001F, 0xFFE0];
+
+// Fonksiyon testi: RGB565 ile turuncu
+var orange = rgb565(255, 165, 0);
+
+// Btn1 rengini palette gore degistir
+for (var i = 0; i < 4; i = i + 1) {
+    target(btn1);
+    set(bg_color, colors[i]);
+    dirty();
+    render();
+}
+
+// Son olarak btn1'i turuncu yap
+target(btn1);
+set(bg_color, orange);
+dirty();
+render();
+
+// Clamp testi
+target(btn2);
+var brightness = clamp(300, 0, 255);
+set(bg_color, rgb565(brightness, brightness, brightness));
+dirty();
+render();
+
+halt();
