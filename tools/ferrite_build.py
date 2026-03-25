@@ -335,6 +335,10 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
         if "image_id" in w:
             cc.set_prop("image_id", w["image_id"])
 
+        # Callbacks
+        if "on_click" in w:
+            cc.set_prop("on_click", w["on_click"])
+
         # Label properties
         if "font_id" in w:
             cc.set_prop("font_id", w["font_id"])
@@ -358,16 +362,17 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
 
 # --- Program compilation ---
 
-def compile_program(source_path: str) -> bytes:
-    """Ferrite lang source → bytecode."""
+def compile_program(source_path: str) -> tuple[bytes, bytes | None]:
+    """Ferrite lang source → (bytecode, metadata_or_None)."""
     try:
         from ferrite_lang import compile as fl_compile
         source = Path(source_path).read_text(encoding="utf-8")
-        return fl_compile(source)
+        bytecode = fl_compile(source)
+        return bytecode, None
     except ImportError:
         print(f"Warning: ferrite_lang not available, reading {source_path} as raw binary",
               file=sys.stderr)
-        return Path(source_path).read_bytes()
+        return Path(source_path).read_bytes(), None
 
 
 # --- Flash filesystem builder ---
@@ -525,12 +530,21 @@ def build(project_path: str, output_path: str) -> dict:
 
         resources.append((name, RES_PAGE, page_data))
 
-    # 4. Programs — .fl → bytecode
+    # 4. Programs — .fl → bytecode + optional metadata
     for prog in project.get("programs", []):
         name = prog["name"]
         source = project_dir / prog["source"]
-        bytecode = compile_program(str(source))
+        bytecode, metadata = compile_program(str(source))
         resources.append((name, RES_PROGRAM, bytecode))
+        # If metadata file exists alongside source, include it
+        meta_path = source.with_suffix('.meta')
+        if metadata:
+            meta_name = name + ".meta" if len(name) + 5 <= 15 else name[:10] + ".meta"
+            resources.append((meta_name, RES_PROGRAM, metadata))
+        elif meta_path.exists():
+            meta_data = meta_path.read_bytes()
+            meta_name = name + ".meta" if len(name) + 5 <= 15 else name[:10] + ".meta"
+            resources.append((meta_name, RES_PROGRAM, meta_data))
 
     # 5. Build flash binary
     fs_binary = build_fs(project, resources)

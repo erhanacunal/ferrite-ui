@@ -4,6 +4,7 @@
 use panic_halt as _;
 
 mod backlight;
+mod callback;
 mod clip;
 mod embedded_font;
 mod flash;
@@ -23,21 +24,22 @@ mod usart;
 mod vm;
 mod widget;
 
+use callback::{CallbackMeta, NO_CALLBACK};
 use cortex_m_rt::entry;
 use flash::Flash;
 use font::{Font, FontList};
-use image::ImageList;
 use gpio::Gpio;
+use image::ImageList;
 use lcd::Lcd;
 use page::PageManager;
 use protocol::{Protocol, RxEvent};
 use touch::Touch;
-use types::{Color, Edges, Offset, Size, COLOR_BLACK, COLOR_RED, COLOR_WHITE};
+use types::{Size, COLOR_BLACK, COLOR_RED, COLOR_WHITE};
 use usart::Usart;
 use vm::{Vm, VmState};
 use widget::WidgetTree;
 
-// === Donanım adresleri (port init) ===
+// === Hardware addresses (port init) ===
 
 const RCU_APB2EN: u32 = 0x4002_1018;
 const RCU_APB1EN: u32 = 0x4002_101C;
@@ -54,7 +56,7 @@ const GPIOD: u32 = 0x4001_1400;
 
 const TIMER2: u32 = 0x4000_0400;
 
-// === Hata kodları ===
+// === Error codes ===
 
 const ERR_PAGE_NOT_FOUND: u8 = 1;
 const ERR_PROGRAM_NOT_FOUND: u8 = 2;
@@ -65,34 +67,34 @@ const ERR_FONT_NOT_FOUND: u8 = 4;
 const ERR_NO_FILESYSTEM: u8 = 5;
 const ERR_PROGRAM_ERROR: u8 = 6;
 
-// === Program kodu max boyutu ===
+// === Max program code size ===
 
 const MAX_CODE_SIZE: usize = 1024;
 
-/// Tüm GPIO portlarını, AFIO, TIMER2 PWM ve flash wait state başlat.
+/// Initialize all GPIO ports, AFIO, TIMER2 PWM and flash wait state.
 fn init_ports() {
     unsafe {
-        // --- Flash wait state = 2 (108MHz için gerekli) ---
+        // Flash wait state = 2 (required for 108MHz)
         let val = core::ptr::read_volatile(FMC_WS as *const u32);
         core::ptr::write_volatile(FMC_WS as *mut u32, (val & !0x7) | 2);
 
-        // --- RCU: Peripheral clock enable ---
+        // RCU: Peripheral clock enable
         // AFEN(0) | PAEN(2) | PBEN(3) | PCEN(4) | PDEN(5) | SPI0EN(12) | USART0EN(14)
         let val = core::ptr::read_volatile(RCU_APB2EN as *const u32);
         core::ptr::write_volatile(RCU_APB2EN as *mut u32, val | 0x503D);
 
-        // --- JTAG disable, SWD enable: SWJ_CFG = 010 ---
+        // JTAG disable, SWD enable: SWJ_CFG = 010
         let val = core::ptr::read_volatile(AFIO_PCF0 as *const u32);
         core::ptr::write_volatile(AFIO_PCF0 as *mut u32, (val & 0xF8FF_FFFF) | 0x0200_0000);
 
-        // --- GPIOB: tüm pinler push-pull output 50MHz (LCD 16-bit data bus) ---
+        // GPIOB: all pins push-pull output 50MHz (LCD 16-bit data bus)
         core::ptr::write_volatile((GPIOB + 0x00) as *mut u32, 0x3333_3333);
         core::ptr::write_volatile((GPIOB + 0x04) as *mut u32, 0x3333_3333);
 
-        // --- GPIOA CTL0 (PA0-PA7) ---
+        // GPIOA CTL0 (PA0-PA7)
         core::ptr::write_volatile((GPIOA + 0x00) as *mut u32, 0xB4B3_3334);
 
-        // --- GPIOA CTL1 (PA8-PA15) ---
+        // GPIOA CTL1 (PA8-PA15)
         let ctl1 = (GPIOA + 0x04) as *mut u32;
         let mut val = core::ptr::read_volatile(ctl1);
         val &= !(0xF << 0);  // PA8:  AF PP 50MHz (TIMER0_CH0 — backlight PWM)
@@ -109,17 +111,17 @@ fn init_ports() {
         val |= 0x3 << 28;
         core::ptr::write_volatile(ctl1, val);
 
-        // --- GPIOA initial pin states ---
+        // GPIOA initial pin states
         core::ptr::write_volatile(
             (GPIOA + 0x10) as *mut u32,
             (1 << 2) | (1 << 4) | (1 << 11) | (1 << 12),
         );
         core::ptr::write_volatile((GPIOA + 0x14) as *mut u32, (1 << 1) | (1 << 3));
 
-        // --- GPIOC CTL0 (PC0-PC7) ---
+        // GPIOC CTL0 (PC0-PC7)
         core::ptr::write_volatile((GPIOC + 0x00) as *mut u32, 0x4444_4477);
 
-        // --- GPIOC CTL1 (PC8-PC15) ---
+        // GPIOC CTL1 (PC8-PC15)
         let ctl1 = (GPIOC + 0x04) as *mut u32;
         let mut val = core::ptr::read_volatile(ctl1);
         val &= !(0xFF);
@@ -134,7 +136,7 @@ fn init_ports() {
         val |= 0x4 << 24;
         core::ptr::write_volatile(ctl1, val);
 
-        // --- GPIOC initial pin states ---
+        // GPIOC initial pin states
         core::ptr::write_volatile((GPIOC + 0x14) as *mut u32, 1 << 12);
         core::ptr::write_volatile(
             (GPIOC + 0x10) as *mut u32,
@@ -142,14 +144,14 @@ fn init_ports() {
         );
         core::ptr::write_volatile((GPIOC + 0x10) as *mut u32, 0x03FC_0000);
 
-        // --- GPIOD: PD2 PP output 50MHz ---
+        // GPIOD: PD2 PP output 50MHz
         let ctl0 = (GPIOD + 0x00) as *mut u32;
         let mut val = core::ptr::read_volatile(ctl0);
         val &= !(0xF << 8);
         val |= 0x3 << 8;
         core::ptr::write_volatile(ctl0, val);
 
-        // --- TIMER2 PWM: display brightness (full remap → PC6-PC9) ---
+        // TIMER2 PWM: display brightness (full remap → PC6-PC9)
         let val = core::ptr::read_volatile(AFIO_PCF0 as *const u32);
         core::ptr::write_volatile(AFIO_PCF0 as *mut u32, val | 0x0C00);
 
@@ -165,7 +167,7 @@ fn init_ports() {
         core::ptr::write_volatile((TIMER2 + 0x28) as *mut u32, 0);
         core::ptr::write_volatile((TIMER2 + 0x00) as *mut u32, 1);
 
-        // --- Backup domain: LXTAL disable ---
+        // Backup domain: LXTAL disable
         let val = core::ptr::read_volatile(PMU_CTL as *const u32);
         core::ptr::write_volatile(PMU_CTL as *mut u32, val | (1 << 8));
         let val = core::ptr::read_volatile(RCU_BDCTL as *const u32);
@@ -173,31 +175,26 @@ fn init_ports() {
     }
 }
 
-// === Hata gösterim ===
+// === Error display ===
 
-/// Ekrana hata kutusu çiz ve USART'tan hata gönder.
+/// Draw error box on screen and send error via USART.
 fn show_error(lcd: &Lcd, font: &Font, flash: &Flash, usart: &Usart, code: u8) {
-    // Ekranı siyaha boya
     lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
 
-    // Hata kutusu (ortalanmış)
     let bx: u16 = 200;
     let by: u16 = 160;
     let bw: u16 = 400;
     let bh: u16 = 160;
 
-    // Kırmızı kenar
     lcd.fill_rect(bx, by, bw, bh, COLOR_RED);
     lcd.fill_rect(bx + 2, by + 2, bw - 4, bh - 4, COLOR_BLACK);
 
-    // "ERROR" başlığı
     let title = b"ERROR";
     let tw = font.text_width(title);
     let tx = bx as i16 + (bw as i16 - tw as i16) / 2;
     let ty = by as i16 + 30;
     font.draw_str(lcd, flash, title, tx, ty, COLOR_RED, Some(COLOR_BLACK));
 
-    // Hata kodu
     let mut code_line = [0u8; 16];
     let code_len = format_error_code(code, &mut code_line);
     let cw = font.text_width(&code_line[..code_len]);
@@ -212,17 +209,14 @@ fn show_error(lcd: &Lcd, font: &Font, flash: &Flash, usart: &Usart, code: u8) {
         Some(COLOR_BLACK),
     );
 
-    // Hata açıklaması
     let desc = error_description(code);
     let dw = font.text_width(desc);
     let dx = bx as i16 + (bw as i16 - dw as i16) / 2;
     font.draw_str(lcd, flash, desc, dx, ty + 56, 0xC618, Some(COLOR_BLACK));
 
-    // USART'tan hata gönder
     protocol::send_error(usart, code);
 }
 
-/// Hata kodunu "Code: NN" formatına çevir
 fn format_error_code(code: u8, buf: &mut [u8; 16]) -> usize {
     let prefix = b"Code: ";
     buf[..6].copy_from_slice(prefix);
@@ -236,7 +230,6 @@ fn format_error_code(code: u8, buf: &mut [u8; 16]) -> usize {
     }
 }
 
-/// Hata kodu açıklaması
 fn error_description(code: u8) -> &'static [u8] {
     match code {
         1 => b"page_main not found",
@@ -250,11 +243,31 @@ fn error_description(code: u8) -> &'static [u8] {
     }
 }
 
+// === Callback helper ===
+
+/// Run a callback function on the callback VM.
+/// Resets the VM, sets PC to the function offset, and runs to completion.
+fn run_callback(
+    cb_vm: &mut Vm,
+    code: &[u8],
+    offset: u16,
+    tree: &mut WidgetTree,
+    lcd: &Lcd,
+    flash: &Flash,
+    fonts: &mut FontList,
+    images: &mut ImageList,
+    fs: Option<&fs::Fs>,
+) {
+    cb_vm.reset();
+    cb_vm.set_pc(offset);
+    cb_vm.run(code, tree, lcd, flash, fonts, images, fs);
+}
+
 // === Entry Point ===
 
 #[entry]
 fn main() -> ! {
-    // --- Çevre birimi başlatma ---
+    // --- Peripheral init ---
     init_ports();
 
     let gpio = Gpio::init();
@@ -279,13 +292,13 @@ fn main() -> ! {
 
     // === STARTUP SEQUENCE ===
 
-    // 1. Backlight %50
+    // 1. Backlight 50%
     backlight.set_brightness(50);
 
-    // 2. Ekran siyah
+    // 2. Black screen
     lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
 
-    // 3. Sol üstte "ferrite-ui" yazısı
+    // 3. Splash text
     fonts.embedded().draw_str(
         &lcd,
         &flash,
@@ -296,7 +309,7 @@ fn main() -> ! {
         Some(COLOR_BLACK),
     );
 
-    // 4. Flash dosya sistemi kontrolü
+    // 4. Flash filesystem
     let mut error_code: u8 = 0;
 
     let fs = match fs::Fs::mount(&flash) {
@@ -321,7 +334,7 @@ fn main() -> ! {
     let mut code_buf = [0u8; MAX_CODE_SIZE];
     let mut code_len: usize = 0;
 
-    // 6. page_main yükle (FS varsa)
+    // 6. Load page_main (if FS available)
     if error_code == 0 {
         let fs_ref = fs.as_ref().unwrap();
         if pm
@@ -332,7 +345,7 @@ fn main() -> ! {
         }
     }
 
-    // 7. main program ara (hata yoksa)
+    // 7. Load main program (if no error)
     if error_code == 0 {
         let fs_ref = fs.as_ref().unwrap();
         match fs_ref.find(&flash, b"main") {
@@ -346,27 +359,55 @@ fn main() -> ! {
         }
     }
 
-    // 8. VM hazırla (hata yoksa)
+    // 8. Load callback metadata
+    let cb_meta = if error_code == 0 {
+        if let Some(fs_ref) = fs.as_ref() {
+            CallbackMeta::load(fs_ref, &flash, b"main").unwrap_or(CallbackMeta::new())
+        } else {
+            CallbackMeta::new()
+        }
+    } else {
+        CallbackMeta::new()
+    };
+
+    // 9. Prepare VMs
     let mut vm = Vm::new();
+    let mut cb_vm = Vm::new();
 
     if error_code == 0 && code_len > 0 {
-        // Sayfayı göster
+        // Show first page
         pm.show(0, &mut tree, &lcd, &flash, &fonts, &images);
-        // VM Ready → Running olarak işaretle, main loop'ta step çalışacak
+
+        // Run on_program_start callback
+        if cb_meta.on_program_start != NO_CALLBACK {
+            run_callback(
+                &mut cb_vm,
+                &code_buf[..code_len],
+                cb_meta.on_program_start,
+                &mut tree,
+                &lcd,
+                &flash,
+                &mut fonts,
+                &mut images,
+                fs.as_ref(),
+            );
+        }
+
+        // Start main VM
         vm.state = VmState::Running;
     }
 
-    // Hata varsa ekrana göster
+    // Show error if any
     if error_code != 0 {
         show_error(&lcd, fonts.embedded(), &flash, &usart, error_code);
     }
 
-    // === ANA DÖNGÜ ===
+    // === MAIN LOOP ===
 
     let mut protocol = Protocol::new();
 
     loop {
-        // --- VM step (sadece Running veya Yielded ise) ---
+        // --- VM step (only when Running or Yielded) ---
         match vm.state {
             VmState::Running | VmState::Yielded => {
                 vm.state = VmState::Running;
@@ -388,7 +429,7 @@ fn main() -> ! {
             _ => {} // Halted, Error, Ready → skip
         }
 
-        // --- USART mesaj işleme ---
+        // --- USART message handling ---
         while let Some(byte) = usart::rx_read_byte() {
             match protocol.feed(byte, &flash) {
                 RxEvent::None => {}
@@ -402,7 +443,6 @@ fn main() -> ! {
                 }
 
                 RxEvent::ProgramReady => {
-                    // Yeni program yükle — code_buf'a kopyala, VM'i sıfırla
                     let prog = protocol.program_code();
                     let new_len = prog.len().min(MAX_CODE_SIZE);
                     code_buf[..new_len].copy_from_slice(&prog[..new_len]);
@@ -419,7 +459,7 @@ fn main() -> ! {
             }
         }
 
-        // --- Touch işleme (hata yoksa) ---
+        // --- Touch handling (if no error) ---
         if error_code == 0 {
             if let Some(event) = touch.poll() {
                 if event.kind == touch::TouchEventKind::Press {
@@ -430,15 +470,45 @@ fn main() -> ! {
                         render::render_dirty(&mut tree, &lcd, &flash, &fonts, &images);
                     }
                 } else if event.kind == touch::TouchEventKind::Release {
+                    // Find pressed widget, release it, and fire on_click callback
+                    let mut clicked_id = widget::WidgetId::NONE;
+                    let mut clicked_func: u16 = 0;
+
                     let (dfs, count) = tree.dfs_order();
                     for i in 0..count {
                         let w = tree.get_mut(dfs[i]);
                         if w.flags & widget::FLAG_PRESSED != 0 {
                             w.flags &= !widget::FLAG_PRESSED;
+                            // Check if release is still on the widget (click = press + release)
+                            let abs = tree.absolute_rect(dfs[i]);
+                            if abs.contains(event.x, event.y) {
+                                clicked_id = dfs[i];
+                                clicked_func = tree.get(dfs[i]).on_click;
+                            }
                             tree.mark_dirty(dfs[i]);
                         }
                     }
+
                     render::render_dirty(&mut tree, &lcd, &flash, &fonts, &images);
+
+                    // Fire on_click callback if defined
+                    if clicked_id.is_some() && clicked_func > 0 && code_len > 0 {
+                        if let Some((offset, _arg_count)) = cb_meta.find_func(clicked_func) {
+                            cb_vm.reset();
+                            cb_vm.set_pc(offset);
+                            // Push widget_id as argument
+                            cb_vm.push_arg(clicked_id.0 as i32);
+                            cb_vm.run(
+                                &code_buf[..code_len],
+                                &mut tree,
+                                &lcd,
+                                &flash,
+                                &mut fonts,
+                                &mut images,
+                                fs.as_ref(),
+                            );
+                        }
+                    }
                 }
             }
         }

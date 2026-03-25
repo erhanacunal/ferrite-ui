@@ -8,7 +8,7 @@ use crate::proto::{
     PROP_BORDER_COLOR, PROP_BORDER_EDGES, PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_T,
     PROP_CLICKABLE, PROP_ENABLED, PROP_FONT_ID, PROP_KIND, PROP_LOCATION, PROP_LOC_X, PROP_LOC_Y,
     PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L, PROP_MARGIN_R, PROP_MARGIN_T, PROP_PADDING,
-    PROP_IMAGE_ID, PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
+    PROP_IMAGE_ID, PROP_ON_CLICK, PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
     PROP_PRESS_COLOR, PROP_SIZE,
     PROP_SIZE_H, PROP_SIZE_W, PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VISIBLE, WT_I16,
     WT_LEN, WT_NO_ARG, WT_VARINT,
@@ -134,7 +134,31 @@ impl Vm {
         self.target = id;
     }
 
-    /// VM'i sıfırla (yeni program için)
+    /// Set program counter (used to jump to callback function offset).
+    pub fn set_pc(&mut self, pc: u16) {
+        self.pc = pc;
+    }
+
+    /// Read the return value left on stack after a callback runs.
+    /// Returns 0 if stack is empty.
+    pub fn pop_result(&mut self) -> i32 {
+        if self.sp > 0 {
+            self.sp -= 1;
+            self.stack[self.sp as usize]
+        } else {
+            0
+        }
+    }
+
+    /// Push an argument onto the stack (used before running a callback).
+    pub fn push_arg(&mut self, val: i32) {
+        if (self.sp as usize) < STACK_SIZE {
+            self.stack[self.sp as usize] = val;
+            self.sp += 1;
+        }
+    }
+
+    /// Reset VM state (for new program or callback invocation)
     pub fn reset(&mut self) {
         self.pc = 0;
         self.sp = 0;
@@ -612,6 +636,7 @@ impl Vm {
             PROP_TEXT_ALIGN => w.text_align = val as u8,
             PROP_PRESS_COLOR => w.press_color = val as u16,
             PROP_IMAGE_ID => w.image_id = val as u8,
+            PROP_ON_CLICK => w.on_click = val as u16,
             _ => {}
         }
     }
@@ -664,6 +689,7 @@ impl Vm {
             PROP_TEXT_ALIGN => w.text_align as i32,
             PROP_PRESS_COLOR => w.press_color as i32,
             PROP_IMAGE_ID => w.image_id as i32,
+            PROP_ON_CLICK => w.on_click as i32,
             _ => 0,
         }
     }

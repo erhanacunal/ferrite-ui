@@ -46,6 +46,7 @@ pub const PROP_FONT_ID: u8 = 0x1C;
 pub const PROP_TEXT_ALIGN: u8 = 0x1D;
 pub const PROP_PRESS_COLOR: u8 = 0x1E;
 pub const PROP_IMAGE_ID: u8 = 0x1F;
+pub const PROP_ON_CLICK: u8 = 0x20;
 
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;

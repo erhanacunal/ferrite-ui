@@ -91,6 +91,9 @@ pub struct Widget {
 
     // Background image (0 = no image, 1-254 = flash image_id)
     pub image_id: u8,
+
+    // Callback: click event (0 = no callback, 1+ = func_id)
+    pub on_click: u16,
 }
 
 impl Widget {
@@ -115,6 +118,7 @@ impl Widget {
             text_len: 0,
             press_color: 0,
             image_id: 0,
+            on_click: 0,
         }
     }
 

@@ -47,7 +47,14 @@ impl Rect {
         self.w == 0 || self.h == 0
     }
 
-    /// İki dikdörtgen kesişiyor mu?
+    /// Check if a point (px, py) is inside this rect.
+    pub fn contains(&self, px: u16, py: u16) -> bool {
+        let px = px as i16;
+        let py = py as i16;
+        px >= self.x && px < self.right() && py >= self.y && py < self.bottom()
+    }
+
+    /// Do two rectangles overlap?
     pub fn intersects(&self, other: &Rect) -> bool {
         !self.is_empty()
             && !other.is_empty()

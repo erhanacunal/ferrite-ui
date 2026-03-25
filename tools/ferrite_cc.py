@@ -110,6 +110,7 @@ class Prop:
     TEXT_ALIGN = 0x1D
     PRESS_COLOR = 0x1E
     IMAGE_ID = 0x1F
+    ON_CLICK = 0x20
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -476,6 +477,7 @@ PROP_NAMES = {
     0x14: 'BORDER_T', 0x15: 'BORDER_R', 0x16: 'BORDER_B', 0x17: 'BORDER_L',
     0x18: 'PADDING_T', 0x19: 'PADDING_R', 0x1A: 'PADDING_B', 0x1B: 'PADDING_L',
     0x1F: 'IMAGE_ID',
+    0x20: 'ON_CLICK',
     0x40: 'LOCATION', 0x41: 'SIZE', 0x42: 'MARGIN',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -631,6 +633,7 @@ PROP_MAP = {
     'text_align': (Prop.TEXT_ALIGN, False),
     'press_color': (Prop.PRESS_COLOR, False),
     'image_id': (Prop.IMAGE_ID, False),
+    'on_click': (Prop.ON_CLICK, False),
 }
 
 
@@ -683,6 +686,11 @@ class Compiler:
         self._next_id = base_id
         self._vars = {}         # name -> var slot (0-15)
         self._next_var = 0
+        self._funcs = {}        # name -> (func_id, arg_count, offset)
+        self._next_func_id = 1
+        self._on_program_start = 0xFFFF
+        self._on_page_changing = 0xFFFF
+        self._on_page_changed = 0xFFFF
 
     # --- Widget management ---
 
@@ -742,6 +750,9 @@ class Compiler:
 
     def halt(self):
         self.asm.halt()
+
+    def ret(self):
+        self.asm.ret()
 
     def yield_(self):
         self.asm.yield_()
@@ -826,6 +837,67 @@ class Compiler:
         """Jump back to loop start, patch exit jump."""
         self.asm.jmp(start)
         self.asm.patch(cond_handle)
+
+    # --- Callback functions ---
+
+    def define_func(self, name, arg_count=0):
+        """Define a callback function at current bytecode position.
+
+        Returns func_id (1-based). The function body follows this call
+        and should end with cc.ret() or cc.halt().
+
+        Example:
+            fid = cc.define_func("on_btn_click", arg_count=1)
+            # widget_id is on stack as argument
+            cc.asm.store(0)   # save to var 0
+            # ... callback body ...
+            cc.ret()
+        """
+        func_id = self._next_func_id
+        offset = self.asm.pos
+        self._funcs[name] = (func_id, arg_count, offset)
+        self._next_func_id += 1
+        return func_id
+
+    def on_program_start(self, func_name):
+        """Register a function as the on_program_start system callback."""
+        if func_name not in self._funcs:
+            raise ValueError(f"Unknown function: {func_name}")
+        self._on_program_start = self._funcs[func_name][2]  # offset
+
+    def on_page_changing(self, func_name):
+        """Register on_page_changing callback. Function receives (old_index, new_index),
+        must return 0 to prevent or non-zero to allow."""
+        if func_name not in self._funcs:
+            raise ValueError(f"Unknown function: {func_name}")
+        self._on_page_changing = self._funcs[func_name][2]
+
+    def on_page_changed(self, func_name):
+        """Register on_page_changed callback. Function receives (index)."""
+        if func_name not in self._funcs:
+            raise ValueError(f"Unknown function: {func_name}")
+        self._on_page_changed = self._funcs[func_name][2]
+
+    def build_meta(self):
+        """Build callback metadata binary.
+
+        Format:
+          func_count(u16) + on_program_start(u16) + on_page_changing(u16)
+          + on_page_changed(u16) + [func_id(u16) + offset(u16) + arg_count(u8)] × N
+        """
+        func_list = list(self._funcs.values())
+        buf = bytearray()
+        buf.extend(struct.pack('<H', len(func_list)))
+        buf.extend(struct.pack('<H', self._on_program_start))
+        buf.extend(struct.pack('<H', self._on_page_changing))
+        buf.extend(struct.pack('<H', self._on_page_changed))
+        for func_id, arg_count, offset in func_list:
+            buf.extend(struct.pack('<HHB', func_id, offset, arg_count))
+        return bytes(buf)
+
+    def has_callbacks(self):
+        """Check if any callback functions have been defined."""
+        return len(self._funcs) > 0
 
     # --- Output ---
 

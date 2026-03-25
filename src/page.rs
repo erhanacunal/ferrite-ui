@@ -179,30 +179,43 @@ impl PageManager {
         }
     }
 
-    /// Sayfayı göster. Mevcut aktif sayfayı gizle, yenisini göster ve çiz.
-    pub fn show(&mut self, index: u8, tree: &mut WidgetTree, lcd: &Lcd, flash: &Flash, fonts: &FontList, images: &ImageList) {
+    /// Check if a page switch is valid. Returns Some((old_index, new_index))
+    /// if the switch can proceed, None if invalid or same page.
+    /// Caller can use this to invoke on_page_changing callback before executing.
+    pub fn prepare_switch(&self, index: u8) -> Option<(u8, u8)> {
         if index as usize >= self.count as usize {
-            return;
+            return None;
         }
-
-        // Aynı sayfa zaten aktifse bir şey yapma
         if self.active == index {
-            return;
+            return None;
         }
+        Some((self.active, index))
+    }
 
-        // Eski sayfayı gizle
+    /// Execute the page switch: hide old, show new, mark dirty, render.
+    /// Call this after prepare_switch() and any on_page_changing callback.
+    pub fn execute_switch(
+        &mut self,
+        index: u8,
+        tree: &mut WidgetTree,
+        lcd: &Lcd,
+        flash: &Flash,
+        fonts: &FontList,
+        images: &ImageList,
+    ) {
+        // Hide old page
         if self.active != 0xFF {
             let old = self.pages[self.active as usize];
             tree.get_mut(old).flags &= !FLAG_VISIBLE;
         }
 
-        // Yeni sayfayı göster
+        // Show new page
         let new = self.pages[index as usize];
         tree.get_mut(new).flags |= FLAG_VISIBLE;
         tree.mark_dirty(new);
         self.active = index;
 
-        // Root'u da dirty işaretle (arka plan temizlenmeli)
+        // Mark root dirty (background needs clearing)
         if tree.root.is_some() {
             tree.mark_dirty(tree.root);
         }
@@ -210,7 +223,22 @@ impl PageManager {
         render::render_dirty(tree, lcd, flash, fonts, images);
     }
 
-    /// Sonraki sayfaya geç (döngüsel)
+    /// Show a page (convenience wrapper without callbacks).
+    pub fn show(
+        &mut self,
+        index: u8,
+        tree: &mut WidgetTree,
+        lcd: &Lcd,
+        flash: &Flash,
+        fonts: &FontList,
+        images: &ImageList,
+    ) {
+        if self.prepare_switch(index).is_some() {
+            self.execute_switch(index, tree, lcd, flash, fonts, images);
+        }
+    }
+
+    /// Next page (circular).
     pub fn next(&mut self, tree: &mut WidgetTree, lcd: &Lcd, flash: &Flash, fonts: &FontList, images: &ImageList) {
         if self.count == 0 {
             return;
@@ -223,7 +251,7 @@ impl PageManager {
         self.show(next_idx, tree, lcd, flash, fonts, images);
     }
 
-    /// Önceki sayfaya geç (döngüsel)
+    /// Previous page (circular).
     pub fn prev(&mut self, tree: &mut WidgetTree, lcd: &Lcd, flash: &Flash, fonts: &FontList, images: &ImageList) {
         if self.count == 0 {
             return;
