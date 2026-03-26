@@ -474,6 +474,74 @@ fillCircle(400, 240, 100, 0x001F);
 fillCircle(50, 50, 5, 0xF800);
 ```
 
+### roundedRect(x, y, w, h, r, color)
+
+Draws a rounded rectangle outline (1px border with quarter-circle corners).
+
+```c
+// Panel with rounded corners
+roundedRect(50, 50, 300, 200, 15, 0xFFFF);
+
+// Button outline
+roundedRect(100, 100, 160, 50, 8, 0x07E0);
+```
+
+### fillRoundedRect(x, y, w, h, r, color)
+
+Draws a filled rounded rectangle.
+
+```c
+// Filled button background
+fillRoundedRect(100, 100, 160, 50, 8, 0x001F);
+
+// Card-style panel
+fillRoundedRect(50, 50, 700, 380, 20, 0x10A2);
+roundedRect(50, 50, 700, 380, 20, 0xFFFF);  // border on top
+```
+
+If the radius is larger than half the width or height, it is clamped automatically. A radius of 0 draws a regular rectangle.
+
+### arc(cx, cy, r, start, end, color)
+
+Draws an arc (portion of a circle outline). Angles are in degrees:
+- **0** = right (3 o'clock)
+- **90** = down (6 o'clock)
+- **180** = left (9 o'clock)
+- **270** = up (12 o'clock)
+
+Wraps around: `arc(cx, cy, r, 350, 10, color)` draws through 0.
+
+```c
+// Top half-circle (gauge background)
+arc(400, 300, 100, 180, 360, 0xFFFF);
+
+// Quarter arc (top-right)
+arc(400, 240, 80, 270, 360, 0xF800);
+
+// Small 60-degree arc
+arc(400, 240, 120, 30, 90, 0x07E0);
+
+// Full circle (same as circle())
+arc(400, 240, 50, 0, 359, 0xFFFF);
+```
+
+Typical use: gauge displays, progress indicators, clock faces.
+
+```c
+// Speedometer gauge: 180-degree arc with tick marks
+var cx = 400;
+var cy = 350;
+
+// Background arc
+arc(cx, cy, 100, 180, 360, 0x4208);
+
+// Value arc (green, 75% of 180 degrees = 135 degrees)
+arc(cx, cy, 100, 180, 315, 0x07E0);
+
+// Center dot
+fillCircle(cx, cy, 5, 0xFFFF);
+```
+
 ### drawImage(x, y, image_id)
 
 Draws a flash-stored image at the given position. The `image_id` must match an image loaded in the flash filesystem (Ferrite Image format).

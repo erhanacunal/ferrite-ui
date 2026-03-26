@@ -662,6 +662,7 @@ NO_VALUE_BUILTINS = {
     'fillRect', 'rect', 'line', 'circle', 'fillCircle',
     'drawImage', 'drawText', 'delay',
     'setText', 'drawStr', 'strClear', 'strFree',
+    'roundedRect', 'fillRoundedRect', 'arc',
 }
 
 
@@ -1293,6 +1294,42 @@ class CodeGen:
                 raise CompileError("strFree() takes 1 argument: str_id", node.line)
             self._gen_expr(node.args[0])
             self.asm.str_free()
+            return
+
+        # --- Built-in: rounded rect & arc ---
+
+        if name == 'roundedRect':
+            # roundedRect(x, y, w, h, r, color)
+            if len(node.args) != 6:
+                raise CompileError("roundedRect() takes 6 arguments: x, y, w, h, r, color", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])  # loc
+            self._gen_packed_pair(node.args[2], node.args[3])  # size
+            self._gen_expr(node.args[4])                        # radius
+            self._gen_expr(node.args[5])                        # color
+            self.asm.builtin(Builtin.ROUNDED_RECT)
+            return
+
+        if name == 'fillRoundedRect':
+            # fillRoundedRect(x, y, w, h, r, color)
+            if len(node.args) != 6:
+                raise CompileError("fillRoundedRect() takes 6 arguments: x, y, w, h, r, color", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])
+            self._gen_packed_pair(node.args[2], node.args[3])
+            self._gen_expr(node.args[4])
+            self._gen_expr(node.args[5])
+            self.asm.builtin(Builtin.FILL_ROUNDED_RECT)
+            return
+
+        if name == 'arc':
+            # arc(cx, cy, r, start, end, color)
+            if len(node.args) != 6:
+                raise CompileError("arc() takes 6 arguments: cx, cy, r, start, end, color", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])  # center
+            self._gen_expr(node.args[2])                        # radius
+            self._gen_expr(node.args[3])                        # start deg
+            self._gen_expr(node.args[4])                        # end deg
+            self._gen_expr(node.args[5])                        # color
+            self.asm.builtin(Builtin.ARC)
             return
 
         # --- User-defined function ---

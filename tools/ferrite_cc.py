@@ -113,6 +113,9 @@ class Builtin:
     DRAW_STR = 16    # stack: [str_id, colors, font_id, loc] → draw
     STR_CLEAR = 17   # no args → smart clear (preserves widget text)
     STR_FREE = 18    # stack: [str_id] → mark for next clear
+    ROUNDED_RECT = 19      # stack: [color, r, size, loc]
+    FILL_ROUNDED_RECT = 20 # stack: [color, r, size, loc]
+    ARC = 21               # stack: [color, end, start, radius, center]
 
 
 class Prop:
@@ -662,6 +665,33 @@ class Asm:
         """Pop str_id, mark for reclamation on next strClear()."""
         self.builtin(Builtin.STR_FREE)
 
+    # --- Rounded rect & arc ---
+
+    def draw_rounded_rect(self, x, y, w, h, r, color):
+        """Emit roundedRect built-in."""
+        self.push(pack_pair(x, y))
+        self.push(pack_pair(w, h))
+        self.push(r)
+        self.push(color)
+        self.builtin(Builtin.ROUNDED_RECT)
+
+    def fill_rounded_rect(self, x, y, w, h, r, color):
+        """Emit fillRoundedRect built-in."""
+        self.push(pack_pair(x, y))
+        self.push(pack_pair(w, h))
+        self.push(r)
+        self.push(color)
+        self.builtin(Builtin.FILL_ROUNDED_RECT)
+
+    def draw_arc(self, cx, cy, r, start, end, color):
+        """Emit arc built-in. Angles in degrees (0=right, 90=down)."""
+        self.push(pack_pair(cx, cy))
+        self.push(r)
+        self.push(start)
+        self.push(end)
+        self.push(color)
+        self.builtin(Builtin.ARC)
+
     # --- Output ---
 
     def build(self):
@@ -710,6 +740,7 @@ BUILTIN_NAMES = {
     8: 'str', 9: 'itos', 10: 'ftos', 11: 'concat',
     12: 'parseInt', 13: 'parseFloat', 14: 'strLen',
     15: 'setText', 16: 'drawStr', 17: 'strClear', 18: 'strFree',
+    19: 'roundedRect', 20: 'fillRoundedRect', 21: 'arc',
 }
 
 PROP_NAMES = {

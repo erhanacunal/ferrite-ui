@@ -107,6 +107,11 @@ const BUILTIN_DRAW_STR: u8 = 16;   // stack: [str_id, colors, font_id, loc] → 
 const BUILTIN_STR_CLEAR: u8 = 17;  // no args → smart clear (preserves widget text)
 const BUILTIN_STR_FREE: u8 = 18;   // stack: [str_id] → marks string for next clear
 
+// Drawing: rounded rect & arc
+const BUILTIN_ROUNDED_RECT: u8 = 19;      // stack: [color, r, size, loc]
+const BUILTIN_FILL_ROUNDED_RECT: u8 = 20; // stack: [color, r, size, loc]
+const BUILTIN_ARC: u8 = 21;               // stack: [color, end, start, radius, center]
+
 // --- VM State ---
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1026,6 +1031,30 @@ impl Vm {
             BUILTIN_STR_FREE => {
                 let str_id = self.pop() as u8;
                 strpool::pool().free(str_id);
+            }
+            BUILTIN_ROUNDED_RECT => {
+                // stack: [color, r, size, loc]
+                let color = self.pop() as u16;
+                let r = self.pop() as u16;
+                let (w, h) = unpack_pair(self.pop());
+                let (x, y) = unpack_pair(self.pop());
+                lcd.draw_rounded_rect(x, y, w, h, r, color);
+            }
+            BUILTIN_FILL_ROUNDED_RECT => {
+                let color = self.pop() as u16;
+                let r = self.pop() as u16;
+                let (w, h) = unpack_pair(self.pop());
+                let (x, y) = unpack_pair(self.pop());
+                lcd.fill_rounded_rect(x, y, w, h, r, color);
+            }
+            BUILTIN_ARC => {
+                // stack: [color, end, start, radius, center]
+                let color = self.pop() as u16;
+                let end = self.pop() as i16;
+                let start = self.pop() as i16;
+                let radius = self.pop() as i16;
+                let (cx, cy) = unpack_pair(self.pop());
+                lcd.draw_arc(cx as i16, cy as i16, radius, start, end, color);
             }
             _ => {
                 self.state = VmState::Error;
