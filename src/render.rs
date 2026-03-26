@@ -59,11 +59,11 @@ fn render_subtree(
 ///    c. Kalan clip rect'ler üzerinden widget'ı çiz
 ///    d. Çocukları aynı occluder listesiyle recursive çiz
 pub fn render_dirty(tree: &mut WidgetTree, lcd: &Lcd, flash: &Flash, fonts: &FontList, images: &ImageList) {
-    let (dfs, dfs_count) = tree.dfs_order();
+    let dfs = tree.dfs_order();
 
     // Dirty widget var mı?
     let mut has_dirty = false;
-    for i in 0..dfs_count {
+    for i in 0..dfs.len() {
         if tree.get(dfs[i]).is_dirty() {
             has_dirty = true;
             break;
@@ -73,7 +73,7 @@ pub fn render_dirty(tree: &mut WidgetTree, lcd: &Lcd, flash: &Flash, fonts: &Fon
         return;
     }
 
-    for di in 0..dfs_count {
+    for di in 0..dfs.len() {
         let id = dfs[di];
 
         if !tree.get(id).is_dirty() || !tree.get(id).is_visible() {
@@ -89,7 +89,7 @@ pub fn render_dirty(tree: &mut WidgetTree, lcd: &Lcd, flash: &Flash, fonts: &Fon
         let mut occ_count: usize = 0;
         let mut after_subtree = false;
 
-        for j in (di + 1)..dfs_count {
+        for j in (di + 1)..dfs.len() {
             if !after_subtree {
                 if !tree.is_descendant(dfs[j], id) {
                     after_subtree = true;
@@ -411,8 +411,8 @@ fn inner_rect(abs: &Rect, border: &crate::types::Edges) -> Rect {
 
 /// Tüm widget'ların dirty flag'ini temizle.
 fn clear_all_dirty(tree: &mut WidgetTree) {
-    let (dfs, count) = tree.dfs_order();
-    for i in 0..count {
+    let dfs = tree.dfs_order();
+    for i in 0..dfs.len() {
         tree.get_mut(dfs[i]).clear_dirty();
     }
 }

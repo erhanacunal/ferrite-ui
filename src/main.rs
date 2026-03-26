@@ -659,8 +659,8 @@ fn main() -> ! {
                     let mut clicked_id = widget::WidgetId::NONE;
                     let mut clicked_func: u16 = 0;
 
-                    let (dfs, count) = tree.dfs_order();
-                    for i in 0..count {
+                    let dfs = tree.dfs_order();
+                    for i in 0..dfs.len() {
                         let w = tree.get_mut(dfs[i]);
                         if w.flags & widget::FLAG_PRESSED != 0 {
                             w.flags &= !widget::FLAG_PRESSED;
@@ -727,8 +727,8 @@ fn main() -> ! {
             let mut paint_ids = [widget::WidgetId::NONE; 8];
             let mut paint_count: usize = 0;
             {
-                let (dfs, count) = tree.dfs_order();
-                for i in 0..count {
+                let dfs = tree.dfs_order();
+                for i in 0..dfs.len() {
                     let w = tree.get(dfs[i]);
                     if w.is_dirty() && w.on_paint != 0 && paint_count < 8 {
                         paint_ids[paint_count] = dfs[i];

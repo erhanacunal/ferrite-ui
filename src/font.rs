@@ -16,6 +16,9 @@
 ///   bitmapOffset: u16, width: u8, height: u8,
 ///   xAdvance: u8, xOffset: i8, yOffset: i8
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use crate::flash::Flash;
 use crate::fs::{Fs, RES_FONT};
 use crate::lcd::Lcd;
@@ -62,23 +65,38 @@ impl GfxGlyph {
     }
 }
 
-/// Max glyph count (ASCII 0x20–0x7E = 95, extended up to 224)
-const MAX_GLYPHS: usize = 128;
-
 /// Glyph bitmap read buffer size
 const BITMAP_BUF_SIZE: usize = 128;
 
 /// Embedded font ID (reserved, user fonts cannot use this)
 pub const EMBEDDED_FONT_ID: u8 = 0;
 
-/// Font — glyph table in RAM, bitmap data in flash or ROM.
+/// Glyph storage — either ROM reference (embedded) or heap-allocated (flash-loaded).
+/// Embedded fonts use zero RAM for glyphs — they point directly to ROM.
+enum GlyphData {
+    /// Static ROM reference (embedded font). Zero RAM cost.
+    Static(&'static [GfxGlyph]),
+    /// Heap-allocated (flash-loaded font). RAM = glyph_count × 7 bytes.
+    Heap(Vec<GfxGlyph>),
+}
+
+impl GlyphData {
+    fn get(&self, index: usize) -> &GfxGlyph {
+        match self {
+            GlyphData::Static(s) => &s[index],
+            GlyphData::Heap(v) => &v[index],
+        }
+    }
+}
+
+/// Font — glyph data from ROM or heap, bitmap data from flash or ROM.
 pub struct Font {
     pub font_id: u8,
     first: u16,
     last: u16,
     y_advance: u8,
     glyph_count: u16,
-    glyphs: [GfxGlyph; MAX_GLYPHS],
+    glyphs: GlyphData,
     /// Absolute flash address of bitmap data
     bitmap_addr: u32,
     /// Embedded bitmap data pointer (ROM). Null means flash is used.
@@ -90,15 +108,15 @@ unsafe impl Send for Font {}
 unsafe impl Sync for Font {}
 
 impl Font {
-    /// Empty/invalid font sentinel (used for FontList initialization).
-    pub const fn empty() -> Self {
+    /// Empty/invalid font sentinel.
+    fn empty() -> Self {
         Font {
             font_id: 0xFF,
             first: 0,
             last: 0,
             y_advance: 0,
             glyph_count: 0,
-            glyphs: [GfxGlyph::empty(); MAX_GLYPHS],
+            glyphs: GlyphData::Heap(Vec::new()),
             bitmap_addr: 0,
             embedded_bitmap: core::ptr::null(),
         }
@@ -128,25 +146,22 @@ impl Font {
             return None;
         }
         let glyph_count = last - first + 1;
-        if glyph_count as usize > MAX_GLYPHS {
-            return None;
-        }
 
-        let mut glyphs = [GfxGlyph::empty(); MAX_GLYPHS];
+        let mut glyphs = Vec::with_capacity(glyph_count as usize);
         let mut g_buf = [0u8; 7];
 
         for i in 0..glyph_count as usize {
             let offset = 6 + (i * 7) as u32;
             flash.read(entry.offset + offset, &mut g_buf);
 
-            glyphs[i] = GfxGlyph {
+            glyphs.push(GfxGlyph {
                 bitmap_offset: u16::from_le_bytes([g_buf[0], g_buf[1]]),
                 width: g_buf[2],
                 height: g_buf[3],
                 x_advance: g_buf[4],
                 x_offset: g_buf[5] as i8,
                 y_offset: g_buf[6] as i8,
-            };
+            });
         }
 
         let bitmap_addr = entry.offset + 6 + glyph_count as u32 * 7;
@@ -157,7 +172,7 @@ impl Font {
             last,
             y_advance,
             glyph_count,
-            glyphs,
+            glyphs: GlyphData::Heap(glyphs),
             bitmap_addr,
             embedded_bitmap: core::ptr::null(),
         })
@@ -186,27 +201,21 @@ impl Font {
     }
 
     /// Create an embedded (ROM) font. Always gets font_id = 0.
+    /// Glyphs reference ROM directly — zero RAM cost for glyph data.
     pub fn from_embedded(
-        glyphs: &[GfxGlyph],
+        glyphs: &'static [GfxGlyph],
         bitmap: &'static [u8],
         first: u16,
         last: u16,
         y_advance: u8,
     ) -> Self {
-        let mut font_glyphs = [GfxGlyph::empty(); MAX_GLYPHS];
-        let count = glyphs.len().min(MAX_GLYPHS);
-        let mut i = 0;
-        while i < count {
-            font_glyphs[i] = glyphs[i];
-            i += 1;
-        }
         Font {
             font_id: EMBEDDED_FONT_ID,
             first,
             last,
             y_advance,
-            glyph_count: count as u16,
-            glyphs: font_glyphs,
+            glyph_count: glyphs.len() as u16,
+            glyphs: GlyphData::Static(glyphs),
             bitmap_addr: 0,
             embedded_bitmap: bitmap.as_ptr(),
         }
@@ -224,7 +233,7 @@ impl Font {
             return 0;
         }
         let idx = (code - self.first) as usize;
-        self.glyphs[idx].x_advance
+        self.glyphs.get(idx).x_advance
     }
 
     /// Calculate string width in pixels.
@@ -253,7 +262,7 @@ impl Font {
         }
 
         let idx = (code - self.first) as usize;
-        let glyph = &self.glyphs[idx];
+        let glyph = self.glyphs.get(idx);
 
         if glyph.width == 0 || glyph.height == 0 {
             return glyph.x_advance;
@@ -415,52 +424,36 @@ impl Font {
 // FontList — application-wide font registry
 // ============================================================
 
-/// Maximum number of loaded fonts (embedded + flash)
-const MAX_FONTS: usize = 4;
-
-/// Application-wide font list. Holds loaded fonts and supports
-/// lookup by font_id with lazy loading from flash.
+/// Application-wide font list. Heap-allocated, grows on demand.
+/// Supports lookup by font_id with lazy loading from flash.
 pub struct FontList {
-    fonts: [Font; MAX_FONTS],
-    count: u8,
+    fonts: Vec<Font>,
 }
 
 impl FontList {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            fonts: [const { Font::empty() }; MAX_FONTS],
-            count: 0,
+            fonts: Vec::new(),
         }
     }
 
-    /// Add a font to the list. Returns false if full.
+    /// Add a font to the list.
     pub fn add(&mut self, font: Font) -> bool {
-        if (self.count as usize) >= MAX_FONTS {
-            return false;
-        }
-        self.fonts[self.count as usize] = font;
-        self.count += 1;
+        self.fonts.push(font);
         true
     }
 
     /// Find a loaded font by font_id. Returns None if not loaded.
     pub fn find(&self, font_id: u8) -> Option<&Font> {
-        for i in 0..self.count as usize {
-            if self.fonts[i].font_id == font_id {
-                return Some(&self.fonts[i]);
-            }
-        }
-        None
+        self.fonts.iter().find(|f| f.font_id == font_id)
     }
 
     /// Find a font by font_id. If not already loaded, search flash
     /// filesystem and load it. Returns true if the font is now available.
     pub fn find_or_load(&mut self, font_id: u8, fs: &Fs, flash: &Flash) -> bool {
-        // Already loaded?
         if self.find(font_id).is_some() {
             return true;
         }
-        // Try loading from flash
         if let Some(font) = Font::load_by_id(fs, flash, font_id) {
             return self.add(font);
         }
@@ -469,12 +462,10 @@ impl FontList {
 
     /// Get the embedded font (font_id = 0). Panics if not added.
     pub fn embedded(&self) -> &Font {
-        // Embedded font is always the first one added
         &self.fonts[0]
     }
 
     /// Resolve a font_id: try exact match, fall back to embedded (id=0).
-    /// This implements the caller pattern: try font_id, if None use embedded.
     pub fn resolve(&self, font_id: u8) -> Option<&Font> {
         self.find(font_id).or_else(|| self.find(EMBEDDED_FONT_ID))
     }

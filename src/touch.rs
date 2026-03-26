@@ -195,10 +195,10 @@ impl Touch {
 /// Ekran koordinatında (x, y) en üstteki CLICKABLE widget'ı bul.
 /// DFS pre-order = z-order (son eşleşen = en üst).
 pub fn hit_test(tree: &WidgetTree, x: u16, y: u16) -> WidgetId {
-    let (dfs, count) = tree.dfs_order();
+    let dfs = tree.dfs_order();
     let mut result = WidgetId::NONE;
 
-    for i in 0..count {
+    for i in 0..dfs.len() {
         let id = dfs[i];
         let w = tree.get(id);
         if w.flags & FLAG_CLICKABLE == 0 || w.flags & FLAG_VISIBLE == 0 {

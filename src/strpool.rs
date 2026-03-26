@@ -204,8 +204,8 @@ pub fn smart_clear(tree: &mut WidgetTree) {
 
     // Phase 1: Build keep bitmask from widget text_ids
     let mut keep: u32 = 0;
-    let (dfs, dfs_count) = tree.dfs_order();
-    for i in 0..dfs_count {
+    let dfs = tree.dfs_order();
+    for i in 0..dfs.len() {
         let text_id = tree.get(dfs[i]).text_id;
         if text_id != 0xFF && (text_id as usize) < MAX_STRINGS {
             keep |= 1 << text_id;
@@ -216,7 +216,7 @@ pub fn smart_clear(tree: &mut WidgetTree) {
     let remap = p.smart_clear(keep);
 
     // Phase 3: Update widget text_id references
-    for i in 0..dfs_count {
+    for i in 0..dfs.len() {
         let w = tree.get_mut(dfs[i]);
         if w.text_id != 0xFF && (w.text_id as usize) < MAX_STRINGS {
             w.text_id = remap[w.text_id as usize];

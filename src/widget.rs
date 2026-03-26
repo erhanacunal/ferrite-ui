@@ -1,3 +1,6 @@
+extern crate alloc;
+
+use alloc::vec::Vec;
 use crate::types::{Color, Edges, Offset, Rect, Size};
 
 // --- Flags ---
@@ -22,7 +25,7 @@ pub const ALIGN_RIGHT: u8 = 2;
 
 // --- WidgetId ---
 
-/// Widget arena indeksi. NONE = bağlantı yok.
+/// Widget index. NONE = no link.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WidgetId(pub u8);
 
@@ -44,37 +47,32 @@ impl WidgetId {
 
 // --- Widget ---
 
-pub const MAX_WIDGETS: usize = 64;
-
-/// Tek bir widget düğümü.
+/// Single widget node.
 ///
-/// Ağaç yapısı: parent + first_child + next_sibling (left-child right-sibling).
-/// Size = border box (border dahil, margin hariç).
-///
-/// kind: KIND_BASE (container), KIND_LABEL (text), KIND_BUTTON (tıklanabilir container).
-/// Label/Button base widget özelliklerini (margin, border, padding, renk) miras alır.
+/// Tree structure: parent + first_child + next_sibling (left-child right-sibling).
+/// Size = border box (border included, margin excluded).
 pub struct Widget {
-    // Ağaç bağlantıları
+    // Tree links
     pub parent: WidgetId,
     pub first_child: WidgetId,
     pub next_sibling: WidgetId,
 
-    // Durum
+    // State
     pub flags: u8,
 
-    // Widget tipi
+    // Widget type
     pub kind: u8,
 
-    // Kutu modeli
+    // Box model
     pub margin: Edges,
     pub border: Edges,
     pub padding: Edges,
 
-    // Konum ve boyut
+    // Position and size
     pub location: Offset,
     pub size: Size,
 
-    // Görünüm
+    // Appearance
     pub background_color: Color,
     pub border_color: Color,
 
@@ -101,7 +99,7 @@ pub struct Widget {
 }
 
 impl Widget {
-    pub(crate) const fn default() -> Self {
+    pub fn default() -> Self {
         Self {
             parent: WidgetId::NONE,
             first_child: WidgetId::NONE,
@@ -146,30 +144,27 @@ impl Widget {
 
 // --- WidgetTree ---
 
-/// Statik arena ile widget ağacı. Heap yok, sabit bellek.
+/// Heap-allocated widget tree. Grows on demand via Vec.
 pub struct WidgetTree {
-    widgets: [Widget; MAX_WIDGETS],
-    count: u8,
+    widgets: Vec<Widget>,
     pub root: WidgetId,
 }
 
 impl WidgetTree {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            widgets: [const { Widget::default() }; MAX_WIDGETS],
-            count: 0,
+            widgets: Vec::new(),
             root: WidgetId::NONE,
         }
     }
 
-    /// Yeni widget tahsis et. Arena doluysa None döner.
+    /// Allocate a new widget. Returns None if WidgetId overflow (max 254).
     pub fn alloc(&mut self) -> Option<WidgetId> {
-        if (self.count as usize) >= MAX_WIDGETS {
-            return None;
+        if self.widgets.len() >= 254 {
+            return None; // WidgetId is u8, 0xFF is NONE sentinel
         }
-        let id = WidgetId(self.count);
-        self.widgets[id.index()] = Widget::default();
-        self.count += 1;
+        let id = WidgetId(self.widgets.len() as u8);
+        self.widgets.push(Widget::default());
         Some(id)
     }
 
@@ -181,9 +176,14 @@ impl WidgetTree {
         &mut self.widgets[id.index()]
     }
 
-    // --- Ağaç işlemleri ---
+    /// Widget count.
+    pub fn count(&self) -> usize {
+        self.widgets.len()
+    }
 
-    /// Alt widget'ı parent'ın çocuk listesinin sonuna ekle (en üst z-order).
+    // --- Tree operations ---
+
+    /// Add child to end of parent's child list (highest z-order).
     pub fn add_child(&mut self, parent: WidgetId, child: WidgetId) {
         self.widgets[child.index()].parent = parent;
 
@@ -199,7 +199,7 @@ impl WidgetTree {
         }
     }
 
-    /// Widget'ın ekran koordinatlarındaki border box dikdörtgenini hesapla.
+    /// Compute widget's absolute border-box rect in screen coordinates.
     pub fn absolute_rect(&self, id: WidgetId) -> Rect {
         let w = &self.widgets[id.index()];
         let mut x = w.location.x + w.margin.left as i16;
@@ -222,7 +222,7 @@ impl WidgetTree {
         Rect::new(x, y, w.size.w, w.size.h)
     }
 
-    /// Widget'ın content area'sını hesapla (children bu alanda konumlanır).
+    /// Compute widget's content area (where children are placed).
     pub fn content_rect(&self, id: WidgetId) -> Rect {
         let abs = self.absolute_rect(id);
         let w = &self.widgets[id.index()];
@@ -239,7 +239,7 @@ impl WidgetTree {
         )
     }
 
-    /// child, ancestor'ın soyundan mı?
+    /// Is child a descendant of ancestor?
     pub fn is_descendant(&self, child: WidgetId, ancestor: WidgetId) -> bool {
         let mut current = self.widgets[child.index()].parent;
         while current.is_some() {
@@ -251,7 +251,7 @@ impl WidgetTree {
         false
     }
 
-    /// Widget'ı ve tüm alt ağacını dirty işaretle.
+    /// Mark widget and all descendants as dirty.
     pub fn mark_dirty(&mut self, id: WidgetId) {
         self.widgets[id.index()].flags |= FLAG_DIRTY;
         let mut child = self.widgets[id.index()].first_child;
@@ -261,48 +261,31 @@ impl WidgetTree {
         }
     }
 
-    /// Ağacı DFS pre-order sırasıyla düzleştir (z-order).
-    pub fn dfs_order(&self) -> ([WidgetId; MAX_WIDGETS], usize) {
-        let mut order = [WidgetId::NONE; MAX_WIDGETS];
-        let mut count: usize = 0;
+    /// Flatten tree to DFS pre-order (z-order).
+    pub fn dfs_order(&self) -> Vec<WidgetId> {
+        let mut order = Vec::new();
 
         if self.root.is_none() {
-            return (order, 0);
+            return order;
         }
 
-        let mut stack = [WidgetId::NONE; MAX_WIDGETS];
-        let mut top: usize = 0;
-        stack[0] = self.root;
-        top = 1;
+        let mut stack = Vec::new();
+        stack.push(self.root);
 
-        while top > 0 {
-            top -= 1;
-            let id = stack[top];
+        while let Some(id) = stack.pop() {
+            order.push(id);
 
-            if count < MAX_WIDGETS {
-                order[count] = id;
-                count += 1;
-            }
-
-            let mut children = [WidgetId::NONE; MAX_WIDGETS];
-            let mut child_count: usize = 0;
+            // Collect children, push in reverse for correct DFS order
             let mut child = self.widgets[id.index()].first_child;
+            let start = stack.len();
             while child.is_some() {
-                children[child_count] = child;
-                child_count += 1;
+                stack.push(child);
                 child = self.widgets[child.index()].next_sibling;
             }
-
-            let mut i = child_count;
-            while i > 0 {
-                i -= 1;
-                if top < MAX_WIDGETS {
-                    stack[top] = children[i];
-                    top += 1;
-                }
-            }
+            // Reverse the children we just pushed
+            stack[start..].reverse();
         }
 
-        (order, count)
+        order
     }
 }
