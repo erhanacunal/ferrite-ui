@@ -858,6 +858,29 @@ while (true) {
 }
 ```
 
+### strFree(str_id)
+
+Marks a single string for reclamation. The string is discarded on the next `strClear()` call, even if a widget references it. Use this to explicitly release strings you no longer need.
+
+```c
+var tmp1 = itos(sensor_value);
+var tmp2 = str(" mV");
+var msg = concat(tmp1, tmp2);
+
+// Done with intermediates, mark them for cleanup
+strFree(tmp1);
+strFree(tmp2);
+
+// msg is still usable until strClear
+drawStr(10, 10, 0, 0xFFFF, 0x0000, msg);
+
+// Now reclaim — msg stays if not freed, tmp1/tmp2 are gone
+strFree(msg);
+strClear();
+```
+
+`strFree` only marks the string — actual space is reclaimed when `strClear()` compacts the pool. Between calls, freed strings still occupy buffer space but their slots are flagged for removal.
+
 ### Pool Limits
 
 | Resource | Limit |

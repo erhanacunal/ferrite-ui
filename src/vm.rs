@@ -104,7 +104,8 @@ const BUILTIN_PARSE_FLOAT: u8 = 13;// stack: [str_id] → [f32_bits]
 const BUILTIN_STR_LEN: u8 = 14;    // stack: [str_id] → [len]
 const BUILTIN_SET_TEXT: u8 = 15;    // stack: [str_id] → sets target widget text
 const BUILTIN_DRAW_STR: u8 = 16;   // stack: [str_id, colors, font_id, loc] → draw
-const BUILTIN_STR_CLEAR: u8 = 17;  // no args → resets string pool
+const BUILTIN_STR_CLEAR: u8 = 17;  // no args → smart clear (preserves widget text)
+const BUILTIN_STR_FREE: u8 = 18;   // stack: [str_id] → marks string for next clear
 
 // --- VM State ---
 
@@ -1021,6 +1022,10 @@ impl Vm {
             }
             BUILTIN_STR_CLEAR => {
                 strpool::smart_clear(tree);
+            }
+            BUILTIN_STR_FREE => {
+                let str_id = self.pop() as u8;
+                strpool::pool().free(str_id);
             }
             _ => {
                 self.state = VmState::Error;

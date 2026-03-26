@@ -661,7 +661,7 @@ NO_VALUE_BUILTINS = {
     'target', 'set', 'parent', 'dirty', 'render', 'halt', 'yield_op',
     'fillRect', 'rect', 'line', 'circle', 'fillCircle',
     'drawImage', 'drawText', 'delay',
-    'setText', 'drawStr', 'strClear',
+    'setText', 'drawStr', 'strClear', 'strFree',
 }
 
 
@@ -1286,6 +1286,13 @@ class CodeGen:
             if len(node.args) != 0:
                 raise CompileError("strClear() takes no arguments", node.line)
             self.asm.str_clear()
+            return
+
+        if name == 'strFree':
+            if len(node.args) != 1:
+                raise CompileError("strFree() takes 1 argument: str_id", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.str_free()
             return
 
         # --- User-defined function ---

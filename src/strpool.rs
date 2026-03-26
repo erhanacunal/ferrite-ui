@@ -32,6 +32,7 @@ pub struct StringPool {
     meta: [StrMeta; MAX_STRINGS],
     count: u8,
     next: u16,
+    freed: u32, // bitmask: 1 = freed, discarded on next smart_clear
 }
 
 static mut POOL: StringPool = StringPool::new();
@@ -43,6 +44,14 @@ impl StringPool {
             meta: [StrMeta::empty(); MAX_STRINGS],
             count: 0,
             next: 0,
+            freed: 0,
+        }
+    }
+
+    /// Mark a string as freed. Space is reclaimed on next smart_clear().
+    pub fn free(&mut self, id: u8) {
+        if (id as usize) < MAX_STRINGS && id < self.count {
+            self.freed |= 1 << id;
         }
     }
 
@@ -119,9 +128,11 @@ impl StringPool {
     pub fn clear(&mut self) {
         self.count = 0;
         self.next = 0;
+        self.freed = 0;
     }
 
     /// Smart clear: keep strings referenced by `keep` bitmask, discard the rest.
+    /// Explicitly freed strings (via `free()`) are always discarded regardless of keep.
     /// Compacts survivors to the front of the buffer with new sequential IDs.
     /// Returns an ID remap table: old_id → new_id (0xFF = discarded).
     pub fn smart_clear(&mut self, keep: u32) -> [u8; MAX_STRINGS] {
@@ -131,6 +142,9 @@ impl StringPool {
         if old_count == 0 {
             return remap;
         }
+
+        // Exclude explicitly freed strings
+        let keep = keep & !self.freed;
 
         // If nothing to keep, just clear everything
         if keep == 0 {
@@ -169,6 +183,7 @@ impl StringPool {
 
         self.count = new_id;
         self.next = write_pos;
+        self.freed = 0;
         remap
     }
 }

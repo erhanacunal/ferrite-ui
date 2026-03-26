@@ -111,7 +111,8 @@ class Builtin:
     STR_LEN = 14     # stack: [str_id] → [len]
     SET_TEXT = 15     # stack: [str_id] → sets target widget text
     DRAW_STR = 16    # stack: [str_id, colors, font_id, loc] → draw
-    STR_CLEAR = 17   # no args → resets string pool
+    STR_CLEAR = 17   # no args → smart clear (preserves widget text)
+    STR_FREE = 18    # stack: [str_id] → mark for next clear
 
 
 class Prop:
@@ -654,8 +655,12 @@ class Asm:
         self.builtin(Builtin.DRAW_STR)
 
     def str_clear(self):
-        """Reset the string pool. All str_ids become invalid."""
+        """Smart clear: free unreferenced strings, preserve widget text."""
         self.builtin(Builtin.STR_CLEAR)
+
+    def str_free(self):
+        """Pop str_id, mark for reclamation on next strClear()."""
+        self.builtin(Builtin.STR_FREE)
 
     # --- Output ---
 
@@ -704,7 +709,7 @@ BUILTIN_NAMES = {
     4: 'fillCircle', 5: 'drawImage', 6: 'drawText', 7: 'delay',
     8: 'str', 9: 'itos', 10: 'ftos', 11: 'concat',
     12: 'parseInt', 13: 'parseFloat', 14: 'strLen',
-    15: 'setText', 16: 'drawStr', 17: 'strClear',
+    15: 'setText', 16: 'drawStr', 17: 'strClear', 18: 'strFree',
 }
 
 PROP_NAMES = {
