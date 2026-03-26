@@ -72,7 +72,7 @@ const ERR_PROGRAM_ERROR: u8 = 6;
 
 // === Max program code size ===
 
-const MAX_CODE_SIZE: usize = 1024;
+const MAX_CODE_SIZE: usize = 8192;
 
 // === RCU registers ===
 

@@ -20,7 +20,7 @@ use crate::flash::Flash;
 use crate::usart::Usart;
 
 /// Maximum program bytecode size received via USART
-const MAX_PROGRAM_SIZE: usize = 1024;
+const MAX_PROGRAM_SIZE: usize = 8192;
 
 /// Maximum user message size (bytes)
 const MAX_USER_MSG: usize = 64;

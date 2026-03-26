@@ -1207,6 +1207,6 @@ halt();
 | Eval stack | 16 deep |
 | Call stack | 8 deep |
 | Array pool | 128 elements, max 16 arrays |
-| Bytecode size | 1024 bytes (USART execute) |
+| Bytecode size | 8192 bytes (USART execute) |
 | Flash code | limited by flash resource size |
 | Clip rects | 32 rectangles |
