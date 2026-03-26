@@ -15,7 +15,8 @@ Python API:
 
 import sys
 import struct
-from ferrite_cc import Asm, Op, WT, Prop, disassemble, encode_svarint, _resolve_prop, PROP_MAP
+from ferrite_cc import (Asm, Op, WT, Prop, Builtin, disassemble, encode_svarint,
+                        _resolve_prop, PROP_MAP, pack_pair, float_bits)
 
 
 # ============================================================
@@ -106,8 +107,35 @@ def tokenize(source):
             else:
                 while i < n and (source[i].isdigit() or source[i] == '_'):
                     i += 1
+                # Check for float literal (decimal point)
+                if i < n and source[i] == '.' and (i + 1 >= n or source[i + 1] != '.'):
+                    i += 1  # skip '.'
+                    while i < n and (source[i].isdigit() or source[i] == '_'):
+                        i += 1
+                    val = float(source[start:i].replace('_', ''))
+                    tokens.append(Token('FLOAT', val, line))
+                    continue
                 val = int(source[start:i].replace('_', ''))
             tokens.append(Token('NUM', val, line))
+            continue
+
+        # String literals
+        if ch == '"':
+            i += 1
+            start = i
+            while i < n and source[i] != '"':
+                if source[i] == '\\':
+                    i += 1  # skip escaped char
+                if source[i] == '\n':
+                    line += 1
+                i += 1
+            if i >= n:
+                raise CompileError("unterminated string literal", line)
+            raw = source[start:i]
+            # Process escape sequences
+            val = raw.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+            tokens.append(Token('STR', val, line))
+            i += 1  # skip closing "
             continue
 
         # Identifiers / keywords
@@ -162,6 +190,18 @@ class NumLit:
 class BoolLit:
     def __init__(self, value, line):
         self.value = value
+        self.line = line
+
+
+class StrLit:
+    def __init__(self, value, line):
+        self.value = value  # str
+        self.line = line
+
+
+class FloatLit:
+    def __init__(self, value, line):
+        self.value = value  # Python float
         self.line = line
 
 
@@ -573,6 +613,12 @@ class Parser:
         if self._check('NUM'):
             tok = self._advance()
             return NumLit(tok.value, tok.line)
+        if self._check('STR'):
+            tok = self._advance()
+            return StrLit(tok.value, tok.line)
+        if self._check('FLOAT'):
+            tok = self._advance()
+            return FloatLit(tok.value, tok.line)
         if self._check('TRUE'):
             tok = self._advance()
             return BoolLit(True, tok.line)
@@ -611,7 +657,12 @@ COMPOUND_SCALARS = {
 }
 
 # Built-ins that don't leave a value on the stack
-NO_VALUE_BUILTINS = {'target', 'set', 'parent', 'dirty', 'render', 'halt', 'yield_op'}
+NO_VALUE_BUILTINS = {
+    'target', 'set', 'parent', 'dirty', 'render', 'halt', 'yield_op',
+    'fillRect', 'rect', 'line', 'circle', 'fillCircle',
+    'drawImage', 'drawText', 'delay',
+    'setText', 'drawStr', 'strClear',
+}
 
 
 class CodeGen:
@@ -912,6 +963,8 @@ class CodeGen:
     def _gen_expr(self, node):
         if isinstance(node, NumLit):
             self.asm.push(node.value)
+        elif isinstance(node, FloatLit):
+            self.asm.push(float_bits(node.value))
         elif isinstance(node, BoolLit):
             self.asm.push(1 if node.value else 0)
         elif isinstance(node, VarRef):
@@ -1030,6 +1083,211 @@ class CodeGen:
             self.asm.yield_()
             return
 
+        # --- Built-in: drawing primitives ---
+        # All use packed u32 args: pack_pair(high, low)
+        # Compiler packs (x,y), (w,h), (fg,bg) automatically.
+
+        if name == 'fillRect':
+            # fillRect(x, y, w, h, color)
+            if len(node.args) != 5:
+                raise CompileError("fillRect() takes 5 arguments: x, y, w, h, color", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])  # loc
+            self._gen_packed_pair(node.args[2], node.args[3])  # size
+            self._gen_expr(node.args[4])                        # color
+            self.asm.builtin(Builtin.FILL_RECT)
+            return
+
+        if name == 'rect':
+            # rect(x, y, w, h, color)
+            if len(node.args) != 5:
+                raise CompileError("rect() takes 5 arguments: x, y, w, h, color", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])
+            self._gen_packed_pair(node.args[2], node.args[3])
+            self._gen_expr(node.args[4])
+            self.asm.builtin(Builtin.RECT)
+            return
+
+        if name == 'line':
+            # line(x0, y0, x1, y1, color)
+            if len(node.args) != 5:
+                raise CompileError("line() takes 5 arguments: x0, y0, x1, y1, color", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])  # start
+            self._gen_packed_pair(node.args[2], node.args[3])  # end
+            self._gen_expr(node.args[4])                        # color
+            self.asm.builtin(Builtin.LINE)
+            return
+
+        if name == 'circle':
+            # circle(cx, cy, r, color)
+            if len(node.args) != 4:
+                raise CompileError("circle() takes 4 arguments: cx, cy, r, color", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])  # center
+            self._gen_expr(node.args[2])                        # radius
+            self._gen_expr(node.args[3])                        # color
+            self.asm.builtin(Builtin.CIRCLE)
+            return
+
+        if name == 'fillCircle':
+            # fillCircle(cx, cy, r, color)
+            if len(node.args) != 4:
+                raise CompileError("fillCircle() takes 4 arguments: cx, cy, r, color", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])
+            self._gen_expr(node.args[2])
+            self._gen_expr(node.args[3])
+            self.asm.builtin(Builtin.FILL_CIRCLE)
+            return
+
+        if name == 'drawImage':
+            # drawImage(x, y, image_id)
+            if len(node.args) != 3:
+                raise CompileError("drawImage() takes 3 arguments: x, y, image_id", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])  # loc
+            self._gen_expr(node.args[2])                        # image_id
+            self.asm.builtin(Builtin.DRAW_IMAGE)
+            return
+
+        if name == 'drawText':
+            # drawText(x, y, font_id, fg, bg, "text")
+            if len(node.args) != 6:
+                raise CompileError("drawText() takes 6 arguments: x, y, font_id, fg, bg, text", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])  # loc
+            self._gen_expr(node.args[2])                        # font_id
+            self._gen_packed_pair(node.args[3], node.args[4])  # colors (fg, bg)
+            # Text must be a string literal — encoded as LEN payload
+            text_arg = node.args[5]
+            if isinstance(text_arg, StrLit):
+                text_bytes = text_arg.value.encode('utf-8')
+            else:
+                raise CompileError("drawText() text argument must be a string literal", node.line)
+            self.asm.builtin_len(Builtin.DRAW_TEXT, text_bytes)
+            return
+
+        if name == 'delay':
+            # delay(ms)
+            if len(node.args) != 1:
+                raise CompileError("delay() takes 1 argument: ms", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.DELAY)
+            return
+
+        # --- Built-in: float32 operations ---
+
+        if name == 'itof':
+            if len(node.args) != 1:
+                raise CompileError("itof() takes 1 argument", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.itof()
+            return
+
+        if name == 'ftoi':
+            if len(node.args) != 1:
+                raise CompileError("ftoi() takes 1 argument", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.ftoi()
+            return
+
+        if name == 'fneg':
+            if len(node.args) != 1:
+                raise CompileError("fneg() takes 1 argument", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.fneg()
+            return
+
+        # Two-arg float ops
+        _FLOAT_BINOPS = {
+            'fadd': 'fadd', 'fsub': 'fsub', 'fmul': 'fmul', 'fdiv': 'fdiv',
+            'feq': 'feq', 'fne': 'fne', 'flt': 'flt', 'fle': 'fle',
+            'fgt': 'fgt', 'fge': 'fge',
+        }
+        if name in _FLOAT_BINOPS:
+            if len(node.args) != 2:
+                raise CompileError(f"{name}() takes 2 arguments", node.line)
+            self._gen_expr(node.args[0])
+            self._gen_expr(node.args[1])
+            getattr(self.asm, _FLOAT_BINOPS[name])()
+            return
+
+        # --- Built-in: string operations ---
+
+        if name == 'str':
+            # str("literal") → str_id
+            if len(node.args) != 1:
+                raise CompileError("str() takes 1 argument (string literal)", node.line)
+            arg = node.args[0]
+            if isinstance(arg, StrLit):
+                self.asm.str_alloc(arg.value)
+            else:
+                raise CompileError("str() argument must be a string literal", node.line)
+            return
+
+        if name == 'itos':
+            if len(node.args) != 1:
+                raise CompileError("itos() takes 1 argument", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.str_itos()
+            return
+
+        if name == 'ftos':
+            if len(node.args) != 1:
+                raise CompileError("ftos() takes 1 argument", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.str_ftos()
+            return
+
+        if name == 'concat':
+            if len(node.args) != 2:
+                raise CompileError("concat() takes 2 arguments", node.line)
+            self._gen_expr(node.args[0])
+            self._gen_expr(node.args[1])
+            self.asm.str_concat()
+            return
+
+        if name == 'parseInt':
+            if len(node.args) != 1:
+                raise CompileError("parseInt() takes 1 argument", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.str_parse_int()
+            return
+
+        if name == 'parseFloat':
+            if len(node.args) != 1:
+                raise CompileError("parseFloat() takes 1 argument", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.str_parse_float()
+            return
+
+        if name == 'strLen':
+            if len(node.args) != 1:
+                raise CompileError("strLen() takes 1 argument", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.str_len()
+            return
+
+        if name == 'setText':
+            # setText(str_id) — sets text on current target widget
+            if len(node.args) != 1:
+                raise CompileError("setText() takes 1 argument", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.str_set_text()
+            return
+
+        if name == 'drawStr':
+            # drawStr(x, y, font_id, fg, bg, str_id)
+            if len(node.args) != 6:
+                raise CompileError("drawStr() takes 6 arguments: x, y, font_id, fg, bg, str_id", node.line)
+            self._gen_packed_pair(node.args[0], node.args[1])  # loc
+            self._gen_expr(node.args[2])                        # font_id
+            self._gen_packed_pair(node.args[3], node.args[4])  # colors
+            self._gen_expr(node.args[5])                        # str_id
+            self.asm.str_draw()
+            return
+
+        if name == 'strClear':
+            if len(node.args) != 0:
+                raise CompileError("strClear() takes no arguments", node.line)
+            self.asm.str_clear()
+            return
+
         # --- User-defined function ---
         if name not in self.functions:
             raise CompileError(f"undefined function: {name}", node.line)
@@ -1078,6 +1336,22 @@ class CodeGen:
                 raise CompileError(f"set({prop_name}) takes 1 value", node.line)
             self._gen_expr(value_args[0])
             self.asm.w_set(prop_id)
+
+    def _gen_packed_pair(self, high_expr, low_expr):
+        """Generate code to push a packed pair (high << 16 | low) onto stack.
+
+        If both are constants, emits a single PUSH with the packed value.
+        Otherwise, generates runtime packing: high * 65536 | low.
+        """
+        if isinstance(high_expr, NumLit) and isinstance(low_expr, NumLit):
+            self.asm.push(pack_pair(high_expr.value, low_expr.value))
+        else:
+            # Runtime: (high * 65536) | low
+            self._gen_expr(high_expr)
+            self.asm.push(65536)
+            self.asm.mul()
+            self._gen_expr(low_expr)
+            self.asm.or_()
 
     def _resolve_widget_id(self, arg):
         """Resolve widget ID from literal or tracked variable."""

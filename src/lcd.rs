@@ -78,4 +78,146 @@ impl Lcd {
             self.send_data(color);
         }
     }
+
+    /// Draw rectangle outline (1px border)
+    pub fn draw_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        // Top edge
+        self.fill_rect(x, y, w, 1, color);
+        // Bottom edge
+        if h > 1 {
+            self.fill_rect(x, y + h - 1, w, 1, color);
+        }
+        // Left edge (excluding corners)
+        if h > 2 {
+            self.fill_rect(x, y + 1, 1, h - 2, color);
+        }
+        // Right edge (excluding corners)
+        if w > 1 && h > 2 {
+            self.fill_rect(x + w - 1, y + 1, 1, h - 2, color);
+        }
+    }
+
+    /// Draw a single pixel at (x, y)
+    #[inline]
+    pub fn draw_pixel(&self, x: u16, y: u16, color: u16) {
+        if x < WIDTH && y < HEIGHT {
+            self.set_address(x, y, x, y);
+            self.send_data(color);
+        }
+    }
+
+    /// Draw line using Bresenham's algorithm
+    pub fn draw_line(&self, x0: i16, y0: i16, x1: i16, y1: i16, color: u16) {
+        let mut x = x0;
+        let mut y = y0;
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx: i16 = if x0 < x1 { 1 } else { -1 };
+        let sy: i16 = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+
+        loop {
+            if x >= 0 && x < WIDTH as i16 && y >= 0 && y < HEIGHT as i16 {
+                self.draw_pixel(x as u16, y as u16, color);
+            }
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
+    /// Draw circle outline using midpoint circle algorithm
+    pub fn draw_circle(&self, cx: i16, cy: i16, r: i16, color: u16) {
+        if r <= 0 {
+            return;
+        }
+        let mut x: i16 = 0;
+        let mut y: i16 = r;
+        let mut d: i16 = 1 - r;
+
+        while x <= y {
+            self.circle_points(cx, cy, x, y, color);
+            if d < 0 {
+                d += 2 * x + 3;
+            } else {
+                d += 2 * (x - y) + 5;
+                y -= 1;
+            }
+            x += 1;
+        }
+    }
+
+    /// Draw filled circle using midpoint algorithm with horizontal spans
+    pub fn fill_circle(&self, cx: i16, cy: i16, r: i16, color: u16) {
+        if r <= 0 {
+            return;
+        }
+        let mut x: i16 = 0;
+        let mut y: i16 = r;
+        let mut d: i16 = 1 - r;
+
+        // Center horizontal line
+        self.hline_clipped(cx - r, cx + r, cy, color);
+
+        while x <= y {
+            x += 1;
+            if d < 0 {
+                d += 2 * x + 1;
+            } else {
+                // Draw horizontal spans for the previous y before decrementing
+                self.hline_clipped(cx - x + 1, cx + x - 1, cy + y, color);
+                self.hline_clipped(cx - x + 1, cx + x - 1, cy - y, color);
+                y -= 1;
+                d += 2 * (x - y) + 1;
+            }
+            self.hline_clipped(cx - y, cx + y, cy + x, color);
+            self.hline_clipped(cx - y, cx + y, cy - x, color);
+        }
+    }
+
+    /// Plot 8 symmetric circle points
+    fn circle_points(&self, cx: i16, cy: i16, x: i16, y: i16, color: u16) {
+        self.plot(cx + x, cy + y, color);
+        self.plot(cx - x, cy + y, color);
+        self.plot(cx + x, cy - y, color);
+        self.plot(cx - x, cy - y, color);
+        self.plot(cx + y, cy + x, color);
+        self.plot(cx - y, cy + x, color);
+        self.plot(cx + y, cy - x, color);
+        self.plot(cx - y, cy - x, color);
+    }
+
+    /// Plot pixel with bounds check (signed coordinates)
+    #[inline]
+    fn plot(&self, x: i16, y: i16, color: u16) {
+        if x >= 0 && x < WIDTH as i16 && y >= 0 && y < HEIGHT as i16 {
+            self.draw_pixel(x as u16, y as u16, color);
+        }
+    }
+
+    /// Draw clipped horizontal line from x0 to x1 (inclusive) at y
+    fn hline_clipped(&self, x0: i16, x1: i16, y: i16, color: u16) {
+        if y < 0 || y >= HEIGHT as i16 {
+            return;
+        }
+        let left = x0.max(0) as u16;
+        let right = x1.min(WIDTH as i16 - 1);
+        if right < 0 || left > right as u16 {
+            return;
+        }
+        let w = right as u16 - left + 1;
+        self.fill_rect(left, y as u16, w, 1, color);
+    }
 }

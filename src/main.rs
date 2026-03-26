@@ -18,6 +18,8 @@ mod page;
 mod proto;
 mod protocol;
 mod render;
+mod strpool;
+mod systick;
 mod touch;
 mod types;
 mod usart;
@@ -402,6 +404,9 @@ fn main() -> ! {
     // --- System clock: IRC8M → PLL ×27 → 108MHz ---
     system_init();
 
+    // --- SysTick: 1ms tick counter ---
+    systick::init();
+
     // --- Peripheral init ---
     init_ports();
 
@@ -564,6 +569,12 @@ fn main() -> ! {
                     show_error(&lcd, fonts.embedded(), &flash, &usart, error_code);
                 }
             }
+            VmState::Waiting => {
+                // Non-blocking delay: check if target tick has passed
+                if systick::millis().wrapping_sub(vm.wait_until) < 0x8000_0000 {
+                    vm.state = VmState::Running;
+                }
+            }
             _ => {} // Halted, Error, Ready → skip
         }
 
@@ -603,6 +614,27 @@ fn main() -> ! {
                     protocol::send_pong(&usart);
                     usart.flush();
                     cortex_m::peripheral::SCB::sys_reset();
+                }
+
+                RxEvent::UserMessage => {
+                    // Fire on_user_message callback with message data as VM array
+                    if cb_meta.on_user_message != NO_CALLBACK && code_len > 0 {
+                        let msg = protocol.user_message();
+                        cb_vm.reset();
+                        if let Some(arr_id) = cb_vm.alloc_array_from(msg) {
+                            cb_vm.set_pc(cb_meta.on_user_message);
+                            cb_vm.push_arg(arr_id);
+                            cb_vm.run(
+                                &code_buf[..code_len],
+                                &mut tree,
+                                &lcd,
+                                &flash,
+                                &mut fonts,
+                                &mut images,
+                                fs.as_ref(),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -657,13 +689,74 @@ fn main() -> ! {
                             );
                         }
                     }
+
+                    // Fire on_tap callback if defined (widget_id, packed x|y)
+                    if clicked_id.is_some() && code_len > 0 {
+                        let tap_func = tree.get(clicked_id).on_tap;
+                        if tap_func > 0 {
+                            if let Some((offset, _arg_count)) = cb_meta.find_func(tap_func) {
+                                cb_vm.reset();
+                                cb_vm.set_pc(offset);
+                                cb_vm.push_arg(clicked_id.0 as i32);
+                                let packed_xy = ((event.x as u32) << 16 | event.y as u32) as i32;
+                                cb_vm.push_arg(packed_xy);
+                                cb_vm.run(
+                                    &code_buf[..code_len],
+                                    &mut tree,
+                                    &lcd,
+                                    &flash,
+                                    &mut fonts,
+                                    &mut images,
+                                    fs.as_ref(),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
 
         // --- Render any dirty widgets (from VM, callbacks, or other state changes) ---
         if error_code == 0 {
+            // Collect widgets with on_paint before render clears dirty flags
+            let mut paint_ids = [widget::WidgetId::NONE; 8];
+            let mut paint_count: usize = 0;
+            {
+                let (dfs, count) = tree.dfs_order();
+                for i in 0..count {
+                    let w = tree.get(dfs[i]);
+                    if w.is_dirty() && w.on_paint != 0 && paint_count < 8 {
+                        paint_ids[paint_count] = dfs[i];
+                        paint_count += 1;
+                    }
+                }
+            }
+
             render::render_dirty(&mut tree, &lcd, &flash, &fonts, &images);
+
+            // Fire on_paint callbacks after widget background is rendered
+            if code_len > 0 {
+                for i in 0..paint_count {
+                    let id = paint_ids[i];
+                    let paint_func = tree.get(id).on_paint;
+                    if paint_func > 0 {
+                        if let Some((offset, _arg_count)) = cb_meta.find_func(paint_func) {
+                            cb_vm.reset();
+                            cb_vm.set_pc(offset);
+                            cb_vm.push_arg(id.0 as i32);
+                            cb_vm.run(
+                                &code_buf[..code_len],
+                                &mut tree,
+                                &lcd,
+                                &flash,
+                                &mut fonts,
+                                &mut images,
+                                fs.as_ref(),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }

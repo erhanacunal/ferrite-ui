@@ -14,12 +14,16 @@
 ///   Field 3, Varint  = Restart
 ///   Field 4, Payload = WriteFs header (8B: total_size u32 LE + chunk_size u32 LE)
 ///   Field 5, Payload = WriteChunk (chunk data bytes)
+///   Field 6, Payload = UserMessage (arbitrary user data, max 64 bytes)
 
 use crate::flash::Flash;
 use crate::usart::Usart;
 
 /// Maximum program bytecode size received via USART
 const MAX_PROGRAM_SIZE: usize = 1024;
+
+/// Maximum user message size (bytes)
+const MAX_USER_MSG: usize = 64;
 
 /// Sector buffer size for flash writes (4KB = 1 erase sector)
 const FS_SECTOR_SIZE: usize = 4096;
@@ -169,6 +173,8 @@ pub enum RxEvent {
     FsChunkDone,
     /// All chunks received, flash write complete (send pong ACK, then restart)
     FsWriteComplete,
+    /// User message received (arbitrary data for VM callback)
+    UserMessage,
 }
 
 // --- Protocol ---
@@ -178,6 +184,8 @@ pub struct Protocol {
     program_buf: [u8; MAX_PROGRAM_SIZE],
     program_len: u16,
     fs_writer: FsWriter,
+    user_msg_buf: [u8; MAX_USER_MSG],
+    user_msg_len: u8,
 }
 
 impl Protocol {
@@ -187,12 +195,19 @@ impl Protocol {
             program_buf: [0; MAX_PROGRAM_SIZE],
             program_len: 0,
             fs_writer: FsWriter::new(),
+            user_msg_buf: [0; MAX_USER_MSG],
+            user_msg_len: 0,
         }
     }
 
     /// Return program bytecode (valid after ProgramReady event).
     pub fn program_code(&self) -> &[u8] {
         &self.program_buf[..self.program_len as usize]
+    }
+
+    /// Return user message data (valid after UserMessage event).
+    pub fn user_message(&self) -> &[u8] {
+        &self.user_msg_buf[..self.user_msg_len as usize]
     }
 
     /// Process a single received byte. Returns an event if a complete message was received.
@@ -239,6 +254,15 @@ impl Protocol {
                                     shift: 0,
                                 };
                             }
+                            6 => {
+                                // UserMessage — read length, then data
+                                self.user_msg_len = 0;
+                                self.state = RxState::Length {
+                                    field: 6,
+                                    value: 0,
+                                    shift: 0,
+                                };
+                            }
                             _ => {} // Unknown field — ignore
                         }
                         RxEvent::None
@@ -265,6 +289,7 @@ impl Protocol {
                         match f {
                             2 => RxEvent::ProgramReady,
                             4 => RxEvent::FsReady,
+                            6 => RxEvent::UserMessage,
                             5 => {
                                 if self.fs_writer.is_complete() {
                                     self.fs_writer.flush(flash);
@@ -312,6 +337,13 @@ impl Protocol {
                         // WriteChunk data → sector buffer
                         self.fs_writer.write_byte(byte, flash);
                     }
+                    6 => {
+                        // User message data → buffer
+                        if (self.user_msg_len as usize) < MAX_USER_MSG {
+                            self.user_msg_buf[self.user_msg_len as usize] = byte;
+                            self.user_msg_len += 1;
+                        }
+                    }
                     _ => {}
                 }
 
@@ -320,6 +352,7 @@ impl Protocol {
                     self.state = RxState::Idle;
                     match field {
                         2 => RxEvent::ProgramReady,
+                        6 => RxEvent::UserMessage,
                         4 => {
                             // Header complete — parse and prepare for chunks
                             self.fs_writer.parse_header();

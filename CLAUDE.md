@@ -1,7 +1,6 @@
 # CLAUDE.md — ferrite-ui
 
 Nextion NX8048K070 ekranı için Rust ile yazılmış bare-metal HMI framework.
-Orijinal firmware Ghidra ile reverse engineering yapılarak FPGA protokolü çözüldü.
 
 ## Donanım
 
@@ -14,7 +13,7 @@ Orijinal firmware Ghidra ile reverse engineering yapılarak FPGA protokolü çö
 - **Flash:** W25Q256JVFQ 32MB (SPI) — UI bytecode, font, görseller burada
 - **RTC:** AT8563T (I2C)
 
-## FPGA Protokolü (Ghidra ile reverse edildi)
+## FPGA Protokolü 
 
 - `GPIOB[15:0]` = 16-bit data bus
 - `PA15`: 1=data, 0=command (LCD_CMD_DATA)

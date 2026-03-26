@@ -94,6 +94,12 @@ pub struct Widget {
 
     // Callback: click event (0 = no callback, 1+ = func_id)
     pub on_click: u16,
+
+    // Callback: custom paint event (0 = no callback, 1+ = func_id)
+    pub on_paint: u16,
+
+    // Callback: tap with coordinates event (0 = no callback, 1+ = func_id)
+    pub on_tap: u16,
 }
 
 impl Widget {
@@ -119,6 +125,8 @@ impl Widget {
             press_color: 0,
             image_id: 0,
             on_click: 0,
+            on_paint: 0,
+            on_tap: 0,
         }
     }
 

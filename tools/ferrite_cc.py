@@ -74,6 +74,44 @@ class Op:
     ARR_LOAD = 38
     ARR_STORE = 39
     ARR_LEN = 40
+    BUILTIN = 41
+    # Float32 (soft-float, all no-arg)
+    ITOF = 42
+    FTOI = 43
+    FADD = 44
+    FSUB = 45
+    FMUL = 46
+    FDIV = 47
+    FNEG = 48
+    FEQ = 49
+    FLT = 50
+    FLE = 51
+    FGT = 52
+    FGE = 53
+    FNE = 54
+
+
+class Builtin:
+    """Built-in method IDs for OP_BUILTIN."""
+    FILL_RECT = 0    # stack: [color, size, loc]
+    RECT = 1         # stack: [color, size, loc]
+    LINE = 2         # stack: [color, end, start]
+    CIRCLE = 3       # stack: [color, radius, center]
+    FILL_CIRCLE = 4  # stack: [color, radius, center]
+    DRAW_IMAGE = 5   # stack: [image_id, loc]
+    DRAW_TEXT = 6    # stack: [colors, font_id, loc] + LEN payload text
+    DELAY = 7        # stack: [ms]
+    # String operations
+    STR = 8          # LEN payload=bytes → [str_id]
+    ITOS = 9         # stack: [i32] → [str_id]
+    FTOS = 10        # stack: [f32] → [str_id]
+    CONCAT = 11      # stack: [str_b, str_a] → [str_id]
+    PARSE_INT = 12   # stack: [str_id] → [i32]
+    PARSE_FLOAT = 13 # stack: [str_id] → [f32]
+    STR_LEN = 14     # stack: [str_id] → [len]
+    SET_TEXT = 15     # stack: [str_id] → sets target widget text
+    DRAW_STR = 16    # stack: [str_id, colors, font_id, loc] → draw
+    STR_CLEAR = 17   # no args → resets string pool
 
 
 class Prop:
@@ -111,6 +149,8 @@ class Prop:
     PRESS_COLOR = 0x1E
     IMAGE_ID = 0x1F
     ON_CLICK = 0x20
+    ON_PAINT = 0x21
+    ON_TAP = 0x22
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -178,6 +218,33 @@ def decode_svarint(data, pos=0):
     """Signed varint decode. Returns (value, bytes_consumed)."""
     raw, consumed = decode_varint(data, pos)
     return zigzag_decode(raw), consumed
+
+
+def float_bits(f):
+    """Convert a Python float to its f32 bit pattern as a signed i32.
+
+    Usage: float_bits(3.14) -> i32 representation of f32
+    """
+    import struct as _st
+    bits = _st.unpack('<I', _st.pack('<f', f))[0]
+    if bits >= 0x80000000:
+        return bits - 0x100000000
+    return bits
+
+
+def pack_pair(high, low):
+    """Pack two u16 values into a single i32: (high << 16) | low.
+
+    Convention:
+      location: pack_pair(x, y)
+      size:     pack_pair(w, h)
+      colors:   pack_pair(fg, bg)
+    """
+    val = ((high & 0xFFFF) << 16) | (low & 0xFFFF)
+    # Convert to signed i32 for VM stack
+    if val >= 0x80000000:
+        val -= 0x100000000
+    return val
 
 
 # ============================================================
@@ -428,6 +495,168 @@ class Asm:
         """Pop arr_id, push length."""
         self._emit_no_arg(Op.ARR_LEN)
 
+    # --- Float32 instructions (soft-float, all no-arg) ---
+
+    def itof(self):
+        """Pop i32, push f32 bits."""
+        self._emit_no_arg(Op.ITOF)
+
+    def ftoi(self):
+        """Pop f32 bits, push i32."""
+        self._emit_no_arg(Op.FTOI)
+
+    def fadd(self):
+        """Pop two f32, push f32 sum."""
+        self._emit_no_arg(Op.FADD)
+
+    def fsub(self):
+        """Pop two f32, push f32 difference (a - b)."""
+        self._emit_no_arg(Op.FSUB)
+
+    def fmul(self):
+        """Pop two f32, push f32 product."""
+        self._emit_no_arg(Op.FMUL)
+
+    def fdiv(self):
+        """Pop two f32, push f32 quotient (a / b)."""
+        self._emit_no_arg(Op.FDIV)
+
+    def fneg(self):
+        """Pop f32, push negated f32."""
+        self._emit_no_arg(Op.FNEG)
+
+    def feq(self):
+        """Pop two f32, push i32 (1 if a == b, else 0)."""
+        self._emit_no_arg(Op.FEQ)
+
+    def flt(self):
+        """Pop two f32, push i32 (1 if a < b, else 0)."""
+        self._emit_no_arg(Op.FLT)
+
+    def fle(self):
+        """Pop two f32, push i32 (1 if a <= b, else 0)."""
+        self._emit_no_arg(Op.FLE)
+
+    def fgt(self):
+        """Pop two f32, push i32 (1 if a > b, else 0)."""
+        self._emit_no_arg(Op.FGT)
+
+    def fge(self):
+        """Pop two f32, push i32 (1 if a >= b, else 0)."""
+        self._emit_no_arg(Op.FGE)
+
+    def fne(self):
+        """Pop two f32, push i32 (1 if a != b, else 0)."""
+        self._emit_no_arg(Op.FNE)
+
+    # --- Built-in methods (OP_BUILTIN) ---
+
+    def builtin(self, method_id):
+        """Emit OP_BUILTIN with varint method_id. Args already on stack."""
+        self._emit_svarint(Op.BUILTIN, method_id)
+
+    def builtin_len(self, method_id, payload):
+        """Emit OP_BUILTIN with LEN payload. First byte = method_id, rest = data."""
+        data = bytes([method_id]) + (payload.encode('utf-8') if isinstance(payload, str) else bytes(payload))
+        self._emit_len(Op.BUILTIN, data)
+
+    def fill_rect(self, x, y, w, h, color):
+        """Emit fillRect built-in: push packed args + BUILTIN 0."""
+        self.push(pack_pair(x, y))
+        self.push(pack_pair(w, h))
+        self.push(color)
+        self.builtin(Builtin.FILL_RECT)
+
+    def draw_rect(self, x, y, w, h, color):
+        """Emit rect outline built-in: push packed args + BUILTIN 1."""
+        self.push(pack_pair(x, y))
+        self.push(pack_pair(w, h))
+        self.push(color)
+        self.builtin(Builtin.RECT)
+
+    def draw_line(self, x0, y0, x1, y1, color):
+        """Emit line built-in: push packed args + BUILTIN 2."""
+        self.push(pack_pair(x0, y0))
+        self.push(pack_pair(x1, y1))
+        self.push(color)
+        self.builtin(Builtin.LINE)
+
+    def draw_circle(self, cx, cy, r, color):
+        """Emit circle outline built-in: push packed args + BUILTIN 3."""
+        self.push(pack_pair(cx, cy))
+        self.push(r)
+        self.push(color)
+        self.builtin(Builtin.CIRCLE)
+
+    def fill_circle(self, cx, cy, r, color):
+        """Emit filled circle built-in: push packed args + BUILTIN 4."""
+        self.push(pack_pair(cx, cy))
+        self.push(r)
+        self.push(color)
+        self.builtin(Builtin.FILL_CIRCLE)
+
+    def draw_image(self, x, y, image_id):
+        """Emit drawImage built-in: push packed args + BUILTIN 5."""
+        self.push(pack_pair(x, y))
+        self.push(image_id)
+        self.builtin(Builtin.DRAW_IMAGE)
+
+    def draw_text(self, x, y, font_id, fg, bg, text):
+        """Emit drawText built-in: push stack args + BUILTIN LEN with text payload.
+        bg=0 means transparent.
+        """
+        self.push(pack_pair(x, y))
+        self.push(font_id)
+        self.push(pack_pair(fg, bg))
+        self.builtin_len(Builtin.DRAW_TEXT, text)
+
+    def delay(self, ms):
+        """Emit delay_ms built-in: push ms + BUILTIN 7."""
+        self.push(ms)
+        self.builtin(Builtin.DELAY)
+
+    # --- String operations ---
+
+    def str_alloc(self, text):
+        """Create a string from literal text. Pushes str_id."""
+        self.builtin_len(Builtin.STR, text)
+
+    def str_itos(self):
+        """Pop i32, push str_id of decimal representation."""
+        self.builtin(Builtin.ITOS)
+
+    def str_ftos(self):
+        """Pop f32 bits, push str_id of float representation."""
+        self.builtin(Builtin.FTOS)
+
+    def str_concat(self):
+        """Pop [str_b, str_a], push concatenated str_id."""
+        self.builtin(Builtin.CONCAT)
+
+    def str_parse_int(self):
+        """Pop str_id, push parsed i32."""
+        self.builtin(Builtin.PARSE_INT)
+
+    def str_parse_float(self):
+        """Pop str_id, push parsed f32 bits."""
+        self.builtin(Builtin.PARSE_FLOAT)
+
+    def str_len(self):
+        """Pop str_id, push length."""
+        self.builtin(Builtin.STR_LEN)
+
+    def str_set_text(self):
+        """Pop str_id, set as text on current target widget."""
+        self.builtin(Builtin.SET_TEXT)
+
+    def str_draw(self):
+        """Pop [str_id, colors, font_id, loc], draw string."""
+        self.builtin(Builtin.DRAW_STR)
+
+    def str_clear(self):
+        """Reset the string pool. All str_ids become invalid."""
+        self.builtin(Builtin.STR_CLEAR)
+
     # --- Output ---
 
     def build(self):
@@ -464,6 +693,18 @@ OP_NAMES = {
     28: 'GT', 29: 'CALL', 30: 'RET', 31: 'YIELD', 32: 'W_RENDER',
     33: 'W_ALLOC', 34: 'W_PARENT', 35: 'F_READ', 36: 'F_WRITE',
     37: 'ARR_ALLOC', 38: 'ARR_LOAD', 39: 'ARR_STORE', 40: 'ARR_LEN',
+    41: 'BUILTIN',
+    42: 'ITOF', 43: 'FTOI',
+    44: 'FADD', 45: 'FSUB', 46: 'FMUL', 47: 'FDIV', 48: 'FNEG',
+    49: 'FEQ', 50: 'FLT', 51: 'FLE', 52: 'FGT', 53: 'FGE', 54: 'FNE',
+}
+
+BUILTIN_NAMES = {
+    0: 'fillRect', 1: 'rect', 2: 'line', 3: 'circle',
+    4: 'fillCircle', 5: 'drawImage', 6: 'drawText', 7: 'delay',
+    8: 'str', 9: 'itos', 10: 'ftos', 11: 'concat',
+    12: 'parseInt', 13: 'parseFloat', 14: 'strLen',
+    15: 'setText', 16: 'drawStr', 17: 'strClear',
 }
 
 PROP_NAMES = {
@@ -477,7 +718,7 @@ PROP_NAMES = {
     0x14: 'BORDER_T', 0x15: 'BORDER_R', 0x16: 'BORDER_B', 0x17: 'BORDER_L',
     0x18: 'PADDING_T', 0x19: 'PADDING_R', 0x1A: 'PADDING_B', 0x1B: 'PADDING_L',
     0x1F: 'IMAGE_ID',
-    0x20: 'ON_CLICK',
+    0x20: 'ON_CLICK', 0x21: 'ON_PAINT', 0x22: 'ON_TAP',
     0x40: 'LOCATION', 0x41: 'SIZE', 0x42: 'MARGIN',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -511,7 +752,10 @@ def disassemble(data):
                 break
             pos += consumed
 
-            if opcode in (Op.W_SET, Op.W_GET):
+            if opcode == Op.BUILTIN:
+                bname = BUILTIN_NAMES.get(val, f'method_{val}')
+                lines.append(f'{addr:04X}: {name} {bname}')
+            elif opcode in (Op.W_SET, Op.W_GET):
                 pname = PROP_NAMES.get(val, f'0x{val:02X}')
                 lines.append(f'{addr:04X}: {name} {pname}')
             elif opcode == Op.W_TARGET:
@@ -547,7 +791,21 @@ def disassemble(data):
             payload = data[pos:pos + length]
             pos += length
 
-            if opcode == Op.W_SET and len(payload) > 0:
+            if opcode == Op.BUILTIN and len(payload) > 0:
+                mid = payload[0]
+                bname = BUILTIN_NAMES.get(mid, f'method_{mid}')
+                text_data = payload[1:]
+                if mid in (Builtin.DRAW_TEXT, Builtin.STR) and text_data:
+                    try:
+                        txt = text_data.decode('utf-8')
+                        lines.append(f'{addr:04X}: {name} {bname} "{txt}"')
+                    except UnicodeDecodeError:
+                        hex_str = ' '.join(f'{b:02X}' for b in text_data)
+                        lines.append(f'{addr:04X}: {name} {bname} [{hex_str}]')
+                else:
+                    hex_str = ' '.join(f'{b:02X}' for b in text_data)
+                    lines.append(f'{addr:04X}: {name} {bname} [{hex_str}]')
+            elif opcode == Op.W_SET and len(payload) > 0:
                 prop_id = payload[0]
                 pname = PROP_NAMES.get(prop_id, f'0x{prop_id:02X}')
                 vals = []
@@ -634,6 +892,8 @@ PROP_MAP = {
     'press_color': (Prop.PRESS_COLOR, False),
     'image_id': (Prop.IMAGE_ID, False),
     'on_click': (Prop.ON_CLICK, False),
+    'on_paint': (Prop.ON_PAINT, False),
+    'on_tap': (Prop.ON_TAP, False),
 }
 
 
@@ -691,6 +951,7 @@ class Compiler:
         self._on_program_start = 0xFFFF
         self._on_page_changing = 0xFFFF
         self._on_page_changed = 0xFFFF
+        self._on_user_message = 0xFFFF
 
     # --- Widget management ---
 
@@ -878,12 +1139,24 @@ class Compiler:
             raise ValueError(f"Unknown function: {func_name}")
         self._on_page_changed = self._funcs[func_name][2]
 
+    def on_user_message(self, func_name):
+        """Register on_user_message callback. Function receives (array_id).
+        Fires when a UserMessage (field 6) is received via USART."""
+        if func_name not in self._funcs:
+            raise ValueError(f"Unknown function: {func_name}")
+        self._on_user_message = self._funcs[func_name][2]
+
     def build_meta(self):
         """Build callback metadata binary.
 
         Format:
-          func_count(u16) + on_program_start(u16) + on_page_changing(u16)
-          + on_page_changed(u16) + [func_id(u16) + offset(u16) + arg_count(u8)] × N
+          Header (8 bytes):
+            func_count(u16) + on_program_start(u16) + on_page_changing(u16)
+            + on_page_changed(u16)
+          Function table:
+            [func_id(u16) + offset(u16) + arg_count(u8)] × N
+          Extended system callbacks (after function table):
+            on_user_message(u16)
         """
         func_list = list(self._funcs.values())
         buf = bytearray()
@@ -893,6 +1166,8 @@ class Compiler:
         buf.extend(struct.pack('<H', self._on_page_changed))
         for func_id, arg_count, offset in func_list:
             buf.extend(struct.pack('<HHB', func_id, offset, arg_count))
+        # Extended: on_user_message (after function table)
+        buf.extend(struct.pack('<H', self._on_user_message))
         return bytes(buf)
 
     def has_callbacks(self):

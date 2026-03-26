@@ -2,13 +2,15 @@
 """ferrite-cli — Host-side tool for communicating with ferrite-ui devices.
 
 Implements the USART protobuf protocol (see protocol.rs).
-Commands: ping, restart, execute <file>, writefs <file>
+Commands: ping, restart, execute <file>, writefs <file>, send <data...>
 
 Usage:
     python ferrite_cli.py -p COM3 ping
     python ferrite_cli.py -p COM3 restart
     python ferrite_cli.py -p COM3 execute program.bin
     python ferrite_cli.py -p COM3 writefs flash.bin
+    python ferrite_cli.py -p COM3 send 0x01 0x02 0x03
+    python ferrite_cli.py -p COM3 send "hello world"
 """
 
 import argparse
@@ -25,6 +27,7 @@ TAG_EXECUTE = (2 << 3) | 2   # 0x12, payload
 TAG_RESTART = (3 << 3) | 0   # 0x18, varint
 TAG_WRITEFS    = (4 << 3) | 2   # 0x22, payload (header: total_size + chunk_size)
 TAG_WRITECHUNK = (5 << 3) | 2   # 0x2A, payload (chunk data)
+TAG_USERMSG    = (6 << 3) | 2   # 0x32, payload (user message data, max 64 bytes)
 
 CHUNK_SIZE = 4096  # Must match device sector buffer size
 
@@ -243,6 +246,49 @@ def cmd_writefs(ser: serial.Serial, path: str) -> bool:
     return True
 
 
+def cmd_send(ser: serial.Serial, data_args: list[str]) -> bool:
+    """Send a user message to the device (field 6, max 64 bytes).
+
+    Data can be specified as:
+      - Hex bytes: 0x0A 0xFF 0x00
+      - Decimal bytes: 10 255 0
+      - Text string: "hello world"
+    """
+    if not data_args:
+        print("no data to send", file=sys.stderr)
+        return False
+
+    # Check if it's a quoted string
+    joined = ' '.join(data_args)
+    if joined.startswith('"') and joined.endswith('"'):
+        payload = joined[1:-1].encode('utf-8')
+    else:
+        # Parse as byte values (hex or decimal)
+        payload = bytearray()
+        for arg in data_args:
+            try:
+                val = int(arg, 0)  # auto-detect hex/dec/oct/bin
+                if val < 0 or val > 255:
+                    print(f"byte value out of range: {arg}", file=sys.stderr)
+                    return False
+                payload.append(val)
+            except ValueError:
+                # Try as raw text
+                payload.extend(arg.encode('utf-8'))
+        payload = bytes(payload)
+
+    if len(payload) > 64:
+        print(f"message too large: {len(payload)} bytes (max 64)", file=sys.stderr)
+        return False
+
+    ser.write(build_payload_msg(TAG_USERMSG, payload))
+    ser.flush()
+
+    hex_str = ' '.join(f'{b:02X}' for b in payload)
+    print(f"send: {len(payload)} bytes [{hex_str}]")
+    return True
+
+
 # --- Main ---
 
 
@@ -265,6 +311,9 @@ def main():
     p_fs = sub.add_parser("writefs", help="Write flash filesystem image")
     p_fs.add_argument("file", help="Flash filesystem image file")
 
+    p_send = sub.add_parser("send", help="Send user message to device (field 6)")
+    p_send.add_argument("data", nargs="+", help="Data: hex bytes (0xFF), decimal (255), or \"text\"")
+
     args = parser.parse_args()
 
     try:
@@ -282,6 +331,8 @@ def main():
             ok = cmd_execute(ser, args.file)
         elif args.command == "writefs":
             ok = cmd_writefs(ser, args.file)
+        elif args.command == "send":
+            ok = cmd_send(ser, args.data)
         else:
             ok = False
 

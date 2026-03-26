@@ -13,6 +13,9 @@
 ///     [0..2] func_id:    u16 LE (1-based, 0 = invalid)
 ///     [2..4] offset:     u16 LE (byte offset in bytecode)
 ///     [4]    arg_count:  u8
+///
+///   Extended system callbacks (after function table, optional):
+///     [+0..+2] on_user_message: u16 LE
 
 use crate::flash::Flash;
 use crate::fs::Fs;
@@ -52,6 +55,7 @@ pub struct CallbackMeta {
     pub on_program_start: u16,
     pub on_page_changing: u16,
     pub on_page_changed: u16,
+    pub on_user_message: u16,
 }
 
 impl CallbackMeta {
@@ -62,6 +66,7 @@ impl CallbackMeta {
             on_program_start: NO_CALLBACK,
             on_page_changing: NO_CALLBACK,
             on_page_changed: NO_CALLBACK,
+            on_user_message: NO_CALLBACK,
         }
     }
 
@@ -96,6 +101,7 @@ impl CallbackMeta {
             on_program_start,
             on_page_changing,
             on_page_changed,
+            on_user_message: NO_CALLBACK,
         };
 
         // Read function entries (5 bytes each)
@@ -108,6 +114,14 @@ impl CallbackMeta {
                 offset: u16::from_le_bytes([buf[2], buf[3]]),
                 arg_count: buf[4],
             };
+        }
+
+        // Extended system callbacks (after function table, backwards compatible)
+        let ext_offset = META_HEADER as u32 + (count * 5) as u32;
+        if entry.size >= ext_offset + 2 {
+            let mut ext = [0u8; 2];
+            flash.read(entry.offset + ext_offset, &mut ext);
+            meta.on_user_message = u16::from_le_bytes(ext);
         }
 
         Some(meta)
