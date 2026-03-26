@@ -1059,9 +1059,9 @@ class Compiler:
     # --- Variables ---
 
     def var(self, name, init_value=0):
-        """Declare a VM variable (max 16). Returns var slot."""
-        if self._next_var >= 16:
-            raise RuntimeError("Max 16 VM variables")
+        """Declare a VM variable (max 32). Returns var slot."""
+        if self._next_var >= 32:
+            raise RuntimeError("Max 32 VM variables")
         var_id = self._next_var
         self._vars[name] = var_id
         self._next_var += 1

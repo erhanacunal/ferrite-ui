@@ -127,10 +127,10 @@ pub enum VmState {
 // --- VM ---
 
 const STACK_SIZE: usize = 16;
-const VAR_COUNT: usize = 16;
+const VAR_COUNT: usize = 32;
 const CALL_STACK_SIZE: usize = 8;
-const ARRAY_POOL_SIZE: usize = 64; // 64 × i32 = 256 byte
-const MAX_ARRAYS: usize = 8;
+const ARRAY_POOL_SIZE: usize = 128; // 128 × i32 = 512 byte
+const MAX_ARRAYS: usize = 16;
 
 #[derive(Clone, Copy)]
 struct ArrMeta {

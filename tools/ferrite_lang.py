@@ -741,8 +741,8 @@ class CodeGen:
     def _alloc_var(self, name):
         if name in self.vars:
             raise CompileError(f"variable already defined: {name}")
-        if self.next_slot >= 16:
-            raise CompileError(f"out of variable slots (max 16): {name}")
+        if self.next_slot >= 32:
+            raise CompileError(f"out of variable slots (max 32): {name}")
         slot = self.next_slot
         self.vars[name] = slot
         self.next_slot += 1

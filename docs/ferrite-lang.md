@@ -1203,10 +1203,10 @@ halt();
 |----------|-------|
 | Widget arena | 64 widgets |
 | Text pool | 256 bytes |
-| Variable slots | 16 (shared main + functions) |
+| Variable slots | 32 (shared main + functions) |
 | Eval stack | 16 deep |
 | Call stack | 8 deep |
-| Array pool | 64 elements, max 8 arrays |
+| Array pool | 128 elements, max 16 arrays |
 | Bytecode size | 1024 bytes (USART execute) |
 | Flash code | limited by flash resource size |
 | Clip rects | 32 rectangles |
