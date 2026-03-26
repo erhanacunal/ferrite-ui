@@ -1,0 +1,135 @@
+// clock.fl — Analog clock face with animated hands
+//
+// Demonstrates: arc, line, fillCircle, fillRoundedRect,
+//               drawText, drawStr, itos, concat, delay, strClear
+
+// === Hand lookup tables ===
+// 12 positions (0=12h, 1=1h, ..., 11=11h)
+// dx = R*sin(i*30°), dy = -R*cos(i*30°)
+
+// Second hand (R=120)
+var sdx[12] = [0, 60, 104, 120, 104, 60, 0, -60, -104, -120, -104, -60];
+var sdy[12] = [-120, -104, -60, 0, 60, 104, 120, 104, 60, 0, -60, -104];
+
+// Minute hand (R=100)
+var mdx[12] = [0, 50, 87, 100, 87, 50, 0, -50, -87, -100, -87, -50];
+var mdy[12] = [-100, -87, -50, 0, 50, 87, 100, 87, 50, 0, -50, -87];
+
+// Hour hand (R=70)
+var hdx[12] = [0, 35, 61, 70, 61, 35, 0, -35, -61, -70, -61, -35];
+var hdy[12] = [-70, -61, -35, 0, 35, 61, 70, 61, 35, 0, -35, -61];
+
+// Time state (simulated)
+var h = 10;
+var m = 10;
+var s = 0;
+
+// Reusable temps (VM has 16 var slots — arrays use 6, time uses 3, temps use 7)
+var i = 0;
+var a = 0;
+var b = 0;
+var c = 0;
+var d = 0;
+var e = 0;
+var t = 0;
+
+// === Draw static face ===
+
+fillRect(0, 0, 800, 480, 0x1082);
+fillCircle(400, 210, 170, 0x2945);
+arc(400, 210, 170, 0, 359, 0x4A69);
+arc(400, 210, 169, 0, 359, 0x4A69);
+
+// Tick marks
+i = 0;
+while (i < 12) {
+    a = 400 + sdx[i];
+    b = 210 + sdy[i];
+    c = 400 + mdx[i];
+    d = 210 + mdy[i];
+    line(c, d, a, b, 0x7BEF);
+    i = i + 1;
+}
+
+// Numbers
+drawText(392, 68, 0, 0xFFFF, 0, "12");
+drawText(515, 215, 0, 0xFFFF, 0, "3");
+drawText(397, 365, 0, 0xFFFF, 0, "6");
+drawText(282, 215, 0, 0xFFFF, 0, "9");
+drawText(370, 265, 0, 0x7BEF, 0, "ferrite");
+
+// Digital panel
+fillRoundedRect(250, 420, 300, 50, 12, 0x2945);
+roundedRect(250, 420, 300, 50, 12, 0x4A69);
+
+// === Animation loop ===
+
+while (true) {
+    // Erase hands
+    fillCircle(400, 210, 140, 0x2945);
+
+    // Redraw ticks + brand
+    i = 0;
+    while (i < 12) {
+        a = 400 + sdx[i];
+        b = 210 + sdy[i];
+        c = 400 + mdx[i];
+        d = 210 + mdy[i];
+        line(c, d, a, b, 0x7BEF);
+        i = i + 1;
+    }
+    drawText(370, 265, 0, 0x7BEF, 0, "ferrite");
+
+    // Hour hand (3px, white)
+    i = h % 12;
+    a = 400 + hdx[i];
+    b = 210 + hdy[i];
+    line(400, 210, a, b, 0xFFFF);
+    line(399, 210, a - 1, b, 0xFFFF);
+    line(401, 210, a + 1, b, 0xFFFF);
+
+    // Minute hand (2px, light gray)
+    i = m / 5;
+    a = 400 + mdx[i];
+    b = 210 + mdy[i];
+    line(400, 210, a, b, 0xBDF7);
+    line(401, 210, a + 1, b, 0xBDF7);
+
+    // Second hand (1px, red)
+    i = s / 5;
+    a = 400 + sdx[i];
+    b = 210 + sdy[i];
+    line(400, 210, a, b, 0xF800);
+
+    // Center dot
+    fillCircle(400, 210, 6, 0xF800);
+    fillCircle(400, 210, 3, 0xFFFF);
+
+    // Digital time "HH:MM:SS"
+    a = itos(h);
+    b = itos(m);
+    c = itos(s);
+    if (h < 10) { a = concat(str("0"), a); }
+    if (m < 10) { b = concat(str("0"), b); }
+    if (s < 10) { c = concat(str("0"), c); }
+    t = concat(a, concat(str(":"), concat(b, concat(str(":"), c))));
+
+    fillRoundedRect(251, 421, 298, 48, 12, 0x2945);
+    drawStr(345, 450, 0, 0xFFFF, 0, t);
+    strClear();
+
+    // Tick
+    delay(1000);
+    s = s + 1;
+    if (s >= 60) {
+        s = 0;
+        m = m + 1;
+        if (m >= 60) {
+            m = 0;
+            h = h + 1;
+            if (h >= 24) {
+                h = 0;
+            }
+        }
+    }
+}

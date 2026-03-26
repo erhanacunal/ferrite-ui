@@ -36,41 +36,50 @@ For the some bricked Nextion Displays :)
 
 ## Ferrite Language
 
-Programs are written in a C-like language (`.fl` files) that compiles to VM bytecode:
+Programs are written in a C-like language (`.fl` files) that compiles to VM bytecode. Here's an [analog clock](examples/clock.fl) that demonstrates drawing primitives, string operations, and the animation loop:
 
 ```c
-var root = alloc();
-target(root);
-set(size, 800, 480);
-set(bg_color, 0x0000);
+// Hand positions: 12 entries (R=120), dx = R*sin(i*30°)
+var sdx[12] = [0, 60, 104, 120, 104, 60, 0, -60, -104, -120, -104, -60];
+var sdy[12] = [-120, -104, -60, 0, 60, 104, 120, 104, 60, 0, -60, -104];
 
-var btn = alloc();
-target(btn);
-set(kind, 2);
-set(location, 300, 200);
-set(size, 200, 80);
-set(bg_color, 0xF800);
-set(press_color, 0x7800);
-set(clickable, 1);
-parent(root);
+var h = 10;
+var m = 10;
+var s = 0;
 
-// Drawing primitives
-line(0, 0, 799, 479, 0xFFFF);
-circle(400, 240, 100, 0x07E0);
+// Clock face
+fillCircle(400, 210, 170, 0x2945);
+arc(400, 210, 170, 0, 359, 0x4A69);
+drawText(392, 68, 0, 0xFFFF, 0, "12");
 
-// Dynamic text
-var count = 42;
-var s = concat(str("Count: "), itos(count));
-drawStr(10, 10, 0, 0xFFFF, 0x0000, s);
+// Digital time panel
+fillRoundedRect(250, 420, 300, 50, 12, 0x2945);
+roundedRect(250, 420, 300, 50, 12, 0x4A69);
 
-// Float math
-var temp = fdiv(fsub(98.6, 32.0), 1.8);
-var msg = concat(str("Temp: "), ftos(temp));
+while (true) {
+    // Second hand (red)
+    var i = s / 5;
+    line(400, 210, 400 + sdx[i], 210 + sdy[i], 0xF800);
 
-halt();
+    // Center dot
+    fillCircle(400, 210, 6, 0xF800);
+    fillCircle(400, 210, 3, 0xFFFF);
+
+    // Digital time "HH:MM:SS"
+    var ts = concat(itos(h), concat(str(":"),
+             concat(itos(m), concat(str(":"), itos(s)))));
+    drawStr(345, 450, 0, 0xFFFF, 0, ts);
+    strClear();  // free temp strings, widget text preserved
+
+    delay(1000);
+    s = s + 1;
+    if (s >= 60) { s = 0; m = m + 1; }
+    if (m >= 60) { m = 0; h = h + 1; }
+    if (h >= 24) { h = 0; }
+}
 ```
 
-See [docs/ferrite-lang.md](docs/ferrite-lang.md) for the full language reference.
+See [docs/ferrite-lang.md](docs/ferrite-lang.md) for the full language reference and [examples/](examples/) for complete programs.
 
 ## Toolchain
 
