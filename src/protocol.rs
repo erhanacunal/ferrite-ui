@@ -22,8 +22,8 @@ use alloc::vec::Vec;
 use crate::flash::Flash;
 use crate::usart::Usart;
 
-/// Maximum program bytecode size received via USART
-const MAX_PROGRAM_SIZE: usize = 1024;
+/// Maximum program bytecode size received via USART (2KB)
+const MAX_PROGRAM_SIZE: usize = 2048;
 
 /// Maximum user message size (bytes)
 const MAX_USER_MSG: usize = 64;
@@ -168,14 +168,17 @@ pub enum RxEvent {
     FsWriteComplete,
     /// User message received (arbitrary data for VM callback)
     UserMessage,
+    /// Program too large — exceeds MAX_PROGRAM_SIZE (2KB)
+    ProgramTooLarge,
 }
 
 // --- Protocol ---
 
 pub struct Protocol {
     state: RxState,
-    program_buf: [u8; MAX_PROGRAM_SIZE],
-    program_len: u16,
+    /// Heap-allocated program buffer — allocated on demand when Execute message arrives.
+    /// Capacity=0 means the program was too large (being skipped).
+    program_buf: Vec<u8>,
     fs_writer: FsWriter,
     user_msg_buf: [u8; MAX_USER_MSG],
     user_msg_len: u8,
@@ -185,8 +188,7 @@ impl Protocol {
     pub fn new() -> Self {
         Self {
             state: RxState::Idle,
-            program_buf: [0; MAX_PROGRAM_SIZE],
-            program_len: 0,
+            program_buf: Vec::new(),
             fs_writer: FsWriter::new(),
             user_msg_buf: [0; MAX_USER_MSG],
             user_msg_len: 0,
@@ -195,7 +197,13 @@ impl Protocol {
 
     /// Return program bytecode (valid after ProgramReady event).
     pub fn program_code(&self) -> &[u8] {
-        &self.program_buf[..self.program_len as usize]
+        &self.program_buf
+    }
+
+    /// Free the program buffer, returning heap memory.
+    /// Call after copying program to code_buf.
+    pub fn free_program(&mut self) {
+        self.program_buf = Vec::new();
     }
 
     /// Return user message data (valid after UserMessage event).
@@ -223,7 +231,6 @@ impl Protocol {
                         match field {
                             2 => {
                                 // Execute — read length, then bytecode
-                                self.program_len = 0;
                                 self.state = RxState::Length {
                                     field: 2,
                                     value: 0,
@@ -277,10 +284,25 @@ impl Protocol {
                     let f = field;
                     self.state = RxState::Idle;
 
+                    // For Execute (field 2): allocate buffer or mark skip
+                    if f == 2 {
+                        if len as usize > MAX_PROGRAM_SIZE {
+                            self.program_buf = Vec::new(); // capacity=0 → skip mode
+                        } else {
+                            self.program_buf = Vec::with_capacity(len as usize);
+                        }
+                    }
+
                     if len == 0 {
                         // Zero-length payload — message complete immediately
                         match f {
-                            2 => RxEvent::ProgramReady,
+                            2 => {
+                                if self.program_buf.capacity() == 0 {
+                                    RxEvent::ProgramTooLarge
+                                } else {
+                                    RxEvent::ProgramReady
+                                }
+                            }
                             4 => RxEvent::FsReady,
                             6 => RxEvent::UserMessage,
                             5 => {
@@ -316,10 +338,9 @@ impl Protocol {
             } => {
                 match field {
                     2 => {
-                        // Program bytecode → buffer
-                        if (self.program_len as usize) < MAX_PROGRAM_SIZE {
-                            self.program_buf[self.program_len as usize] = byte;
-                            self.program_len += 1;
+                        // Program bytecode → heap buffer (skip if capacity=0)
+                        if self.program_buf.capacity() > 0 {
+                            self.program_buf.push(byte);
                         }
                     }
                     4 => {
@@ -344,7 +365,13 @@ impl Protocol {
                 if *remaining == 0 {
                     self.state = RxState::Idle;
                     match field {
-                        2 => RxEvent::ProgramReady,
+                        2 => {
+                            if self.program_buf.capacity() == 0 {
+                                RxEvent::ProgramTooLarge
+                            } else {
+                                RxEvent::ProgramReady
+                            }
+                        }
                         6 => RxEvent::UserMessage,
                         4 => {
                             // Header complete — parse and prepare for chunks

@@ -4,11 +4,13 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use ctx::Ctx;
 use panic_halt as _;
 
 mod backlight;
 mod callback;
 mod clip;
+mod ctx;
 mod embedded_font;
 mod flash;
 mod font;
@@ -33,17 +35,17 @@ mod widget;
 use callback::{CallbackMeta, NO_CALLBACK};
 use cortex_m_rt::entry;
 use flash::Flash;
-use font::{Font, FontList};
+use font::Font;
 use gpio::Gpio;
 use image::ImageList;
 use lcd::Lcd;
 use page::PageManager;
 use protocol::{Protocol, RxEvent};
+use strpool::StringPool;
 use touch::Touch;
 use types::{Size, COLOR_BLACK, COLOR_RED, COLOR_WHITE};
 use usart::Usart;
 use vm::{Vm, VmState};
-use widget::WidgetTree;
 
 // === Hardware addresses (port init) ===
 
@@ -73,6 +75,7 @@ const ERR_IMAGE_NOT_FOUND: u8 = 3;
 const ERR_FONT_NOT_FOUND: u8 = 4;
 const ERR_NO_FILESYSTEM: u8 = 5;
 const ERR_PROGRAM_ERROR: u8 = 6;
+const ERR_INSUFFICIENT_MEMORY: u8 = 7;
 
 // === Max program code size ===
 
@@ -377,6 +380,7 @@ fn error_description(code: u8) -> &'static [u8] {
         4 => b"font not found",
         5 => b"no file system in flash",
         6 => b"program execution error",
+        7 => b"insufficient memory",
         99 => b"unknown error",
         _ => b"error",
     }
@@ -386,20 +390,10 @@ fn error_description(code: u8) -> &'static [u8] {
 
 /// Run a callback function on the callback VM.
 /// Resets the VM, sets PC to the function offset, and runs to completion.
-fn run_callback(
-    cb_vm: &mut Vm,
-    code: &[u8],
-    offset: u16,
-    tree: &mut WidgetTree,
-    lcd: &Lcd,
-    flash: &Flash,
-    fonts: &mut FontList,
-    images: &mut ImageList,
-    fs: Option<&fs::Fs>,
-) {
+fn run_callback(cb_vm: &mut Vm, code: &[u8], offset: u16, ctx: &mut Ctx) {
     cb_vm.reset();
     cb_vm.set_pc(offset);
-    cb_vm.run(code, tree, lcd, flash, fonts, images, fs);
+    cb_vm.run(code, ctx);
 }
 
 // === Entry Point ===
@@ -419,15 +413,21 @@ fn main() -> ! {
     init_ports();
 
     let gpio = Gpio::init();
-    let lcd = Lcd::new(gpio);
-    let flash = Flash::init();
     let usart = Usart::init();
     let mut touch = Touch::init();
     let backlight = backlight::Backlight::init();
 
-    // --- Font list (embedded font is always id=0) — heap allocated ---
-    let mut fonts = Box::new(FontList::new());
-    fonts.add(Font::from_embedded(
+    // --- Application context (heap allocated) ---
+    let mut ctx = Box::new(Ctx {
+        lcd: Lcd::new(gpio),
+        flash: flash::Flash::init(),
+        tree: widget::WidgetTree::new(),
+        fonts: font::FontList::new(),
+        images: ImageList::new(),
+        strpool: StringPool::new(),
+        fs: None,
+    });
+    ctx.fonts.add(Font::from_embedded(
         &embedded_font::GLYPHS,
         &embedded_font::BITMAP,
         embedded_font::FIRST,
@@ -435,21 +435,18 @@ fn main() -> ! {
         embedded_font::Y_ADVANCE,
     ));
 
-    // --- Image list ---
-    let mut images = ImageList::new();
-
     // === STARTUP SEQUENCE ===
 
-    // 1. Backlight 50%
+    // 1. Backlight
     backlight.set_brightness(100);
 
     // 2. Black screen
-    lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
+    ctx.lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
 
     // 3. Splash text
-    fonts.embedded().draw_str(
-        &lcd,
-        &flash,
+    ctx.fonts.embedded().draw_str(
+        &ctx.lcd,
+        &ctx.flash,
         b"ferrite-ui",
         10,
         24,
@@ -460,23 +457,19 @@ fn main() -> ! {
     // 4. Flash filesystem
     let mut error_code: u8 = 0;
 
-    let fs = match fs::Fs::mount(&flash) {
-        Ok(f) => Some(f),
-        Err(_) => {
-            error_code = ERR_NO_FILESYSTEM;
-            None
-        }
-    };
+    match fs::Fs::mount(&ctx.flash) {
+        Ok(f) => ctx.fs = Some(f),
+        Err(_) => error_code = ERR_NO_FILESYSTEM,
+    }
 
-    // 5. Widget tree + root — heap allocated
-    let mut tree = Box::new(WidgetTree::new());
-    let root = tree.alloc().unwrap();
+    // 5. Widget tree root
+    let root = ctx.tree.alloc().unwrap();
     {
-        let w = tree.get_mut(root);
+        let w = ctx.tree.get_mut(root);
         w.size = Size { w: 800, h: 480 };
         w.background_color = COLOR_BLACK;
     }
-    tree.root = root;
+    ctx.tree.root = root;
 
     let mut pm = PageManager::new();
     let mut code_buf = Box::new([0u8; MAX_CODE_SIZE]);
@@ -484,28 +477,28 @@ fn main() -> ! {
 
     // 6. Load page_main (optional — program can run without pages)
     if error_code == 0 {
-        let fs_ref = fs.as_ref().unwrap();
-        pm.load_page(&mut tree, &lcd, fs_ref, &flash, b"page_main");
+        pm.load_page(&mut ctx, b"page_main");
     }
 
     // 7. Load main program (if no error)
     if error_code == 0 {
-        let fs_ref = fs.as_ref().unwrap();
-        match fs_ref.find(&flash, b"main") {
-            Some(entry) => {
-                code_len = entry.size.min(MAX_CODE_SIZE as u32) as usize;
-                fs_ref.read_resource(&flash, &entry, 0, &mut code_buf[..code_len]);
-            }
-            None => {
-                error_code = ERR_PROGRAM_NOT_FOUND;
+        if let Some(fs_ref) = ctx.fs.as_ref() {
+            match fs_ref.find(&ctx.flash, b"main") {
+                Some(entry) => {
+                    code_len = entry.size.min(MAX_CODE_SIZE as u32) as usize;
+                    fs_ref.read_resource(&ctx.flash, &entry, 0, &mut code_buf[..code_len]);
+                }
+                None => {
+                    error_code = ERR_PROGRAM_NOT_FOUND;
+                }
             }
         }
     }
 
     // 8. Load callback metadata
     let cb_meta = if error_code == 0 {
-        if let Some(fs_ref) = fs.as_ref() {
-            CallbackMeta::load(fs_ref, &flash, b"main").unwrap_or(CallbackMeta::new())
+        if let Some(fs_ref) = ctx.fs.as_ref() {
+            CallbackMeta::load(fs_ref, &ctx.flash, b"main").unwrap_or(CallbackMeta::new())
         } else {
             CallbackMeta::new()
         }
@@ -520,26 +513,16 @@ fn main() -> ! {
     if error_code == 0 && code_len > 0 {
         // Show first page (if any was loaded)
         if pm.count() > 0 {
-            pm.show(0, &mut tree, &lcd, &flash, &fonts, &images);
+            pm.show(0, &mut ctx);
         }
 
         // Run on_program_start callback
         if cb_meta.on_program_start != NO_CALLBACK {
-            run_callback(
-                &mut cb_vm,
-                &code_buf[..code_len],
-                cb_meta.on_program_start,
-                &mut tree,
-                &lcd,
-                &flash,
-                &mut fonts,
-                &mut images,
-                fs.as_ref(),
-            );
+            run_callback(&mut cb_vm, &code_buf[..code_len], cb_meta.on_program_start, &mut ctx);
         }
 
         // Full initial render
-        render::render_all(&mut tree, &lcd, &flash, &fonts, &images);
+        render::render_all(&mut ctx);
 
         // Start main VM
         vm.state = VmState::Running;
@@ -547,7 +530,7 @@ fn main() -> ! {
 
     // Show error if any
     if error_code != 0 {
-        show_error(&lcd, fonts.embedded(), &flash, &usart, error_code);
+        show_error(&ctx.lcd, ctx.fonts.embedded(), &ctx.flash, &usart, error_code);
     }
 
     // === MAIN LOOP ===
@@ -559,19 +542,11 @@ fn main() -> ! {
         match vm.state {
             VmState::Running | VmState::Yielded => {
                 vm.state = VmState::Running;
-                vm.step(
-                    &code_buf[..code_len],
-                    &mut tree,
-                    &lcd,
-                    &flash,
-                    &mut fonts,
-                    &mut images,
-                    fs.as_ref(),
-                );
+                vm.step(&code_buf[..code_len], &mut ctx);
 
                 if vm.state == VmState::Error {
                     error_code = ERR_PROGRAM_ERROR;
-                    show_error(&lcd, fonts.embedded(), &flash, &usart, error_code);
+                    show_error(&ctx.lcd, ctx.fonts.embedded(), &ctx.flash, &usart, error_code);
                 }
             }
             VmState::Waiting => {
@@ -585,7 +560,7 @@ fn main() -> ! {
 
         // --- USART message handling ---
         while let Some(byte) = usart::rx_read_byte() {
-            match protocol.feed(byte, &flash) {
+            match protocol.feed(byte, &ctx.flash) {
                 RxEvent::None => {}
 
                 RxEvent::Ping => {
@@ -601,10 +576,15 @@ fn main() -> ! {
                     let new_len = prog.len().min(MAX_CODE_SIZE);
                     code_buf[..new_len].copy_from_slice(&prog[..new_len]);
                     code_len = new_len;
+                    protocol.free_program();
 
                     vm.reset();
                     vm.state = VmState::Running;
                     error_code = 0;
+                }
+
+                RxEvent::ProgramTooLarge => {
+                    protocol::send_error(&usart, ERR_INSUFFICIENT_MEMORY);
                 }
 
                 RxEvent::FsReady => {
@@ -622,22 +602,13 @@ fn main() -> ! {
                 }
 
                 RxEvent::UserMessage => {
-                    // Fire on_user_message callback with message data as VM array
                     if cb_meta.on_user_message != NO_CALLBACK && code_len > 0 {
                         let msg = protocol.user_message();
                         cb_vm.reset();
                         if let Some(arr_id) = cb_vm.alloc_array_from(msg) {
                             cb_vm.set_pc(cb_meta.on_user_message);
                             cb_vm.push_arg(arr_id);
-                            cb_vm.run(
-                                &code_buf[..code_len],
-                                &mut tree,
-                                &lcd,
-                                &flash,
-                                &mut fonts,
-                                &mut images,
-                                fs.as_ref(),
-                            );
+                            cb_vm.run(&code_buf[..code_len], &mut ctx);
                         }
                     }
                 }
@@ -648,56 +619,45 @@ fn main() -> ! {
         if error_code == 0 {
             if let Some(event) = touch.poll() {
                 if event.kind == touch::TouchEventKind::Press {
-                    let hit = touch::hit_test(&tree, event.x, event.y);
+                    let hit = touch::hit_test(&ctx.tree, event.x, event.y);
                     if hit.is_some() {
-                        tree.get_mut(hit).flags |= widget::FLAG_PRESSED;
-                        tree.mark_dirty(hit);
-                        render::render_dirty(&mut tree, &lcd, &flash, &fonts, &images);
+                        ctx.tree.get_mut(hit).flags |= widget::FLAG_PRESSED;
+                        ctx.tree.mark_dirty(hit);
+                        render::render_dirty(&mut ctx);
                     }
                 } else if event.kind == touch::TouchEventKind::Release {
-                    // Find pressed widget, release it, and fire on_click callback
                     let mut clicked_id = widget::WidgetId::NONE;
                     let mut clicked_func: u16 = 0;
 
-                    let dfs = tree.dfs_order();
+                    let dfs = ctx.tree.dfs_order();
                     for i in 0..dfs.len() {
-                        let w = tree.get_mut(dfs[i]);
+                        let w = ctx.tree.get_mut(dfs[i]);
                         if w.flags & widget::FLAG_PRESSED != 0 {
                             w.flags &= !widget::FLAG_PRESSED;
-                            // Check if release is still on the widget (click = press + release)
-                            let abs = tree.absolute_rect(dfs[i]);
+                            let abs = ctx.tree.absolute_rect(dfs[i]);
                             if abs.contains(event.x, event.y) {
                                 clicked_id = dfs[i];
-                                clicked_func = tree.get(dfs[i]).on_click;
+                                clicked_func = ctx.tree.get(dfs[i]).on_click;
                             }
-                            tree.mark_dirty(dfs[i]);
+                            ctx.tree.mark_dirty(dfs[i]);
                         }
                     }
 
-                    render::render_dirty(&mut tree, &lcd, &flash, &fonts, &images);
+                    render::render_dirty(&mut ctx);
 
-                    // Fire on_click callback if defined
+                    // Fire on_click callback
                     if clicked_id.is_some() && clicked_func > 0 && code_len > 0 {
                         if let Some((offset, _arg_count)) = cb_meta.find_func(clicked_func) {
                             cb_vm.reset();
                             cb_vm.set_pc(offset);
-                            // Push widget_id as argument
                             cb_vm.push_arg(clicked_id.0 as i32);
-                            cb_vm.run(
-                                &code_buf[..code_len],
-                                &mut tree,
-                                &lcd,
-                                &flash,
-                                &mut fonts,
-                                &mut images,
-                                fs.as_ref(),
-                            );
+                            cb_vm.run(&code_buf[..code_len], &mut ctx);
                         }
                     }
 
-                    // Fire on_tap callback if defined (widget_id, packed x|y)
+                    // Fire on_tap callback (widget_id, packed x|y)
                     if clicked_id.is_some() && code_len > 0 {
-                        let tap_func = tree.get(clicked_id).on_tap;
+                        let tap_func = ctx.tree.get(clicked_id).on_tap;
                         if tap_func > 0 {
                             if let Some((offset, _arg_count)) = cb_meta.find_func(tap_func) {
                                 cb_vm.reset();
@@ -705,15 +665,7 @@ fn main() -> ! {
                                 cb_vm.push_arg(clicked_id.0 as i32);
                                 let packed_xy = ((event.x as u32) << 16 | event.y as u32) as i32;
                                 cb_vm.push_arg(packed_xy);
-                                cb_vm.run(
-                                    &code_buf[..code_len],
-                                    &mut tree,
-                                    &lcd,
-                                    &flash,
-                                    &mut fonts,
-                                    &mut images,
-                                    fs.as_ref(),
-                                );
+                                cb_vm.run(&code_buf[..code_len], &mut ctx);
                             }
                         }
                     }
@@ -721,15 +673,14 @@ fn main() -> ! {
             }
         }
 
-        // --- Render any dirty widgets (from VM, callbacks, or other state changes) ---
+        // --- Render dirty widgets + on_paint callbacks ---
         if error_code == 0 {
-            // Collect widgets with on_paint before render clears dirty flags
             let mut paint_ids = [widget::WidgetId::NONE; 8];
             let mut paint_count: usize = 0;
             {
-                let dfs = tree.dfs_order();
+                let dfs = ctx.tree.dfs_order();
                 for i in 0..dfs.len() {
-                    let w = tree.get(dfs[i]);
+                    let w = ctx.tree.get(dfs[i]);
                     if w.is_dirty() && w.on_paint != 0 && paint_count < 8 {
                         paint_ids[paint_count] = dfs[i];
                         paint_count += 1;
@@ -737,27 +688,18 @@ fn main() -> ! {
                 }
             }
 
-            render::render_dirty(&mut tree, &lcd, &flash, &fonts, &images);
+            render::render_dirty(&mut ctx);
 
-            // Fire on_paint callbacks after widget background is rendered
             if code_len > 0 {
                 for i in 0..paint_count {
                     let id = paint_ids[i];
-                    let paint_func = tree.get(id).on_paint;
+                    let paint_func = ctx.tree.get(id).on_paint;
                     if paint_func > 0 {
                         if let Some((offset, _arg_count)) = cb_meta.find_func(paint_func) {
                             cb_vm.reset();
                             cb_vm.set_pc(offset);
                             cb_vm.push_arg(id.0 as i32);
-                            cb_vm.run(
-                                &code_buf[..code_len],
-                                &mut tree,
-                                &lcd,
-                                &flash,
-                                &mut fonts,
-                                &mut images,
-                                fs.as_ref(),
-                            );
+                            cb_vm.run(&code_buf[..code_len], &mut ctx);
                         }
                     }
                 }

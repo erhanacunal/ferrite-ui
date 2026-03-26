@@ -80,7 +80,7 @@ pub struct Widget {
     pub text_color: Color,
     pub font_id: u8,
     pub text_align: u8,
-    pub text_id: u8, // StringPool str_id (0xFF = no text)
+    pub text_id: u16, // StringPool str_id (0xFFFF = no text)
 
     // Button fields
     pub press_color: Color,
@@ -116,7 +116,7 @@ impl Widget {
             text_color: 0xFFFF,
             font_id: 0xFF,
             text_align: ALIGN_LEFT,
-            text_id: 0xFF,
+            text_id: 0xFFFF,
             press_color: 0,
             image_id: 0,
             on_click: 0,

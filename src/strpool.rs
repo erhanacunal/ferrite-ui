@@ -1,236 +1,114 @@
-/// Static string pool for VM string operations.
+/// Heap-allocated string pool for VM string operations.
 ///
-/// Global static (no allocator) — same pattern as USART ring buffer.
-/// Single-threaded bare-metal: safe to access via unsafe global.
-///
-/// Pool: 2048 byte buffer, 32 string slots, append-only.
-/// Strings are immutable once created.
-/// `smart_clear()` collects unreferenced strings while preserving widget text.
-///
-/// RAM cost: 2048 + 32×4 + 4 = ~2.2 KB
+/// Each string is a separate heap allocation (Vec<u8>) with a unique auto-incrementing ID.
+/// No static memory — all strings live on the heap.
 
-const POOL_SIZE: usize = 2048;
-const MAX_STRINGS: usize = 32;
+extern crate alloc;
 
-/// Temporary formatting buffer (shared, not re-entrant — fine for single-threaded VM)
+use alloc::vec::Vec;
+use crate::widget::WidgetTree;
+
 const FMT_BUF_SIZE: usize = 32;
 
-#[derive(Clone, Copy)]
-struct StrMeta {
-    offset: u16,
-    len: u16,
-}
-
-impl StrMeta {
-    const fn empty() -> Self {
-        Self { offset: 0, len: 0 }
-    }
+/// Internal string representation — not exposed outside this module.
+struct FerriString {
+    id: u16,
+    buf: Vec<u8>,
 }
 
 pub struct StringPool {
-    buf: [u8; POOL_SIZE],
-    meta: [StrMeta; MAX_STRINGS],
-    count: u8,
-    next: u16,
-    freed: u32, // bitmask: 1 = freed, discarded on next smart_clear
+    strings: Vec<FerriString>,
+    next_id: u16,
 }
 
-static mut POOL: StringPool = StringPool::new();
-
 impl StringPool {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            buf: [0; POOL_SIZE],
-            meta: [StrMeta::empty(); MAX_STRINGS],
-            count: 0,
-            next: 0,
-            freed: 0,
+            strings: Vec::new(),
+            next_id: 0,
         }
     }
 
-    /// Mark a string as freed. Space is reclaimed on next smart_clear().
-    pub fn free(&mut self, id: u8) {
-        if (id as usize) < MAX_STRINGS && id < self.count {
-            self.freed |= 1 << id;
-        }
-    }
-
-    /// Allocate a string from a byte slice. Returns string ID or None if full.
-    pub fn alloc(&mut self, data: &[u8]) -> Option<u8> {
-        let len = data.len();
-        if self.count as usize >= MAX_STRINGS || self.next as usize + len > POOL_SIZE {
-            return None;
-        }
-        let id = self.count;
-        let offset = self.next;
-        self.buf[offset as usize..offset as usize + len].copy_from_slice(data);
-        self.meta[id as usize] = StrMeta {
-            offset,
-            len: len as u16,
-        };
-        self.next += len as u16;
-        self.count += 1;
+    /// Allocate a string from a byte slice. Returns unique string ID.
+    pub fn alloc(&mut self, data: &[u8]) -> Option<u16> {
+        let id = self.next_id;
+        self.strings.push(FerriString {
+            id,
+            buf: Vec::from(data),
+        });
+        self.next_id = self.next_id.wrapping_add(1);
         Some(id)
     }
 
+    /// Remove a string by ID.
+    pub fn free(&mut self, id: u16) {
+        self.strings.retain(|s| s.id != id);
+    }
+
     /// Get string bytes by ID.
-    pub fn get(&self, id: u8) -> &[u8] {
-        if id >= self.count {
-            return &[];
+    pub fn get(&self, id: u16) -> &[u8] {
+        match self.strings.iter().find(|s| s.id == id) {
+            Some(s) => &s.buf,
+            None => &[],
         }
-        let m = &self.meta[id as usize];
-        &self.buf[m.offset as usize..m.offset as usize + m.len as usize]
     }
 
-    /// Get string length.
-    pub fn len(&self, id: u8) -> u16 {
-        if id >= self.count {
-            return 0;
+    /// Get string length by ID.
+    pub fn len(&self, id: u16) -> u16 {
+        match self.strings.iter().find(|s| s.id == id) {
+            Some(s) => s.buf.len() as u16,
+            None => 0,
         }
-        self.meta[id as usize].len
     }
 
-    /// Concatenate two strings. Returns new string ID or None if full.
-    pub fn concat(&mut self, a: u8, b: u8) -> Option<u8> {
-        if a >= self.count || b >= self.count {
-            return None;
-        }
-        let a_meta = self.meta[a as usize];
-        let b_meta = self.meta[b as usize];
-        let total = a_meta.len as usize + b_meta.len as usize;
-        if self.count as usize >= MAX_STRINGS || self.next as usize + total > POOL_SIZE {
-            return None;
-        }
-        let id = self.count;
-        let offset = self.next;
-        // Copy a
-        let a_start = a_meta.offset as usize;
-        let a_len = a_meta.len as usize;
-        for i in 0..a_len {
-            self.buf[offset as usize + i] = self.buf[a_start + i];
-        }
-        // Copy b
-        let b_start = b_meta.offset as usize;
-        let b_len = b_meta.len as usize;
-        for i in 0..b_len {
-            self.buf[offset as usize + a_len + i] = self.buf[b_start + i];
-        }
-        self.meta[id as usize] = StrMeta {
-            offset,
-            len: total as u16,
+    /// Concatenate two strings. Returns new string ID.
+    pub fn concat(&mut self, a: u16, b: u16) -> Option<u16> {
+        let a_data = match self.strings.iter().find(|s| s.id == a) {
+            Some(s) => s.buf.clone(),
+            None => return None,
         };
-        self.next += total as u16;
-        self.count += 1;
+        let b_data = match self.strings.iter().find(|s| s.id == b) {
+            Some(s) => &s.buf,
+            None => return None,
+        };
+
+        let mut combined = a_data;
+        combined.extend_from_slice(b_data);
+
+        let id = self.next_id;
+        self.strings.push(FerriString {
+            id,
+            buf: combined,
+        });
+        self.next_id = self.next_id.wrapping_add(1);
         Some(id)
     }
 
     /// Reset the entire pool. All string IDs become invalid.
     pub fn clear(&mut self) {
-        self.count = 0;
-        self.next = 0;
-        self.freed = 0;
+        self.strings.clear();
     }
 
-    /// Smart clear: keep strings referenced by `keep` bitmask, discard the rest.
-    /// Explicitly freed strings (via `free()`) are always discarded regardless of keep.
-    /// Compacts survivors to the front of the buffer with new sequential IDs.
-    /// Returns an ID remap table: old_id → new_id (0xFF = discarded).
-    pub fn smart_clear(&mut self, keep: u32) -> [u8; MAX_STRINGS] {
-        let mut remap = [0xFFu8; MAX_STRINGS];
-        let old_count = self.count as usize;
-
-        if old_count == 0 {
-            return remap;
+    /// Smart clear: keep only strings referenced by widget text_id fields.
+    /// Unreferenced strings are freed. Widget IDs remain stable (no remapping needed).
+    pub fn smart_clear(&mut self, tree: &mut WidgetTree) {
+        if self.strings.is_empty() {
+            return;
         }
 
-        // Exclude explicitly freed strings
-        let keep = keep & !self.freed;
-
-        // If nothing to keep, just clear everything
-        if keep == 0 {
-            self.clear();
-            return remap;
-        }
-
-        let mut new_id: u8 = 0;
-        let mut write_pos: u16 = 0;
-
-        for old_id in 0..old_count {
-            if keep & (1 << old_id) == 0 {
-                continue; // discard
+        // Collect referenced string IDs from widget text_ids
+        let dfs = tree.dfs_order();
+        let mut keep: Vec<u16> = Vec::new();
+        for i in 0..dfs.len() {
+            let text_id = tree.get(dfs[i]).text_id;
+            if text_id != 0xFFFF && !keep.contains(&text_id) {
+                keep.push(text_id);
             }
-
-            let m = self.meta[old_id];
-            let src = m.offset as usize;
-            let len = m.len as usize;
-            let dst = write_pos as usize;
-
-            // Move bytes forward (src >= dst always, since we compact left)
-            if dst != src {
-                for i in 0..len {
-                    self.buf[dst + i] = self.buf[src + i];
-                }
-            }
-
-            self.meta[new_id as usize] = StrMeta {
-                offset: write_pos,
-                len: m.len,
-            };
-            remap[old_id] = new_id;
-            write_pos += m.len;
-            new_id += 1;
         }
 
-        self.count = new_id;
-        self.next = write_pos;
-        self.freed = 0;
-        remap
+        // Remove unreferenced strings
+        self.strings.retain(|s| keep.contains(&s.id));
     }
-}
-
-// === Smart clear with widget text preservation ===
-
-use crate::widget::WidgetTree;
-
-/// Clear the string pool while preserving strings referenced by widget text_id fields.
-/// Compacts survivors to the front, updates widget references to new IDs.
-pub fn smart_clear(tree: &mut WidgetTree) {
-    let p = pool();
-    let count = p.count;
-
-    if count == 0 {
-        return;
-    }
-
-    // Phase 1: Build keep bitmask from widget text_ids
-    let mut keep: u32 = 0;
-    let dfs = tree.dfs_order();
-    for i in 0..dfs.len() {
-        let text_id = tree.get(dfs[i]).text_id;
-        if text_id != 0xFF && (text_id as usize) < MAX_STRINGS {
-            keep |= 1 << text_id;
-        }
-    }
-
-    // Phase 2: Compact pool, get remap table
-    let remap = p.smart_clear(keep);
-
-    // Phase 3: Update widget text_id references
-    for i in 0..dfs.len() {
-        let w = tree.get_mut(dfs[i]);
-        if w.text_id != 0xFF && (w.text_id as usize) < MAX_STRINGS {
-            w.text_id = remap[w.text_id as usize];
-        }
-    }
-}
-
-// === Global access ===
-
-/// Get mutable reference to the global string pool.
-/// Safety: single-threaded bare-metal, no interrupts access this.
-#[inline]
-pub fn pool() -> &'static mut StringPool {
-    unsafe { &mut *(&raw mut POOL) }
 }
 
 // === Formatting: i32 to string ===
@@ -289,11 +167,11 @@ pub fn format_i32(val: i32, buf: &mut [u8]) -> usize {
     end
 }
 
-/// Convert i32 to string in the global pool. Returns string ID or None.
-pub fn itos(val: i32) -> Option<u8> {
+/// Convert i32 to string in the pool. Returns string ID.
+pub fn itos(pool: &mut StringPool, val: i32) -> Option<u16> {
     let mut tmp = [0u8; FMT_BUF_SIZE];
     let len = format_i32(val, &mut tmp);
-    pool().alloc(&tmp[..len])
+    pool.alloc(&tmp[..len])
 }
 
 // === Formatting: f32 to string ===
@@ -357,19 +235,19 @@ pub fn format_f32(val: f32, buf: &mut [u8]) -> usize {
     pos
 }
 
-/// Convert f32 to string in the global pool. Returns string ID or None.
-pub fn ftos(bits: u32) -> Option<u8> {
+/// Convert f32 to string in the pool. Returns string ID.
+pub fn ftos(pool: &mut StringPool, bits: u32) -> Option<u16> {
     let val = f32::from_bits(bits);
     let mut tmp = [0u8; FMT_BUF_SIZE];
     let len = format_f32(val, &mut tmp);
-    pool().alloc(&tmp[..len])
+    pool.alloc(&tmp[..len])
 }
 
 // === Parsing: string to number ===
 
 /// Parse a string (by ID) as i32. Returns 0 on failure.
-pub fn parse_int(id: u8) -> i32 {
-    let data = pool().get(id);
+pub fn parse_int(pool: &StringPool, id: u16) -> i32 {
+    let data = pool.get(id);
     if data.is_empty() {
         return 0;
     }
@@ -410,8 +288,8 @@ pub fn parse_int(id: u8) -> i32 {
 }
 
 /// Parse a string (by ID) as f32. Returns f32 bits. Returns 0.0 bits on failure.
-pub fn parse_float(id: u8) -> u32 {
-    let data = pool().get(id);
+pub fn parse_float(pool: &StringPool, id: u16) -> u32 {
+    let data = pool.get(id);
     if data.is_empty() {
         return 0.0f32.to_bits();
     }

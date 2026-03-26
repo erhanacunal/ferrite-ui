@@ -1,33 +1,24 @@
-/// Sayfa yönetimi — root widget altında tam ekran sayfalar
+/// Page management — full-screen pages under root widget.
 ///
-/// Her sayfa root'un çocuğu olan tam ekran (800×480) bir widget.
-/// Aynı anda sadece bir sayfa görünür. Geçiş: eski gizle, yeni göster.
+/// Each page is a child of root, full-screen (800x480).
+/// Only one page visible at a time. Transition: hide old, show new.
 ///
-/// Sayfalar flash'tan bytecode ile yüklenebilir (VM çalıştırır)
-/// veya runtime'da elle oluşturulabilir.
+/// Pages can be loaded from flash via bytecode (VM executes it)
+/// or created at runtime manually.
 
-use crate::flash::Flash;
-use crate::font::FontList;
-use crate::fs::{Fs, RES_PAGE};
-use crate::image::ImageList;
-use crate::lcd::Lcd;
+use crate::ctx::Ctx;
+use crate::fs::RES_PAGE;
 use crate::render;
 use crate::types::{Color, Size};
 use crate::vm::Vm;
-use crate::widget::{WidgetId, WidgetTree, FLAG_VISIBLE};
+use crate::widget::{WidgetId, FLAG_VISIBLE};
 
-/// Max sayfa sayısı
 const MAX_PAGES: usize = 8;
-
-/// Bytecode okuma buffer boyutu (flash'tan sayfa bytecode'u)
 const PAGE_CODE_BUF: usize = 512;
 
 pub struct PageManager {
-    /// Her sayfanın widget ağacındaki kök WidgetId'si
     pages: [WidgetId; MAX_PAGES],
-    /// Kayıtlı sayfa sayısı
     count: u8,
-    /// Aktif sayfa indeksi (0xFF = hiçbiri)
     active: u8,
 }
 
@@ -40,30 +31,18 @@ impl PageManager {
         }
     }
 
-    /// Kayıtlı sayfa sayısı
     pub fn count(&self) -> u8 {
         self.count
     }
 
-    /// Aktif sayfanın indeksi (None = hiçbiri aktif değil)
     pub fn active_index(&self) -> Option<u8> {
-        if self.active == 0xFF {
-            None
-        } else {
-            Some(self.active)
-        }
+        if self.active == 0xFF { None } else { Some(self.active) }
     }
 
-    /// Aktif sayfanın WidgetId'si
     pub fn active_page(&self) -> WidgetId {
-        if self.active == 0xFF {
-            WidgetId::NONE
-        } else {
-            self.pages[self.active as usize]
-        }
+        if self.active == 0xFF { WidgetId::NONE } else { self.pages[self.active as usize] }
     }
 
-    /// İndekse göre sayfa WidgetId'si
     pub fn page(&self, index: u8) -> WidgetId {
         if (index as usize) < self.count as usize {
             self.pages[index as usize]
@@ -72,12 +51,10 @@ impl PageManager {
         }
     }
 
-    /// Yeni boş sayfa oluştur ve root'un çocuğu olarak ekle.
-    /// Tam ekran (800×480), başlangıçta invisible.
-    /// Dönüş: (sayfa indeksi, sayfa WidgetId)
+    /// Create a new empty page as child of root. Initially invisible.
     pub fn create_page(
         &mut self,
-        tree: &mut WidgetTree,
+        tree: &mut crate::widget::WidgetTree,
         bg_color: Color,
     ) -> Option<(u8, WidgetId)> {
         if self.count as usize >= MAX_PAGES {
@@ -89,11 +66,9 @@ impl PageManager {
             let w = tree.get_mut(page_id);
             w.size = Size { w: 800, h: 480 };
             w.background_color = bg_color;
-            // Başlangıçta invisible — show ile açılır
             w.flags &= !FLAG_VISIBLE;
         }
 
-        // Root'un çocuğu olarak ekle
         if tree.root.is_some() {
             tree.add_child(tree.root, page_id);
         }
@@ -105,83 +80,85 @@ impl PageManager {
         Some((index, page_id))
     }
 
-    /// Flash'taki sayfa bytecode'unu yükleyerek sayfa oluştur.
-    /// Bytecode, page widget'ı target olarak alır ve alt widget'ları oluşturur.
-    ///
-    /// Flash resource formatı (RES_PAGE):
-    ///   - bg_color: u16 LE (2B) — sayfa arka plan rengi
-    ///   - bytecode: remaining bytes — VM bytecode (widget'ları oluşturur)
+    /// Load page from flash bytecode resource.
     pub fn load_page(
         &mut self,
-        tree: &mut WidgetTree,
-        lcd: &Lcd,
-        fs: &Fs,
-        flash: &Flash,
+        ctx: &mut Ctx,
         resource_name: &[u8],
     ) -> Option<u8> {
-        let entry = fs.find(flash, resource_name)?;
-
-        // İlk 2 byte: bg_color
-        let mut hdr = [0u8; 2];
-        fs.read_resource(flash, &entry, 0, &mut hdr);
-        let bg_color = u16::from_le_bytes([hdr[0], hdr[1]]);
-
-        // Sayfa oluştur
-        let (index, page_id) = self.create_page(tree, bg_color)?;
-
-        // Bytecode oku ve çalıştır
-        let code_size = entry.size.saturating_sub(2) as usize;
-        if code_size > 0 && code_size <= PAGE_CODE_BUF {
+        // Phase 1: Read from flash (scoped borrow of ctx.fs)
+        let (bg_color, code, code_size) = {
+            let fs = ctx.fs.as_ref()?;
+            let entry = fs.find(&ctx.flash, resource_name)?;
+            let mut hdr = [0u8; 2];
+            fs.read_resource(&ctx.flash, &entry, 0, &mut hdr);
+            let bg_color = u16::from_le_bytes([hdr[0], hdr[1]]);
+            let code_size = entry.size.saturating_sub(2) as usize;
             let mut code = [0u8; PAGE_CODE_BUF];
-            fs.read_resource(flash, &entry, 2, &mut code[..code_size]);
+            if code_size > 0 && code_size <= PAGE_CODE_BUF {
+                fs.read_resource(&ctx.flash, &entry, 2, &mut code[..code_size]);
+            }
+            (bg_color, code, code_size)
+        };
 
+        // Phase 2: Create page and run VM (fs borrow dropped)
+        let (index, page_id) = self.create_page(&mut ctx.tree, bg_color)?;
+
+        if code_size > 0 && code_size <= PAGE_CODE_BUF {
             let mut vm = Vm::new();
-            // Page widget'ı target olarak ayarla
             vm.set_target(page_id);
-            let mut dummy_fonts = FontList::new();
-            let mut dummy_images = ImageList::new();
-            vm.run(&code[..code_size], tree, lcd, flash, &mut dummy_fonts, &mut dummy_images, None);
+            vm.run(&code[..code_size], ctx);
         }
 
         Some(index)
     }
 
     /// Load all RES_PAGE resources from flash.
-    pub fn load_all_pages(
-        &mut self,
-        tree: &mut WidgetTree,
-        lcd: &Lcd,
-        fs: &Fs,
-        flash: &Flash,
-    ) {
-        let page_count = fs.count_by_kind(flash, RES_PAGE);
+    pub fn load_all_pages(&mut self, ctx: &mut Ctx) {
+        // Phase 1: Count pages (scoped borrow)
+        let page_count = {
+            let fs = match ctx.fs.as_ref() {
+                Some(fs) => fs,
+                None => return,
+            };
+            fs.count_by_kind(&ctx.flash, RES_PAGE)
+        };
+
         for i in 0..page_count {
-            if let Some(entry) = fs.find_nth_by_kind(flash, RES_PAGE, i) {
-                // İlk 2 byte: bg_color
-                let mut hdr = [0u8; 2];
-                fs.read_resource(flash, &entry, 0, &mut hdr);
-                let bg_color = u16::from_le_bytes([hdr[0], hdr[1]]);
-
-                if let Some((_index, page_id)) = self.create_page(tree, bg_color) {
+            // Read entry data (scoped borrow)
+            let page_data = {
+                let fs = match ctx.fs.as_ref() {
+                    Some(fs) => fs,
+                    None => return,
+                };
+                if let Some(entry) = fs.find_nth_by_kind(&ctx.flash, RES_PAGE, i) {
+                    let mut hdr = [0u8; 2];
+                    fs.read_resource(&ctx.flash, &entry, 0, &mut hdr);
+                    let bg_color = u16::from_le_bytes([hdr[0], hdr[1]]);
                     let code_size = entry.size.saturating_sub(2) as usize;
+                    let mut code = [0u8; PAGE_CODE_BUF];
                     if code_size > 0 && code_size <= PAGE_CODE_BUF {
-                        let mut code = [0u8; PAGE_CODE_BUF];
-                        fs.read_resource(flash, &entry, 2, &mut code[..code_size]);
+                        fs.read_resource(&ctx.flash, &entry, 2, &mut code[..code_size]);
+                    }
+                    Some((bg_color, code, code_size))
+                } else {
+                    None
+                }
+            };
 
+            // Create page and run VM (fs borrow dropped)
+            if let Some((bg_color, code, code_size)) = page_data {
+                if let Some((_index, page_id)) = self.create_page(&mut ctx.tree, bg_color) {
+                    if code_size > 0 && code_size <= PAGE_CODE_BUF {
                         let mut vm = Vm::new();
                         vm.set_target(page_id);
-                        let mut dummy_fonts = FontList::new();
-                        let mut dummy_images = ImageList::new();
-                        vm.run(&code[..code_size], tree, lcd, flash, &mut dummy_fonts, &mut dummy_images, None);
+                        vm.run(&code[..code_size], ctx);
                     }
                 }
             }
         }
     }
 
-    /// Check if a page switch is valid. Returns Some((old_index, new_index))
-    /// if the switch can proceed, None if invalid or same page.
-    /// Caller can use this to invoke on_page_changing callback before executing.
     pub fn prepare_switch(&self, index: u8) -> Option<(u8, u8)> {
         if index as usize >= self.count as usize {
             return None;
@@ -192,67 +169,40 @@ impl PageManager {
         Some((self.active, index))
     }
 
-    /// Execute the page switch: hide old, show new, mark dirty, render.
-    /// Call this after prepare_switch() and any on_page_changing callback.
-    pub fn execute_switch(
-        &mut self,
-        index: u8,
-        tree: &mut WidgetTree,
-        lcd: &Lcd,
-        flash: &Flash,
-        fonts: &FontList,
-        images: &ImageList,
-    ) {
-        // Hide old page
+    pub fn execute_switch(&mut self, index: u8, ctx: &mut Ctx) {
         if self.active != 0xFF {
             let old = self.pages[self.active as usize];
-            tree.get_mut(old).flags &= !FLAG_VISIBLE;
+            ctx.tree.get_mut(old).flags &= !FLAG_VISIBLE;
         }
 
-        // Show new page
         let new = self.pages[index as usize];
-        tree.get_mut(new).flags |= FLAG_VISIBLE;
-        tree.mark_dirty(new);
+        ctx.tree.get_mut(new).flags |= FLAG_VISIBLE;
+        ctx.tree.mark_dirty(new);
         self.active = index;
 
-        // Mark root dirty (background needs clearing)
-        if tree.root.is_some() {
-            tree.mark_dirty(tree.root);
+        if ctx.tree.root.is_some() {
+            let root = ctx.tree.root;
+            ctx.tree.mark_dirty(root);
         }
 
-        render::render_dirty(tree, lcd, flash, fonts, images);
+        render::render_dirty(ctx);
     }
 
-    /// Show a page (convenience wrapper without callbacks).
-    pub fn show(
-        &mut self,
-        index: u8,
-        tree: &mut WidgetTree,
-        lcd: &Lcd,
-        flash: &Flash,
-        fonts: &FontList,
-        images: &ImageList,
-    ) {
+    pub fn show(&mut self, index: u8, ctx: &mut Ctx) {
         if self.prepare_switch(index).is_some() {
-            self.execute_switch(index, tree, lcd, flash, fonts, images);
+            self.execute_switch(index, ctx);
         }
     }
 
-    /// Next page (circular).
-    pub fn next(&mut self, tree: &mut WidgetTree, lcd: &Lcd, flash: &Flash, fonts: &FontList, images: &ImageList) {
+    pub fn next(&mut self, ctx: &mut Ctx) {
         if self.count == 0 {
             return;
         }
-        let next_idx = if self.active == 0xFF {
-            0
-        } else {
-            (self.active + 1) % self.count
-        };
-        self.show(next_idx, tree, lcd, flash, fonts, images);
+        let next_idx = if self.active == 0xFF { 0 } else { (self.active + 1) % self.count };
+        self.show(next_idx, ctx);
     }
 
-    /// Previous page (circular).
-    pub fn prev(&mut self, tree: &mut WidgetTree, lcd: &Lcd, flash: &Flash, fonts: &FontList, images: &ImageList) {
+    pub fn prev(&mut self, ctx: &mut Ctx) {
         if self.count == 0 {
             return;
         }
@@ -261,6 +211,6 @@ impl PageManager {
         } else {
             self.active - 1
         };
-        self.show(prev_idx, tree, lcd, flash, fonts, images);
+        self.show(prev_idx, ctx);
     }
 }
