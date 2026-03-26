@@ -43,9 +43,11 @@ use page::PageManager;
 use protocol::{Protocol, RxEvent};
 use strpool::StringPool;
 use touch::Touch;
-use types::{Size, COLOR_BLACK, COLOR_RED, COLOR_WHITE};
+use types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE, Size};
 use usart::Usart;
 use vm::{Vm, VmState};
+
+use crate::systick::delay_ms;
 
 // === Hardware addresses (port init) ===
 
@@ -98,18 +100,18 @@ const CTL_PLLEN: u32 = 1 << 24;
 const CTL_PLLSTB: u32 = 1 << 25;
 
 // RCU_CFG0 bits/masks
-const CFG0_SCS: u32 = 0x03;           // System clock switch [1:0]
-const CFG0_SCSS: u32 = 0x0C;          // System clock switch status [3:2]
-const CFG0_AHBPSC: u32 = 0xF0;        // AHB prescaler [7:4]
-const CFG0_APB1PSC: u32 = 0x700;      // APB1 prescaler [10:8]
-const CFG0_APB2PSC: u32 = 0x3800;     // APB2 prescaler [13:11]
-const CFG0_ADCPSC: u32 = 0xC000;      // ADC prescaler [15:14]
+const CFG0_SCS: u32 = 0x03; // System clock switch [1:0]
+const CFG0_SCSS: u32 = 0x0C; // System clock switch status [3:2]
+const CFG0_AHBPSC: u32 = 0xF0; // AHB prescaler [7:4]
+const CFG0_APB1PSC: u32 = 0x700; // APB1 prescaler [10:8]
+const CFG0_APB2PSC: u32 = 0x3800; // APB2 prescaler [13:11]
+const CFG0_ADCPSC: u32 = 0xC000; // ADC prescaler [15:14]
 const CFG0_PLLSEL: u32 = 1 << 16;
 const CFG0_PREDV0: u32 = 1 << 17;
-const CFG0_PLLMF: u32 = 0xF << 18;   // PLL multiplier [21:18]
+const CFG0_PLLMF: u32 = 0xF << 18; // PLL multiplier [21:18]
 const CFG0_USBDPSC: u32 = 0x3 << 22;
 const CFG0_CKOUT0SEL: u32 = 0x7 << 24;
-const CFG0_PLLMF_4: u32 = 1 << 27;   // PLL multiplier bit 4
+const CFG0_PLLMF_4: u32 = 1 << 27; // PLL multiplier bit 4
 const CFG0_ADCPSC_2: u32 = 1 << 28;
 
 // PLL source = IRC8M/2, multiply by 27 → (4MHz × 27) = 108MHz
@@ -155,15 +157,27 @@ fn system_init() {
 
         // Reset HXTALEN, CKMEN, PLLEN
         let val = core::ptr::read_volatile(RCU_CTL as *const u32);
-        core::ptr::write_volatile(RCU_CTL as *mut u32, val & !(CTL_HXTALEN | CTL_CKMEN | CTL_PLLEN));
+        core::ptr::write_volatile(
+            RCU_CTL as *mut u32,
+            val & !(CTL_HXTALEN | CTL_CKMEN | CTL_PLLEN),
+        );
 
         // Reset CFG0: prescalers, clock source, PLL config
         let val = core::ptr::read_volatile(RCU_CFG0 as *const u32);
         core::ptr::write_volatile(
             RCU_CFG0 as *mut u32,
-            val & !(CFG0_SCS | CFG0_AHBPSC | CFG0_APB1PSC | CFG0_APB2PSC
-                | CFG0_ADCPSC | CFG0_ADCPSC_2 | CFG0_CKOUT0SEL
-                | CFG0_PLLSEL | CFG0_PREDV0 | CFG0_PLLMF | CFG0_USBDPSC | CFG0_PLLMF_4),
+            val & !(CFG0_SCS
+                | CFG0_AHBPSC
+                | CFG0_APB1PSC
+                | CFG0_APB2PSC
+                | CFG0_ADCPSC
+                | CFG0_ADCPSC_2
+                | CFG0_CKOUT0SEL
+                | CFG0_PLLSEL
+                | CFG0_PREDV0
+                | CFG0_PLLMF
+                | CFG0_USBDPSC
+                | CFG0_PLLMF_4),
         );
 
         // Reset HXTALBPS
@@ -199,7 +213,10 @@ fn system_init() {
 
         // PLL = IRC8M/2 × 27 = 108MHz (PLLSEL=0 selects IRC8M/2)
         let val = core::ptr::read_volatile(RCU_CFG0 as *const u32);
-        core::ptr::write_volatile(RCU_CFG0 as *mut u32, (val & !(CFG0_PLLMF | CFG0_PLLMF_4)) | PLL_MUL27);
+        core::ptr::write_volatile(
+            RCU_CFG0 as *mut u32,
+            (val & !(CFG0_PLLMF | CFG0_PLLMF_4)) | PLL_MUL27,
+        );
 
         // Enable PLL
         let val = core::ptr::read_volatile(RCU_CTL as *const u32);
@@ -239,11 +256,11 @@ fn init_ports() {
         // GPIOA CTL1 (PA8-PA15)
         let ctl1 = (GPIOA + 0x04) as *mut u32;
         let mut val = core::ptr::read_volatile(ctl1);
-        val &= !(0xF << 0);  // PA8:  PP output 50MHz (backlight off until timer init)
+        val &= !(0xF << 0); // PA8:  PP output 50MHz (backlight off until timer init)
         val |= 0x3 << 0;
-        val &= !(0xF << 4);  // PA9:  AF PP 50MHz (USART0 TX)
+        val &= !(0xF << 4); // PA9:  AF PP 50MHz (USART0 TX)
         val |= 0xB << 4;
-        val &= !(0xF << 8);  // PA10: floating input (USART0 RX)
+        val &= !(0xF << 8); // PA10: floating input (USART0 RX)
         val |= 0x4 << 8;
         val &= !(0xF << 12); // PA11: PP output 50MHz
         val |= 0x3 << 12;
@@ -280,10 +297,7 @@ fn init_ports() {
 
         // GPIOC initial pin states
         core::ptr::write_volatile((GPIOC + 0x14) as *mut u32, 1 << 12);
-        core::ptr::write_volatile(
-            (GPIOC + 0x10) as *mut u32,
-            (1 << 0) | (1 << 1) | (1 << 13),
-        );
+        core::ptr::write_volatile((GPIOC + 0x10) as *mut u32, (1 << 0) | (1 << 1) | (1 << 13));
         core::ptr::write_volatile((GPIOC + 0x10) as *mut u32, 0x03FC_0000);
 
         // GPIOD: PD2 PP output 50MHz
@@ -439,6 +453,9 @@ fn main() -> ! {
 
     // 1. Backlight
     backlight.set_brightness(100);
+    delay_ms(500);
+
+    ctx.lcd.begin_frame();
 
     // 2. Black screen
     ctx.lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
@@ -453,6 +470,8 @@ fn main() -> ! {
         COLOR_WHITE,
         Some(COLOR_BLACK),
     );
+
+    ctx.lcd.end_frame();
 
     // 4. Flash filesystem
     let mut error_code: u8 = 0;
@@ -518,7 +537,12 @@ fn main() -> ! {
 
         // Run on_program_start callback
         if cb_meta.on_program_start != NO_CALLBACK {
-            run_callback(&mut cb_vm, &code_buf[..code_len], cb_meta.on_program_start, &mut ctx);
+            run_callback(
+                &mut cb_vm,
+                &code_buf[..code_len],
+                cb_meta.on_program_start,
+                &mut ctx,
+            );
         }
 
         // Full initial render
@@ -530,7 +554,13 @@ fn main() -> ! {
 
     // Show error if any
     if error_code != 0 {
-        show_error(&ctx.lcd, ctx.fonts.embedded(), &ctx.flash, &usart, error_code);
+        show_error(
+            &ctx.lcd,
+            ctx.fonts.embedded(),
+            &ctx.flash,
+            &usart,
+            error_code,
+        );
     }
 
     // === MAIN LOOP ===
@@ -546,7 +576,13 @@ fn main() -> ! {
 
                 if vm.state == VmState::Error {
                     error_code = ERR_PROGRAM_ERROR;
-                    show_error(&ctx.lcd, ctx.fonts.embedded(), &ctx.flash, &usart, error_code);
+                    show_error(
+                        &ctx.lcd,
+                        ctx.fonts.embedded(),
+                        &ctx.flash,
+                        &usart,
+                        error_code,
+                    );
                 }
             }
             VmState::Waiting => {
@@ -588,6 +624,11 @@ fn main() -> ! {
                 }
 
                 RxEvent::FsReady => {
+                    // Pause VM during flash write to avoid ring buffer overflow
+                    let vm_was_running = vm.state == VmState::Running || vm.state == VmState::Waiting || vm.state == VmState::Yielded;
+                    if vm_was_running {
+                        vm.state = VmState::Halted;
+                    }
                     protocol::send_pong(&usart);
                 }
 

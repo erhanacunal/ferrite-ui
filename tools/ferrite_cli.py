@@ -36,7 +36,7 @@ TAG_ERROR = (1 << 3) | 2     # 0x0A, payload
 TAG_PONG  = (2 << 3) | 0     # 0x10, varint
 
 BAUD_RATE = 115200
-DEFAULT_TIMEOUT = 2.0  # seconds
+DEFAULT_TIMEOUT = 5.0  # seconds
 
 ERROR_DESCRIPTIONS = {
     1: "page_main not found",
@@ -45,6 +45,7 @@ ERROR_DESCRIPTIONS = {
     4: "font not found",
     5: "no file system in flash",
     6: "program execution error",
+    7: "insufficient memory",
 }
 
 
@@ -101,39 +102,54 @@ def open_port(port: str, timeout: float = DEFAULT_TIMEOUT) -> serial.Serial:
 def read_response(ser: serial.Serial) -> tuple[str, int | None]:
     """Read a single device response. Returns (type, value).
 
+    Skips any non-protocol bytes (e.g. debug prints) until a valid tag is found.
+
     Returns:
         ("pong", None) for pong
         ("error", code) for error
         ("timeout", None) if no response
     """
-    tag_byte = ser.read(1)
-    if not tag_byte:
-        return ("timeout", None)
+    orig_timeout = ser.timeout
+    deadline = time.time() + orig_timeout
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        ser.timeout = remaining
+        tag_byte = ser.read(1)
+        if not tag_byte:
+            break
+        print(f"DEBUG: received byte 0x{tag_byte[0]:02X} ('{chr(tag_byte[0])}')", file=sys.stderr)
 
-    tag = tag_byte[0]
+        tag = tag_byte[0]
 
-    if tag == TAG_PONG:
-        return ("pong", None)
+        if tag == TAG_PONG:
+            ser.timeout = orig_timeout
+            return ("pong", None)
 
-    if tag == TAG_ERROR:
-        # Read length varint
-        length_bytes = bytearray()
-        while True:
-            b = ser.read(1)
-            if not b:
+        if tag == TAG_ERROR:
+            # Read length varint
+            length_bytes = bytearray()
+            while True:
+                b = ser.read(1)
+                if not b:
+                    ser.timeout = orig_timeout
+                    return ("timeout", None)
+                length_bytes.append(b[0])
+                if b[0] & 0x80 == 0:
+                    break
+            length, _ = decode_varint(bytes(length_bytes))
+            # Read payload
+            payload = ser.read(length)
+            ser.timeout = orig_timeout
+            if len(payload) < length:
                 return ("timeout", None)
-            length_bytes.append(b[0])
-            if b[0] & 0x80 == 0:
-                break
-        length, _ = decode_varint(bytes(length_bytes))
-        # Read payload
-        payload = ser.read(length)
-        if len(payload) < length:
-            return ("timeout", None)
-        return ("error", payload[0])
+            return ("error", payload[0])
 
-    # Unknown tag — skip
-    return ("unknown", tag)
+        # Unknown byte (debug output etc.) — skip and keep reading
+
+    ser.timeout = orig_timeout
+    return ("timeout", None)
 
 
 # --- Commands ---
@@ -174,8 +190,8 @@ def cmd_execute(ser: serial.Serial, path: str) -> bool:
         print(f"file not found: {path}", file=sys.stderr)
         return False
 
-    if len(payload) > 1024:
-        print(f"program too large: {len(payload)} bytes (max 1024, use writefs for larger)", file=sys.stderr)
+    if len(payload) > 2048:
+        print(f"program too large: {len(payload)} bytes (max 2048, use writefs for larger)", file=sys.stderr)
         return False
 
     ser.write(build_payload_msg(TAG_EXECUTE, payload))
@@ -207,6 +223,7 @@ def cmd_writefs(ser: serial.Serial, path: str) -> bool:
 
     # 1. Send header: total_size(u32 LE) + chunk_size(u32 LE)
     header = struct.pack("<II", total_size, CHUNK_SIZE)
+    
     ser.write(build_payload_msg(TAG_WRITEFS, header))
     ser.flush()
 

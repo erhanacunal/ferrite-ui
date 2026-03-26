@@ -185,15 +185,31 @@ impl WidgetTree {
 
     /// Add child to end of parent's child list (highest z-order).
     pub fn add_child(&mut self, parent: WidgetId, child: WidgetId) {
+        // Prevent self-parenting and adding parent as its own child
+        if parent == child {
+            return;
+        }
         self.widgets[child.index()].parent = parent;
+        // Ensure child's next_sibling is cleared (prevent stale links)
+        self.widgets[child.index()].next_sibling = WidgetId::NONE;
 
         let first = self.widgets[parent.index()].first_child;
         if first.is_none() {
             self.widgets[parent.index()].first_child = child;
         } else {
+            let max = self.widgets.len();
             let mut last = first;
+            let mut guard = 0usize;
             while self.widgets[last.index()].next_sibling.is_some() {
-                last = self.widgets[last.index()].next_sibling;
+                let next = self.widgets[last.index()].next_sibling;
+                if next == child {
+                    return; // already a sibling
+                }
+                last = next;
+                guard += 1;
+                if guard > max {
+                    return; // sibling cycle detected
+                }
             }
             self.widgets[last.index()].next_sibling = child;
         }
@@ -205,8 +221,14 @@ impl WidgetTree {
         let mut x = w.location.x + w.margin.left as i16;
         let mut y = w.location.y + w.margin.top as i16;
 
+        let max = self.widgets.len();
+        let mut depth = 0usize;
         let mut pid = w.parent;
         while pid.is_some() {
+            depth += 1;
+            if depth > max {
+                break; // parent cycle detected
+            }
             let p = &self.widgets[pid.index()];
             x += p.location.x
                 + p.margin.left as i16
@@ -241,10 +263,16 @@ impl WidgetTree {
 
     /// Is child a descendant of ancestor?
     pub fn is_descendant(&self, child: WidgetId, ancestor: WidgetId) -> bool {
+        let max = self.widgets.len();
+        let mut depth = 0usize;
         let mut current = self.widgets[child.index()].parent;
         while current.is_some() {
             if current == ancestor {
                 return true;
+            }
+            depth += 1;
+            if depth > max {
+                return false; // parent cycle
             }
             current = self.widgets[current.index()].parent;
         }
@@ -264,6 +292,7 @@ impl WidgetTree {
     /// Flatten tree to DFS pre-order (z-order).
     pub fn dfs_order(&self) -> Vec<WidgetId> {
         let mut order = Vec::new();
+        let max = self.widgets.len();
 
         if self.root.is_none() {
             return order;
@@ -273,14 +302,22 @@ impl WidgetTree {
         stack.push(self.root);
 
         while let Some(id) = stack.pop() {
+            if order.len() >= max {
+                break; // safety: more iterations than widgets → cycle
+            }
             order.push(id);
 
             // Collect children, push in reverse for correct DFS order
             let mut child = self.widgets[id.index()].first_child;
             let start = stack.len();
+            let mut child_count = 0usize;
             while child.is_some() {
                 stack.push(child);
                 child = self.widgets[child.index()].next_sibling;
+                child_count += 1;
+                if child_count > max {
+                    break; // safety: sibling cycle
+                }
             }
             // Reverse the children we just pushed
             stack[start..].reverse();

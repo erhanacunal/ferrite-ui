@@ -59,19 +59,21 @@ impl Gpio {
             let bop = (GPIOA_BASE + GPIO_BOP_OFFSET) as *mut u32;
             core::ptr::write_volatile(bop, 1 << LCD_CLK_PIN);
 
-            spin(2);
+            cortex_m::asm::nop(); 
 
             let bc = (GPIOA_BASE + GPIO_BC_OFFSET) as *mut u32;
             core::ptr::write_volatile(bc, 1 << LCD_CLK_PIN);
 
-            spin(2);
+           //spin(1);
+           cortex_m::asm::nop();
+           cortex_m::asm::nop();
         }
     }
 }
 
 /// 108MHz CPU'yu FPGA'ya senkronize etmek için kısa gecikme
 #[inline(always)]
-fn spin(cycles: u32) {
+pub fn spin(cycles: u32) {
     for _ in 0..cycles {
         cortex_m::asm::nop();
     }

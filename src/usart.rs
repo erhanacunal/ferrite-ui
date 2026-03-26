@@ -180,6 +180,35 @@ pub fn rx_len() -> u8 {
     }
 }
 
+// --- Debug output (free functions, no Usart instance needed) ---
+
+/// Write debug bytes directly to USART hardware (blocking).
+pub fn dbg(data: &[u8]) {
+    unsafe {
+        for &b in data {
+            while read_volatile(USART_STAT as *const u32) & STAT_TBE == 0 {}
+            write_volatile(USART_DATA as *mut u32, b as u32);
+        }
+    }
+}
+
+/// Write a u16 as decimal digits to USART.
+pub fn dbg_u16(val: u16) {
+    let mut buf = [0u8; 5];
+    let mut n = val;
+    let mut pos = 5;
+    if n == 0 {
+        dbg(b"0");
+        return;
+    }
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    dbg(&buf[pos..]);
+}
+
 /// Ring buffer'ı sıfırla.
 pub fn rx_clear() {
     unsafe {

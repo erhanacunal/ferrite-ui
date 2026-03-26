@@ -663,6 +663,7 @@ NO_VALUE_BUILTINS = {
     'drawImage', 'drawText', 'delay',
     'setText', 'drawStr', 'strClear', 'strFree',
     'roundedRect', 'fillRoundedRect', 'arc',
+    'beginFrame', 'endFrame',
 }
 
 
@@ -1330,6 +1331,18 @@ class CodeGen:
             self._gen_expr(node.args[4])                        # end deg
             self._gen_expr(node.args[5])                        # color
             self.asm.builtin(Builtin.ARC)
+            return
+
+        if name == 'beginFrame':
+            if len(node.args) != 0:
+                raise CompileError("beginFrame() takes no arguments", node.line)
+            self.asm.builtin(Builtin.BEGIN_FRAME)
+            return
+
+        if name == 'endFrame':
+            if len(node.args) != 0:
+                raise CompileError("endFrame() takes no arguments", node.line)
+            self.asm.builtin(Builtin.END_FRAME)
             return
 
         # --- User-defined function ---

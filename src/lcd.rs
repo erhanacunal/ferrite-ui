@@ -1,28 +1,51 @@
 use crate::gpio::Gpio;
 
-/// FPGA komut kodları (Ghidra reverse engineering)
+/// FPGA command codes (Ghidra reverse engineering)
 const CMD_Y_START: u16 = 0x02;
 const CMD_X_START: u16 = 0x03;
+const CMD_FRONT_SWAP: u16 = 0x04;
+const CMD_BACK_SELECT: u16 = 0x05;
 const CMD_Y_END: u16 = 0x06;
 const CMD_X_END: u16 = 0x07;
 const CMD_PIXEL_WRITE: u16 = 0x0F;
 
-/// LCD boyutları
 pub const WIDTH: u16 = 800;
 pub const HEIGHT: u16 = 480;
 
 pub struct Lcd {
     gpio: Gpio,
+    /// Front buffer index (what FPGA displays). Tracks CMD4 value.
+    lcd4: u8,
+    /// Back buffer index (what CPU writes to). Tracks CMD5 value.
+    lcd5: u8,
 }
 
 impl Lcd {
     pub fn new(gpio: Gpio) -> Self {
-        Self { gpio }
+        Self { gpio, lcd4: 0, lcd5: 0 }
+    }
+
+    /// Begin a new frame: toggle back buffer so CPU writes to the hidden buffer.
+    /// No-op if buffers are already swapped (fresh buffer available).
+    pub fn begin_frame(&mut self) {
+        if self.lcd4 == self.lcd5 {
+            self.lcd5 ^= 1;
+            self.send_command(CMD_BACK_SELECT);
+            self.send_data(self.lcd5 as u16);
+        }
+    }
+
+    /// End frame: swap front buffer to show what was just drawn.
+    /// FPGA atomically swaps — no tearing.
+    pub fn end_frame(&mut self) {
+        self.lcd4 = self.lcd5;
+        self.send_command(CMD_FRONT_SWAP);
+        self.send_data(self.lcd4 as u16);
     }
 
     /// FPGA'ya komut gönder
     #[inline(always)]
-    fn send_command(&self, cmd: u16) {
+    pub fn send_command(&self, cmd: u16) {
         self.gpio.set_cmd_data(false); // command mode
         self.gpio.write_data_bus(cmd);
         self.gpio.clock_pulse();
@@ -30,7 +53,7 @@ impl Lcd {
 
     /// FPGA'ya data gönder
     #[inline(always)]
-    fn send_data(&self, data: u16) {
+    pub fn send_data(&self, data: u16) {
         self.gpio.set_cmd_data(true); // data mode
         self.gpio.write_data_bus(data);
         self.gpio.clock_pulse();

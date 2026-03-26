@@ -15,15 +15,18 @@ For the some bricked Nextion Displays :)
 | Flash | W25Q256JVFQ | 32MB SPI, stores fonts/images/bytecode |
 | RTC | AT8563T | I2C |
 
+![Ferrite Clock Example](docs/images/ferrite_clock.jpeg)
+
 ## Features
 
-- **Widget system** -- HTML-like tree structure with CSS box model (margin, border, padding), arena-allocated (64 widgets, no heap)
+- **Widget system** -- HTML-like tree structure with CSS box model (margin, border, padding), heap-allocated (Vec-backed, no fixed limits)
 - **Widget types** -- Base (container), Label (text + font + alignment), Button (press state + children)
 - **Dirty redraw** -- Clip-based painter's algorithm, only repaints changed widgets
-- **Bytecode VM** -- 55 opcodes, protobuf tag encoding, 16 variables, 8-deep call stack
-- **Drawing primitives** -- fillRect, rect, line, circle, fillCircle, drawImage, drawText
+- **Double buffering** -- FPGA back/front buffer swap for tear-free rendering
+- **Bytecode VM** -- 55 opcodes, protobuf tag encoding, 32 variables, 8-deep call stack
+- **Drawing primitives** -- fillRect, rect, line, circle, fillCircle, roundedRect, fillRoundedRect, arc, drawImage, drawText
 - **Float32 arithmetic** -- Software float (add/sub/mul/div/neg + comparisons + conversion)
-- **String pool** -- 2KB static buffer for runtime string operations (itos, ftos, concat, parse)
+- **String pool** -- Heap-allocated strings with auto-incrementing IDs, smart GC preserving widget text
 - **Touch input** -- Debounced press/hold/release events, hit testing, on_click and on_tap callbacks
 - **Custom paint** -- on_paint callback for widget custom drawing
 - **Flash filesystem** -- TOC-based, named resources (fonts, images, programs, pages)
@@ -32,11 +35,11 @@ For the some bricked Nextion Displays :)
 - **Page manager** -- Multiple full-screen pages, show/hide, flash loading
 - **USART protocol** -- Protobuf-style serial communication (ping, execute, flash write, user messages)
 - **Backlight PWM** -- 0-100% brightness via hardware timer
-- **SysTick timer** -- 1ms tick counter for non-blocking delays
+- **SysTick timer** -- 1ms tick counter, blocking and non-blocking delays
 
 ## Ferrite Language
 
-Programs are written in a C-like language (`.fl` files) that compiles to VM bytecode. Here's an [analog clock](examples/clock.fl) that demonstrates drawing primitives, string operations, and the animation loop:
+Programs are written in a C-like language (`.fl` files) that compiles to VM bytecode. Here's an [analog clock](examples/clock/standalone.fl) that demonstrates drawing primitives, string operations, and the animation loop:
 
 ```c
 // Hand positions: 12 entries (R=120), dx = R*sin(i*30°)
@@ -125,13 +128,11 @@ Binary output: `target/thumbv7m-none-eabi/release/ferrite-ui`
 
 | Component | Size |
 |-----------|------|
-| Widget arena (64 widgets) | ~3.5 KB |
-| String pool | ~2.1 KB |
-| Text pool (labels) | 256 B |
+| Heap (linked-list allocator) | 16 KB |
 | Clip region (32 rects) | 256 B |
-| VM (x2: main + callback) | ~300 B |
-| Array pool (per VM) | 256 B |
 | USART RX ring buffer | 128 B |
+
+Heap-allocated: Ctx (WidgetTree, FontList, ImageList, StringPool), VMs (x2), code buffer (4KB), fonts, arrays, strings.
 
 ## Project Structure
 
@@ -139,10 +140,11 @@ Binary output: `target/thumbv7m-none-eabi/release/ferrite-ui`
 ferrite-ui/
 ├── src/
 │   ├── main.rs          Entry point, startup, main loop
+│   ├── ctx.rs           Shared application context (Ctx struct)
 │   ├── vm.rs            Bytecode VM (55 opcodes, builtins, f32)
-│   ├── widget.rs        Widget tree, arena allocator, box model
+│   ├── widget.rs        Widget tree, heap-allocated, box model
 │   ├── render.rs        Painter's algorithm, dirty redraw, clip
-│   ├── lcd.rs           FPGA display protocol, drawing primitives
+│   ├── lcd.rs           FPGA display protocol, double buffer, drawing primitives
 │   ├── clip.rs          Clip region (rect subtract algorithm)
 │   ├── touch.rs         XPT2046 driver, hit test, debounce
 │   ├── flash.rs         W25Q256 SPI flash driver
@@ -150,7 +152,8 @@ ferrite-ui/
 │   ├── image.rs         Ferrite Image (FI) decoder
 │   ├── fs.rs            Flash filesystem (TOC, named resources)
 │   ├── page.rs          Page manager (multi-page UI)
-│   ├── strpool.rs       Static string pool (2KB, itos/ftos/concat)
+│   ├── strpool.rs       Heap string pool (itos/ftos/concat/GC)
+│   ├── heap.rs          Linked-list heap allocator (16KB)
 │   ├── systick.rs       SysTick 1ms timer
 │   ├── callback.rs      Callback metadata (function table)
 │   ├── protocol.rs      USART protobuf protocol
@@ -173,11 +176,13 @@ ferrite-ui/
 
 ## Architecture
 
-- **No heap, no allocator** -- all memory is statically allocated
+- **Custom heap allocator** -- 16KB linked-list allocator, all large structures heap-allocated via Box/Vec
 - **No OS, no runtime** -- `#![no_std]`, `#![no_main]`, `cortex-m-rt` entry point
 - **No frame buffer in CPU RAM** -- pixels are written directly to the FPGA over a 16-bit GPIO bus
+- **Double buffered** -- FPGA handles front/back buffer swap, tear-free rendering
 - **Dirty redraw only** -- the clip-based painter's algorithm redraws only changed widgets
 - **Bytecode VM** -- UI logic runs as bytecode programs, uploaded via USART or loaded from flash
+- **Shared context** -- Ctx struct bundles LCD, Flash, WidgetTree, FontList, ImageList, StringPool, Fs
 
 ## License
 

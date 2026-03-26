@@ -30,9 +30,15 @@ fn render_subtree(ctx: &Ctx, id: WidgetId) {
     draw_widget(ctx, id, &abs);
 
     let mut child = widget.first_child;
+    let max = ctx.tree.count();
+    let mut guard = 0usize;
     while child.is_some() {
         render_subtree(ctx, child);
         child = ctx.tree.get(child).next_sibling;
+        guard += 1;
+        if guard > max {
+            break; // sibling cycle
+        }
     }
 }
 

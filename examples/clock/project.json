@@ -2,18 +2,11 @@
   "version": 1,
   "screen": [800, 480],
   "fonts": [],
-  "images": [],
-  "pages": [
-    {
-      "name": "page_main",
-      "background": "0x1082",
-      "source": "page_main.fl"
-    }
-  ],
+  "images": [],  
   "programs": [
     {
       "name": "main",
-      "source": "main.fl"
+      "source": "standalone.fl"
     }
   ]
 }

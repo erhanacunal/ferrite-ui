@@ -48,6 +48,13 @@ pub fn millis() -> u32 {
     unsafe { core::ptr::read_volatile(&raw const TICK_MS) }
 }
 
+/// Blocking delay for `ms` milliseconds.
+#[inline]
+pub fn delay_ms(ms: u32) {
+    let start = millis();
+    while millis().wrapping_sub(start) < ms {}
+}
+
 /// SysTick exception handler — called every 1ms.
 /// cortex-m-rt routes the SysTick vector here via the `#[exception]` attribute.
 #[unsafe(no_mangle)]

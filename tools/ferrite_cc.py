@@ -116,6 +116,8 @@ class Builtin:
     ROUNDED_RECT = 19      # stack: [color, r, size, loc]
     FILL_ROUNDED_RECT = 20 # stack: [color, r, size, loc]
     ARC = 21               # stack: [color, end, start, radius, center]
+    BEGIN_FRAME = 22       # no args — toggle back buffer
+    END_FRAME = 23         # no args — swap front ← back
 
 
 class Prop:

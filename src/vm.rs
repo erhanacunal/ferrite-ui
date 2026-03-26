@@ -110,6 +110,8 @@ const BUILTIN_STR_FREE: u8 = 18;   // stack: [str_id] → marks string for next 
 const BUILTIN_ROUNDED_RECT: u8 = 19;      // stack: [color, r, size, loc]
 const BUILTIN_FILL_ROUNDED_RECT: u8 = 20; // stack: [color, r, size, loc]
 const BUILTIN_ARC: u8 = 21;               // stack: [color, end, start, radius, center]
+const BUILTIN_BEGIN_FRAME: u8 = 22;       // no args — toggle back buffer
+const BUILTIN_END_FRAME: u8 = 23;         // no args — swap front ← back
 
 // --- VM State ---
 
@@ -986,6 +988,12 @@ impl Vm {
                 let radius = self.pop() as i16;
                 let (cx, cy) = unpack_pair(self.pop());
                 ctx.lcd.draw_arc(cx as i16, cy as i16, radius, start, end, color);
+            }
+            BUILTIN_BEGIN_FRAME => {
+                ctx.lcd.begin_frame();
+            }
+            BUILTIN_END_FRAME => {
+                ctx.lcd.end_frame();
             }
             _ => {
                 self.state = VmState::Error;
