@@ -174,8 +174,8 @@ def cmd_execute(ser: serial.Serial, path: str) -> bool:
         print(f"file not found: {path}", file=sys.stderr)
         return False
 
-    if len(payload) > 8192:
-        print(f"program too large: {len(payload)} bytes (max 8192)", file=sys.stderr)
+    if len(payload) > 1024:
+        print(f"program too large: {len(payload)} bytes (max 1024, use writefs for larger)", file=sys.stderr)
         return False
 
     ser.write(build_payload_msg(TAG_EXECUTE, payload))
