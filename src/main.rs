@@ -60,6 +60,7 @@ const TIMER2: u32 = 0x4000_0400;
 
 // === Error codes ===
 
+#[allow(dead_code)]
 const ERR_PAGE_NOT_FOUND: u8 = 1;
 const ERR_PROGRAM_NOT_FOUND: u8 = 2;
 #[allow(dead_code)]
@@ -474,15 +475,10 @@ fn main() -> ! {
     let mut code_buf = [0u8; MAX_CODE_SIZE];
     let mut code_len: usize = 0;
 
-    // 6. Load page_main (if FS available)
+    // 6. Load page_main (optional — program can run without pages)
     if error_code == 0 {
         let fs_ref = fs.as_ref().unwrap();
-        if pm
-            .load_page(&mut tree, &lcd, fs_ref, &flash, b"page_main")
-            .is_none()
-        {
-            error_code = ERR_PAGE_NOT_FOUND;
-        }
+        pm.load_page(&mut tree, &lcd, fs_ref, &flash, b"page_main");
     }
 
     // 7. Load main program (if no error)
@@ -515,8 +511,10 @@ fn main() -> ! {
     let mut cb_vm = Vm::new();
 
     if error_code == 0 && code_len > 0 {
-        // Show first page
-        pm.show(0, &mut tree, &lcd, &flash, &fonts, &images);
+        // Show first page (if any was loaded)
+        if pm.count() > 0 {
+            pm.show(0, &mut tree, &lcd, &flash, &fonts, &images);
+        }
 
         // Run on_program_start callback
         if cb_meta.on_program_start != NO_CALLBACK {
