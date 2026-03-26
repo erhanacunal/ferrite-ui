@@ -45,7 +45,6 @@ impl WidgetId {
 // --- Widget ---
 
 pub const MAX_WIDGETS: usize = 64;
-const TEXT_POOL_SIZE: usize = 256;
 
 /// Tek bir widget düğümü.
 ///
@@ -79,12 +78,11 @@ pub struct Widget {
     pub background_color: Color,
     pub border_color: Color,
 
-    // Label alanları
+    // Label fields
     pub text_color: Color,
     pub font_id: u8,
     pub text_align: u8,
-    pub text_offset: u16, // WidgetTree::text_pool'daki offset
-    pub text_len: u8,
+    pub text_id: u8, // StringPool str_id (0xFF = no text)
 
     // Button fields
     pub press_color: Color,
@@ -120,8 +118,7 @@ impl Widget {
             text_color: 0xFFFF,
             font_id: 0xFF,
             text_align: ALIGN_LEFT,
-            text_offset: 0,
-            text_len: 0,
+            text_id: 0xFF,
             press_color: 0,
             image_id: 0,
             on_click: 0,
@@ -150,11 +147,8 @@ impl Widget {
 // --- WidgetTree ---
 
 /// Statik arena ile widget ağacı. Heap yok, sabit bellek.
-/// Text pool: label metinleri için append-only buffer (256 byte).
 pub struct WidgetTree {
     widgets: [Widget; MAX_WIDGETS],
-    text_pool: [u8; TEXT_POOL_SIZE],
-    text_pool_len: u16,
     count: u8,
     pub root: WidgetId,
 }
@@ -163,8 +157,6 @@ impl WidgetTree {
     pub const fn new() -> Self {
         Self {
             widgets: [const { Widget::default() }; MAX_WIDGETS],
-            text_pool: [0u8; TEXT_POOL_SIZE],
-            text_pool_len: 0,
             count: 0,
             root: WidgetId::NONE,
         }
@@ -187,55 +179,6 @@ impl WidgetTree {
 
     pub fn get_mut(&mut self, id: WidgetId) -> &mut Widget {
         &mut self.widgets[id.index()]
-    }
-
-    // --- Text pool ---
-
-    /// Widget'a metin ata. Text pool'a kopyalar.
-    /// Aynı widget'a tekrar set_text çağrılırsa:
-    ///   - Yeni metin ≤ eski uzunluk → yerinde üzerine yazar (pool büyümez)
-    ///   - Yeni metin > eski uzunluk → pool'a yeni yer tahsis eder (eski alan kayıp)
-    pub fn set_text(&mut self, id: WidgetId, text: &[u8]) -> bool {
-        let len = text.len();
-        if len > 255 {
-            return false;
-        }
-
-        let w = &self.widgets[id.index()];
-
-        // Yerinde üzerine yazma (eski alan yeterli)
-        if w.text_len as usize >= len && w.text_len > 0 {
-            let start = w.text_offset as usize;
-            self.text_pool[start..start + len].copy_from_slice(text);
-            self.widgets[id.index()].text_len = len as u8;
-            return true;
-        }
-
-        // Pool'a yeni yer tahsis et
-        if self.text_pool_len as usize + len > TEXT_POOL_SIZE {
-            return false;
-        }
-        let offset = self.text_pool_len as usize;
-        self.text_pool[offset..offset + len].copy_from_slice(text);
-        self.text_pool_len += len as u16;
-        self.widgets[id.index()].text_offset = offset as u16;
-        self.widgets[id.index()].text_len = len as u8;
-        true
-    }
-
-    /// Widget'ın metnini döndür. Metin yoksa boş slice.
-    pub fn get_text(&self, id: WidgetId) -> &[u8] {
-        let w = &self.widgets[id.index()];
-        if w.text_len == 0 {
-            return &[];
-        }
-        let start = w.text_offset as usize;
-        let end = start + w.text_len as usize;
-        if end <= TEXT_POOL_SIZE {
-            &self.text_pool[start..end]
-        } else {
-            &[]
-        }
     }
 
     // --- Ağaç işlemleri ---

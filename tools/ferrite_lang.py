@@ -1316,6 +1316,20 @@ class CodeGen:
         prop_id, is_compound = _resolve_prop(prop_name)
         value_args = node.args[1:]
 
+        # Special: set(text, "literal") or set(text, str_id_expr)
+        if prop_id == Prop.TEXT:
+            if len(value_args) != 1:
+                raise CompileError("set(text) takes 1 value", node.line)
+            arg = value_args[0]
+            if isinstance(arg, StrLit):
+                # String literal → W_SET PROP_TEXT LEN (allocates in StringPool)
+                self.asm.w_set_text(arg.value)
+            else:
+                # Expression (str_id) → BUILTIN SET_TEXT
+                self._gen_expr(arg)
+                self.asm.str_set_text()
+            return
+
         if is_compound:
             # Check if all values are constant
             all_const = all(isinstance(a, NumLit) for a in value_args)

@@ -849,10 +849,14 @@ impl Vm {
     }
 
     fn set_compound_prop(&mut self, tree: &mut WidgetTree, prop_id: u8, data: &[u8]) {
-        // PROP_TEXT: payload = raw text bytes → tree.set_text()
+        // PROP_TEXT: payload = raw text bytes → allocate in StringPool, set text_id
         if prop_id == PROP_TEXT {
             if self.target.is_some() {
-                tree.set_text(self.target, data);
+                if let Some(str_id) = strpool::pool().alloc(data) {
+                    tree.get_mut(self.target).text_id = str_id;
+                } else {
+                    self.state = VmState::Error;
+                }
             }
             return;
         }
@@ -997,10 +1001,9 @@ impl Vm {
                 self.push(strpool::pool().len(id) as i32);
             }
             BUILTIN_SET_TEXT => {
-                let id = self.pop() as u8;
+                let str_id = self.pop() as u8;
                 if self.target.is_some() {
-                    let data = strpool::pool().get(id);
-                    tree.set_text(self.target, data);
+                    tree.get_mut(self.target).text_id = str_id;
                 }
             }
             BUILTIN_DRAW_STR => {

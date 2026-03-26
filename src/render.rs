@@ -3,6 +3,7 @@ use crate::flash::Flash;
 use crate::font::FontList;
 use crate::image::ImageList;
 use crate::lcd::{self, Lcd};
+use crate::strpool;
 use crate::types::{Color, Rect};
 use crate::widget::{
     WidgetId, WidgetTree, ALIGN_CENTER, ALIGN_RIGHT, FLAG_PRESSED, KIND_BUTTON, KIND_LABEL,
@@ -329,10 +330,13 @@ fn draw_label_text(
     abs: &Rect,
 ) {
     let widget = tree.get(id);
-    let text = tree.get_text(id);
 
     // No text or no font assigned
-    if text.is_empty() || widget.font_id == 0xFF {
+    if widget.text_id == 0xFF || widget.font_id == 0xFF {
+        return;
+    }
+    let text = strpool::pool().get(widget.text_id);
+    if text.is_empty() {
         return;
     }
     // Resolve font by ID, fall back to embedded font

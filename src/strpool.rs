@@ -9,7 +9,7 @@
 /// RAM cost: 2048 + 16×4 + 4 = ~2.1 KB
 
 const POOL_SIZE: usize = 2048;
-const MAX_STRINGS: usize = 16;
+const MAX_STRINGS: usize = 32;
 
 /// Temporary formatting buffer (shared, not re-entrant — fine for single-threaded VM)
 const FMT_BUF_SIZE: usize = 32;

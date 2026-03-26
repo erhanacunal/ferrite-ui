@@ -894,6 +894,8 @@ PROP_MAP = {
     'on_click': (Prop.ON_CLICK, False),
     'on_paint': (Prop.ON_PAINT, False),
     'on_tap': (Prop.ON_TAP, False),
+    'text': (Prop.TEXT, True),
+    'text_id': (Prop.TEXT, True),  # alias — same underlying prop
 }
 
 

@@ -2,7 +2,7 @@
 
 Bare-metal HMI framework for the Nextion NX8048K070 display, written in Rust. Replaces the original Nextion firmware with a clean-room implementation.
 
-The original FPGA display protocol was reverse-engineered from the stock firmware using Ghidra.
+For the some bricked Nextion Displays :)
 
 ## Hardware
 
