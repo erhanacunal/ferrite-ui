@@ -515,7 +515,7 @@ def build(project_path: str, output_path: str) -> dict:
             fi_data.insert(8, image_id)
         resources.append((name, RES_IMAGE, bytes(fi_data)))
 
-    # 3. Pages — widget tree JSON → bytecode
+    # 3. Pages — JSON widget tree OR .fl source → bytecode
     # Widget ID tahsisi: root(0) → page widgets → page contents
     next_id = 1  # root=0 main.rs'de, page'ler 1'den başlar
 
@@ -524,9 +524,20 @@ def build(project_path: str, output_path: str) -> dict:
         page_widget_id = next_id
         next_id += 1  # page widget'ı PageManager tarafından alloc edilir
 
-        base_id = next_id  # content widget'lar buradan başlar
-        page_data, widget_count = compile_page(page, page_widget_id, base_id)
-        next_id += widget_count
+        if "source" in page:
+            # Compile .fl source as page (bg_color prefix + bytecode)
+            from ferrite_lang import compile_page as fl_compile_page
+            bg_color = parse_color(page.get("background", "0x0000"))
+            source_path = project_dir / page["source"]
+            source = source_path.read_text(encoding="utf-8")
+            page_data = fl_compile_page(source, bg_color, str(source_path))
+            # Count alloc() calls in bytecode to track widget IDs
+            widget_count = source.count("alloc(")
+            next_id += widget_count
+        else:
+            base_id = next_id  # content widget'lar buradan başlar
+            page_data, widget_count = compile_page(page, page_widget_id, base_id)
+            next_id += widget_count
 
         resources.append((name, RES_PAGE, page_data))
 
