@@ -1020,7 +1020,7 @@ impl Vm {
                 }
             }
             BUILTIN_STR_CLEAR => {
-                strpool::pool().clear();
+                strpool::smart_clear(tree);
             }
             _ => {
                 self.state = VmState::Error;

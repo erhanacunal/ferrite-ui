@@ -795,15 +795,25 @@ drawStr(10, 460, 0, 0x07E0, 0x0000, label);   // "60 FPS" in green
 
 ### strClear()
 
-Resets the entire string pool. All string IDs become invalid. Call this periodically in loops to prevent pool exhaustion.
+Clears the string pool while **preserving strings referenced by widget text**. Temporary strings (from `itos`, `concat`, etc.) are freed, but any string assigned to a widget via `set(text, ...)` or `setText()` survives.
+
+This works by scanning all widget `text_id` fields, compacting survivors to the front of the pool, and updating widget references. It's safe to call in a loop without losing label text.
 
 ```c
+// Label text survives strClear — no need to re-set it each iteration
+var label = alloc();
+target(label);
+set(kind, 1);
+set(text, "Permanent title");  // this string survives strClear
+
+var i = 0;
 while (true) {
-    var temp = itos(read_sensor());
-    var msg = concat(str("T="), concat(temp, str("C")));
-    drawStr(10, 10, 0, 0xFFFF, 0x0000, msg);
-    delay(1000);
-    strClear();  // free all strings for next iteration
+    var s = concat(str("Count: "), itos(i));  // temp strings
+    drawStr(10, 50, 0, 0xFFFF, 0x0000, s);
+    delay(100);
+    i = i + 1;
+    strClear();  // frees "Count: ", itos result, concat result
+                 // keeps "Permanent title" on the label
 }
 ```
 
@@ -853,10 +863,10 @@ while (true) {
 | Resource | Limit |
 |----------|-------|
 | Pool buffer | 2,048 bytes |
-| Max strings | 16 simultaneous |
+| Max strings | 32 simultaneous |
 | ftos precision | 2 decimal places |
 
-When the pool is full, string operations fail silently (VM error state). Always call `strClear()` in loops.
+When the pool is full, string operations set the VM error state. Call `strClear()` in loops to reclaim space -- widget text is automatically preserved.
 
 ## Events and Callbacks
 

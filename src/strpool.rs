@@ -3,10 +3,11 @@
 /// Global static (no allocator) — same pattern as USART ring buffer.
 /// Single-threaded bare-metal: safe to access via unsafe global.
 ///
-/// Pool: 2048 byte buffer, 16 string slots, append-only.
-/// Strings are immutable once created. `clear()` resets the entire pool.
+/// Pool: 2048 byte buffer, 32 string slots, append-only.
+/// Strings are immutable once created.
+/// `smart_clear()` collects unreferenced strings while preserving widget text.
 ///
-/// RAM cost: 2048 + 16×4 + 4 = ~2.1 KB
+/// RAM cost: 2048 + 32×4 + 4 = ~2.2 KB
 
 const POOL_SIZE: usize = 2048;
 const MAX_STRINGS: usize = 32;
@@ -118,6 +119,93 @@ impl StringPool {
     pub fn clear(&mut self) {
         self.count = 0;
         self.next = 0;
+    }
+
+    /// Smart clear: keep strings referenced by `keep` bitmask, discard the rest.
+    /// Compacts survivors to the front of the buffer with new sequential IDs.
+    /// Returns an ID remap table: old_id → new_id (0xFF = discarded).
+    pub fn smart_clear(&mut self, keep: u32) -> [u8; MAX_STRINGS] {
+        let mut remap = [0xFFu8; MAX_STRINGS];
+        let old_count = self.count as usize;
+
+        if old_count == 0 {
+            return remap;
+        }
+
+        // If nothing to keep, just clear everything
+        if keep == 0 {
+            self.clear();
+            return remap;
+        }
+
+        let mut new_id: u8 = 0;
+        let mut write_pos: u16 = 0;
+
+        for old_id in 0..old_count {
+            if keep & (1 << old_id) == 0 {
+                continue; // discard
+            }
+
+            let m = self.meta[old_id];
+            let src = m.offset as usize;
+            let len = m.len as usize;
+            let dst = write_pos as usize;
+
+            // Move bytes forward (src >= dst always, since we compact left)
+            if dst != src {
+                for i in 0..len {
+                    self.buf[dst + i] = self.buf[src + i];
+                }
+            }
+
+            self.meta[new_id as usize] = StrMeta {
+                offset: write_pos,
+                len: m.len,
+            };
+            remap[old_id] = new_id;
+            write_pos += m.len;
+            new_id += 1;
+        }
+
+        self.count = new_id;
+        self.next = write_pos;
+        remap
+    }
+}
+
+// === Smart clear with widget text preservation ===
+
+use crate::widget::WidgetTree;
+
+/// Clear the string pool while preserving strings referenced by widget text_id fields.
+/// Compacts survivors to the front, updates widget references to new IDs.
+pub fn smart_clear(tree: &mut WidgetTree) {
+    let p = pool();
+    let count = p.count;
+
+    if count == 0 {
+        return;
+    }
+
+    // Phase 1: Build keep bitmask from widget text_ids
+    let mut keep: u32 = 0;
+    let (dfs, dfs_count) = tree.dfs_order();
+    for i in 0..dfs_count {
+        let text_id = tree.get(dfs[i]).text_id;
+        if text_id != 0xFF && (text_id as usize) < MAX_STRINGS {
+            keep |= 1 << text_id;
+        }
+    }
+
+    // Phase 2: Compact pool, get remap table
+    let remap = p.smart_clear(keep);
+
+    // Phase 3: Update widget text_id references
+    for i in 0..dfs_count {
+        let w = tree.get_mut(dfs[i]);
+        if w.text_id != 0xFF && (w.text_id as usize) < MAX_STRINGS {
+            w.text_id = remap[w.text_id as usize];
+        }
     }
 }
 
