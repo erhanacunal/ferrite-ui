@@ -172,4 +172,6 @@ ferrite-ui/
 
 ## License
 
+MIT License. See [LICENSE](LICENSE) for details.
+
 This project is an independent, clean-room implementation. It is not affiliated with or endorsed by ITEAD (Nextion).
