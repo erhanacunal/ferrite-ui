@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use panic_halt as _;
 
 mod backlight;
@@ -11,6 +14,7 @@ mod flash;
 mod font;
 mod fs;
 mod gpio;
+mod heap;
 mod image;
 mod irq;
 mod lcd;
@@ -72,7 +76,7 @@ const ERR_PROGRAM_ERROR: u8 = 6;
 
 // === Max program code size ===
 
-const MAX_CODE_SIZE: usize = 8192;
+const MAX_CODE_SIZE: usize = 4096;
 
 // === RCU registers ===
 
@@ -405,6 +409,9 @@ fn main() -> ! {
     // --- System clock: IRC8M → PLL ×27 → 108MHz ---
     system_init();
 
+    // --- Heap allocator init (must be before any Box/Vec) ---
+    heap::init();
+
     // --- SysTick: 1ms tick counter ---
     systick::init();
 
@@ -418,8 +425,8 @@ fn main() -> ! {
     let mut touch = Touch::init();
     let backlight = backlight::Backlight::init();
 
-    // --- Font list (embedded font is always id=0) ---
-    let mut fonts = FontList::new();
+    // --- Font list (embedded font is always id=0) — heap allocated ---
+    let mut fonts = Box::new(FontList::new());
     fonts.add(Font::from_embedded(
         &embedded_font::GLYPHS,
         &embedded_font::BITMAP,
@@ -461,8 +468,8 @@ fn main() -> ! {
         }
     };
 
-    // 5. Widget tree + root
-    let mut tree = WidgetTree::new();
+    // 5. Widget tree + root — heap allocated
+    let mut tree = Box::new(WidgetTree::new());
     let root = tree.alloc().unwrap();
     {
         let w = tree.get_mut(root);
@@ -472,7 +479,7 @@ fn main() -> ! {
     tree.root = root;
 
     let mut pm = PageManager::new();
-    let mut code_buf = [0u8; MAX_CODE_SIZE];
+    let mut code_buf = Box::new([0u8; MAX_CODE_SIZE]);
     let mut code_len: usize = 0;
 
     // 6. Load page_main (optional — program can run without pages)
@@ -506,9 +513,9 @@ fn main() -> ! {
         CallbackMeta::new()
     };
 
-    // 9. Prepare VMs
-    let mut vm = Vm::new();
-    let mut cb_vm = Vm::new();
+    // 9. Prepare VMs — heap allocated
+    let mut vm = Box::new(Vm::new());
+    let mut cb_vm = Box::new(Vm::new());
 
     if error_code == 0 && code_len > 0 {
         // Show first page (if any was loaded)

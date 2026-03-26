@@ -16,6 +16,9 @@
 ///   Field 5, Payload = WriteChunk (chunk data bytes)
 ///   Field 6, Payload = UserMessage (arbitrary user data, max 64 bytes)
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use crate::flash::Flash;
 use crate::usart::Usart;
 
@@ -27,9 +30,6 @@ const MAX_USER_MSG: usize = 64;
 
 /// Sector buffer size for flash writes (4KB = 1 erase sector)
 const FS_SECTOR_SIZE: usize = 4096;
-
-/// Static 4KB sector buffer — used only during WriteFs operation.
-static mut FS_SECTOR_BUF: [u8; FS_SECTOR_SIZE] = [0; FS_SECTOR_SIZE];
 
 // --- RX State Machine ---
 
@@ -50,13 +50,13 @@ enum RxState {
     },
 }
 
-// --- FS Writer (chunked flash write with 4KB sector buffer) ---
+// --- FS Writer (chunked flash write with heap-allocated sector buffer) ---
 
 struct FsWriter {
     /// Current flash write address
     addr: u32,
-    /// Position within FS_SECTOR_BUF
-    buf_pos: u16,
+    /// Sector buffer — heap-allocated on demand (4KB, freed on device restart)
+    buf: Vec<u8>,
     /// Total bytes expected (from header)
     total_size: u32,
     /// Total bytes received so far
@@ -68,10 +68,10 @@ struct FsWriter {
 }
 
 impl FsWriter {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             addr: 0,
-            buf_pos: 0,
+            buf: Vec::new(),
             total_size: 0,
             received: 0,
             header_buf: [0; 8],
@@ -94,26 +94,25 @@ impl FsWriter {
     }
 
     /// Parse the collected header and prepare for chunk reception.
+    /// Allocates the 4KB sector buffer from heap.
     fn parse_header(&mut self) {
         let b = &self.header_buf;
         self.total_size =
             (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24);
-        // chunk_size at b[4..8] — informational only, device doesn't need it
         self.addr = 0;
-        self.buf_pos = 0;
         self.received = 0;
+        // Allocate sector buffer on heap (4KB)
+        self.buf.clear();
+        self.buf.reserve(FS_SECTOR_SIZE);
     }
 
     /// Write a single data byte into the sector buffer.
     /// Flushes a full 4KB sector to flash when the buffer is full.
     fn write_byte(&mut self, byte: u8, flash: &Flash) {
-        unsafe {
-            FS_SECTOR_BUF[self.buf_pos as usize] = byte;
-        }
-        self.buf_pos += 1;
+        self.buf.push(byte);
         self.received += 1;
 
-        if self.buf_pos as usize == FS_SECTOR_SIZE {
+        if self.buf.len() == FS_SECTOR_SIZE {
             self.flush_sector(flash);
         }
     }
@@ -121,36 +120,30 @@ impl FsWriter {
     /// Erase sector and write the full 4KB buffer to flash.
     fn flush_sector(&mut self, flash: &Flash) {
         flash.erase_sector(self.addr);
-        // Write in 256-byte pages
-        let buf = unsafe { &*(&raw const FS_SECTOR_BUF) };
         let mut offset: usize = 0;
         while offset < FS_SECTOR_SIZE {
-            flash.write(self.addr + offset as u32, &buf[offset..offset + 256]);
+            flash.write(self.addr + offset as u32, &self.buf[offset..offset + 256]);
             offset += 256;
         }
         self.addr += FS_SECTOR_SIZE as u32;
-        self.buf_pos = 0;
+        self.buf.clear();
     }
 
     /// Flush any remaining bytes in the buffer (partial sector at end).
     fn flush(&mut self, flash: &Flash) {
-        let len = self.buf_pos as usize;
+        let len = self.buf.len();
         if len == 0 {
             return;
         }
 
-        // Erase sector at current address
         flash.erase_sector(self.addr);
-
-        // Write remaining bytes in 256-byte pages
-        let buf = unsafe { &*(&raw const FS_SECTOR_BUF) };
         let mut offset: usize = 0;
         while offset < len {
             let page_len = (len - offset).min(256);
-            flash.write(self.addr + offset as u32, &buf[offset..offset + page_len]);
+            flash.write(self.addr + offset as u32, &self.buf[offset..offset + page_len]);
             offset += page_len;
         }
-        self.buf_pos = 0;
+        self.buf.clear();
     }
 
     /// Returns true when all expected bytes have been received.
@@ -189,7 +182,7 @@ pub struct Protocol {
 }
 
 impl Protocol {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: RxState::Idle,
             program_buf: [0; MAX_PROGRAM_SIZE],
