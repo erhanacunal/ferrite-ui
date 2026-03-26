@@ -1,5 +1,5 @@
 @echo off
-cargo build --release 2>&1 | findstr /i "error"
+cargo build --release 2>&1 | findstr /r /c:"^error"
 if %errorlevel% equ 0 (
     echo Build failed.
     exit /b 1
