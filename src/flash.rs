@@ -104,6 +104,12 @@ pub struct Flash {
 }
 
 impl Flash {
+    /// Create a Flash handle without hardware init.
+    /// Use only after init() has been called once (hardware is already configured).
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+
     /// Initialize the flash driver: SPI0 config, DMA0 clock, 4-byte address mode.
     /// GPIO and peripheral clocks are set up in init_ports().
     pub fn init() -> Self {

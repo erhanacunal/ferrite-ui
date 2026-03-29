@@ -107,7 +107,7 @@ impl PageManager {
         if code_size > 0 && code_size <= PAGE_CODE_BUF {
             let mut vm = Vm::new();
             vm.set_target(page_id);
-            vm.run(&code[..code_size], ctx);
+            vm.run(&crate::vm::RamCode::new(&code[..code_size]), ctx);
         }
 
         Some(index)
@@ -152,7 +152,7 @@ impl PageManager {
                     if code_size > 0 && code_size <= PAGE_CODE_BUF {
                         let mut vm = Vm::new();
                         vm.set_target(page_id);
-                        vm.run(&code[..code_size], ctx);
+                        vm.run(&crate::vm::RamCode::new(&code[..code_size]), ctx);
                     }
                 }
             }

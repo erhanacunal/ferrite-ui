@@ -2,6 +2,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use crate::ctx::Ctx;
+use crate::flash::Flash;
 use crate::strpool;
 use crate::systick;
 use crate::proto::{
@@ -17,6 +18,102 @@ use crate::proto::{
 use crate::render;
 use crate::types::{Edges, Offset, Size};
 use crate::widget::{WidgetId, FLAG_CLICKABLE, FLAG_ENABLED, FLAG_VISIBLE};
+
+// === Code source abstraction ===
+
+/// Trait for reading bytecode — either from RAM or flash.
+pub trait CodeSource {
+    /// Total bytecode length in bytes.
+    fn len(&self) -> usize;
+    /// Read a single byte at absolute position. Returns 0 if out of bounds.
+    fn byte_at(&self, pos: usize) -> u8;
+    /// Read a slice of bytes into buf. Returns number of bytes actually read.
+    fn read_bytes(&self, pos: usize, buf: &mut [u8]) -> usize;
+}
+
+/// RAM-backed code source — wraps a &[u8] slice (zero-cost).
+pub struct RamCode<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> RamCode<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+}
+
+impl CodeSource for RamCode<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
+    fn byte_at(&self, pos: usize) -> u8 {
+        if pos < self.data.len() { self.data[pos] } else { 0 }
+    }
+
+    #[inline]
+    fn read_bytes(&self, pos: usize, buf: &mut [u8]) -> usize {
+        if pos >= self.data.len() {
+            return 0;
+        }
+        let avail = self.data.len() - pos;
+        let n = buf.len().min(avail);
+        buf[..n].copy_from_slice(&self.data[pos..pos + n]);
+        n
+    }
+}
+
+
+/// Flash-backed code source — reads bytecode directly from SPI flash.
+/// Each read goes straight to flash via SPI (13.5MHz, ~1μs per byte).
+/// No RAM buffer needed — saves 4KB code_buf for large programs.
+///
+/// Flash is a zero-sized hardware accessor (no state), so FlashCode
+/// owns its own instance to avoid borrow conflicts with Ctx.
+pub struct FlashCode {
+    flash: Flash,
+    base_addr: u32,
+    code_len: usize,
+}
+
+impl FlashCode {
+    /// Create a flash code source. `base_addr` is the absolute flash address
+    /// of the bytecode resource. `code_len` is the size in bytes.
+    pub fn new(base_addr: u32, code_len: usize) -> Self {
+        Self { flash: Flash::new(), base_addr, code_len }
+    }
+}
+
+impl CodeSource for FlashCode {
+    #[inline]
+    fn len(&self) -> usize {
+        self.code_len
+    }
+
+    #[inline]
+    fn byte_at(&self, pos: usize) -> u8 {
+        if pos >= self.code_len {
+            return 0;
+        }
+        let mut b = [0u8; 1];
+        self.flash.read(self.base_addr + pos as u32, &mut b);
+        b[0]
+    }
+
+    fn read_bytes(&self, pos: usize, buf: &mut [u8]) -> usize {
+        if pos >= self.code_len {
+            return 0;
+        }
+        let avail = self.code_len - pos;
+        let n = buf.len().min(avail);
+        if n > 0 {
+            self.flash.read(self.base_addr + pos as u32, &mut buf[..n]);
+        }
+        n
+    }
+}
 
 // --- 1-byte opcode map (IL-style) ---
 
@@ -233,7 +330,7 @@ impl Vm {
         Some(id as i32)
     }
 
-    pub fn run(&mut self, code: &[u8], ctx: &mut Ctx) {
+    pub fn run(&mut self, code: &dyn CodeSource, ctx: &mut Ctx) {
         self.state = VmState::Running;
         while self.state == VmState::Running {
             self.step(code, ctx);
@@ -243,11 +340,11 @@ impl Vm {
     // --- Byte reading helpers ---
 
     #[inline]
-    fn read_u8(&mut self, code: &[u8]) -> u8 {
+    fn read_u8(&mut self, code: &dyn CodeSource) -> u8 {
         let pos = self.pc as usize;
         if pos < code.len() {
             self.pc += 1;
-            code[pos]
+            code.byte_at(pos)
         } else {
             self.state = VmState::Error;
             0
@@ -255,16 +352,18 @@ impl Vm {
     }
 
     #[inline]
-    fn read_i8(&mut self, code: &[u8]) -> i8 {
+    fn read_i8(&mut self, code: &dyn CodeSource) -> i8 {
         self.read_u8(code) as i8
     }
 
     #[inline]
-    fn read_u16(&mut self, code: &[u8]) -> u16 {
+    fn read_u16(&mut self, code: &dyn CodeSource) -> u16 {
         let pos = self.pc as usize;
         if pos + 2 <= code.len() {
             self.pc += 2;
-            u16::from_le_bytes([code[pos], code[pos + 1]])
+            let mut buf = [0u8; 2];
+            code.read_bytes(pos, &mut buf);
+            u16::from_le_bytes(buf)
         } else {
             self.state = VmState::Error;
             0
@@ -272,16 +371,18 @@ impl Vm {
     }
 
     #[inline]
-    fn read_i16(&mut self, code: &[u8]) -> i16 {
+    fn read_i16(&mut self, code: &dyn CodeSource) -> i16 {
         self.read_u16(code) as i16
     }
 
     #[inline]
-    fn read_i32(&mut self, code: &[u8]) -> i32 {
+    fn read_i32(&mut self, code: &dyn CodeSource) -> i32 {
         let pos = self.pc as usize;
         if pos + 4 <= code.len() {
             self.pc += 4;
-            i32::from_le_bytes([code[pos], code[pos + 1], code[pos + 2], code[pos + 3]])
+            let mut buf = [0u8; 4];
+            code.read_bytes(pos, &mut buf);
+            i32::from_le_bytes(buf)
         } else {
             self.state = VmState::Error;
             0
@@ -289,13 +390,13 @@ impl Vm {
     }
 
     #[inline]
-    fn read_u32(&mut self, code: &[u8]) -> u32 {
+    fn read_u32(&mut self, code: &dyn CodeSource) -> u32 {
         self.read_i32(code) as u32
     }
 
     // --- Execute a single instruction ---
 
-    pub fn step(&mut self, code: &[u8], ctx: &mut Ctx) {
+    pub fn step(&mut self, code: &dyn CodeSource, ctx: &mut Ctx) {
         let op = self.read_u8(code);
         if self.state == VmState::Error {
             return;
@@ -475,10 +576,12 @@ impl Vm {
                 let start = self.pc as usize;
                 let end = start + len;
                 if end <= code.len() {
-                    let data = &code[start..end];
+                    let mut buf = [0u8; 32];
+                    let n = len.min(buf.len());
+                    code.read_bytes(start, &mut buf[..n]);
                     self.pc = end as u16;
                     if self.target.is_some() {
-                        self.set_compound_prop(prop_id, data, ctx);
+                        self.set_compound_prop(prop_id, &buf[..n], ctx);
                     }
                 } else {
                     self.state = VmState::Error;
@@ -494,12 +597,10 @@ impl Vm {
                 let byte_len = count * 4;
                 if start + byte_len <= code.len() {
                     let mut values: Vec<i32> = Vec::with_capacity(count);
+                    let mut tmp = [0u8; 4];
                     for i in 0..count {
-                        let off = start + i * 4;
-                        let v = i32::from_le_bytes([
-                            code[off], code[off + 1], code[off + 2], code[off + 3],
-                        ]);
-                        values.push(v);
+                        code.read_bytes(start + i * 4, &mut tmp);
+                        values.push(i32::from_le_bytes(tmp));
                     }
                     self.pc = (start + byte_len) as u16;
                     let id = self.next_arr_id;
@@ -529,10 +630,12 @@ impl Vm {
                 let len = self.read_u8(code) as usize;
                 let start = self.pc as usize;
                 if start + len <= code.len() {
-                    let data = &code[start..start + len];
+                    let mut buf = [0u8; 64];
+                    let n = len.min(buf.len());
+                    code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as u16;
-                    if !data.is_empty() {
-                        ctx.flash.write(addr, data);
+                    if n > 0 {
+                        ctx.flash.write(addr, &buf[..n]);
                     }
                 } else {
                     self.state = VmState::Error;
@@ -582,7 +685,9 @@ impl Vm {
                 let len = self.read_u8(code) as usize;
                 let start = self.pc as usize;
                 if start + len <= code.len() {
-                    let text = &code[start..start + len];
+                    let mut buf = [0u8; 64];
+                    let n = len.min(buf.len());
+                    code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as u16;
                     let colors = self.pop();
                     let (fg, bg) = unpack_pair(colors);
@@ -590,7 +695,7 @@ impl Vm {
                     let (x, y) = unpack_pair(self.pop());
                     if let Some(font) = ctx.fonts.resolve(font_id) {
                         let bg_opt = if bg == 0 { None } else { Some(bg) };
-                        font.draw_str(&ctx.lcd, &ctx.flash, text, x as i16, y as i16, fg, bg_opt);
+                        font.draw_str(&ctx.lcd, &ctx.flash, &buf[..n], x as i16, y as i16, fg, bg_opt);
                     }
                 } else {
                     self.state = VmState::Error;
@@ -606,9 +711,11 @@ impl Vm {
                 let len = self.read_u8(code) as usize;
                 let start = self.pc as usize;
                 if start + len <= code.len() {
-                    let text = &code[start..start + len];
+                    let mut buf = [0u8; 64];
+                    let n = len.min(buf.len());
+                    code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as u16;
-                    match ctx.strpool.alloc(text) {
+                    match ctx.strpool.alloc(&buf[..n]) {
                         Some(id) => self.push(id as i32),
                         None => self.state = VmState::Error,
                     }

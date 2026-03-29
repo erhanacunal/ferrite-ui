@@ -158,13 +158,21 @@ impl WidgetTree {
         }
     }
 
+    /// Remove all widgets and reset root. Frees heap memory.
+    pub fn clear(&mut self) {
+        self.widgets.clear();
+        self.root = WidgetId::NONE;
+    }
+
     /// Allocate a new widget. Returns None if WidgetId overflow (max 254).
     pub fn alloc(&mut self) -> Option<WidgetId> {
         if self.widgets.len() >= 254 {
             return None; // WidgetId is u8, 0xFF is NONE sentinel
         }
         let id = WidgetId(self.widgets.len() as u8);
-        self.widgets.push(Widget::default());
+        let mut w = Widget::default();
+        w.flags |= FLAG_DIRTY;
+        self.widgets.push(w);
         Some(id)
     }
 

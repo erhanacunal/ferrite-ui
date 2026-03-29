@@ -51,7 +51,7 @@ JSON format:
       }
     ],
     "programs": [
-      {"name": "init", "source": "scripts/init.fl"}
+      {"name": "init", "source": "scripts/init.fl", "exec_mode": "ram|flash"}
     ]
   }
 """
@@ -79,6 +79,9 @@ RES_FONT = 0
 RES_IMAGE = 1
 RES_PROGRAM = 2
 RES_PAGE = 3
+
+# Resource flags (stored in entry reserved[0], byte 28)
+RES_FLAG_FLASH_EXEC = 0x01
 
 KIND_BASE = 0
 KIND_LABEL = 1
@@ -377,10 +380,10 @@ def compile_program(source_path: str) -> tuple[bytes, bytes | None]:
 
 # --- Flash filesystem builder ---
 
-def build_fs(project: dict, resources: list[tuple[str, int, bytes]]) -> bytes:
+def build_fs(project: dict, resources: list[tuple[str, int, bytes, int]]) -> bytes:
     """Flash filesystem binary oluştur.
 
-    resources: [(name, kind, data), ...]
+    resources: [(name, kind, data, flags), ...]
     """
     if len(resources) > MAX_RESOURCES:
         raise ValueError(f"Too many resources: {len(resources)} (max {MAX_RESOURCES})")
@@ -396,7 +399,7 @@ def build_fs(project: dict, resources: list[tuple[str, int, bytes]]) -> bytes:
     table = bytearray()
     data_blob = bytearray()
 
-    for name, kind, data in resources:
+    for name, kind, data, flags in resources:
         # Name: 16 byte null-padded ASCII
         name_bytes = name.encode("ascii")[:15]
         name_padded = name_bytes + b'\x00' * (16 - len(name_bytes))
@@ -411,7 +414,7 @@ def build_fs(project: dict, resources: list[tuple[str, int, bytes]]) -> bytes:
         # [17:20] = padding (zeros)
         struct.pack_into("<I", entry, 20, offset)
         struct.pack_into("<I", entry, 24, len(data))
-        # [28:32] = reserved (zeros)
+        entry[28] = flags  # resource flags (e.g. RES_FLAG_FLASH_EXEC)
 
         table.extend(entry)
         data_blob.extend(data)
@@ -484,7 +487,7 @@ def build(project_path: str, output_path: str) -> dict:
 
         # Combined resource: header (with font_id) + bitmap data
         combined = bytes(header_data) + bitmap_data
-        resources.append((name, RES_FONT, combined))
+        resources.append((name, RES_FONT, combined, 0))
 
     # 2. Images — PNG → FI format (header extended to 9 bytes with image_id)
     image_ids_seen = set()
@@ -515,7 +518,7 @@ def build(project_path: str, output_path: str) -> dict:
         # New:      ... + image_id[1] = 9 bytes
         if len(fi_data) >= 8:
             fi_data.insert(8, image_id)
-        resources.append((name, RES_IMAGE, bytes(fi_data)))
+        resources.append((name, RES_IMAGE, bytes(fi_data), 0))
 
     # 3. Pages — JSON widget tree OR .fl source → bytecode
     # Widget ID tahsisi: root(0) → page widgets → page contents
@@ -541,23 +544,25 @@ def build(project_path: str, output_path: str) -> dict:
             page_data, widget_count = compile_page(page, page_widget_id, base_id)
             next_id += widget_count
 
-        resources.append((name, RES_PAGE, page_data))
+        resources.append((name, RES_PAGE, page_data, 0))
 
     # 4. Programs — .fl → bytecode + optional metadata
     for prog in project.get("programs", []):
         name = prog["name"]
         source = project_dir / prog["source"]
         bytecode, metadata = compile_program(str(source))
-        resources.append((name, RES_PROGRAM, bytecode))
+        exec_mode = prog.get("exec_mode", "ram")
+        prog_flags = RES_FLAG_FLASH_EXEC if exec_mode == "flash" else 0
+        resources.append((name, RES_PROGRAM, bytecode, prog_flags))
         # If metadata file exists alongside source, include it
         meta_path = source.with_suffix('.meta')
         if metadata:
             meta_name = name + ".meta" if len(name) + 5 <= 15 else name[:10] + ".meta"
-            resources.append((meta_name, RES_PROGRAM, metadata))
+            resources.append((meta_name, RES_PROGRAM, metadata, prog_flags))
         elif meta_path.exists():
             meta_data = meta_path.read_bytes()
             meta_name = name + ".meta" if len(name) + 5 <= 15 else name[:10] + ".meta"
-            resources.append((meta_name, RES_PROGRAM, meta_data))
+            resources.append((meta_name, RES_PROGRAM, meta_data, prog_flags))
 
     # 5. Build flash binary
     fs_binary = build_fs(project, resources)
@@ -571,7 +576,7 @@ def build(project_path: str, output_path: str) -> dict:
         "data_size": data_size,
         "total_size": len(fs_binary),
         "next_widget_id": next_id,
-        "details": [(name, kind, len(data)) for name, kind, data in resources],
+        "details": [(name, kind, len(data)) for name, kind, data, _flags in resources],
     }
 
 

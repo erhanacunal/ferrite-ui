@@ -435,7 +435,7 @@ fn error_description(code: u8) -> &'static [u8] {
 
 /// Run a callback function on the callback VM.
 /// Resets the VM, sets PC to the function offset, and runs to completion.
-fn run_callback(cb_vm: &mut Vm, code: &[u8], offset: u16, ctx: &mut Ctx) {
+fn run_callback(cb_vm: &mut Vm, code: &dyn vm::CodeSource, offset: u16, ctx: &mut Ctx) {
     cb_vm.reset();
     cb_vm.set_pc(offset);
     cb_vm.run(code, ctx);
@@ -538,6 +538,8 @@ fn main() -> ! {
     let mut pm = PageManager::new();
     let mut code_buf = Box::new([0u8; MAX_CODE_SIZE]);
     let mut code_len: usize = 0;
+    let mut flash_addr: u32 = 0; // flash base address when flash_exec = true
+    let mut flash_exec = false;
 
     // 6. Load page_main (optional — program can run without pages)
     if error_code == 0 {
@@ -549,8 +551,16 @@ fn main() -> ! {
         if let Some(fs_ref) = ctx.fs.as_ref() {
             match fs_ref.find(&ctx.flash, b"main") {
                 Some(entry) => {
-                    code_len = entry.size.min(MAX_CODE_SIZE as u32) as usize;
-                    fs_ref.read_resource(&ctx.flash, &entry, 0, &mut code_buf[..code_len]);
+                    if entry.flags & fs::RES_FLAG_FLASH_EXEC != 0 {
+                        // Flash execution: VM reads from flash on demand
+                        flash_exec = true;
+                        flash_addr = entry.offset;
+                        code_len = entry.size as usize;
+                    } else {
+                        // RAM execution: copy bytecode to RAM buffer
+                        code_len = entry.size.min(MAX_CODE_SIZE as u32) as usize;
+                        fs_ref.read_resource(&ctx.flash, &entry, 0, &mut code_buf[..code_len]);
+                    }
                 }
                 None => {
                     error_code = ERR_PROGRAM_NOT_FOUND;
@@ -582,12 +592,13 @@ fn main() -> ! {
 
         // Run on_program_start callback
         if cb_meta.on_program_start != NO_CALLBACK {
-            run_callback(
-                &mut cb_vm,
-                &code_buf[..code_len],
-                cb_meta.on_program_start,
-                &mut ctx,
-            );
+            if flash_exec {
+                let fc = vm::FlashCode::new(flash_addr, code_len);
+                run_callback(&mut cb_vm, &fc, cb_meta.on_program_start, &mut ctx);
+            } else {
+                let rc = vm::RamCode::new(&code_buf[..code_len]);
+                run_callback(&mut cb_vm, &rc, cb_meta.on_program_start, &mut ctx);
+            }
         }
 
         // Full initial render
@@ -613,12 +624,31 @@ fn main() -> ! {
 
     let mut protocol = Protocol::new();
 
+    // Flash code source (persistent when flash_exec=true)
+    let mut fc = vm::FlashCode::new(flash_addr, code_len);
+
+    // Run callback VM with the active code source
+    macro_rules! cb_run {
+        ($cb_vm:expr, $ctx:expr) => {
+            if flash_exec {
+                $cb_vm.run(&fc, $ctx)
+            } else {
+                let src = vm::RamCode::new(&code_buf[..code_len]);
+                $cb_vm.run(&src, $ctx)
+            }
+        };
+    }
+
     loop {
         // --- VM step (only when Running or Yielded) ---
         match vm.state {
             VmState::Running | VmState::Yielded => {
                 vm.state = VmState::Running;
-                vm.step(&code_buf[..code_len], &mut ctx);
+                if flash_exec {
+                    vm.step(&fc, &mut ctx);
+                } else {
+                    vm.step(&vm::RamCode::new(&code_buf[..code_len]), &mut ctx);
+                }
 
                 if vm.state == VmState::Error {
                     error_code = ERR_PROGRAM_ERROR;
@@ -669,6 +699,22 @@ fn main() -> ! {
                 }
 
                 RxEvent::ProgramReady => {
+                    // Clear previous state: widgets, strings, VM arrays
+                    ctx.tree.clear();
+                    ctx.strpool.clear();
+                    vm.reset();
+                    cb_vm.reset();
+                    flash_exec = false; // Dynamic programs always use RAM
+
+                    // Re-create root widget (id=0, full screen, black)
+                    let root = ctx.tree.alloc().unwrap();
+                    {
+                        let w = ctx.tree.get_mut(root);
+                        w.size = Size { w: 800, h: 480 };
+                        w.background_color = COLOR_BLACK;
+                    }
+                    ctx.tree.root = root;
+
                     let prog = protocol.program_code();
 
                     if prog.len() >= 12 && prog[0] == b'F' && prog[1] == b'X' {
@@ -736,7 +782,7 @@ fn main() -> ! {
                         if let Some(arr_id) = cb_vm.alloc_array_from(msg) {
                             cb_vm.set_pc(cb_meta.on_user_message);
                             cb_vm.push_arg(arr_id);
-                            cb_vm.run(&code_buf[..code_len], &mut ctx);
+                            cb_run!(cb_vm, &mut ctx);
                         }
                     }
                 }
@@ -746,8 +792,11 @@ fn main() -> ! {
         // --- Touch handling (if no error) ---
         if error_code == 0 {
             if let Some(event) = touch.poll() {
+                // Write touch event to uart 
+                //usart::dbg(format!("Touch at {}, {}, {:?}\n", event.x, event.y, event.kind).as_bytes());
+
                 if event.kind == touch::TouchEventKind::Press {                
-                    //usart::dbg(format!("Touch at {}, {}\n", event.x, event.y).as_bytes());    
+                    
                     let hit = touch::hit_test(&ctx.tree, event.x, event.y);                    
                     if hit.is_some() {
                         //usart::dbg(format!("Hit widget {}\n", hit.0).as_bytes());
@@ -761,7 +810,7 @@ fn main() -> ! {
                         cb_vm.set_pc(cb_meta.on_touch_down);
                         cb_vm.push_arg(event.x as i32);
                         cb_vm.push_arg(event.y as i32);
-                        cb_vm.run(&code_buf[..code_len], &mut ctx);
+                        cb_run!(cb_vm, &mut ctx);
                     }
                 } else if event.kind == touch::TouchEventKind::Hold {
                     if cb_meta.on_touch_move != NO_CALLBACK && code_len > 0 {
@@ -769,7 +818,7 @@ fn main() -> ! {
                         cb_vm.set_pc(cb_meta.on_touch_move);
                         cb_vm.push_arg(event.x as i32);
                         cb_vm.push_arg(event.y as i32);
-                        cb_vm.run(&code_buf[..code_len], &mut ctx);
+                        cb_run!(cb_vm, &mut ctx);
                     }
                 } else if event.kind == touch::TouchEventKind::Release {
                     let mut clicked_id = widget::WidgetId::NONE;
@@ -797,7 +846,7 @@ fn main() -> ! {
                             cb_vm.reset();
                             cb_vm.set_pc(offset);
                             cb_vm.push_arg(clicked_id.0 as i32);
-                            cb_vm.run(&code_buf[..code_len], &mut ctx);
+                            cb_run!(cb_vm, &mut ctx);
                         }
                     }
 
@@ -811,7 +860,7 @@ fn main() -> ! {
                                 cb_vm.push_arg(clicked_id.0 as i32);
                                 let packed_xy = ((event.x as u32) << 16 | event.y as u32) as i32;
                                 cb_vm.push_arg(packed_xy);
-                                cb_vm.run(&code_buf[..code_len], &mut ctx);
+                                cb_run!(cb_vm, &mut ctx);
                             }
                         }
                     }
@@ -819,7 +868,7 @@ fn main() -> ! {
                     if cb_meta.on_touch_up != NO_CALLBACK && code_len > 0 {
                         cb_vm.reset();
                         cb_vm.set_pc(cb_meta.on_touch_up);
-                        cb_vm.run(&code_buf[..code_len], &mut ctx);
+                        cb_run!(cb_vm, &mut ctx);
                     }
                 }
             }
@@ -851,7 +900,7 @@ fn main() -> ! {
                             cb_vm.reset();
                             cb_vm.set_pc(offset);
                             cb_vm.push_arg(id.0 as i32);
-                            cb_vm.run(&code_buf[..code_len], &mut ctx);
+                            cb_run!(cb_vm, &mut ctx);
                         }
                     }
                 }

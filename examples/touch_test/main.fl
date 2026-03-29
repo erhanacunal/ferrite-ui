@@ -25,6 +25,15 @@ set(press_color, rgb565(0,0,255));
 set(clickable, 1);
 parent(panel);
 
+var btn2 = alloc();
+target(btn2);
+set(location, 40, 40);
+set(size, 100, 60);
+set(bg_color, rgb565(0,255,0));
+set(press_color, rgb565(0,0,255));
+set(clickable, 1);
+parent(panel);
+
 render();
 
 while(true) {

@@ -38,7 +38,12 @@ const CMD_Z1: u8 = 0xB0; // 1_011_0_0_00 — Z1 pressure
 
 /// Max raw ADC difference between two consecutive reads.
 /// If exceeded, the reading is rejected as noise.
-const RAW_ERROR: u16 = 10;
+/// XPT2046 jitter is ~25 raw units (≈5 screen pixels), so 50 gives margin.
+const RAW_ERROR: u16 = 50;
+
+/// Number of consecutive failed reads before a Release event is emitted.
+/// Prevents flickering caused by intermittent noisy XPT2046 readings.
+const RELEASE_DEBOUNCE: u8 = 5;
 
 /// Z1 pressure threshold. Below this = no touch.
 /// When touched Z1 is typically 200-4000. When not touched Z1 is near 0.
@@ -120,7 +125,7 @@ enum TouchState {
     Held,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum TouchEventKind {
     Press,
     Hold,
@@ -136,6 +141,7 @@ pub struct TouchEvent {
 
 pub struct Touch {
     state: TouchState,
+    fail_count: u8,
     last_x: u16,
     last_y: u16,
     pub cal: CalParams,
@@ -146,6 +152,7 @@ impl Touch {
     pub fn init() -> Self {
         Touch {
             state: TouchState::Idle,
+            fail_count: 0,
             last_x: 0,
             last_y: 0,
             cal: CalParams::default(),
@@ -161,6 +168,7 @@ impl Touch {
                 if let Some((x, y)) = sample {
                     self.last_x = x;
                     self.last_y = y;
+                    self.fail_count = 0;
                     self.state = TouchState::Pressed;
                     Some(TouchEvent {
                         kind: TouchEventKind::Press,
@@ -176,6 +184,7 @@ impl Touch {
                 if let Some((x, y)) = sample {
                     self.last_x = x;
                     self.last_y = y;
+                    self.fail_count = 0;
                     self.state = TouchState::Held;
                     Some(TouchEvent {
                         kind: TouchEventKind::Hold,
@@ -183,12 +192,19 @@ impl Touch {
                         y,
                     })
                 } else {
-                    self.state = TouchState::Idle;
-                    Some(TouchEvent {
-                        kind: TouchEventKind::Release,
-                        x: self.last_x,
-                        y: self.last_y,
-                    })
+                    self.fail_count += 1;
+                    if self.fail_count >= RELEASE_DEBOUNCE {
+                        self.state = TouchState::Idle;
+                        self.fail_count = 0;
+                        Some(TouchEvent {
+                            kind: TouchEventKind::Release,
+                            x: self.last_x,
+                            y: self.last_y,
+                        })
+                    } else {
+                        // Noisy read — ignore, keep pressed state
+                        None
+                    }
                 }
             }
         }

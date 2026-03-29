@@ -63,9 +63,13 @@ pub struct Fs {
 #[derive(Clone, Copy)]
 pub struct ResourceEntry {
     pub kind: u8,
+    pub flags: u8,
     pub offset: u32,
     pub size: u32,
 }
+
+/// Resource flags (stored in entry reserved[0])
+pub const RES_FLAG_FLASH_EXEC: u8 = 0x01;
 
 // --- Mount hataları ---
 
@@ -142,9 +146,9 @@ impl Fs {
                     entry_buf[26],
                     entry_buf[27],
                 ]);
-                // [28..32] = reserved
+                let flags = entry_buf[28]; // reserved[0] = resource flags
 
-                return Some(ResourceEntry { kind, offset, size });
+                return Some(ResourceEntry { kind, flags, offset, size });
             }
         }
 
@@ -213,7 +217,7 @@ impl Fs {
             entry_buf[27],
         ]);
 
-        Some(ResourceEntry { kind, offset, size })
+        Some(ResourceEntry { kind, flags: entry_buf[28], offset, size })
     }
 
     /// Belirli tipteki n. resource'u bul (0-based).
@@ -245,7 +249,7 @@ impl Fs {
                         entry_buf[26],
                         entry_buf[27],
                     ]);
-                    return Some(ResourceEntry { kind, offset, size });
+                    return Some(ResourceEntry { kind, flags: entry_buf[28], offset, size });
                 }
                 found += 1;
             }
