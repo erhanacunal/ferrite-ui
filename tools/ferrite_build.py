@@ -68,11 +68,12 @@ from ferrite_cc import Asm, Compiler, Prop, encode_svarint
 # --- Constants (fs.rs ile birebir aynı) ---
 
 MAGIC = b"FERR"
-HEADER_OFFSET = 0x1000
-TABLE_OFFSET = 0x1010
-DATA_START = 0x2000
+FS_BASE = 0x1000       # Sector 0 reserved for ConfigStore
+HEADER_OFFSET = 0x0000  # Relative to FS image start (written at FS_BASE in flash)
+HEADER_SIZE = 16
+TABLE_OFFSET = HEADER_OFFSET + HEADER_SIZE  # 0x10
 ENTRY_SIZE = 32
-MAX_RESOURCES = 127
+MAX_RESOURCES = 1000
 
 RES_FONT = 0
 RES_IMAGE = 1
@@ -365,10 +366,9 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
 def compile_program(source_path: str) -> tuple[bytes, bytes | None]:
     """Ferrite lang source → (bytecode, metadata_or_None)."""
     try:
-        from ferrite_lang import compile as fl_compile
+        from ferrite_lang import compile_with_meta
         source = Path(source_path).read_text(encoding="utf-8")
-        bytecode = fl_compile(source)
-        return bytecode, None
+        return compile_with_meta(source, filename=source_path)
     except ImportError:
         print(f"Warning: ferrite_lang not available, reading {source_path} as raw binary",
               file=sys.stderr)
@@ -386,21 +386,23 @@ def build_fs(project: dict, resources: list[tuple[str, int, bytes]]) -> bytes:
         raise ValueError(f"Too many resources: {len(resources)} (max {MAX_RESOURCES})")
 
     screen = project.get("screen", [800, 480])
-    version = project.get("version", 1)
+    version = project.get("version", 2)
     count = len(resources)
 
-    # Resource table ve data blob
+    # Data starts right after the resource table (relative to image start)
+    data_base_rel = TABLE_OFFSET + count * ENTRY_SIZE
+
+    # Resource table and data blob
     table = bytearray()
     data_blob = bytearray()
-    data_base = DATA_START  # veriler 0x2000'den başlar
 
     for name, kind, data in resources:
         # Name: 16 byte null-padded ASCII
         name_bytes = name.encode("ascii")[:15]
         name_padded = name_bytes + b'\x00' * (16 - len(name_bytes))
 
-        # Offset: flash'taki mutlak adres
-        offset = data_base + len(data_blob)
+        # Offset: absolute flash address (FS image is written at FS_BASE)
+        offset = FS_BASE + data_base_rel + len(data_blob)
 
         # Entry: name[16] + kind(1) + pad(3) + offset(4) + size(4) + reserved(4)
         entry = bytearray(ENTRY_SIZE)
@@ -414,11 +416,11 @@ def build_fs(project: dict, resources: list[tuple[str, int, bytes]]) -> bytes:
         table.extend(entry)
         data_blob.extend(data)
 
-    # Checksum: table byte'larının toplamı
+    # Checksum: additive sum of table bytes
     checksum = sum(table) & 0xFFFFFFFF
 
-    # Header (16 byte)
-    header = bytearray(16)
+    # Header (16 bytes)
+    header = bytearray(HEADER_SIZE)
     header[0:4] = MAGIC
     struct.pack_into("<H", header, 4, version)
     struct.pack_into("<H", header, 6, screen[0])
@@ -426,10 +428,10 @@ def build_fs(project: dict, resources: list[tuple[str, int, bytes]]) -> bytes:
     struct.pack_into("<H", header, 10, count)
     struct.pack_into("<I", header, 12, checksum)
 
-    # Full binary
-    binary = bytearray(DATA_START)  # 0x0000 - 0x1FFF zeros
-    binary[HEADER_OFFSET:HEADER_OFFSET + 16] = header
-    binary[TABLE_OFFSET:TABLE_OFFSET + len(table)] = table
+    # Full binary — header + table + data, no gaps
+    binary = bytearray()
+    binary.extend(header)
+    binary.extend(table)
     binary.extend(data_blob)
 
     return bytes(binary)
@@ -562,7 +564,8 @@ def build(project_path: str, output_path: str) -> dict:
     Path(output_path).write_bytes(fs_binary)
 
     # Stats
-    data_size = len(fs_binary) - DATA_START
+    header_and_table = HEADER_SIZE + len(resources) * ENTRY_SIZE
+    data_size = len(fs_binary) - header_and_table
     return {
         "resources": len(resources),
         "data_size": data_size,

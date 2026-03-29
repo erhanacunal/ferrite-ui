@@ -1,41 +1,44 @@
-/// Flash File System — W25Q256 üzerinde basit TOC (Table of Contents) yapısı
+/// Flash File System — compact TOC (Table of Contents) on W25Q256
 ///
-/// Layout:
-///   0x000000 - 0x000FFF : Reserved (4KB = 1 sector, erase guard)
-///   0x001000 - 0x00100F : Header (16 byte)
-///   0x001010 - 0x001FFF : Resource Table (max 127 entry × 32 byte)
-///   0x002000+           : Resource data (packed)
+/// Sector 0 (0x000000-0x000FFF) is reserved for ConfigStore.
+/// FS starts at FS_BASE (0x001000):
+///   FS_BASE + 0x00 - 0x0F : Header (16 bytes)
+///   FS_BASE + 0x10 - ...  : Resource Table (N × 32 bytes)
+///   immediately after     : Resource data (packed)
 ///
-/// Resource'lara isimle erişilir (null-terminated ASCII, max 15 karakter).
+/// Resources are accessed by name (null-terminated ASCII, max 15 chars).
 /// Kind: Font=0, Image=1, Program=2, Page=3
 
 use crate::flash::Flash;
 
-// --- Layout sabitleri ---
+// --- Layout constants ---
 
-/// İlk sektör boş bırakılır (erase guard). W25Q256 min erase = 4KB.
-const RESERVED_SIZE: u32 = 0x1000;
+/// FS base address — sector 0 is reserved for ConfigStore
+pub const FS_BASE: u32 = 0x1000;
 
-/// Header başlangıcı
-const HEADER_OFFSET: u32 = RESERVED_SIZE; // 0x1000
+/// Header starts at FS_BASE
+const HEADER_OFFSET: u32 = FS_BASE;
 
-/// Resource table başlangıcı (header'dan hemen sonra)
-const TABLE_OFFSET: u32 = HEADER_OFFSET + 16; // 0x1010
+/// Header size in bytes
+const HEADER_SIZE: u32 = 16;
 
-/// Resource data başlangıcı (sector 2)
-const DATA_START: u32 = 0x2000;
+/// Resource table starts right after the header
+const TABLE_OFFSET: u32 = HEADER_OFFSET + HEADER_SIZE;
 
 /// Magic number: "FERR" (little-endian)
 const MAGIC: u32 = 0x5252_4546;
 
-/// Max resource sayısı: (0x2000 - 0x1010) / 32 = 127
-const MAX_RESOURCES: usize = 127;
+/// Max resource count (limited by u16 in header, practical limit ~1000)
+const MAX_RESOURCES: usize = 1000;
 
 /// Resource name max uzunluğu (null-terminator dahil)
 const NAME_LEN: usize = 16;
 
 /// Tek bir resource table entry boyutu
 const ENTRY_SIZE: usize = 32;
+
+// Expected version
+const CURRENT_VERSION: u16 = 2;
 
 // --- Resource tipleri ---
 
@@ -70,6 +73,7 @@ pub struct ResourceEntry {
 pub enum FsError {
     BadMagic,
     TooManyResources,
+    BadVersion,
 }
 
 impl Fs {
@@ -87,6 +91,9 @@ impl Fs {
 
         // Version (2B LE)
         let version = u16::from_le_bytes([buf[4], buf[5]]);
+        if version != CURRENT_VERSION {
+            return Err(FsError::BadVersion);
+        }
 
         // Screen dimensions (2B + 2B LE)
         let screen_w = u16::from_le_bytes([buf[6], buf[7]]);

@@ -15,15 +15,18 @@
 ///   Field 4, Payload = WriteFs header (8B: total_size u32 LE + chunk_size u32 LE)
 ///   Field 5, Payload = WriteChunk (chunk data bytes)
 ///   Field 6, Payload = UserMessage (arbitrary user data, max 64 bytes)
+///   Field 7, Varint  = MemInfo (query free heap memory)
+///   Field 8, Varint  = TouchCalibrate (start 3-point touch calibration)
 
 extern crate alloc;
 
 use alloc::vec::Vec;
 use crate::flash::Flash;
+use crate::fs::FS_BASE;
 use crate::usart::Usart;
 
 /// Maximum program bytecode size received via USART (2KB)
-const MAX_PROGRAM_SIZE: usize = 2048;
+pub const MAX_PROGRAM_SIZE: usize = 2048;
 
 /// Maximum user message size (bytes)
 const MAX_USER_MSG: usize = 64;
@@ -99,7 +102,7 @@ impl FsWriter {
         let b = &self.header_buf;
         self.total_size =
             (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24);
-        self.addr = 0;
+        self.addr = FS_BASE;
         self.received = 0;
         // Allocate sector buffer on heap (4KB)
         self.buf.clear();
@@ -168,6 +171,10 @@ pub enum RxEvent {
     FsWriteComplete,
     /// User message received (arbitrary data for VM callback)
     UserMessage,
+    /// Memory info request — respond with free heap bytes
+    MemInfo,
+    /// Start 3-point touch calibration sequence
+    TouchCalibrate,
     /// Program too large — exceeds MAX_PROGRAM_SIZE (2KB)
     ProgramTooLarge,
 }
@@ -224,6 +231,8 @@ impl Protocol {
                     0 => match field {
                         1 => RxEvent::Ping,
                         3 => RxEvent::Restart,
+                        7 => RxEvent::MemInfo,
+                        8 => RxEvent::TouchCalibrate,
                         _ => RxEvent::None,
                     },
                     // Payload type: tag + length varint + payload
@@ -409,4 +418,33 @@ pub fn send_error(usart: &Usart, code: u8) {
 pub fn send_pong(usart: &Usart) {
     // tag = (2 << 3) | 0 = 0x10
     usart.write(&[0x10]);
+}
+
+/// Send memory info: Field 3, Varint type — tag + varint(free_bytes)
+pub fn send_meminfo(usart: &Usart, free_bytes: u32) {
+    // tag = (3 << 3) | 0 = 0x18
+    usart.write_byte(0x18);
+    // Encode free_bytes as varint
+    let mut val = free_bytes;
+    loop {
+        let mut b = (val & 0x7F) as u8;
+        val >>= 7;
+        if val != 0 {
+            b |= 0x80;
+        }
+        usart.write_byte(b);
+        if val == 0 {
+            break;
+        }
+    }
+}
+
+/// Send touch calibration result: Field 4, Payload type
+/// Payload: flags(1) + x_min(2) + x_max(2) + y_min(2) + y_max(2) = 9 bytes
+/// flags: bit0=xy_swap, bit1=x_flip, bit2=y_flip
+pub fn send_touch_cal(usart: &Usart, cal: &crate::touch::CalParams) {
+    // tag = (4 << 3) | 2 = 0x22, length = 9
+    usart.write_byte(0x22);
+    usart.write_byte(9);
+    usart.write(&cal.to_bytes());
 }

@@ -3,19 +3,20 @@
 /// Loaded from flash filesystem as "<program>.meta" resource.
 ///
 /// Flash format:
-///   Header (8 bytes):
-///     [0..2] func_count:        u16 LE
-///     [2..4] on_program_start:  u16 LE (bytecode offset, 0xFFFF = not defined)
-///     [4..6] on_page_changing:  u16 LE
-///     [6..8] on_page_changed:   u16 LE
+///   Header (16 bytes):
+///     [0..2]   func_count:        u16 LE
+///     [2..4]   on_program_start:  u16 LE (bytecode offset, 0xFFFF = not defined)
+///     [4..6]   on_page_changing:  u16 LE
+///     [6..8]   on_page_changed:   u16 LE
+///     [8..10]  on_user_message:   u16 LE
+///     [10..12] on_touch_down:     u16 LE
+///     [12..14] on_touch_up:       u16 LE
+///     [14..16] on_touch_move:     u16 LE
 ///
 ///   Function table (5 bytes per entry):
 ///     [0..2] func_id:    u16 LE (1-based, 0 = invalid)
 ///     [2..4] offset:     u16 LE (byte offset in bytecode)
 ///     [4]    arg_count:  u8
-///
-///   Extended system callbacks (after function table, optional):
-///     [+0..+2] on_user_message: u16 LE
 
 use crate::flash::Flash;
 use crate::fs::Fs;
@@ -24,58 +25,62 @@ use crate::fs::Fs;
 const MAX_FUNCS: usize = 16;
 
 /// Metadata header size in bytes
-const META_HEADER: usize = 8;
+const META_HEADER: usize = 16;
+
+/// Raw function table size: MAX_FUNCS * 5 bytes per entry
+const FUNC_TABLE_SIZE: usize = MAX_FUNCS * 5;
 
 /// Sentinel value: callback not defined
 pub const NO_CALLBACK: u16 = 0xFFFF;
 
-/// Single function entry in the callback table
-#[derive(Clone, Copy)]
-struct FuncEntry {
-    func_id: u16,
-    offset: u16,
-    arg_count: u8,
-}
-
-impl FuncEntry {
-    const fn empty() -> Self {
-        Self {
-            func_id: 0,
-            offset: 0,
-            arg_count: 0,
-        }
-    }
-}
-
 /// Callback metadata: function table + system callback slots.
-/// Loaded from flash, used to dispatch widget and system callbacks.
+/// Function table stored as raw bytes — parsed on demand in find_func().
 pub struct CallbackMeta {
-    funcs: [FuncEntry; MAX_FUNCS],
+    func_raw: [u8; FUNC_TABLE_SIZE],
     func_count: u8,
     pub on_program_start: u16,
     pub on_page_changing: u16,
     pub on_page_changed: u16,
     pub on_user_message: u16,
+    pub on_touch_down: u16,
+    pub on_touch_up: u16,
+    pub on_touch_move: u16,
 }
 
 impl CallbackMeta {
     pub const fn new() -> Self {
         Self {
-            funcs: [FuncEntry::empty(); MAX_FUNCS],
+            func_raw: [0; FUNC_TABLE_SIZE],
             func_count: 0,
             on_program_start: NO_CALLBACK,
             on_page_changing: NO_CALLBACK,
             on_page_changed: NO_CALLBACK,
             on_user_message: NO_CALLBACK,
+            on_touch_down: NO_CALLBACK,
+            on_touch_up: NO_CALLBACK,
+            on_touch_move: NO_CALLBACK,
         }
+    }
+
+    /// Parse the 16-byte header from a byte slice into system callback fields.
+    fn parse_header(hdr: &[u8]) -> (u16, u16, u16, u16, u16, u16, u16, u16) {
+        (
+            u16::from_le_bytes([hdr[0], hdr[1]]),   // func_count
+            u16::from_le_bytes([hdr[2], hdr[3]]),   // on_program_start
+            u16::from_le_bytes([hdr[4], hdr[5]]),   // on_page_changing
+            u16::from_le_bytes([hdr[6], hdr[7]]),   // on_page_changed
+            u16::from_le_bytes([hdr[8], hdr[9]]),   // on_user_message
+            u16::from_le_bytes([hdr[10], hdr[11]]), // on_touch_down
+            u16::from_le_bytes([hdr[12], hdr[13]]), // on_touch_up
+            u16::from_le_bytes([hdr[14], hdr[15]]), // on_touch_move
+        )
     }
 
     /// Load callback metadata from flash filesystem.
     /// Looks for resource named "<name>.meta" (e.g., "main.meta").
     pub fn load(fs: &Fs, flash: &Flash, name: &[u8]) -> Option<Self> {
-        // Build the meta resource name: name + ".meta"
         let mut meta_name = [0u8; 16];
-        let name_len = name.len().min(10); // leave room for ".meta\0"
+        let name_len = name.len().min(10);
         meta_name[..name_len].copy_from_slice(&name[..name_len]);
         meta_name[name_len..name_len + 5].copy_from_slice(b".meta");
         let full_len = name_len + 5;
@@ -85,54 +90,81 @@ impl CallbackMeta {
             return None;
         }
 
-        // Read header
         let mut hdr = [0u8; META_HEADER];
         flash.read(entry.offset, &mut hdr);
 
-        let func_count = u16::from_le_bytes([hdr[0], hdr[1]]);
-        let on_program_start = u16::from_le_bytes([hdr[2], hdr[3]]);
-        let on_page_changing = u16::from_le_bytes([hdr[4], hdr[5]]);
-        let on_page_changed = u16::from_le_bytes([hdr[6], hdr[7]]);
+        let (fc, ops, opc, opd, oum, otd, otu, otm) = Self::parse_header(&hdr);
+        let count = (fc as usize).min(MAX_FUNCS);
 
-        let count = (func_count as usize).min(MAX_FUNCS);
-        let mut meta = CallbackMeta {
-            funcs: [FuncEntry::empty(); MAX_FUNCS],
+        let mut meta = Self {
+            func_raw: [0; FUNC_TABLE_SIZE],
             func_count: count as u8,
-            on_program_start,
-            on_page_changing,
-            on_page_changed,
-            on_user_message: NO_CALLBACK,
+            on_program_start: ops,
+            on_page_changing: opc,
+            on_page_changed: opd,
+            on_user_message: oum,
+            on_touch_down: otd,
+            on_touch_up: otu,
+            on_touch_move: otm,
         };
 
-        // Read function entries (5 bytes each)
-        let mut buf = [0u8; 5];
-        for i in 0..count {
-            let addr = entry.offset + META_HEADER as u32 + (i * 5) as u32;
-            flash.read(addr, &mut buf);
-            meta.funcs[i] = FuncEntry {
-                func_id: u16::from_le_bytes([buf[0], buf[1]]),
-                offset: u16::from_le_bytes([buf[2], buf[3]]),
-                arg_count: buf[4],
-            };
-        }
-
-        // Extended system callbacks (after function table, backwards compatible)
-        let ext_offset = META_HEADER as u32 + (count * 5) as u32;
-        if entry.size >= ext_offset + 2 {
-            let mut ext = [0u8; 2];
-            flash.read(entry.offset + ext_offset, &mut ext);
-            meta.on_user_message = u16::from_le_bytes(ext);
+        // Read function table directly into raw buffer
+        let table_bytes = count * 5;
+        if table_bytes > 0 {
+            flash.read(
+                entry.offset + META_HEADER as u32,
+                &mut meta.func_raw[..table_bytes],
+            );
         }
 
         Some(meta)
     }
 
-    /// Find a function by func_id. Returns (offset, arg_count) or None.
+    /// Parse callback metadata from a byte slice (RAM buffer).
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < META_HEADER {
+            return None;
+        }
+
+        let (fc, ops, opc, opd, oum, otd, otu, otm) = Self::parse_header(&data[..META_HEADER]);
+        let count = (fc as usize).min(MAX_FUNCS);
+
+        let mut meta = Self {
+            func_raw: [0; FUNC_TABLE_SIZE],
+            func_count: count as u8,
+            on_program_start: ops,
+            on_page_changing: opc,
+            on_page_changed: opd,
+            on_user_message: oum,
+            on_touch_down: otd,
+            on_touch_up: otu,
+            on_touch_move: otm,
+        };
+
+        // Copy function table raw bytes
+        let table_bytes = count * 5;
+        let table_end = META_HEADER + table_bytes;
+        if data.len() >= table_end && table_bytes > 0 {
+            meta.func_raw[..table_bytes].copy_from_slice(&data[META_HEADER..table_end]);
+        }
+
+        Some(meta)
+    }
+
+    /// Find a function by func_id. Parses raw bytes on demand.
+    /// Returns (offset, arg_count) or None.
     pub fn find_func(&self, func_id: u16) -> Option<(u16, u8)> {
-        for i in 0..self.func_count as usize {
-            if self.funcs[i].func_id == func_id {
-                return Some((self.funcs[i].offset, self.funcs[i].arg_count));
+        let count = self.func_count as usize;
+        let mut i = 0;
+        while i < count {
+            let off = i * 5;
+            let fid = u16::from_le_bytes([self.func_raw[off], self.func_raw[off + 1]]);
+            if fid == func_id {
+                let foff = u16::from_le_bytes([self.func_raw[off + 2], self.func_raw[off + 3]]);
+                let argc = self.func_raw[off + 4];
+                return Some((foff, argc));
             }
+            i += 1;
         }
         None
     }

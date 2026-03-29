@@ -3,7 +3,7 @@ use crate::ctx::Ctx;
 use crate::lcd::{self, Lcd};
 use crate::types::{Color, Rect};
 use crate::widget::{
-    WidgetId, ALIGN_CENTER, ALIGN_RIGHT, FLAG_PRESSED, KIND_BUTTON, KIND_LABEL,
+    WidgetId, WidgetTree, ALIGN_CENTER, ALIGN_RIGHT, FLAG_PRESSED, KIND_BUTTON, KIND_LABEL,
 };
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
@@ -126,23 +126,47 @@ fn render_subtree_clipped(ctx: &Ctx, id: WidgetId, occluders: &[Rect]) {
 
 // --- Drawing ---
 
+/// Effective background color for a widget.
+/// If the widget is a pressed button, returns press_color.
+/// If the widget is a child of a pressed button and shares the same
+/// background_color, inherits the parent button's press_color.
 #[inline]
-fn effective_bg(widget: &crate::widget::Widget) -> Color {
-    if widget.kind == KIND_BUTTON
-        && widget.flags & FLAG_PRESSED != 0
-        && widget.press_color != 0
-    {
-        widget.press_color
-    } else {
-        widget.background_color
+fn effective_bg(tree: &WidgetTree, id: WidgetId) -> Color {
+    let widget = tree.get(id);
+
+    // This widget is pressed and has a press_color
+    if widget.flags & FLAG_PRESSED != 0 && widget.press_color != 0 {
+        return widget.press_color;
     }
+
+    // Check ancestor — if a parent is pressed and this widget shares
+    // the same background, inherit press_color
+    let mut pid = widget.parent;
+    let max = tree.count();
+    let mut depth = 0usize;
+    while pid.is_some() {
+        let p = tree.get(pid);
+        if p.flags & FLAG_PRESSED != 0 && p.press_color != 0 {
+            if widget.background_color == p.background_color {
+                return p.press_color;
+            }
+            break;
+        }
+        pid = p.parent;
+        depth += 1;
+        if depth > max {
+            break;
+        }
+    }
+
+    widget.background_color
 }
 
 /// Draw widget without clipping (full render path).
 fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
     let widget = ctx.tree.get(id);
     let b = &widget.border;
-    let bg_color = effective_bg(widget);
+    let bg_color = effective_bg(&ctx.tree, id);
 
     // Border
     if b.top > 0 {
@@ -209,7 +233,7 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
 fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     let widget = ctx.tree.get(id);
     let b = &widget.border;
-    let bg_color = effective_bg(widget);
+    let bg_color = effective_bg(&ctx.tree, id);
 
     let border_rects = [
         Rect::new(abs.x, abs.y, abs.w, b.top as u16),
@@ -310,7 +334,7 @@ fn draw_label_text(ctx: &Ctx, id: WidgetId, abs: &Rect) {
 
     let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
 
-    let bg_color = effective_bg(widget);
+    let bg_color = effective_bg(&ctx.tree, id);
     font.draw_str(&ctx.lcd, &ctx.flash, text, tx, ty, widget.text_color, Some(bg_color));
 }
 

@@ -2,12 +2,14 @@
 """ferrite-cli — Host-side tool for communicating with ferrite-ui devices.
 
 Implements the USART protobuf protocol (see protocol.rs).
-Commands: ping, restart, execute <file>, writefs <file>, send <data...>
+Commands: ping, restart, meminfo, execute <file>, writefs <file>, send <data...>, calibrate
 
 Usage:
     python ferrite_cli.py -p COM3 ping
+    python ferrite_cli.py -p COM3 meminfo
     python ferrite_cli.py -p COM3 restart
     python ferrite_cli.py -p COM3 execute program.bin
+    python ferrite_cli.py -p COM3 -l execute program.fxe   (execute + listen)
     python ferrite_cli.py -p COM3 writefs flash.bin
     python ferrite_cli.py -p COM3 send 0x01 0x02 0x03
     python ferrite_cli.py -p COM3 send "hello world"
@@ -28,12 +30,16 @@ TAG_RESTART = (3 << 3) | 0   # 0x18, varint
 TAG_WRITEFS    = (4 << 3) | 2   # 0x22, payload (header: total_size + chunk_size)
 TAG_WRITECHUNK = (5 << 3) | 2   # 0x2A, payload (chunk data)
 TAG_USERMSG    = (6 << 3) | 2   # 0x32, payload (user message data, max 64 bytes)
+TAG_MEMINFO    = (7 << 3) | 0   # 0x38, varint
+TAG_TOUCHCAL   = (8 << 3) | 0   # 0x40, varint (start touch calibration)
 
 CHUNK_SIZE = 4096  # Must match device sector buffer size
 
 # Device → Host tags
-TAG_ERROR = (1 << 3) | 2     # 0x0A, payload
-TAG_PONG  = (2 << 3) | 0     # 0x10, varint
+TAG_ERROR    = (1 << 3) | 2   # 0x0A, payload
+TAG_PONG     = (2 << 3) | 0   # 0x10, varint
+TAG_MEMINFO_RESP = (3 << 3) | 0  # 0x18, varint (free heap bytes)
+TAG_TOUCHCAL_RESP = (4 << 3) | 2  # 0x22, payload (calibration result, 9 bytes)
 
 BAUD_RATE = 115200
 DEFAULT_TIMEOUT = 5.0  # seconds
@@ -127,7 +133,7 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             ser.timeout = orig_timeout
             return ("pong", None)
 
-        if tag == TAG_ERROR:
+        if tag == TAG_ERROR or tag == TAG_TOUCHCAL_RESP:
             # Read length varint
             length_bytes = bytearray()
             while True:
@@ -144,7 +150,9 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             ser.timeout = orig_timeout
             if len(payload) < length:
                 return ("timeout", None)
-            return ("error", payload[0])
+            if tag == TAG_ERROR:
+                return ("error", payload[0])
+            return ("touchcal", payload)
 
         # Unknown byte (debug output etc.) — skip and keep reading
 
@@ -306,6 +314,87 @@ def cmd_send(ser: serial.Serial, data_args: list[str]) -> bool:
     return True
 
 
+def listen_serial(ser: serial.Serial):
+    """Listen for incoming serial data and print it. Ctrl+C to stop."""
+    print("--- Listening (Ctrl+C to stop) ---", flush=True)
+    ser.timeout = 0.1  # short timeout for responsive Ctrl+C
+
+    buf = bytearray()
+    try:
+        while True:
+            data = ser.read(256)
+            if not data:
+                continue
+            for b in data:
+                if b == 0x0A:  # \n — flush line
+                    try:
+                        line = bytes(buf).decode('utf-8', errors='replace').rstrip('\r')
+                    except Exception:
+                        line = ' '.join(f'{x:02X}' for x in buf)
+                    print(line, flush=True)
+                    buf.clear()
+                elif b >= 0x20 or b == 0x0D or b == 0x09:  # printable, \r, \t
+                    buf.append(b)
+                else:
+                    # Non-printable byte — show hex inline
+                    buf.extend(f'\\x{b:02X}'.encode())
+    except KeyboardInterrupt:
+        # Flush remaining buffer
+        if buf:
+            try:
+                line = bytes(buf).decode('utf-8', errors='replace').rstrip('\r')
+            except Exception:
+                line = ' '.join(f'{x:02X}' for x in buf)
+            print(line, flush=True)
+        print("\n--- Stopped ---")
+
+
+def cmd_calibrate(ser: serial.Serial) -> bool:
+    """Start 3-point touch calibration.
+
+    Sends the calibrate command and waits for the device to complete the
+    calibration sequence (user must touch 3 crosshairs on screen).
+    Receives calibration result payload.
+    """
+    print("Starting touch calibration...")
+    print("Touch the 3 crosshairs on screen in order (top-left, top-right, bottom-left)")
+    ser.write(build_varint_msg(TAG_TOUCHCAL))
+    ser.flush()
+
+    # Use a long timeout — user needs time to touch 3 points
+    orig_timeout = ser.timeout
+    ser.timeout = 60.0
+
+    resp_type, resp_val = read_response(ser)
+    ser.timeout = orig_timeout
+
+    if resp_type == "touchcal" and resp_val and len(resp_val) >= 9:
+        flags = resp_val[0]
+        xy_swap = bool(flags & 0x01)
+        x_flip  = bool(flags & 0x02)
+        y_flip  = bool(flags & 0x04)
+        x_min = int.from_bytes(resp_val[1:3], 'little')
+        x_max = int.from_bytes(resp_val[3:5], 'little')
+        y_min = int.from_bytes(resp_val[5:7], 'little')
+        y_max = int.from_bytes(resp_val[7:9], 'little')
+        print(f"Calibration complete:")
+        print(f"  xy_swap = {xy_swap}")
+        print(f"  x_flip  = {x_flip}")
+        print(f"  y_flip  = {y_flip}")
+        print(f"  x_min   = {x_min}")
+        print(f"  x_max   = {x_max}")
+        print(f"  y_min   = {y_min}")
+        print(f"  y_max   = {y_max}")
+        return True
+    elif resp_type == "error":
+        desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
+        print(f"error: code {resp_val} — {desc}", file=sys.stderr)
+        return False
+    else:
+        print(f"no calibration response (timeout or unexpected: {resp_type})", file=sys.stderr)
+        return False
+
+
 # --- Main ---
 
 
@@ -316,6 +405,8 @@ def main():
     )
     parser.add_argument("-p", "--port", required=True, help="Serial port (e.g. COM3, /dev/ttyUSB0)")
     parser.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT, help="Response timeout in seconds (default: 2.0)")
+    parser.add_argument("-l", "--listen", action="store_true",
+                        help="After command, listen for serial messages (Ctrl+C to stop)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -330,6 +421,8 @@ def main():
 
     p_send = sub.add_parser("send", help="Send user message to device (field 6)")
     p_send.add_argument("data", nargs="+", help="Data: hex bytes (0xFF), decimal (255), or \"text\"")
+
+    sub.add_parser("calibrate", help="Start 3-point touch calibration")
 
     args = parser.parse_args()
 
@@ -350,8 +443,13 @@ def main():
             ok = cmd_writefs(ser, args.file)
         elif args.command == "send":
             ok = cmd_send(ser, args.data)
+        elif args.command == "calibrate":
+            ok = cmd_calibrate(ser)
         else:
             ok = False
+
+        if args.listen:
+            listen_serial(ser)
 
     sys.exit(0 if ok else 1)
 

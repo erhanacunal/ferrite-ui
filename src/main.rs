@@ -6,10 +6,11 @@ extern crate alloc;
 use alloc::boxed::Box;
 use ctx::Ctx;
 use panic_halt as _;
-
+//use alloc::format;
 mod backlight;
 mod callback;
 mod clip;
+mod config;
 mod ctx;
 mod embedded_font;
 mod flash;
@@ -334,15 +335,16 @@ fn init_ports() {
 // === Error display ===
 
 /// Draw error box on screen and send error via USART.
-fn show_error(lcd: &Lcd, font: &Font, flash: &Flash, usart: &Usart, code: u8) {
+fn show_error(lcd: &mut Lcd, font: &Font, flash: &Flash, usart: &Usart, code: u8, vm_pc: Option<u16>) {
+    lcd.begin_frame();
     lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
 
     let bx: u16 = 200;
-    let by: u16 = 160;
+    let by: u16 = 140;
     let bw: u16 = 400;
-    let bh: u16 = 160;
+    let bh: u16 = 200;
 
-    lcd.fill_rect(bx, by, bw, bh, COLOR_RED);
+    lcd.draw_rect(bx, by, bw, bh, COLOR_RED);
     lcd.fill_rect(bx + 2, by + 2, bw - 4, bh - 4, COLOR_BLACK);
 
     let title = b"ERROR";
@@ -370,7 +372,36 @@ fn show_error(lcd: &Lcd, font: &Font, flash: &Flash, usart: &Usart, code: u8) {
     let dx = bx as i16 + (bw as i16 - dw as i16) / 2;
     font.draw_str(lcd, flash, desc, dx, ty + 56, 0xC618, Some(COLOR_BLACK));
 
+    // Show VM program counter if available
+    if let Some(pc) = vm_pc {
+        let mut pc_buf = [0u8; 12];
+        let pc_len = format_hex_u16(b"PC: 0x", pc, &mut pc_buf);
+        let pw = font.text_width(&pc_buf[..pc_len]);
+        let px = bx as i16 + (bw as i16 - pw as i16) / 2;
+        font.draw_str(
+            lcd,
+            flash,
+            &pc_buf[..pc_len],
+            px,
+            ty + 84,
+            0xFD20,
+            Some(COLOR_BLACK),
+        );
+    }
+    lcd.end_frame();
+
     protocol::send_error(usart, code);
+}
+
+fn format_hex_u16(prefix: &[u8], val: u16, buf: &mut [u8; 12]) -> usize {
+    let plen = prefix.len().min(6);
+    buf[..plen].copy_from_slice(&prefix[..plen]);
+    let hex = b"0123456789ABCDEF";
+    buf[plen] = hex[((val >> 12) & 0xF) as usize];
+    buf[plen + 1] = hex[((val >> 8) & 0xF) as usize];
+    buf[plen + 2] = hex[((val >> 4) & 0xF) as usize];
+    buf[plen + 3] = hex[(val & 0xF) as usize];
+    plen + 4
 }
 
 fn format_error_code(code: u8, buf: &mut [u8; 16]) -> usize {
@@ -434,7 +465,7 @@ fn main() -> ! {
     // --- Application context (heap allocated) ---
     let mut ctx = Box::new(Ctx {
         lcd: Lcd::new(gpio),
-        flash: flash::Flash::init(),
+        flash: Flash::init(),
         tree: widget::WidgetTree::new(),
         fonts: font::FontList::new(),
         images: ImageList::new(),
@@ -449,29 +480,43 @@ fn main() -> ! {
         embedded_font::Y_ADVANCE,
     ));
 
+    // --- Config store (flash sector 0) ---
+    let mut cfg = config::ConfigStore::mount_or_format(&ctx.flash);
+
+    // Load touch calibration from config (if saved)
+    let mut cal_buf = [0u8; 9];
+    if let Some(len) = cfg.read(&ctx.flash, config::KEY_TOUCH_CAL, &mut cal_buf) {
+        if len >= 9 {
+            if let Some(cal) = touch::CalParams::from_bytes(&cal_buf) {
+                touch.cal = cal;
+            }
+        }
+    }
+
     // === STARTUP SEQUENCE ===
 
     // 1. Backlight
-    backlight.set_brightness(100);
+
     delay_ms(500);
 
     ctx.lcd.begin_frame();
-
-    // 2. Black screen
     ctx.lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
-
-    // 3. Splash text
-    ctx.fonts.embedded().draw_str(
-        &ctx.lcd,
-        &ctx.flash,
-        b"ferrite-ui",
-        10,
-        24,
-        COLOR_WHITE,
-        Some(COLOR_BLACK),
-    );
-
     ctx.lcd.end_frame();
+    ctx.lcd.begin_frame();
+    ctx.lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
+    ctx.lcd.end_frame();
+
+    backlight.set_brightness(100);
+    // 3. Splash text
+    // ctx.fonts.embedded().draw_str(
+    //     &ctx.lcd,
+    //     &ctx.flash,
+    //     b"ferrite-ui",
+    //     10,
+    //     24,
+    //     COLOR_WHITE,
+    //     Some(COLOR_BLACK),
+    // );
 
     // 4. Flash filesystem
     let mut error_code: u8 = 0;
@@ -515,7 +560,7 @@ fn main() -> ! {
     }
 
     // 8. Load callback metadata
-    let cb_meta = if error_code == 0 {
+    let mut cb_meta = Box::new(if error_code == 0 {
         if let Some(fs_ref) = ctx.fs.as_ref() {
             CallbackMeta::load(fs_ref, &ctx.flash, b"main").unwrap_or(CallbackMeta::new())
         } else {
@@ -523,7 +568,7 @@ fn main() -> ! {
         }
     } else {
         CallbackMeta::new()
-    };
+    });
 
     // 9. Prepare VMs — heap allocated
     let mut vm = Box::new(Vm::new());
@@ -555,11 +600,12 @@ fn main() -> ! {
     // Show error if any
     if error_code != 0 {
         show_error(
-            &ctx.lcd,
+            &mut ctx.lcd,
             ctx.fonts.embedded(),
             &ctx.flash,
             &usart,
             error_code,
+            None,
         );
     }
 
@@ -577,11 +623,12 @@ fn main() -> ! {
                 if vm.state == VmState::Error {
                     error_code = ERR_PROGRAM_ERROR;
                     show_error(
-                        &ctx.lcd,
+                        &mut ctx.lcd,
                         ctx.fonts.embedded(),
                         &ctx.flash,
                         &usart,
                         error_code,
+                        Some(vm.pc()),
                     );
                 }
             }
@@ -607,13 +654,51 @@ fn main() -> ! {
                     cortex_m::peripheral::SCB::sys_reset();
                 }
 
+                RxEvent::MemInfo => {
+                    let (free, _largest) = heap::stats();
+                    protocol::send_meminfo(&usart, free as u32);
+                }
+
+                RxEvent::TouchCalibrate => {
+                    let cal = touch::run_calibration(&mut touch, &ctx.lcd);
+                    // Save to flash config
+                    cfg.write(&ctx.flash, config::KEY_TOUCH_CAL, &cal.to_bytes());
+                    protocol::send_touch_cal(&usart, &cal);
+                    // Re-render after calibration clears the screen
+                    render::render_all(&mut ctx);
+                }
+
                 RxEvent::ProgramReady => {
                     let prog = protocol.program_code();
-                    let new_len = prog.len().min(MAX_CODE_SIZE);
-                    code_buf[..new_len].copy_from_slice(&prog[..new_len]);
-                    code_len = new_len;
-                    protocol.free_program();
 
+                    if prog.len() >= 12 && prog[0] == b'F' && prog[1] == b'X' {
+                        let prog_size = u16::from_le_bytes([prog[4], prog[5]]) as usize;
+                        let meta_size = u16::from_le_bytes([prog[6], prog[7]]) as usize;
+                        let prog_start: usize = 12;
+                        let meta_start = prog_start + prog_size;
+
+                        let new_len = prog_size.min(protocol::MAX_PROGRAM_SIZE);
+                        if prog_start + new_len <= prog.len() {
+                            code_buf[..new_len]
+                                .copy_from_slice(&prog[prog_start..prog_start + new_len]);
+                            code_len = new_len;
+                        }
+
+                        if meta_size > 0 && meta_start + meta_size <= prog.len() {
+                            *cb_meta =
+                                CallbackMeta::from_bytes(&prog[meta_start..meta_start + meta_size])
+                                    .unwrap_or(CallbackMeta::new());
+                        } else {
+                            *cb_meta = CallbackMeta::new();
+                        }
+                    } else {
+                        let new_len = prog.len().min(protocol::MAX_PROGRAM_SIZE);
+                        code_buf[..new_len].copy_from_slice(&prog[..new_len]);
+                        code_len = new_len;
+                        *cb_meta = CallbackMeta::new();
+                    }
+
+                    protocol.free_program();
                     vm.reset();
                     vm.state = VmState::Running;
                     error_code = 0;
@@ -625,7 +710,9 @@ fn main() -> ! {
 
                 RxEvent::FsReady => {
                     // Pause VM during flash write to avoid ring buffer overflow
-                    let vm_was_running = vm.state == VmState::Running || vm.state == VmState::Waiting || vm.state == VmState::Yielded;
+                    let vm_was_running = vm.state == VmState::Running
+                        || vm.state == VmState::Waiting
+                        || vm.state == VmState::Yielded;
                     if vm_was_running {
                         vm.state = VmState::Halted;
                     }
@@ -659,12 +746,30 @@ fn main() -> ! {
         // --- Touch handling (if no error) ---
         if error_code == 0 {
             if let Some(event) = touch.poll() {
-                if event.kind == touch::TouchEventKind::Press {
-                    let hit = touch::hit_test(&ctx.tree, event.x, event.y);
+                if event.kind == touch::TouchEventKind::Press {                
+                    //usart::dbg(format!("Touch at {}, {}\n", event.x, event.y).as_bytes());    
+                    let hit = touch::hit_test(&ctx.tree, event.x, event.y);                    
                     if hit.is_some() {
+                        //usart::dbg(format!("Hit widget {}\n", hit.0).as_bytes());
                         ctx.tree.get_mut(hit).flags |= widget::FLAG_PRESSED;
                         ctx.tree.mark_dirty(hit);
                         render::render_dirty(&mut ctx);
+                    }
+
+                    if cb_meta.on_touch_down != NO_CALLBACK && code_len > 0 {
+                        cb_vm.reset();
+                        cb_vm.set_pc(cb_meta.on_touch_down);
+                        cb_vm.push_arg(event.x as i32);
+                        cb_vm.push_arg(event.y as i32);
+                        cb_vm.run(&code_buf[..code_len], &mut ctx);
+                    }
+                } else if event.kind == touch::TouchEventKind::Hold {
+                    if cb_meta.on_touch_move != NO_CALLBACK && code_len > 0 {
+                        cb_vm.reset();
+                        cb_vm.set_pc(cb_meta.on_touch_move);
+                        cb_vm.push_arg(event.x as i32);
+                        cb_vm.push_arg(event.y as i32);
+                        cb_vm.run(&code_buf[..code_len], &mut ctx);
                     }
                 } else if event.kind == touch::TouchEventKind::Release {
                     let mut clicked_id = widget::WidgetId::NONE;
@@ -709,6 +814,12 @@ fn main() -> ! {
                                 cb_vm.run(&code_buf[..code_len], &mut ctx);
                             }
                         }
+                    }
+
+                    if cb_meta.on_touch_up != NO_CALLBACK && code_len > 0 {
+                        cb_vm.reset();
+                        cb_vm.set_pc(cb_meta.on_touch_up);
+                        cb_vm.run(&code_buf[..code_len], &mut ctx);
                     }
                 }
             }

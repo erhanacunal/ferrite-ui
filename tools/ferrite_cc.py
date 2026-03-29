@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """ferrite-ui bytecode compiler / assembler / disassembler.
 
-Bytecode format: protobuf tag encoding
-  tag = (opcode << 3) | wire_type
-  Wire types: 0=varint(zigzag), 1=i16(LE), 2=LEN, 5=no-arg
+Bytecode format: 1-byte instruction set with .NET IL-style specialized short forms.
+  - No-arg ops: single byte
+  - Short forms: PUSH_0..2, PUSH_M1, LOAD_0..4, STORE_0..4 (1 byte)
+  - With args: opcode + fixed-size arguments (i8/i16/i32/u8/u16)
+  - Builtins: first-class opcodes at 0x80+
+  - Float ops: at 0xC0+
 
 Usage:
   # CLI
@@ -19,105 +22,150 @@ import struct
 import sys
 
 # ============================================================
-# Constants (proto.rs ile birebir aynı)
+# Constants
 # ============================================================
 
 
-class WT:
-    """Wire types."""
-    VARINT = 0
-    I16 = 1
-    LEN = 2
-    NO_ARG = 5
-
-
 class Op:
-    """VM opcodes."""
-    HALT = 0
-    PUSH = 1
-    POP = 2
-    LOAD = 3
-    STORE = 4
-    ADD = 5
-    SUB = 6
-    EQ = 7
-    LT = 8
-    JMP = 9
-    JZ = 10
-    JNZ = 11
-    W_TARGET = 12
-    W_SET = 13
-    W_GET = 14
-    W_DIRTY = 15
-    DUP = 16
-    SWAP = 17
-    MUL = 18
-    DIV = 19
-    MOD = 20
-    NEG = 21
-    AND = 22
-    OR = 23
-    NOT = 24
-    NE = 25
-    LE = 26
-    GE = 27
-    GT = 28
-    CALL = 29
-    RET = 30
-    YIELD = 31
-    W_RENDER = 32
-    W_ALLOC = 33
-    W_PARENT = 34
-    F_READ = 35
-    F_WRITE = 36
-    ARR_ALLOC = 37
-    ARR_LOAD = 38
-    ARR_STORE = 39
-    ARR_LEN = 40
-    BUILTIN = 41
-    # Float32 (soft-float, all no-arg)
-    ITOF = 42
-    FTOI = 43
-    FADD = 44
-    FSUB = 45
-    FMUL = 46
-    FDIV = 47
-    FNEG = 48
-    FEQ = 49
-    FLT = 50
-    FLE = 51
-    FGT = 52
-    FGE = 53
-    FNE = 54
+    """1-byte opcode map -- IL-style with specialized short forms."""
+    # No-arg instructions (1 byte total)
+    HALT       = 0x00
+    POP        = 0x01
+    DUP        = 0x02
+    SWAP       = 0x03
+    ADD        = 0x04
+    SUB        = 0x05
+    MUL        = 0x06
+    DIV        = 0x07
+    MOD        = 0x08
+    NEG        = 0x09
+    AND        = 0x0A
+    OR         = 0x0B
+    NOT        = 0x0C
+    EQ         = 0x0D
+    NE         = 0x0E
+    LT         = 0x0F
+    LE         = 0x10
+    GT         = 0x11
+    GE         = 0x12
+    RET        = 0x13
+    YIELD      = 0x14
+    W_DIRTY    = 0x15
+    W_RENDER   = 0x16
+    ARR_LOAD   = 0x17
+    ARR_STORE  = 0x18
+    ARR_LEN    = 0x19
+    W_ALLOC    = 0x1A
+
+    # Specialized short forms (1 byte, no args)
+    PUSH_0     = 0x20
+    PUSH_1     = 0x21
+    PUSH_2     = 0x22
+    PUSH_M1    = 0x23  # push -1
+    LOAD_0     = 0x24
+    LOAD_1     = 0x25
+    LOAD_2     = 0x26
+    LOAD_3     = 0x27
+    LOAD_4     = 0x28
+    STORE_0    = 0x29
+    STORE_1    = 0x2A
+    STORE_2    = 0x2B
+    STORE_3    = 0x2C
+    STORE_4    = 0x2D
+
+    # With fixed-size arguments
+    PUSH_I8    = 0x30  # + i8  (1 byte signed)
+    PUSH_I16   = 0x31  # + i16 (2 bytes LE signed)
+    PUSH_I32   = 0x32  # + i32 (4 bytes LE signed)
+    LOAD       = 0x33  # + u8 slot
+    STORE      = 0x34  # + u8 slot
+    JMP        = 0x35  # + u16 target
+    JZ         = 0x36  # + u16 target
+    JNZ        = 0x37  # + u16 target
+    CALL       = 0x38  # + u16 target
+    W_TARGET   = 0x39  # + u8 widget_id
+    W_SET      = 0x3A  # + u8 prop_id (value from stack)
+    W_GET      = 0x3B  # + u8 prop_id (pushes to stack)
+    W_PARENT   = 0x3C  # + u8 parent_id
+    W_SET_LEN  = 0x3D  # + u8 prop_id + u8 len + data (compound prop)
+    ARR_ALLOC  = 0x3E  # + u8 size
+    ARR_INIT   = 0x3F  # + u8 count + i32 values (LE)
+    F_READ     = 0x40  # + u32 addr + u16 len
+    F_WRITE    = 0x41  # + u32 addr + u8 len + data
+
+    # Builtins as first-class opcodes (all no-arg, operands on stack)
+    FILL_RECT       = 0x80
+    RECT            = 0x81
+    LINE            = 0x82
+    CIRCLE          = 0x83
+    FILL_CIRCLE     = 0x84
+    DRAW_IMAGE      = 0x85
+    DRAW_TEXT_LIT   = 0x86  # + u8 len + text (inline literal)
+    DELAY           = 0x87
+    STR_LIT         = 0x88  # + u8 len + text (inline literal)
+    ITOS            = 0x89
+    FTOS            = 0x8A
+    CONCAT          = 0x8B
+    PARSE_INT       = 0x8C
+    PARSE_FLOAT     = 0x8D
+    STR_LEN         = 0x8E
+    SET_TEXT         = 0x8F
+    DRAW_STR        = 0x90
+    STR_CLEAR       = 0x91
+    STR_FREE        = 0x92
+    ROUNDED_RECT    = 0x93
+    FILL_ROUNDED_RECT = 0x94
+    ARC             = 0x95
+    BEGIN_FRAME     = 0x96
+    END_FRAME       = 0x97
+    SEND_USART      = 0x98
+    SEND_USART_STR  = 0x99
+
+    # Float ops (all no-arg)
+    ITOF = 0xC0
+    FTOI = 0xC1
+    FADD = 0xC2
+    FSUB = 0xC3
+    FMUL = 0xC4
+    FDIV = 0xC5
+    FNEG = 0xC6
+    FEQ  = 0xC7
+    FLT  = 0xC8
+    FLE  = 0xC9
+    FGT  = 0xCA
+    FGE  = 0xCB
+    FNE  = 0xCC
 
 
+# Backwards compatibility -- Builtin constants map to method IDs (0-based).
+# Used by ferrite_lang.py via asm.builtin(Builtin.XXX)
 class Builtin:
-    """Built-in method IDs for OP_BUILTIN."""
-    FILL_RECT = 0    # stack: [color, size, loc]
-    RECT = 1         # stack: [color, size, loc]
-    LINE = 2         # stack: [color, end, start]
-    CIRCLE = 3       # stack: [color, radius, center]
-    FILL_CIRCLE = 4  # stack: [color, radius, center]
-    DRAW_IMAGE = 5   # stack: [image_id, loc]
-    DRAW_TEXT = 6    # stack: [colors, font_id, loc] + LEN payload text
-    DELAY = 7        # stack: [ms]
-    # String operations
-    STR = 8          # LEN payload=bytes → [str_id]
-    ITOS = 9         # stack: [i32] → [str_id]
-    FTOS = 10        # stack: [f32] → [str_id]
-    CONCAT = 11      # stack: [str_b, str_a] → [str_id]
-    PARSE_INT = 12   # stack: [str_id] → [i32]
-    PARSE_FLOAT = 13 # stack: [str_id] → [f32]
-    STR_LEN = 14     # stack: [str_id] → [len]
-    SET_TEXT = 15     # stack: [str_id] → sets target widget text
-    DRAW_STR = 16    # stack: [str_id, colors, font_id, loc] → draw
-    STR_CLEAR = 17   # no args → smart clear (preserves widget text)
-    STR_FREE = 18    # stack: [str_id] → mark for next clear
-    ROUNDED_RECT = 19      # stack: [color, r, size, loc]
-    FILL_ROUNDED_RECT = 20 # stack: [color, r, size, loc]
-    ARC = 21               # stack: [color, end, start, radius, center]
-    BEGIN_FRAME = 22       # no args — toggle back buffer
-    END_FRAME = 23         # no args — swap front ← back
+    FILL_RECT = 0
+    RECT = 1
+    LINE = 2
+    CIRCLE = 3
+    FILL_CIRCLE = 4
+    DRAW_IMAGE = 5
+    DRAW_TEXT = 6
+    DELAY = 7
+    STR = 8
+    ITOS = 9
+    FTOS = 10
+    CONCAT = 11
+    PARSE_INT = 12
+    PARSE_FLOAT = 13
+    STR_LEN = 14
+    SET_TEXT = 15
+    DRAW_STR = 16
+    STR_CLEAR = 17
+    STR_FREE = 18
+    ROUNDED_RECT = 19
+    FILL_ROUNDED_RECT = 20
+    ARC = 21
+    BEGIN_FRAME = 22
+    END_FRAME = 23
+    SEND_USART = 24
+    SEND_USART_STR = 25
 
 
 class Prop:
@@ -167,7 +215,8 @@ class Prop:
 
 
 # ============================================================
-# Protobuf encoding / decoding
+# Varint encoding / decoding (still used by USART protocol
+# and compound property zigzag encoding in W_SET_LEN payload)
 # ============================================================
 
 
@@ -226,6 +275,10 @@ def decode_svarint(data, pos=0):
     return zigzag_decode(raw), consumed
 
 
+# Alias for disassembler internal use
+_decode_svarint = decode_svarint
+
+
 def float_bits(f):
     """Convert a Python float to its f32 bit pattern as a signed i32.
 
@@ -259,7 +312,7 @@ def pack_pair(high, low):
 
 
 class Asm:
-    """Low-level bytecode assembler. 1:1 opcode mapping.
+    """Low-level bytecode assembler. 1-byte opcode instruction set.
 
     Example:
         a = Asm()
@@ -289,326 +342,386 @@ class Asm:
         else:
             self._buf.extend(data)
 
-    def _emit_tag(self, opcode, wt):
-        tag = (opcode << 3) | wt
-        self._emit(encode_varint(tag))
+    def _emit_u8(self, val):
+        self._buf.append(val & 0xFF)
 
-    def _emit_no_arg(self, opcode):
-        self._emit_tag(opcode, WT.NO_ARG)
+    def _emit_i8(self, val):
+        self._buf.append(val & 0xFF)
 
-    def _emit_svarint(self, opcode, val):
-        """Emit opcode + zigzag-encoded varint arg."""
-        self._emit_tag(opcode, WT.VARINT)
-        self._emit(encode_svarint(val))
+    def _emit_u16(self, val):
+        self._buf.extend(struct.pack('<H', val & 0xFFFF))
 
-    def _emit_i16(self, opcode, val):
-        self._emit_tag(opcode, WT.I16)
-        self._emit(struct.pack('<H', val & 0xFFFF))
+    def _emit_i16(self, val):
+        self._buf.extend(struct.pack('<h', val))
 
-    def _emit_len(self, opcode, payload):
-        self._emit_tag(opcode, WT.LEN)
-        self._emit(encode_varint(len(payload)))
-        self._emit(payload)
+    def _emit_i32(self, val):
+        self._buf.extend(struct.pack('<i', val))
 
-    # --- No-arg instructions (wt=5) ---
+    # --- No-arg instructions (single byte) ---
 
     def halt(self):
-        self._emit_no_arg(Op.HALT)
+        self._emit(Op.HALT)
 
     def pop(self):
-        self._emit_no_arg(Op.POP)
-
-    def add(self):
-        self._emit_no_arg(Op.ADD)
-
-    def sub(self):
-        self._emit_no_arg(Op.SUB)
-
-    def eq(self):
-        self._emit_no_arg(Op.EQ)
-
-    def lt(self):
-        self._emit_no_arg(Op.LT)
-
-    def w_dirty(self):
-        self._emit_no_arg(Op.W_DIRTY)
+        self._emit(Op.POP)
 
     def dup(self):
-        self._emit_no_arg(Op.DUP)
+        self._emit(Op.DUP)
 
     def swap(self):
-        self._emit_no_arg(Op.SWAP)
+        self._emit(Op.SWAP)
+
+    def add(self):
+        self._emit(Op.ADD)
+
+    def sub(self):
+        self._emit(Op.SUB)
 
     def mul(self):
-        self._emit_no_arg(Op.MUL)
+        self._emit(Op.MUL)
 
     def div(self):
-        self._emit_no_arg(Op.DIV)
+        self._emit(Op.DIV)
 
     def modulo(self):
-        self._emit_no_arg(Op.MOD)
+        self._emit(Op.MOD)
+
+    # Alias for compat
+    def mod_(self):
+        self._emit(Op.MOD)
 
     def neg(self):
-        self._emit_no_arg(Op.NEG)
+        self._emit(Op.NEG)
 
     def and_(self):
-        self._emit_no_arg(Op.AND)
+        self._emit(Op.AND)
 
     def or_(self):
-        self._emit_no_arg(Op.OR)
+        self._emit(Op.OR)
 
     def not_(self):
-        self._emit_no_arg(Op.NOT)
+        self._emit(Op.NOT)
+
+    def eq(self):
+        self._emit(Op.EQ)
 
     def ne(self):
-        self._emit_no_arg(Op.NE)
+        self._emit(Op.NE)
+
+    def lt(self):
+        self._emit(Op.LT)
 
     def le(self):
-        self._emit_no_arg(Op.LE)
-
-    def ge(self):
-        self._emit_no_arg(Op.GE)
+        self._emit(Op.LE)
 
     def gt(self):
-        self._emit_no_arg(Op.GT)
+        self._emit(Op.GT)
+
+    def ge(self):
+        self._emit(Op.GE)
 
     def ret(self):
-        self._emit_no_arg(Op.RET)
+        self._emit(Op.RET)
 
     def yield_(self):
-        self._emit_no_arg(Op.YIELD)
+        self._emit(Op.YIELD)
+
+    def w_dirty(self):
+        self._emit(Op.W_DIRTY)
 
     def w_render(self):
-        self._emit_no_arg(Op.W_RENDER)
+        self._emit(Op.W_RENDER)
+
+    def arr_load(self):
+        """Pop [arr_id, index], push arr[index]."""
+        self._emit(Op.ARR_LOAD)
+
+    def arr_store(self):
+        """Pop [arr_id, index, value], store value."""
+        self._emit(Op.ARR_STORE)
+
+    def arr_len(self):
+        """Pop arr_id, push length."""
+        self._emit(Op.ARR_LEN)
 
     def w_alloc(self):
-        self._emit_no_arg(Op.W_ALLOC)
+        self._emit(Op.W_ALLOC)
 
-    # --- Varint arg instructions (wt=0) ---
-    # VM decode_signed_varint kullanir, tum varint'ler zigzag encoded.
+    # --- Specialized short forms + general forms ---
 
     def push(self, val):
-        self._emit_svarint(Op.PUSH, val)
+        if val == 0:
+            self._emit(Op.PUSH_0)
+        elif val == 1:
+            self._emit(Op.PUSH_1)
+        elif val == 2:
+            self._emit(Op.PUSH_2)
+        elif val == -1:
+            self._emit(Op.PUSH_M1)
+        elif -128 <= val <= 127:
+            self._emit(Op.PUSH_I8)
+            self._emit_i8(val)
+        elif -32768 <= val <= 32767:
+            self._emit(Op.PUSH_I16)
+            self._emit_i16(val)
+        else:
+            self._emit(Op.PUSH_I32)
+            self._emit_i32(val)
 
-    def load(self, var_id):
-        self._emit_svarint(Op.LOAD, var_id)
+    def load(self, slot):
+        if 0 <= slot <= 4:
+            self._emit(Op.LOAD_0 + slot)
+        else:
+            self._emit(Op.LOAD)
+            self._emit_u8(slot)
 
-    def store(self, var_id):
-        self._emit_svarint(Op.STORE, var_id)
+    def store(self, slot):
+        if 0 <= slot <= 4:
+            self._emit(Op.STORE_0 + slot)
+        else:
+            self._emit(Op.STORE)
+            self._emit_u8(slot)
 
-    def w_target(self, widget_id):
-        self._emit_svarint(Op.W_TARGET, widget_id)
-
-    def w_set(self, prop_id):
-        """Scalar W_SET: prop_id varint arg, value from stack."""
-        self._emit_svarint(Op.W_SET, prop_id)
-
-    def w_get(self, prop_id):
-        self._emit_svarint(Op.W_GET, prop_id)
-
-    def w_parent(self, parent_id):
-        self._emit_svarint(Op.W_PARENT, parent_id)
-
-    # --- i16 arg instructions (wt=1) ---
+    # --- Jump/call -- opcode + u16 LE target ---
 
     def jmp(self, target):
-        self._emit_i16(Op.JMP, target)
+        self._emit(Op.JMP)
+        self._emit_u16(target)
 
     def jz(self, target):
-        self._emit_i16(Op.JZ, target)
+        self._emit(Op.JZ)
+        self._emit_u16(target)
 
     def jnz(self, target):
-        self._emit_i16(Op.JNZ, target)
+        self._emit(Op.JNZ)
+        self._emit_u16(target)
 
     def call(self, target):
-        self._emit_i16(Op.CALL, target)
+        self._emit(Op.CALL)
+        self._emit_u16(target)
 
     # --- Forward jump helpers ---
 
+    def jmp_fwd(self):
+        """JMP placeholder. Returns patch position for later patching."""
+        self._emit(Op.JMP)
+        pos = self.pos
+        self._emit_u16(0)
+        return pos
+
     def jz_fwd(self):
-        """JZ placeholder. Returns patch position for later patching."""
-        self._emit_tag(Op.JZ, WT.I16)
-        patch_pos = self.pos
-        self._emit(b'\x00\x00')
-        return patch_pos
+        """JZ placeholder. Returns patch position."""
+        self._emit(Op.JZ)
+        pos = self.pos
+        self._emit_u16(0)
+        return pos
 
     def jnz_fwd(self):
         """JNZ placeholder. Returns patch position."""
-        self._emit_tag(Op.JNZ, WT.I16)
-        patch_pos = self.pos
-        self._emit(b'\x00\x00')
-        return patch_pos
+        self._emit(Op.JNZ)
+        pos = self.pos
+        self._emit_u16(0)
+        return pos
 
-    def jmp_fwd(self):
-        """JMP placeholder. Returns patch position."""
-        self._emit_tag(Op.JMP, WT.I16)
-        patch_pos = self.pos
-        self._emit(b'\x00\x00')
-        return patch_pos
+    def call_fwd(self):
+        """CALL placeholder. Returns patch position."""
+        self._emit(Op.CALL)
+        pos = self.pos
+        self._emit_u16(0)
+        return pos
 
     def patch(self, patch_pos, target=None):
         """Patch a forward jump. Default target = current position."""
         if target is None:
             target = self.pos
-        struct.pack_into('<H', self._buf, patch_pos, target)
+        struct.pack_into('<H', self._buf, patch_pos, target & 0xFFFF)
 
-    # --- LEN payload instructions (wt=2) ---
+    # --- Widget ops ---
+
+    def w_target(self, widget_id):
+        self._emit(Op.W_TARGET)
+        self._emit_u8(widget_id)
+
+    def w_set(self, prop_id):
+        """Set scalar property (value from stack)."""
+        self._emit(Op.W_SET)
+        self._emit_u8(prop_id)
 
     def w_set_compound(self, prop_id, values):
-        """Compound W_SET: LEN payload = prop_id + packed zigzag varints."""
-        payload = bytearray([prop_id])
-        for v in values:
-            payload.extend(encode_svarint(v))
-        self._emit_len(Op.W_SET, bytes(payload))
-
-    def w_set_text(self, text):
-        """W_SET with PROP_TEXT: LEN payload = prop_id + raw text bytes."""
-        payload = bytes([Prop.TEXT]) + (text.encode('utf-8') if isinstance(text, str) else bytes(text))
-        self._emit_len(Op.W_SET, payload)
-
-    def f_read(self, addr, length):
-        """F_READ: flash addr (4B LE) + length (2B LE)."""
-        payload = struct.pack('<IH', addr, length)
-        self._emit_len(Op.F_READ, payload)
-
-    def f_write(self, addr, data):
-        """F_WRITE: flash addr (4B LE) + data bytes."""
-        payload = struct.pack('<I', addr) + bytes(data)
-        self._emit_len(Op.F_WRITE, payload)
-
-    # --- Array instructions ---
-
-    def arr_alloc(self, size):
-        """Allocate zero-filled array. Pushes array_id."""
-        self._emit_svarint(Op.ARR_ALLOC, size)
-
-    def arr_alloc_init(self, values):
-        """Allocate and init array from values. Pushes array_id."""
+        """Set compound property (inline data, zigzag-encoded values)."""
         payload = bytearray()
         for v in values:
             payload.extend(encode_svarint(v))
-        self._emit_len(Op.ARR_ALLOC, bytes(payload))
+        self._emit(Op.W_SET_LEN)
+        self._emit_u8(prop_id)
+        self._emit_u8(len(payload))
+        self._emit(payload)
 
-    def arr_load(self):
-        """Pop [arr_id, index], push arr[index]."""
-        self._emit_no_arg(Op.ARR_LOAD)
+    def w_set_text(self, text):
+        """Set text property (inline text bytes)."""
+        text_bytes = text.encode('utf-8') if isinstance(text, str) else bytes(text)
+        self._emit(Op.W_SET_LEN)
+        self._emit_u8(Prop.TEXT)
+        self._emit_u8(len(text_bytes))
+        self._emit(text_bytes)
 
-    def arr_store(self):
-        """Pop [arr_id, index, value], store value."""
-        self._emit_no_arg(Op.ARR_STORE)
+    def w_get(self, prop_id):
+        self._emit(Op.W_GET)
+        self._emit_u8(prop_id)
 
-    def arr_len(self):
-        """Pop arr_id, push length."""
-        self._emit_no_arg(Op.ARR_LEN)
+    def w_parent(self, parent_id):
+        self._emit(Op.W_PARENT)
+        self._emit_u8(parent_id)
+
+    # --- Array ops ---
+
+    def arr_alloc(self, size):
+        """Allocate zero-filled array. Pushes array_id."""
+        self._emit(Op.ARR_ALLOC)
+        self._emit_u8(size)
+
+    def arr_alloc_init(self, values):
+        """Allocate and init array from values. Pushes array_id."""
+        self._emit(Op.ARR_INIT)
+        self._emit_u8(len(values))
+        for v in values:
+            self._emit_i32(v)
+
+    # --- Flash ops ---
+
+    def f_read(self, addr, length):
+        """F_READ: flash addr (4B LE) + length (2B LE)."""
+        self._emit(Op.F_READ)
+        self._emit(struct.pack('<IH', addr, length))
+
+    def f_write(self, addr, data):
+        """F_WRITE: flash addr (4B LE) + len (1B) + data bytes."""
+        self._emit(Op.F_WRITE)
+        self._emit(struct.pack('<I', addr))
+        self._emit_u8(len(data))
+        self._emit(data)
 
     # --- Float32 instructions (soft-float, all no-arg) ---
 
     def itof(self):
         """Pop i32, push f32 bits."""
-        self._emit_no_arg(Op.ITOF)
+        self._emit(Op.ITOF)
 
     def ftoi(self):
         """Pop f32 bits, push i32."""
-        self._emit_no_arg(Op.FTOI)
+        self._emit(Op.FTOI)
 
     def fadd(self):
         """Pop two f32, push f32 sum."""
-        self._emit_no_arg(Op.FADD)
+        self._emit(Op.FADD)
 
     def fsub(self):
         """Pop two f32, push f32 difference (a - b)."""
-        self._emit_no_arg(Op.FSUB)
+        self._emit(Op.FSUB)
 
     def fmul(self):
         """Pop two f32, push f32 product."""
-        self._emit_no_arg(Op.FMUL)
+        self._emit(Op.FMUL)
 
     def fdiv(self):
         """Pop two f32, push f32 quotient (a / b)."""
-        self._emit_no_arg(Op.FDIV)
+        self._emit(Op.FDIV)
 
     def fneg(self):
         """Pop f32, push negated f32."""
-        self._emit_no_arg(Op.FNEG)
+        self._emit(Op.FNEG)
 
     def feq(self):
         """Pop two f32, push i32 (1 if a == b, else 0)."""
-        self._emit_no_arg(Op.FEQ)
+        self._emit(Op.FEQ)
 
     def flt(self):
         """Pop two f32, push i32 (1 if a < b, else 0)."""
-        self._emit_no_arg(Op.FLT)
+        self._emit(Op.FLT)
 
     def fle(self):
         """Pop two f32, push i32 (1 if a <= b, else 0)."""
-        self._emit_no_arg(Op.FLE)
+        self._emit(Op.FLE)
 
     def fgt(self):
         """Pop two f32, push i32 (1 if a > b, else 0)."""
-        self._emit_no_arg(Op.FGT)
+        self._emit(Op.FGT)
 
     def fge(self):
         """Pop two f32, push i32 (1 if a >= b, else 0)."""
-        self._emit_no_arg(Op.FGE)
+        self._emit(Op.FGE)
 
     def fne(self):
         """Pop two f32, push i32 (1 if a != b, else 0)."""
-        self._emit_no_arg(Op.FNE)
+        self._emit(Op.FNE)
 
-    # --- Built-in methods (OP_BUILTIN) ---
+    # --- Built-in methods ---
 
     def builtin(self, method_id):
-        """Emit OP_BUILTIN with varint method_id. Args already on stack."""
-        self._emit_svarint(Op.BUILTIN, method_id)
+        """Emit a builtin as its opcode. Maps old Builtin constant (0-based)
+        to new opcode (0x80+)."""
+        opcode = Op.FILL_RECT + method_id
+        self._emit(opcode)
 
     def builtin_len(self, method_id, payload):
-        """Emit OP_BUILTIN with LEN payload. First byte = method_id, rest = data."""
-        data = bytes([method_id]) + (payload.encode('utf-8') if isinstance(payload, str) else bytes(payload))
-        self._emit_len(Op.BUILTIN, data)
+        """Emit a builtin with inline payload (drawText or str literal)."""
+        if method_id == Builtin.DRAW_TEXT:
+            self._emit(Op.DRAW_TEXT_LIT)
+        elif method_id == Builtin.STR:
+            self._emit(Op.STR_LIT)
+        else:
+            # Fallback: should not happen
+            self._emit(Op.FILL_RECT + method_id)
+            return
+        text = payload.encode('utf-8') if isinstance(payload, str) else bytes(payload)
+        self._emit_u8(len(text))
+        self._emit(text)
+
+    # --- High-level drawing helpers ---
 
     def fill_rect(self, x, y, w, h, color):
-        """Emit fillRect built-in: push packed args + BUILTIN 0."""
+        """Emit fillRect built-in: push packed args + opcode."""
         self.push(pack_pair(x, y))
         self.push(pack_pair(w, h))
         self.push(color)
-        self.builtin(Builtin.FILL_RECT)
+        self._emit(Op.FILL_RECT)
 
     def draw_rect(self, x, y, w, h, color):
-        """Emit rect outline built-in: push packed args + BUILTIN 1."""
+        """Emit rect outline built-in: push packed args + opcode."""
         self.push(pack_pair(x, y))
         self.push(pack_pair(w, h))
         self.push(color)
-        self.builtin(Builtin.RECT)
+        self._emit(Op.RECT)
 
     def draw_line(self, x0, y0, x1, y1, color):
-        """Emit line built-in: push packed args + BUILTIN 2."""
+        """Emit line built-in: push packed args + opcode."""
         self.push(pack_pair(x0, y0))
         self.push(pack_pair(x1, y1))
         self.push(color)
-        self.builtin(Builtin.LINE)
+        self._emit(Op.LINE)
 
     def draw_circle(self, cx, cy, r, color):
-        """Emit circle outline built-in: push packed args + BUILTIN 3."""
+        """Emit circle outline built-in: push packed args + opcode."""
         self.push(pack_pair(cx, cy))
         self.push(r)
         self.push(color)
-        self.builtin(Builtin.CIRCLE)
+        self._emit(Op.CIRCLE)
 
     def fill_circle(self, cx, cy, r, color):
-        """Emit filled circle built-in: push packed args + BUILTIN 4."""
+        """Emit filled circle built-in: push packed args + opcode."""
         self.push(pack_pair(cx, cy))
         self.push(r)
         self.push(color)
-        self.builtin(Builtin.FILL_CIRCLE)
+        self._emit(Op.FILL_CIRCLE)
 
     def draw_image(self, x, y, image_id):
-        """Emit drawImage built-in: push packed args + BUILTIN 5."""
+        """Emit drawImage built-in: push packed args + opcode."""
         self.push(pack_pair(x, y))
         self.push(image_id)
-        self.builtin(Builtin.DRAW_IMAGE)
+        self._emit(Op.DRAW_IMAGE)
 
     def draw_text(self, x, y, font_id, fg, bg, text):
-        """Emit drawText built-in: push stack args + BUILTIN LEN with text payload.
+        """Emit drawText built-in: push stack args + inline text payload.
         bg=0 means transparent.
         """
         self.push(pack_pair(x, y))
@@ -617,9 +730,9 @@ class Asm:
         self.builtin_len(Builtin.DRAW_TEXT, text)
 
     def delay(self, ms):
-        """Emit delay_ms built-in: push ms + BUILTIN 7."""
+        """Emit delay_ms built-in: push ms + opcode."""
         self.push(ms)
-        self.builtin(Builtin.DELAY)
+        self._emit(Op.DELAY)
 
     # --- String operations ---
 
@@ -629,43 +742,43 @@ class Asm:
 
     def str_itos(self):
         """Pop i32, push str_id of decimal representation."""
-        self.builtin(Builtin.ITOS)
+        self._emit(Op.ITOS)
 
     def str_ftos(self):
         """Pop f32 bits, push str_id of float representation."""
-        self.builtin(Builtin.FTOS)
+        self._emit(Op.FTOS)
 
     def str_concat(self):
         """Pop [str_b, str_a], push concatenated str_id."""
-        self.builtin(Builtin.CONCAT)
+        self._emit(Op.CONCAT)
 
     def str_parse_int(self):
         """Pop str_id, push parsed i32."""
-        self.builtin(Builtin.PARSE_INT)
+        self._emit(Op.PARSE_INT)
 
     def str_parse_float(self):
         """Pop str_id, push parsed f32 bits."""
-        self.builtin(Builtin.PARSE_FLOAT)
+        self._emit(Op.PARSE_FLOAT)
 
     def str_len(self):
         """Pop str_id, push length."""
-        self.builtin(Builtin.STR_LEN)
+        self._emit(Op.STR_LEN)
 
     def str_set_text(self):
         """Pop str_id, set as text on current target widget."""
-        self.builtin(Builtin.SET_TEXT)
+        self._emit(Op.SET_TEXT)
 
     def str_draw(self):
         """Pop [str_id, colors, font_id, loc], draw string."""
-        self.builtin(Builtin.DRAW_STR)
+        self._emit(Op.DRAW_STR)
 
     def str_clear(self):
         """Smart clear: free unreferenced strings, preserve widget text."""
-        self.builtin(Builtin.STR_CLEAR)
+        self._emit(Op.STR_CLEAR)
 
     def str_free(self):
         """Pop str_id, mark for reclamation on next strClear()."""
-        self.builtin(Builtin.STR_FREE)
+        self._emit(Op.STR_FREE)
 
     # --- Rounded rect & arc ---
 
@@ -675,7 +788,7 @@ class Asm:
         self.push(pack_pair(w, h))
         self.push(r)
         self.push(color)
-        self.builtin(Builtin.ROUNDED_RECT)
+        self._emit(Op.ROUNDED_RECT)
 
     def fill_rounded_rect(self, x, y, w, h, r, color):
         """Emit fillRoundedRect built-in."""
@@ -683,7 +796,7 @@ class Asm:
         self.push(pack_pair(w, h))
         self.push(r)
         self.push(color)
-        self.builtin(Builtin.FILL_ROUNDED_RECT)
+        self._emit(Op.FILL_ROUNDED_RECT)
 
     def draw_arc(self, cx, cy, r, start, end, color):
         """Emit arc built-in. Angles in degrees (0=right, 90=down)."""
@@ -692,7 +805,7 @@ class Asm:
         self.push(start)
         self.push(end)
         self.push(color)
-        self.builtin(Builtin.ARC)
+        self._emit(Op.ARC)
 
     # --- Output ---
 
@@ -722,27 +835,40 @@ class Asm:
 # ============================================================
 
 OP_NAMES = {
-    0: 'HALT', 1: 'PUSH', 2: 'POP', 3: 'LOAD', 4: 'STORE',
-    5: 'ADD', 6: 'SUB', 7: 'EQ', 8: 'LT', 9: 'JMP', 10: 'JZ',
-    11: 'JNZ', 12: 'W_TARGET', 13: 'W_SET', 14: 'W_GET', 15: 'W_DIRTY',
-    16: 'DUP', 17: 'SWAP', 18: 'MUL', 19: 'DIV', 20: 'MOD', 21: 'NEG',
-    22: 'AND', 23: 'OR', 24: 'NOT', 25: 'NE', 26: 'LE', 27: 'GE',
-    28: 'GT', 29: 'CALL', 30: 'RET', 31: 'YIELD', 32: 'W_RENDER',
-    33: 'W_ALLOC', 34: 'W_PARENT', 35: 'F_READ', 36: 'F_WRITE',
-    37: 'ARR_ALLOC', 38: 'ARR_LOAD', 39: 'ARR_STORE', 40: 'ARR_LEN',
-    41: 'BUILTIN',
-    42: 'ITOF', 43: 'FTOI',
-    44: 'FADD', 45: 'FSUB', 46: 'FMUL', 47: 'FDIV', 48: 'FNEG',
-    49: 'FEQ', 50: 'FLT', 51: 'FLE', 52: 'FGT', 53: 'FGE', 54: 'FNE',
-}
+    0x00: 'HALT', 0x01: 'POP', 0x02: 'DUP', 0x03: 'SWAP',
+    0x04: 'ADD', 0x05: 'SUB', 0x06: 'MUL', 0x07: 'DIV',
+    0x08: 'MOD', 0x09: 'NEG', 0x0A: 'AND', 0x0B: 'OR',
+    0x0C: 'NOT', 0x0D: 'EQ', 0x0E: 'NE', 0x0F: 'LT',
+    0x10: 'LE', 0x11: 'GT', 0x12: 'GE', 0x13: 'RET',
+    0x14: 'YIELD', 0x15: 'W_DIRTY', 0x16: 'W_RENDER',
+    0x17: 'ARR_LOAD', 0x18: 'ARR_STORE', 0x19: 'ARR_LEN',
+    0x1A: 'W_ALLOC',
 
-BUILTIN_NAMES = {
-    0: 'fillRect', 1: 'rect', 2: 'line', 3: 'circle',
-    4: 'fillCircle', 5: 'drawImage', 6: 'drawText', 7: 'delay',
-    8: 'str', 9: 'itos', 10: 'ftos', 11: 'concat',
-    12: 'parseInt', 13: 'parseFloat', 14: 'strLen',
-    15: 'setText', 16: 'drawStr', 17: 'strClear', 18: 'strFree',
-    19: 'roundedRect', 20: 'fillRoundedRect', 21: 'arc',
+    0x20: 'PUSH_0', 0x21: 'PUSH_1', 0x22: 'PUSH_2', 0x23: 'PUSH_M1',
+    0x24: 'LOAD_0', 0x25: 'LOAD_1', 0x26: 'LOAD_2', 0x27: 'LOAD_3', 0x28: 'LOAD_4',
+    0x29: 'STORE_0', 0x2A: 'STORE_1', 0x2B: 'STORE_2', 0x2C: 'STORE_3', 0x2D: 'STORE_4',
+
+    0x30: 'PUSH_I8', 0x31: 'PUSH_I16', 0x32: 'PUSH_I32',
+    0x33: 'LOAD', 0x34: 'STORE',
+    0x35: 'JMP', 0x36: 'JZ', 0x37: 'JNZ', 0x38: 'CALL',
+    0x39: 'W_TARGET', 0x3A: 'W_SET', 0x3B: 'W_GET', 0x3C: 'W_PARENT',
+    0x3D: 'W_SET_LEN', 0x3E: 'ARR_ALLOC', 0x3F: 'ARR_INIT',
+    0x40: 'F_READ', 0x41: 'F_WRITE',
+
+    0x80: 'fillRect', 0x81: 'rect', 0x82: 'line', 0x83: 'circle',
+    0x84: 'fillCircle', 0x85: 'drawImage', 0x86: 'drawTextLit',
+    0x87: 'delay', 0x88: 'strLit', 0x89: 'itos', 0x8A: 'ftos',
+    0x8B: 'concat', 0x8C: 'parseInt', 0x8D: 'parseFloat',
+    0x8E: 'strLen', 0x8F: 'setText', 0x90: 'drawStr',
+    0x91: 'strClear', 0x92: 'strFree',
+    0x93: 'roundedRect', 0x94: 'fillRoundedRect', 0x95: 'arc',
+    0x96: 'beginFrame', 0x97: 'endFrame',
+    0x98: 'sendUsart', 0x99: 'sendUsartStr',
+
+    0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
+    0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
+    0xC7: 'feq', 0xC8: 'flt', 0xC9: 'fle',
+    0xCA: 'fgt', 0xCB: 'fge', 0xCC: 'fne',
 }
 
 PROP_NAMES = {
@@ -761,6 +887,15 @@ PROP_NAMES = {
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
 
+# Set of no-arg opcodes for disassembler
+_NO_ARG_OPS = (
+    set(range(0x00, 0x1B)) |           # 0x00-0x1A
+    set(range(0x20, 0x2E)) |           # 0x20-0x2D
+    {op for op in range(0x80, 0x9A)    # 0x80-0x99 except 0x86, 0x88
+     if op not in (0x86, 0x88)} |
+    set(range(0xC0, 0xCD))             # 0xC0-0xCC
+)
+
 
 def disassemble(data):
     """Disassemble bytecode to human-readable text."""
@@ -768,120 +903,123 @@ def disassemble(data):
     pos = 0
     while pos < len(data):
         addr = pos
-        try:
-            tag, consumed = decode_varint(data, pos)
-        except ValueError:
-            lines.append(f'{addr:04X}: ??? (truncated)')
-            break
-        pos += consumed
+        op = data[pos]
+        pos += 1
+        name = OP_NAMES.get(op, f'??? (0x{op:02X})')
 
-        wt = tag & 7
-        opcode = tag >> 3
-        name = OP_NAMES.get(opcode, f'OP_{opcode}')
-
-        if wt == WT.NO_ARG:
+        # No-arg ops
+        if op in _NO_ARG_OPS:
             lines.append(f'{addr:04X}: {name}')
 
-        elif wt == WT.VARINT:
-            try:
-                val, consumed = decode_svarint(data, pos)
-            except ValueError:
-                lines.append(f'{addr:04X}: {name} ??? (truncated)')
-                break
-            pos += consumed
+        # PUSH_I8
+        elif op == Op.PUSH_I8:
+            val = struct.unpack_from('<b', data, pos)[0]
+            pos += 1
+            lines.append(f'{addr:04X}: PUSH {val}')
 
-            if opcode == Op.BUILTIN:
-                bname = BUILTIN_NAMES.get(val, f'method_{val}')
-                lines.append(f'{addr:04X}: {name} {bname}')
-            elif opcode in (Op.W_SET, Op.W_GET):
-                pname = PROP_NAMES.get(val, f'0x{val:02X}')
-                lines.append(f'{addr:04X}: {name} {pname}')
-            elif opcode == Op.W_TARGET:
-                lines.append(f'{addr:04X}: {name} #{val}')
-            elif opcode == Op.W_PARENT:
-                lines.append(f'{addr:04X}: {name} #{val}')
-            elif opcode == Op.PUSH:
-                if val > 255:
-                    lines.append(f'{addr:04X}: {name} {val} (0x{val & 0xFFFF:04X})')
-                else:
-                    lines.append(f'{addr:04X}: {name} {val}')
-            else:
-                lines.append(f'{addr:04X}: {name} {val}')
-
-        elif wt == WT.I16:
-            if pos + 2 > len(data):
-                lines.append(f'{addr:04X}: {name} ??? (truncated)')
-                break
-            val = struct.unpack_from('<H', data, pos)[0]
+        # PUSH_I16
+        elif op == Op.PUSH_I16:
+            val = struct.unpack_from('<h', data, pos)[0]
             pos += 2
-            lines.append(f'{addr:04X}: {name} @{val:04X}')
+            lines.append(f'{addr:04X}: PUSH {val} (0x{val & 0xFFFF:04X})')
 
-        elif wt == WT.LEN:
-            try:
-                length, consumed = decode_varint(data, pos)
-            except ValueError:
-                lines.append(f'{addr:04X}: {name} ??? (truncated)')
-                break
-            pos += consumed
-            if pos + length > len(data):
-                lines.append(f'{addr:04X}: {name} ??? (payload truncated)')
-                break
-            payload = data[pos:pos + length]
-            pos += length
+        # PUSH_I32
+        elif op == Op.PUSH_I32:
+            val = struct.unpack_from('<i', data, pos)[0]
+            pos += 4
+            lines.append(f'{addr:04X}: PUSH {val} (0x{val & 0xFFFFFFFF:08X})')
 
-            if opcode == Op.BUILTIN and len(payload) > 0:
-                mid = payload[0]
-                bname = BUILTIN_NAMES.get(mid, f'method_{mid}')
-                text_data = payload[1:]
-                if mid in (Builtin.DRAW_TEXT, Builtin.STR) and text_data:
-                    try:
-                        txt = text_data.decode('utf-8')
-                        lines.append(f'{addr:04X}: {name} {bname} "{txt}"')
-                    except UnicodeDecodeError:
-                        hex_str = ' '.join(f'{b:02X}' for b in text_data)
-                        lines.append(f'{addr:04X}: {name} {bname} [{hex_str}]')
-                else:
-                    hex_str = ' '.join(f'{b:02X}' for b in text_data)
-                    lines.append(f'{addr:04X}: {name} {bname} [{hex_str}]')
-            elif opcode == Op.W_SET and len(payload) > 0:
-                prop_id = payload[0]
-                pname = PROP_NAMES.get(prop_id, f'0x{prop_id:02X}')
-                vals = []
-                p = 1
-                while p < len(payload):
-                    try:
-                        v, c = decode_svarint(payload, p)
-                        vals.append(str(v))
-                        p += c
-                    except ValueError:
-                        break
-                lines.append(f'{addr:04X}: {name} {pname} [{", ".join(vals)}]')
-            elif opcode == Op.F_READ and len(payload) >= 6:
-                flash_addr = struct.unpack_from('<I', payload)[0]
-                read_len = struct.unpack_from('<H', payload, 4)[0]
-                lines.append(f'{addr:04X}: {name} 0x{flash_addr:08X} len={read_len}')
-            elif opcode == Op.ARR_ALLOC:
+        # LOAD / STORE with u8 slot
+        elif op == Op.LOAD:
+            slot = data[pos]; pos += 1
+            lines.append(f'{addr:04X}: LOAD {slot}')
+        elif op == Op.STORE:
+            slot = data[pos]; pos += 1
+            lines.append(f'{addr:04X}: STORE {slot}')
+
+        # JMP/JZ/JNZ/CALL with u16 target
+        elif op in (Op.JMP, Op.JZ, Op.JNZ, Op.CALL):
+            target = struct.unpack_from('<H', data, pos)[0]
+            pos += 2
+            lines.append(f'{addr:04X}: {name} @{target:04X}')
+
+        # W_TARGET, W_SET, W_GET, W_PARENT with u8 arg
+        elif op == Op.W_TARGET:
+            wid = data[pos]; pos += 1
+            lines.append(f'{addr:04X}: W_TARGET {wid}')
+        elif op == Op.W_SET:
+            prop = data[pos]; pos += 1
+            pname = PROP_NAMES.get(prop, f'0x{prop:02X}')
+            lines.append(f'{addr:04X}: W_SET {pname}')
+        elif op == Op.W_GET:
+            prop = data[pos]; pos += 1
+            pname = PROP_NAMES.get(prop, f'0x{prop:02X}')
+            lines.append(f'{addr:04X}: W_GET {pname}')
+        elif op == Op.W_PARENT:
+            pid = data[pos]; pos += 1
+            lines.append(f'{addr:04X}: W_PARENT {pid}')
+
+        # W_SET_LEN: prop_id + len + data
+        elif op == Op.W_SET_LEN:
+            prop = data[pos]; pos += 1
+            length = data[pos]; pos += 1
+            payload = data[pos:pos+length]; pos += length
+            pname = PROP_NAMES.get(prop, f'0x{prop:02X}')
+            if prop == Prop.TEXT:
+                try:
+                    text = bytes(payload).decode('utf-8')
+                    lines.append(f'{addr:04X}: W_SET {pname} "{text}"')
+                except Exception:
+                    lines.append(f'{addr:04X}: W_SET {pname} [{" ".join(f"0x{b:02X}" for b in payload)}]')
+            else:
                 vals = []
                 p = 0
                 while p < len(payload):
-                    try:
-                        v, c = decode_svarint(payload, p)
-                        vals.append(str(v))
-                        p += c
-                    except ValueError:
-                        break
-                lines.append(f'{addr:04X}: {name} [{", ".join(vals)}]')
-            elif opcode == Op.F_WRITE and len(payload) >= 4:
-                flash_addr = struct.unpack_from('<I', payload)[0]
-                dlen = len(payload) - 4
-                lines.append(f'{addr:04X}: {name} 0x{flash_addr:08X} [{dlen}B]')
-            else:
-                hex_str = ' '.join(f'{b:02X}' for b in payload)
-                lines.append(f'{addr:04X}: {name} [{hex_str}]')
+                    v, c = _decode_svarint(payload, p)
+                    vals.append(str(v))
+                    p += c
+                lines.append(f'{addr:04X}: W_SET {pname} ({", ".join(vals)})')
+
+        # ARR_ALLOC: u8 size
+        elif op == Op.ARR_ALLOC:
+            size = data[pos]; pos += 1
+            lines.append(f'{addr:04X}: ARR_ALLOC {size}')
+
+        # ARR_INIT: u8 count + i32 values
+        elif op == Op.ARR_INIT:
+            count = data[pos]; pos += 1
+            vals = []
+            for _ in range(count):
+                v = struct.unpack_from('<i', data, pos)[0]
+                vals.append(str(v))
+                pos += 4
+            lines.append(f'{addr:04X}: ARR_INIT [{", ".join(vals)}]')
+
+        # F_READ: u32 addr + u16 len
+        elif op == Op.F_READ:
+            faddr = struct.unpack_from('<I', data, pos)[0]; pos += 4
+            flen = struct.unpack_from('<H', data, pos)[0]; pos += 2
+            lines.append(f'{addr:04X}: F_READ 0x{faddr:08X} len={flen}')
+
+        # F_WRITE: u32 addr + u8 len + data
+        elif op == Op.F_WRITE:
+            faddr = struct.unpack_from('<I', data, pos)[0]; pos += 4
+            flen = data[pos]; pos += 1
+            pos += flen
+            lines.append(f'{addr:04X}: F_WRITE 0x{faddr:08X} len={flen}')
+
+        # DRAW_TEXT_LIT, STR_LIT: u8 len + text
+        elif op in (Op.DRAW_TEXT_LIT, Op.STR_LIT):
+            length = data[pos]; pos += 1
+            text_bytes = data[pos:pos+length]; pos += length
+            try:
+                text = bytes(text_bytes).decode('utf-8')
+                lines.append(f'{addr:04X}: {name} "{text}"')
+            except Exception:
+                lines.append(f'{addr:04X}: {name} [{length} bytes]')
 
         else:
-            lines.append(f'{addr:04X}: ??? wt={wt} opcode={opcode}')
-            break
+            lines.append(f'{addr:04X}: ??? 0x{op:02X}')
 
     return '\n'.join(lines)
 
@@ -933,7 +1071,7 @@ PROP_MAP = {
     'on_paint': (Prop.ON_PAINT, False),
     'on_tap': (Prop.ON_TAP, False),
     'text': (Prop.TEXT, True),
-    'text_id': (Prop.TEXT, True),  # alias — same underlying prop
+    'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }
 
 
@@ -992,6 +1130,9 @@ class Compiler:
         self._on_page_changing = 0xFFFF
         self._on_page_changed = 0xFFFF
         self._on_user_message = 0xFFFF
+        self._on_touch_down = 0xFFFF
+        self._on_touch_up = 0xFFFF
+        self._on_touch_move = 0xFFFF
 
     # --- Widget management ---
 
@@ -1186,28 +1327,52 @@ class Compiler:
             raise ValueError(f"Unknown function: {func_name}")
         self._on_user_message = self._funcs[func_name][2]
 
+    def on_touch_down(self, func_name):
+        """Register on_touch_down callback. Function receives (x, y).
+        Fires on touch press event."""
+        if func_name not in self._funcs:
+            raise ValueError(f"Unknown function: {func_name}")
+        self._on_touch_down = self._funcs[func_name][2]
+
+    def on_touch_up(self, func_name):
+        """Register on_touch_up callback. Function receives no arguments.
+        Fires on touch release event."""
+        if func_name not in self._funcs:
+            raise ValueError(f"Unknown function: {func_name}")
+        self._on_touch_up = self._funcs[func_name][2]
+
+    def on_touch_move(self, func_name):
+        """Register on_touch_move callback. Function receives (x, y).
+        Fires while touch is held and moving."""
+        if func_name not in self._funcs:
+            raise ValueError(f"Unknown function: {func_name}")
+        self._on_touch_move = self._funcs[func_name][2]
+
     def build_meta(self):
         """Build callback metadata binary.
 
         Format:
-          Header (8 bytes):
+          Header (16 bytes):
             func_count(u16) + on_program_start(u16) + on_page_changing(u16)
-            + on_page_changed(u16)
+            + on_page_changed(u16) + on_user_message(u16) + on_touch_down(u16)
+            + on_touch_up(u16) + on_touch_move(u16)
           Function table:
-            [func_id(u16) + offset(u16) + arg_count(u8)] × N
-          Extended system callbacks (after function table):
-            on_user_message(u16)
+            [func_id(u16) + offset(u16) + arg_count(u8)] x N
         """
         func_list = list(self._funcs.values())
         buf = bytearray()
+        # Header (16 bytes)
         buf.extend(struct.pack('<H', len(func_list)))
         buf.extend(struct.pack('<H', self._on_program_start))
         buf.extend(struct.pack('<H', self._on_page_changing))
         buf.extend(struct.pack('<H', self._on_page_changed))
+        buf.extend(struct.pack('<H', self._on_user_message))
+        buf.extend(struct.pack('<H', self._on_touch_down))
+        buf.extend(struct.pack('<H', self._on_touch_up))
+        buf.extend(struct.pack('<H', self._on_touch_move))
+        # Function table
         for func_id, arg_count, offset in func_list:
             buf.extend(struct.pack('<HHB', func_id, offset, arg_count))
-        # Extended: on_user_message (after function table)
-        buf.extend(struct.pack('<H', self._on_user_message))
         return bytes(buf)
 
     def has_callbacks(self):

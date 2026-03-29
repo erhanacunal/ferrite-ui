@@ -15,7 +15,8 @@ Python API:
 
 import sys
 import struct
-from ferrite_cc import (Asm, Op, WT, Prop, Builtin, disassemble, encode_svarint,
+from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
+                        disassemble, encode_svarint,
                         _resolve_prop, PROP_MAP, pack_pair, float_bits)
 
 
@@ -664,6 +665,7 @@ NO_VALUE_BUILTINS = {
     'setText', 'drawStr', 'strClear', 'strFree',
     'roundedRect', 'fillRoundedRect', 'arc',
     'beginFrame', 'endFrame',
+    'sendUsart',
 }
 
 
@@ -683,6 +685,14 @@ class CodeGen:
         # Phase 1: Pre-allocate main variable slots (count only)
         main_slots = self._count_var_slots(program.statements)
         self._fn_base = main_slots
+
+        # Phase 1b: Pre-scan main statements for alloc() calls to populate widget_ids.
+        # This allows functions (compiled in Phase 3) to reference widgets by name.
+        for stmt in program.statements:
+            if isinstance(stmt, VarDecl) and stmt.init is not None:
+                if isinstance(stmt.init, CallExpr) and stmt.init.name == 'alloc':
+                    self.widget_ids[stmt.name] = self.next_widget_id
+                    self.next_widget_id += 1
 
         # Phase 2: Register functions
         for fn in program.functions:
@@ -843,8 +853,9 @@ class CodeGen:
             # Scalar variable
             if node.init is not None:
                 if isinstance(node.init, CallExpr) and node.init.name == 'alloc':
-                    self.widget_ids[node.name] = self.next_widget_id
-                    self.next_widget_id += 1
+                    if node.name not in self.widget_ids:
+                        self.widget_ids[node.name] = self.next_widget_id
+                        self.next_widget_id += 1
                 self._gen_expr(node.init)
             else:
                 self.asm.push(0)
@@ -1345,6 +1356,22 @@ class CodeGen:
             self.asm.builtin(Builtin.END_FRAME)
             return
 
+        if name == 'sendUsart':
+            # sendUsart(array_or_str) — send bytes via USART
+            if len(node.args) != 1:
+                raise CompileError("sendUsart() takes 1 argument: array or str_id", node.line)
+            arg = node.args[0]
+            if isinstance(arg, VarRef) and arg.name in self.array_vars:
+                # Array variable — load arr_id, use array builtin
+                slot = self._var_slot(arg.name, node.line)
+                self.asm.load(slot)
+                self.asm.builtin(Builtin.SEND_USART)
+            else:
+                # String expression (str_id) — use string builtin
+                self._gen_expr(arg)
+                self.asm.builtin(Builtin.SEND_USART_STR)
+            return
+
         # --- User-defined function ---
         if name not in self.functions:
             raise CompileError(f"undefined function: {name}", node.line)
@@ -1361,7 +1388,7 @@ class CodeGen:
         if info['addr'] is not None:
             self.asm.call(info['addr'])
         else:
-            self.asm._emit_tag(Op.CALL, WT.I16)
+            self.asm._emit(Op.CALL)
             info['patches'].append(self.asm.pos)
             self.asm._emit(b'\x00\x00')
 
@@ -1462,6 +1489,93 @@ def compile(source, filename="<input>"):
         raise CompileError(f"internal error: {e}")
 
 
+# System callback name → (registration_method, expected_arg_count)
+SYSTEM_CALLBACKS = {
+    'on_program_start': ('on_program_start', 0),
+    'on_page_changing':  ('on_page_changing', 2),
+    'on_page_changed':   ('on_page_changed', 1),
+    'on_user_message':   ('on_user_message', 1),
+    'on_touch_down':     ('on_touch_down', 2),
+    'on_touch_up':       ('on_touch_up', 0),
+    'on_touch_move':     ('on_touch_move', 2),
+}
+
+
+def compile_with_meta(source, filename="<input>"):
+    """Compile source code to (bytecode, metadata_or_None).
+
+    Detects functions named as system callbacks (on_program_start, on_touch_down, etc.)
+    and automatically generates callback metadata.
+    """
+    try:
+        tokens = tokenize(source)
+        parser = Parser(tokens)
+        program = parser.parse()
+
+        sys_cbs = {}
+        for fn in program.functions:
+            if fn.name in SYSTEM_CALLBACKS:
+                method, expected_args = SYSTEM_CALLBACKS[fn.name]
+                if len(fn.params) != expected_args:
+                    raise CompileError(
+                        f"{fn.name}() expects {expected_args} parameter(s), got {len(fn.params)}",
+                        fn.line if hasattr(fn, 'line') else 0)
+                sys_cbs[fn.name] = method
+
+        codegen = CodeGen()
+        bytecode = codegen.generate(program)
+
+        if not sys_cbs and not any(
+            info['addr'] is not None for info in codegen.functions.values()
+        ):
+            return bytecode, None
+
+        cc = CcCompiler()
+        for fn_name, info in codegen.functions.items():
+            if info['addr'] is not None:
+                cc.define_func(fn_name, arg_count=len(
+                    [fn for fn in program.functions if fn.name == fn_name][0].params
+                ))
+                cc._funcs[fn_name] = (cc._funcs[fn_name][0], len(
+                    [fn for fn in program.functions if fn.name == fn_name][0].params
+                ), info['addr'])
+
+        for fn_name, method in sys_cbs.items():
+            getattr(cc, method)(fn_name)
+
+        metadata = cc.build_meta() if cc.has_callbacks() else None
+        return bytecode, metadata
+
+    except CompileError:
+        raise
+    except Exception as e:
+        raise CompileError(f"internal error: {e}")
+
+
+def build_image(source, filename="<input>"):
+    """Compile source to execute image format: header + bytecode + metadata.
+
+    Image format (12-byte header):
+      [0..2]  magic: "FX"
+      [2..4]  version: u16 LE (1)
+      [4..6]  program_size: u16 LE
+      [6..8]  metadata_size: u16 LE (0 = no metadata)
+      [8..12] reserved (zeros)
+      [12..]  program bytecode
+      [12+program_size..] metadata (if any)
+    """
+    bytecode, metadata = compile_with_meta(source, filename)
+    meta_bytes = metadata if metadata else b''
+
+    header = bytearray(12)
+    header[0:2] = b'FX'
+    struct.pack_into('<H', header, 2, 1)
+    struct.pack_into('<H', header, 4, len(bytecode))
+    struct.pack_into('<H', header, 6, len(meta_bytes))
+
+    return bytes(header) + bytecode + meta_bytes
+
+
 def compile_page(source, bg_color=0x0000, filename="<input>"):
     """Compile source to page format: bg_color(u16 LE) + bytecode."""
     bytecode = compile(source, filename)
@@ -1481,6 +1595,8 @@ def main():
     parser.add_argument('-o', '--output', help='Output binary file')
     parser.add_argument('--page', type=str, default=None,
                         help='Page mode: bg_color as hex (e.g. 0x0000)')
+    parser.add_argument('--image', action='store_true',
+                        help='Output execute image (header + bytecode + metadata)')
     parser.add_argument('--disasm', action='store_true', help='Print disassembly')
     parser.add_argument('--hexdump', action='store_true', help='Print hex dump')
     args = parser.parse_args()
@@ -1489,34 +1605,50 @@ def main():
         source = f.read()
 
     try:
-        if args.page is not None:
+        if args.image:
+            output = build_image(source, args.source)
+            raw_code = output[12:12 + struct.unpack_from('<H', output, 4)[0]]
+        elif args.page is not None:
             bg = int(args.page, 0)
-            bytecode = compile_page(source, bg, args.source)
+            output = compile_page(source, bg, args.source)
+            raw_code = output[2:]
         else:
-            bytecode = compile(source, args.source)
+            output = compile(source, args.source)
+            raw_code = output
     except CompileError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    raw_code = bytecode[2:] if args.page is not None else bytecode
-
     if args.output:
         with open(args.output, 'wb') as f:
-            f.write(bytecode)
-        print(f"{args.source} -> {args.output} ({len(bytecode)} bytes)")
+            f.write(output)
+        msg = f"{args.source} -> {args.output} ({len(output)} bytes)"
+        if args.image:
+            prog_sz = struct.unpack_from('<H', output, 4)[0]
+            meta_sz = struct.unpack_from('<H', output, 6)[0]
+            msg += f" (program: {prog_sz}B, metadata: {meta_sz}B)"
+        print(msg)
 
     if args.disasm:
         if args.page is not None:
-            bg = struct.unpack_from('<H', bytecode)[0]
+            bg = struct.unpack_from('<H', output)[0]
             print(f'; page bg_color: 0x{bg:04X}')
+        if args.image:
+            prog_sz = struct.unpack_from('<H', output, 4)[0]
+            meta_sz = struct.unpack_from('<H', output, 6)[0]
+            print(f'; image v1: program={prog_sz}B metadata={meta_sz}B')
         print(disassemble(raw_code))
 
     if args.hexdump:
         a = Asm()
-        a._buf = bytearray(bytecode)
+        a._buf = bytearray(output)
         print(a.hexdump())
 
     if not args.output and not args.disasm and not args.hexdump:
+        if args.image:
+            prog_sz = struct.unpack_from('<H', output, 4)[0]
+            meta_sz = struct.unpack_from('<H', output, 6)[0]
+            print(f'; image v1: program={prog_sz}B metadata={meta_sz}B')
         print(disassemble(raw_code))
 
 

@@ -11,107 +11,122 @@ use crate::proto::{
     PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L, PROP_MARGIN_R, PROP_MARGIN_T, PROP_PADDING,
     PROP_IMAGE_ID, PROP_ON_CLICK, PROP_ON_PAINT, PROP_ON_TAP,
     PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
-    PROP_PRESS_COLOR, PROP_SIZE,
-    PROP_SIZE_H, PROP_SIZE_W, PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VISIBLE, WT_I16,
-    WT_LEN, WT_NO_ARG, WT_VARINT,
+    PROP_PRESS_COLOR, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W,
+    PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VISIBLE,
 };
 use crate::render;
 use crate::types::{Edges, Offset, Size};
 use crate::widget::{WidgetId, FLAG_CLICKABLE, FLAG_ENABLED, FLAG_VISIBLE};
 
-// --- Opcodes ---
+// --- 1-byte opcode map (IL-style) ---
 
-// Primary (0–15): 1-byte tag
-pub(crate) const OP_HALT: u8 = 0;
-pub(crate) const OP_PUSH: u8 = 1;
-pub(crate) const OP_POP: u8 = 2;
-pub(crate) const OP_LOAD: u8 = 3;
-pub(crate) const OP_STORE: u8 = 4;
-pub(crate) const OP_ADD: u8 = 5;
-pub(crate) const OP_SUB: u8 = 6;
-pub(crate) const OP_EQ: u8 = 7;
-pub(crate) const OP_LT: u8 = 8;
-pub(crate) const OP_JMP: u8 = 9;
-pub(crate) const OP_JZ: u8 = 10;
-pub(crate) const OP_JNZ: u8 = 11;
-pub(crate) const OP_W_TARGET: u8 = 12;
-pub(crate) const OP_W_SET: u8 = 13;
-pub(crate) const OP_W_GET: u8 = 14;
-pub(crate) const OP_W_DIRTY: u8 = 15;
+// No-arg instructions (1 byte total)
+const OP_HALT: u8 = 0x00;
+const OP_POP: u8 = 0x01;
+const OP_DUP: u8 = 0x02;
+const OP_SWAP: u8 = 0x03;
+const OP_ADD: u8 = 0x04;
+const OP_SUB: u8 = 0x05;
+const OP_MUL: u8 = 0x06;
+const OP_DIV: u8 = 0x07;
+const OP_MOD: u8 = 0x08;
+const OP_NEG: u8 = 0x09;
+const OP_AND: u8 = 0x0A;
+const OP_OR: u8 = 0x0B;
+const OP_NOT: u8 = 0x0C;
+const OP_EQ: u8 = 0x0D;
+const OP_NE: u8 = 0x0E;
+const OP_LT: u8 = 0x0F;
+const OP_LE: u8 = 0x10;
+const OP_GT: u8 = 0x11;
+const OP_GE: u8 = 0x12;
+const OP_RET: u8 = 0x13;
+const OP_YIELD: u8 = 0x14;
+const OP_W_DIRTY: u8 = 0x15;
+const OP_W_RENDER: u8 = 0x16;
+const OP_ARR_LOAD: u8 = 0x17;
+const OP_ARR_STORE: u8 = 0x18;
+const OP_ARR_LEN: u8 = 0x19;
+const OP_W_ALLOC: u8 = 0x1A;
 
-// Extended (16+): 2-byte tag
-pub(crate) const OP_DUP: u8 = 16;
-pub(crate) const OP_SWAP: u8 = 17;
-pub(crate) const OP_MUL: u8 = 18;
-pub(crate) const OP_DIV: u8 = 19;
-pub(crate) const OP_MOD: u8 = 20;
-pub(crate) const OP_NEG: u8 = 21;
-pub(crate) const OP_AND: u8 = 22;
-pub(crate) const OP_OR: u8 = 23;
-pub(crate) const OP_NOT: u8 = 24;
-pub(crate) const OP_NE: u8 = 25;
-pub(crate) const OP_LE: u8 = 26;
-pub(crate) const OP_GE: u8 = 27;
-pub(crate) const OP_GT: u8 = 28;
-pub(crate) const OP_CALL: u8 = 29;
-pub(crate) const OP_RET: u8 = 30;
-pub(crate) const OP_YIELD: u8 = 31;
-pub(crate) const OP_W_RENDER: u8 = 32;
-pub(crate) const OP_W_ALLOC: u8 = 33;
-pub(crate) const OP_W_PARENT: u8 = 34;
-pub(crate) const OP_F_READ: u8 = 35;
-pub(crate) const OP_F_WRITE: u8 = 36;
-pub(crate) const OP_ARR_ALLOC: u8 = 37; // varint=size (zero-fill) | LEN=packed init data
-pub(crate) const OP_ARR_LOAD: u8 = 38;  // [arr_id, idx] → [value]
-pub(crate) const OP_ARR_STORE: u8 = 39; // [arr_id, idx, val] → []
-pub(crate) const OP_ARR_LEN: u8 = 40;   // [arr_id] → [len]
-pub(crate) const OP_BUILTIN: u8 = 41;   // varint=method_id (stack args) | LEN=method_id+payload
+// Specialized short forms (1 byte, no args)
+const OP_PUSH_0: u8 = 0x20;
+const OP_PUSH_1: u8 = 0x21;
+const OP_PUSH_2: u8 = 0x22;
+const OP_PUSH_M1: u8 = 0x23;
+const OP_LOAD_0: u8 = 0x24;
+const OP_LOAD_1: u8 = 0x25;
+const OP_LOAD_2: u8 = 0x26;
+const OP_LOAD_3: u8 = 0x27;
+const OP_LOAD_4: u8 = 0x28;
+const OP_STORE_0: u8 = 0x29;
+const OP_STORE_1: u8 = 0x2A;
+const OP_STORE_2: u8 = 0x2B;
+const OP_STORE_3: u8 = 0x2C;
+const OP_STORE_4: u8 = 0x2D;
 
-// Float32 (soft-float, all no-arg — operands from stack)
-pub(crate) const OP_ITOF: u8 = 42;  // [i32] → [f32 bits]
-pub(crate) const OP_FTOI: u8 = 43;  // [f32 bits] → [i32]
-pub(crate) const OP_FADD: u8 = 44;  // [a, b] → [a + b]  (f32)
-pub(crate) const OP_FSUB: u8 = 45;  // [a, b] → [a - b]  (f32)
-pub(crate) const OP_FMUL: u8 = 46;  // [a, b] → [a * b]  (f32)
-pub(crate) const OP_FDIV: u8 = 47;  // [a, b] → [a / b]  (f32)
-pub(crate) const OP_FNEG: u8 = 48;  // [a] → [-a]        (f32)
-pub(crate) const OP_FEQ: u8 = 49;   // [a, b] → [i32 0/1]
-pub(crate) const OP_FLT: u8 = 50;   // [a, b] → [i32 0/1]
-pub(crate) const OP_FLE: u8 = 51;   // [a, b] → [i32 0/1]
-pub(crate) const OP_FGT: u8 = 52;   // [a, b] → [i32 0/1]
-pub(crate) const OP_FGE: u8 = 53;   // [a, b] → [i32 0/1]
-pub(crate) const OP_FNE: u8 = 54;   // [a, b] → [i32 0/1]
+// With fixed-size arguments
+const OP_PUSH_I8: u8 = 0x30;   // + i8
+const OP_PUSH_I16: u8 = 0x31;  // + i16 LE
+const OP_PUSH_I32: u8 = 0x32;  // + i32 LE
+const OP_LOAD: u8 = 0x33;      // + u8 slot
+const OP_STORE: u8 = 0x34;     // + u8 slot
+const OP_JMP: u8 = 0x35;       // + u16 target
+const OP_JZ: u8 = 0x36;        // + u16 target
+const OP_JNZ: u8 = 0x37;       // + u16 target
+const OP_CALL: u8 = 0x38;      // + u16 target
+const OP_W_TARGET: u8 = 0x39;  // + u8 widget_id
+const OP_W_SET: u8 = 0x3A;     // + u8 prop_id (value from stack)
+const OP_W_GET: u8 = 0x3B;     // + u8 prop_id
+const OP_W_PARENT: u8 = 0x3C;  // + u8 parent_id
+const OP_W_SET_LEN: u8 = 0x3D; // + u8 prop_id + u8 len + data
+const OP_ARR_ALLOC: u8 = 0x3E; // + u8 size
+const OP_ARR_INIT: u8 = 0x3F;  // + u8 count + i32 values LE
+const OP_F_READ: u8 = 0x40;    // + u32 addr + u16 len
+const OP_F_WRITE: u8 = 0x41;   // + u32 addr + u8 len + data
 
-// --- Built-in method IDs ---
+// Builtins as first-class opcodes (args on stack)
+const OP_FILL_RECT: u8 = 0x80;
+const OP_RECT: u8 = 0x81;
+const OP_LINE: u8 = 0x82;
+const OP_CIRCLE: u8 = 0x83;
+const OP_FILL_CIRCLE: u8 = 0x84;
+const OP_DRAW_IMAGE: u8 = 0x85;
+const OP_DRAW_TEXT_LIT: u8 = 0x86; // + u8 len + text
+const OP_DELAY: u8 = 0x87;
+const OP_STR_LIT: u8 = 0x88;       // + u8 len + text
+const OP_ITOS: u8 = 0x89;
+const OP_FTOS: u8 = 0x8A;
+const OP_CONCAT: u8 = 0x8B;
+const OP_PARSE_INT: u8 = 0x8C;
+const OP_PARSE_FLOAT: u8 = 0x8D;
+const OP_STR_LEN: u8 = 0x8E;
+const OP_SET_TEXT: u8 = 0x8F;
+const OP_DRAW_STR: u8 = 0x90;
+const OP_STR_CLEAR: u8 = 0x91;
+const OP_STR_FREE: u8 = 0x92;
+const OP_ROUNDED_RECT: u8 = 0x93;
+const OP_FILL_ROUNDED_RECT: u8 = 0x94;
+const OP_ARC: u8 = 0x95;
+const OP_BEGIN_FRAME: u8 = 0x96;
+const OP_END_FRAME: u8 = 0x97;
+const OP_SEND_USART: u8 = 0x98;
+const OP_SEND_USART_STR: u8 = 0x99;
 
-const BUILTIN_FILL_RECT: u8 = 0;  // stack: [color, size, loc]
-const BUILTIN_RECT: u8 = 1;       // stack: [color, size, loc]
-const BUILTIN_LINE: u8 = 2;       // stack: [color, end, start]
-const BUILTIN_CIRCLE: u8 = 3;     // stack: [color, radius, center]
-const BUILTIN_FILL_CIRCLE: u8 = 4;// stack: [color, radius, center]
-const BUILTIN_DRAW_IMAGE: u8 = 5; // stack: [image_id, loc]
-const BUILTIN_DRAW_TEXT: u8 = 6;  // stack: [colors, font_id, loc] + LEN payload=text
-const BUILTIN_DELAY: u8 = 7;      // stack: [ms]
-
-// String operations (strpool)
-const BUILTIN_STR: u8 = 8;         // LEN: payload=bytes → [str_id]
-const BUILTIN_ITOS: u8 = 9;        // stack: [i32] → [str_id]
-const BUILTIN_FTOS: u8 = 10;       // stack: [f32_bits] → [str_id]
-const BUILTIN_CONCAT: u8 = 11;     // stack: [str_b, str_a] → [str_id]
-const BUILTIN_PARSE_INT: u8 = 12;  // stack: [str_id] → [i32]
-const BUILTIN_PARSE_FLOAT: u8 = 13;// stack: [str_id] → [f32_bits]
-const BUILTIN_STR_LEN: u8 = 14;    // stack: [str_id] → [len]
-const BUILTIN_SET_TEXT: u8 = 15;    // stack: [str_id] → sets target widget text
-const BUILTIN_DRAW_STR: u8 = 16;   // stack: [str_id, colors, font_id, loc] → draw
-const BUILTIN_STR_CLEAR: u8 = 17;  // no args → smart clear (preserves widget text)
-const BUILTIN_STR_FREE: u8 = 18;   // stack: [str_id] → marks string for next clear
-
-// Drawing: rounded rect & arc
-const BUILTIN_ROUNDED_RECT: u8 = 19;      // stack: [color, r, size, loc]
-const BUILTIN_FILL_ROUNDED_RECT: u8 = 20; // stack: [color, r, size, loc]
-const BUILTIN_ARC: u8 = 21;               // stack: [color, end, start, radius, center]
-const BUILTIN_BEGIN_FRAME: u8 = 22;       // no args — toggle back buffer
-const BUILTIN_END_FRAME: u8 = 23;         // no args — swap front ← back
+// Float ops (all no-arg)
+const OP_ITOF: u8 = 0xC0;
+const OP_FTOI: u8 = 0xC1;
+const OP_FADD: u8 = 0xC2;
+const OP_FSUB: u8 = 0xC3;
+const OP_FMUL: u8 = 0xC4;
+const OP_FDIV: u8 = 0xC5;
+const OP_FNEG: u8 = 0xC6;
+const OP_FEQ: u8 = 0xC7;
+const OP_FLT: u8 = 0xC8;
+const OP_FLE: u8 = 0xC9;
+const OP_FGT: u8 = 0xCA;
+const OP_FGE: u8 = 0xCB;
+const OP_FNE: u8 = 0xCC;
 
 // --- VM State ---
 
@@ -130,6 +145,7 @@ pub enum VmState {
 const STACK_SIZE: usize = 16;
 const VAR_COUNT: usize = 32;
 const CALL_STACK_SIZE: usize = 8;
+
 /// Internal heap-allocated VM array.
 struct VmArray {
     id: u16,
@@ -145,10 +161,8 @@ pub struct Vm {
     call_sp: u8,
     target: WidgetId,
     pub state: VmState,
-    // Heap-allocated arrays
     arrays: Vec<VmArray>,
     next_arr_id: u16,
-    // Non-blocking delay target tick
     pub wait_until: u32,
 }
 
@@ -169,18 +183,18 @@ impl Vm {
         }
     }
 
-    /// Set target widget (for page bytecode etc.).
     pub fn set_target(&mut self, id: WidgetId) {
         self.target = id;
     }
 
-    /// Set program counter (used to jump to callback function offset).
     pub fn set_pc(&mut self, pc: u16) {
         self.pc = pc;
     }
 
-    /// Read the return value left on stack after a callback runs.
-    /// Returns 0 if stack is empty.
+    pub fn pc(&self) -> u16 {
+        self.pc
+    }
+
     pub fn pop_result(&mut self) -> i32 {
         if self.sp > 0 {
             self.sp -= 1;
@@ -190,7 +204,6 @@ impl Vm {
         }
     }
 
-    /// Push an argument onto the stack (used before running a callback).
     pub fn push_arg(&mut self, val: i32) {
         if (self.sp as usize) < STACK_SIZE {
             self.stack[self.sp as usize] = val;
@@ -198,7 +211,6 @@ impl Vm {
         }
     }
 
-    /// Reset VM state (for new program or callback invocation)
     pub fn reset(&mut self) {
         self.pc = 0;
         self.sp = 0;
@@ -210,8 +222,6 @@ impl Vm {
         self.wait_until = 0;
     }
 
-    /// Allocate an array from external data and return its ID.
-    /// Used by main loop to pass user message data to callbacks.
     pub fn alloc_array_from(&mut self, data: &[u8]) -> Option<i32> {
         if data.is_empty() {
             return None;
@@ -223,7 +233,6 @@ impl Vm {
         Some(id as i32)
     }
 
-    /// Run program until halt/yield/error
     pub fn run(&mut self, code: &[u8], ctx: &mut Ctx) {
         self.state = VmState::Running;
         while self.state == VmState::Running {
@@ -231,65 +240,499 @@ impl Vm {
         }
     }
 
-    /// Execute a single instruction
+    // --- Byte reading helpers ---
+
+    #[inline]
+    fn read_u8(&mut self, code: &[u8]) -> u8 {
+        let pos = self.pc as usize;
+        if pos < code.len() {
+            self.pc += 1;
+            code[pos]
+        } else {
+            self.state = VmState::Error;
+            0
+        }
+    }
+
+    #[inline]
+    fn read_i8(&mut self, code: &[u8]) -> i8 {
+        self.read_u8(code) as i8
+    }
+
+    #[inline]
+    fn read_u16(&mut self, code: &[u8]) -> u16 {
+        let pos = self.pc as usize;
+        if pos + 2 <= code.len() {
+            self.pc += 2;
+            u16::from_le_bytes([code[pos], code[pos + 1]])
+        } else {
+            self.state = VmState::Error;
+            0
+        }
+    }
+
+    #[inline]
+    fn read_i16(&mut self, code: &[u8]) -> i16 {
+        self.read_u16(code) as i16
+    }
+
+    #[inline]
+    fn read_i32(&mut self, code: &[u8]) -> i32 {
+        let pos = self.pc as usize;
+        if pos + 4 <= code.len() {
+            self.pc += 4;
+            i32::from_le_bytes([code[pos], code[pos + 1], code[pos + 2], code[pos + 3]])
+        } else {
+            self.state = VmState::Error;
+            0
+        }
+    }
+
+    #[inline]
+    fn read_u32(&mut self, code: &[u8]) -> u32 {
+        self.read_i32(code) as u32
+    }
+
+    // --- Execute a single instruction ---
+
     pub fn step(&mut self, code: &[u8], ctx: &mut Ctx) {
-        let (tag, consumed) = match proto::decode_varint(code, self.pc as usize) {
-            Some(v) => v,
-            None => {
-                self.state = VmState::Error;
-                return;
+        let op = self.read_u8(code);
+        if self.state == VmState::Error {
+            return;
+        }
+
+        match op {
+            // --- No-arg: stack, arithmetic, logic, comparison ---
+            OP_HALT => self.state = VmState::Halted,
+            OP_POP => { self.pop(); }
+            OP_DUP => { let v = self.peek(); self.push(v); }
+            OP_SWAP => {
+                if self.sp >= 2 {
+                    let i = (self.sp - 1) as usize;
+                    let j = (self.sp - 2) as usize;
+                    self.stack.swap(i, j);
+                } else {
+                    self.state = VmState::Error;
+                }
             }
-        };
-        self.pc += consumed as u16;
+            OP_ADD => { let b = self.pop(); let a = self.pop(); self.push(a.wrapping_add(b)); }
+            OP_SUB => { let b = self.pop(); let a = self.pop(); self.push(a.wrapping_sub(b)); }
+            OP_MUL => { let b = self.pop(); let a = self.pop(); self.push(a.wrapping_mul(b)); }
+            OP_DIV => { let b = self.pop(); let a = self.pop(); self.push(if b != 0 { a / b } else { 0 }); }
+            OP_MOD => { let b = self.pop(); let a = self.pop(); self.push(if b != 0 { a % b } else { 0 }); }
+            OP_NEG => { let a = self.pop(); self.push(a.wrapping_neg()); }
+            OP_AND => { let b = self.pop(); let a = self.pop(); self.push(a & b); }
+            OP_OR  => { let b = self.pop(); let a = self.pop(); self.push(a | b); }
+            OP_NOT => { let a = self.pop(); self.push(if a == 0 { 1 } else { 0 }); }
+            OP_EQ  => { let b = self.pop(); let a = self.pop(); self.push(if a == b { 1 } else { 0 }); }
+            OP_NE  => { let b = self.pop(); let a = self.pop(); self.push(if a != b { 1 } else { 0 }); }
+            OP_LT  => { let b = self.pop(); let a = self.pop(); self.push(if a < b { 1 } else { 0 }); }
+            OP_LE  => { let b = self.pop(); let a = self.pop(); self.push(if a <= b { 1 } else { 0 }); }
+            OP_GT  => { let b = self.pop(); let a = self.pop(); self.push(if a > b { 1 } else { 0 }); }
+            OP_GE  => { let b = self.pop(); let a = self.pop(); self.push(if a >= b { 1 } else { 0 }); }
+            OP_RET => {
+                if self.call_sp > 0 {
+                    self.call_sp -= 1;
+                    self.pc = self.call_stack[self.call_sp as usize];
+                } else {
+                    self.state = VmState::Error;
+                }
+            }
+            OP_YIELD => self.state = VmState::Yielded,
+            OP_W_DIRTY => {
+                if self.target.is_some() { ctx.tree.mark_dirty(self.target); }
+            }
+            OP_W_RENDER => render::render_dirty(ctx),
+            OP_ARR_LOAD => {
+                let idx = self.pop();
+                let arr_id = self.pop();
+                self.arr_load(arr_id, idx);
+            }
+            OP_ARR_STORE => {
+                let val = self.pop();
+                let idx = self.pop();
+                let arr_id = self.pop();
+                self.arr_store(arr_id, idx, val);
+            }
+            OP_ARR_LEN => {
+                let arr_id = self.pop();
+                self.arr_len(arr_id);
+            }
+            OP_W_ALLOC => {
+                if let Some(id) = ctx.tree.alloc() {
+                    self.push(id.0 as i32);
+                } else {
+                    self.state = VmState::Error;
+                }
+            }
 
-        let wire_type = (tag & 0x07) as u8;
-        let opcode = (tag >> 3) as u8;
+            // --- Specialized short forms ---
+            OP_PUSH_0  => self.push(0),
+            OP_PUSH_1  => self.push(1),
+            OP_PUSH_2  => self.push(2),
+            OP_PUSH_M1 => self.push(-1),
+            OP_LOAD_0  => self.push(self.vars[0]),
+            OP_LOAD_1  => self.push(self.vars[1]),
+            OP_LOAD_2  => self.push(self.vars[2]),
+            OP_LOAD_3  => self.push(self.vars[3]),
+            OP_LOAD_4  => self.push(self.vars[4]),
+            OP_STORE_0 => { let v = self.pop(); self.vars[0] = v; }
+            OP_STORE_1 => { let v = self.pop(); self.vars[1] = v; }
+            OP_STORE_2 => { let v = self.pop(); self.vars[2] = v; }
+            OP_STORE_3 => { let v = self.pop(); self.vars[3] = v; }
+            OP_STORE_4 => { let v = self.pop(); self.vars[4] = v; }
 
-        match wire_type {
-            WT_NO_ARG => self.exec_no_arg(opcode, ctx),
-            WT_VARINT => {
-                let (val, consumed) =
-                    match proto::decode_signed_varint(code, self.pc as usize) {
-                        Some(v) => v,
-                        None => {
-                            self.state = VmState::Error;
-                            return;
+            // --- With arguments ---
+            OP_PUSH_I8 => {
+                let val = self.read_i8(code) as i32;
+                self.push(val);
+            }
+            OP_PUSH_I16 => {
+                let val = self.read_i16(code) as i32;
+                self.push(val);
+            }
+            OP_PUSH_I32 => {
+                let val = self.read_i32(code);
+                self.push(val);
+            }
+            OP_LOAD => {
+                let slot = self.read_u8(code) as usize;
+                if slot < VAR_COUNT {
+                    self.push(self.vars[slot]);
+                } else {
+                    self.state = VmState::Error;
+                }
+            }
+            OP_STORE => {
+                let slot = self.read_u8(code) as usize;
+                if slot < VAR_COUNT {
+                    self.vars[slot] = self.pop();
+                } else {
+                    self.state = VmState::Error;
+                }
+            }
+            OP_JMP => {
+                let target = self.read_u16(code);
+                self.pc = target;
+            }
+            OP_JZ => {
+                let target = self.read_u16(code);
+                if self.pop() == 0 { self.pc = target; }
+            }
+            OP_JNZ => {
+                let target = self.read_u16(code);
+                if self.pop() != 0 { self.pc = target; }
+            }
+            OP_CALL => {
+                let target = self.read_u16(code);
+                if (self.call_sp as usize) < CALL_STACK_SIZE {
+                    self.call_stack[self.call_sp as usize] = self.pc;
+                    self.call_sp += 1;
+                    self.pc = target;
+                } else {
+                    self.state = VmState::Error;
+                }
+            }
+            OP_W_TARGET => {
+                let wid = self.read_u8(code);
+                self.target = WidgetId(wid);
+            }
+            OP_W_SET => {
+                let prop_id = self.read_u8(code);
+                let val = self.pop();
+                if self.target.is_some() {
+                    self.set_scalar_prop(ctx, prop_id, val);
+                    if prop_id == PROP_FONT_ID {
+                        if let Some(fs) = ctx.fs.as_ref() {
+                            ctx.fonts.find_or_load(val as u8, fs, &ctx.flash);
                         }
-                    };
-                self.pc += consumed as u16;
-                self.exec_varint(opcode, val, ctx);
-            }
-            WT_I16 => {
-                let pos = self.pc as usize;
-                if pos + 2 > code.len() {
-                    self.state = VmState::Error;
-                    return;
-                }
-                let val = u16::from_le_bytes([code[pos], code[pos + 1]]);
-                self.pc += 2;
-                self.exec_i16(opcode, val);
-            }
-            WT_LEN => {
-                let (len, consumed) = match proto::decode_varint(code, self.pc as usize) {
-                    Some(v) => v,
-                    None => {
-                        self.state = VmState::Error;
-                        return;
                     }
-                };
-                self.pc += consumed as u16;
+                    if prop_id == PROP_IMAGE_ID {
+                        if let Some(fs) = ctx.fs.as_ref() {
+                            ctx.images.find_or_load(val as u8, fs, &ctx.flash);
+                        }
+                    }
+                }
+            }
+            OP_W_GET => {
+                let prop_id = self.read_u8(code);
+                if self.target.is_some() {
+                    let v = self.get_scalar_prop(ctx, prop_id);
+                    self.push(v);
+                } else {
+                    self.push(0);
+                }
+            }
+            OP_W_PARENT => {
+                let parent = self.read_u8(code);
+                if self.target.is_some() {
+                    ctx.tree.add_child(WidgetId(parent), self.target);
+                }
+            }
+            OP_W_SET_LEN => {
+                let prop_id = self.read_u8(code);
+                let len = self.read_u8(code) as usize;
                 let start = self.pc as usize;
-                let end = start + len as usize;
-                if end > code.len() {
+                let end = start + len;
+                if end <= code.len() {
+                    let data = &code[start..end];
+                    self.pc = end as u16;
+                    if self.target.is_some() {
+                        self.set_compound_prop(prop_id, data, ctx);
+                    }
+                } else {
+                    self.state = VmState::Error;
+                }
+            }
+            OP_ARR_ALLOC => {
+                let size = self.read_u8(code) as u16;
+                self.arr_alloc(size);
+            }
+            OP_ARR_INIT => {
+                let count = self.read_u8(code) as usize;
+                let start = self.pc as usize;
+                let byte_len = count * 4;
+                if start + byte_len <= code.len() {
+                    let mut values: Vec<i32> = Vec::with_capacity(count);
+                    for i in 0..count {
+                        let off = start + i * 4;
+                        let v = i32::from_le_bytes([
+                            code[off], code[off + 1], code[off + 2], code[off + 3],
+                        ]);
+                        values.push(v);
+                    }
+                    self.pc = (start + byte_len) as u16;
+                    let id = self.next_arr_id;
+                    self.arrays.push(VmArray { id, data: values });
+                    self.next_arr_id = self.next_arr_id.wrapping_add(1);
+                    self.push(id as i32);
+                } else {
+                    self.state = VmState::Error;
+                }
+            }
+            OP_F_READ => {
+                let addr = self.read_u32(code);
+                let len = self.read_u16(code) as usize;
+                if len > (STACK_SIZE - self.sp as usize) {
                     self.state = VmState::Error;
                     return;
                 }
-                self.exec_len(opcode, &code[start..end], ctx);
-                self.pc = end as u16;
+                let mut buf = [0u8; STACK_SIZE];
+                let read_len = if len > STACK_SIZE { STACK_SIZE } else { len };
+                ctx.flash.read(addr, &mut buf[..read_len]);
+                for i in 0..read_len {
+                    self.push(buf[i] as i32);
+                }
             }
-            _ => {
-                self.state = VmState::Error;
+            OP_F_WRITE => {
+                let addr = self.read_u32(code);
+                let len = self.read_u8(code) as usize;
+                let start = self.pc as usize;
+                if start + len <= code.len() {
+                    let data = &code[start..start + len];
+                    self.pc = (start + len) as u16;
+                    if !data.is_empty() {
+                        ctx.flash.write(addr, data);
+                    }
+                } else {
+                    self.state = VmState::Error;
+                }
             }
+
+            // --- Builtins (args on stack) ---
+            OP_FILL_RECT => {
+                let color = self.pop() as u16;
+                let (w, h) = unpack_pair(self.pop());
+                let (x, y) = unpack_pair(self.pop());
+                ctx.lcd.fill_rect(x, y, w, h, color);
+            }
+            OP_RECT => {
+                let color = self.pop() as u16;
+                let (w, h) = unpack_pair(self.pop());
+                let (x, y) = unpack_pair(self.pop());
+                ctx.lcd.draw_rect(x, y, w, h, color);
+            }
+            OP_LINE => {
+                let color = self.pop() as u16;
+                let (x1, y1) = unpack_pair(self.pop());
+                let (x0, y0) = unpack_pair(self.pop());
+                ctx.lcd.draw_line(x0 as i16, y0 as i16, x1 as i16, y1 as i16, color);
+            }
+            OP_CIRCLE => {
+                let color = self.pop() as u16;
+                let radius = self.pop() as i16;
+                let (cx, cy) = unpack_pair(self.pop());
+                ctx.lcd.draw_circle(cx as i16, cy as i16, radius, color);
+            }
+            OP_FILL_CIRCLE => {
+                let color = self.pop() as u16;
+                let radius = self.pop() as i16;
+                let (cx, cy) = unpack_pair(self.pop());
+                ctx.lcd.fill_circle(cx as i16, cy as i16, radius, color);
+            }
+            OP_DRAW_IMAGE => {
+                let image_id = self.pop() as u8;
+                let (x, y) = unpack_pair(self.pop());
+                if let Some(img) = ctx.images.find(image_id) {
+                    img.draw(&ctx.lcd, &ctx.flash, x, y);
+                }
+            }
+            OP_DRAW_TEXT_LIT => {
+                // Inline text: u8 len + text bytes, stack: [colors, font_id, loc]
+                let len = self.read_u8(code) as usize;
+                let start = self.pc as usize;
+                if start + len <= code.len() {
+                    let text = &code[start..start + len];
+                    self.pc = (start + len) as u16;
+                    let colors = self.pop();
+                    let (fg, bg) = unpack_pair(colors);
+                    let font_id = self.pop() as u8;
+                    let (x, y) = unpack_pair(self.pop());
+                    if let Some(font) = ctx.fonts.resolve(font_id) {
+                        let bg_opt = if bg == 0 { None } else { Some(bg) };
+                        font.draw_str(&ctx.lcd, &ctx.flash, text, x as i16, y as i16, fg, bg_opt);
+                    }
+                } else {
+                    self.state = VmState::Error;
+                }
+            }
+            OP_DELAY => {
+                let ms = self.pop() as u32;
+                self.wait_until = systick::millis().wrapping_add(ms);
+                self.state = VmState::Waiting;
+            }
+            OP_STR_LIT => {
+                // Inline text: u8 len + text bytes → allocate in pool, push str_id
+                let len = self.read_u8(code) as usize;
+                let start = self.pc as usize;
+                if start + len <= code.len() {
+                    let text = &code[start..start + len];
+                    self.pc = (start + len) as u16;
+                    match ctx.strpool.alloc(text) {
+                        Some(id) => self.push(id as i32),
+                        None => self.state = VmState::Error,
+                    }
+                } else {
+                    self.state = VmState::Error;
+                }
+            }
+            OP_ITOS => {
+                let val = self.pop();
+                match strpool::itos(&mut ctx.strpool, val) {
+                    Some(id) => self.push(id as i32),
+                    None => self.state = VmState::Error,
+                }
+            }
+            OP_FTOS => {
+                let bits = self.pop() as u32;
+                match strpool::ftos(&mut ctx.strpool, bits) {
+                    Some(id) => self.push(id as i32),
+                    None => self.state = VmState::Error,
+                }
+            }
+            OP_CONCAT => {
+                let b = self.pop() as u16;
+                let a = self.pop() as u16;
+                match ctx.strpool.concat(a, b) {
+                    Some(id) => self.push(id as i32),
+                    None => self.state = VmState::Error,
+                }
+            }
+            OP_PARSE_INT => {
+                let id = self.pop() as u16;
+                self.push(strpool::parse_int(&ctx.strpool, id));
+            }
+            OP_PARSE_FLOAT => {
+                let id = self.pop() as u16;
+                self.push(strpool::parse_float(&ctx.strpool, id) as i32);
+            }
+            OP_STR_LEN => {
+                let id = self.pop() as u16;
+                self.push(ctx.strpool.len(id) as i32);
+            }
+            OP_SET_TEXT => {
+                let str_id = self.pop() as u16;
+                if self.target.is_some() {
+                    ctx.tree.get_mut(self.target).text_id = str_id;
+                }
+            }
+            OP_DRAW_STR => {
+                let str_id = self.pop() as u16;
+                let colors = self.pop();
+                let (fg, bg) = unpack_pair(colors);
+                let font_id = self.pop() as u8;
+                let (x, y) = unpack_pair(self.pop());
+                let data = ctx.strpool.get(str_id);
+                if let Some(font) = ctx.fonts.resolve(font_id) {
+                    let bg_opt = if bg == 0 { None } else { Some(bg) };
+                    font.draw_str(&ctx.lcd, &ctx.flash, data, x as i16, y as i16, fg, bg_opt);
+                }
+            }
+            OP_STR_CLEAR => ctx.strpool.smart_clear(&mut ctx.tree),
+            OP_STR_FREE => {
+                let str_id = self.pop() as u16;
+                ctx.strpool.free(str_id);
+            }
+            OP_ROUNDED_RECT => {
+                let color = self.pop() as u16;
+                let r = self.pop() as u16;
+                let (w, h) = unpack_pair(self.pop());
+                let (x, y) = unpack_pair(self.pop());
+                ctx.lcd.draw_rounded_rect(x, y, w, h, r, color);
+            }
+            OP_FILL_ROUNDED_RECT => {
+                let color = self.pop() as u16;
+                let r = self.pop() as u16;
+                let (w, h) = unpack_pair(self.pop());
+                let (x, y) = unpack_pair(self.pop());
+                ctx.lcd.fill_rounded_rect(x, y, w, h, r, color);
+            }
+            OP_ARC => {
+                let color = self.pop() as u16;
+                let end = self.pop() as i16;
+                let start = self.pop() as i16;
+                let radius = self.pop() as i16;
+                let (cx, cy) = unpack_pair(self.pop());
+                ctx.lcd.draw_arc(cx as i16, cy as i16, radius, start, end, color);
+            }
+            OP_BEGIN_FRAME => ctx.lcd.begin_frame(),
+            OP_END_FRAME => ctx.lcd.end_frame(),
+            OP_SEND_USART => {
+                let arr_id = self.pop() as u16;
+                if let Some(arr) = self.arrays.iter().find(|a| a.id == arr_id) {
+                    for &val in &arr.data {
+                        crate::usart::dbg(&[val as u8]);
+                    }
+                }
+            }
+            OP_SEND_USART_STR => {
+                let str_id = self.pop() as u16;
+                let bytes = ctx.strpool.get(str_id);
+                crate::usart::dbg(bytes);
+            }
+
+            // --- Float32 (soft-float) ---
+            OP_ITOF => {
+                let i = self.pop();
+                self.push((i as f32).to_bits() as i32);
+            }
+            OP_FTOI => {
+                let bits = self.pop() as u32;
+                self.push(f32::from_bits(bits) as i32);
+            }
+            OP_FADD => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push((a + b).to_bits() as i32); }
+            OP_FSUB => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push((a - b).to_bits() as i32); }
+            OP_FMUL => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push((a * b).to_bits() as i32); }
+            OP_FDIV => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if b != 0.0 { a / b } else { 0.0 }.to_bits() as i32); }
+            OP_FNEG => { let a = f32::from_bits(self.pop() as u32); self.push((-a).to_bits() as i32); }
+            OP_FEQ => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a == b { 1 } else { 0 }); }
+            OP_FLT => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a < b { 1 } else { 0 }); }
+            OP_FLE => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a <= b { 1 } else { 0 }); }
+            OP_FGT => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a > b { 1 } else { 0 }); }
+            OP_FGE => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a >= b { 1 } else { 0 }); }
+            OP_FNE => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a != b { 1 } else { 0 }); }
+
+            _ => self.state = VmState::Error,
         }
     }
 
@@ -319,385 +762,6 @@ impl Vm {
             self.stack[(self.sp - 1) as usize]
         } else {
             0
-        }
-    }
-
-    // --- Dispatch: no-arg instructions (wt=5) ---
-
-    fn exec_no_arg(&mut self, opcode: u8, ctx: &mut Ctx) {
-        match opcode {
-            OP_HALT => {
-                self.state = VmState::Halted;
-            }
-            OP_POP => {
-                self.pop();
-            }
-            OP_ADD => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(a.wrapping_add(b));
-            }
-            OP_SUB => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(a.wrapping_sub(b));
-            }
-            OP_EQ => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(if a == b { 1 } else { 0 });
-            }
-            OP_LT => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(if a < b { 1 } else { 0 });
-            }
-            OP_W_DIRTY => {
-                if self.target.is_some() {
-                    ctx.tree.mark_dirty(self.target);
-                }
-            }
-            OP_DUP => {
-                let val = self.peek();
-                self.push(val);
-            }
-            OP_SWAP => {
-                if self.sp >= 2 {
-                    let i = (self.sp - 1) as usize;
-                    let j = (self.sp - 2) as usize;
-                    self.stack.swap(i, j);
-                } else {
-                    self.state = VmState::Error;
-                }
-            }
-            OP_MUL => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(a.wrapping_mul(b));
-            }
-            OP_DIV => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(if b != 0 { a / b } else { 0 });
-            }
-            OP_MOD => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(if b != 0 { a % b } else { 0 });
-            }
-            OP_NEG => {
-                let a = self.pop();
-                self.push(a.wrapping_neg());
-            }
-            OP_AND => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(a & b);
-            }
-            OP_OR => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(a | b);
-            }
-            OP_NOT => {
-                let a = self.pop();
-                self.push(if a == 0 { 1 } else { 0 });
-            }
-            OP_NE => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(if a != b { 1 } else { 0 });
-            }
-            OP_LE => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(if a <= b { 1 } else { 0 });
-            }
-            OP_GE => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(if a >= b { 1 } else { 0 });
-            }
-            OP_GT => {
-                let b = self.pop();
-                let a = self.pop();
-                self.push(if a > b { 1 } else { 0 });
-            }
-            OP_RET => {
-                if self.call_sp > 0 {
-                    self.call_sp -= 1;
-                    self.pc = self.call_stack[self.call_sp as usize];
-                } else {
-                    self.state = VmState::Error;
-                }
-            }
-            OP_YIELD => {
-                self.state = VmState::Yielded;
-            }
-            OP_W_RENDER => {
-                render::render_dirty(ctx);
-            }
-            OP_W_ALLOC => {
-                if let Some(id) = ctx.tree.alloc() {
-                    self.push(id.0 as i32);
-                } else {
-                    self.state = VmState::Error;
-                }
-            }
-            OP_ARR_LOAD => {
-                let idx = self.pop();
-                let arr_id = self.pop();
-                self.arr_load(arr_id, idx);
-            }
-            OP_ARR_STORE => {
-                let val = self.pop();
-                let idx = self.pop();
-                let arr_id = self.pop();
-                self.arr_store(arr_id, idx, val);
-            }
-            OP_ARR_LEN => {
-                let arr_id = self.pop();
-                self.arr_len(arr_id);
-            }
-            // --- Float32 (soft-float) ---
-            OP_ITOF => {
-                let i = self.pop();
-                let f = (i as f32).to_bits() as i32;
-                self.push(f);
-            }
-            OP_FTOI => {
-                let bits = self.pop() as u32;
-                let f = f32::from_bits(bits);
-                self.push(f as i32);
-            }
-            OP_FADD => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
-                self.push((a + b).to_bits() as i32);
-            }
-            OP_FSUB => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
-                self.push((a - b).to_bits() as i32);
-            }
-            OP_FMUL => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
-                self.push((a * b).to_bits() as i32);
-            }
-            OP_FDIV => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
-                let r = if b != 0.0 { a / b } else { 0.0 };
-                self.push(r.to_bits() as i32);
-            }
-            OP_FNEG => {
-                let a = f32::from_bits(self.pop() as u32);
-                self.push((-a).to_bits() as i32);
-            }
-            OP_FEQ => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
-                self.push(if a == b { 1 } else { 0 });
-            }
-            OP_FLT => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
-                self.push(if a < b { 1 } else { 0 });
-            }
-            OP_FLE => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
-                self.push(if a <= b { 1 } else { 0 });
-            }
-            OP_FGT => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
-                self.push(if a > b { 1 } else { 0 });
-            }
-            OP_FGE => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
-                self.push(if a >= b { 1 } else { 0 });
-            }
-            OP_FNE => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
-                self.push(if a != b { 1 } else { 0 });
-            }
-            _ => {
-                self.state = VmState::Error;
-            }
-        }
-    }
-
-    // --- Dispatch: varint arg instructions (wt=0) ---
-
-    fn exec_varint(&mut self, opcode: u8, val: i32, ctx: &mut Ctx) {
-        match opcode {
-            OP_PUSH => {
-                self.push(val);
-            }
-            OP_LOAD => {
-                let idx = val as usize;
-                if idx < VAR_COUNT {
-                    self.push(self.vars[idx]);
-                } else {
-                    self.state = VmState::Error;
-                }
-            }
-            OP_STORE => {
-                let idx = val as usize;
-                if idx < VAR_COUNT {
-                    self.vars[idx] = self.pop();
-                } else {
-                    self.state = VmState::Error;
-                }
-            }
-            OP_W_TARGET => {
-                self.target = WidgetId(val as u8);
-            }
-            OP_W_SET => {
-                let prop_id = val as u8;
-                let stack_val = self.pop();
-                if self.target.is_some() {
-                    self.set_scalar_prop(ctx, prop_id, stack_val);
-                    // When font_id is set, try to load the font from flash
-                    if prop_id == PROP_FONT_ID {
-                        if let Some(fs) = ctx.fs.as_ref() {
-                            ctx.fonts.find_or_load(stack_val as u8, fs, &ctx.flash);
-                        }
-                    }
-                    // When image_id is set, try to load the image from flash
-                    if prop_id == PROP_IMAGE_ID {
-                        if let Some(fs) = ctx.fs.as_ref() {
-                            ctx.images.find_or_load(stack_val as u8, fs, &ctx.flash);
-                        }
-                    }
-                }
-            }
-            OP_W_GET => {
-                let prop_id = val as u8;
-                if self.target.is_some() {
-                    let v = self.get_scalar_prop(ctx, prop_id);
-                    self.push(v);
-                } else {
-                    self.push(0);
-                }
-            }
-            OP_W_PARENT => {
-                let parent = WidgetId(val as u8);
-                if self.target.is_some() {
-                    ctx.tree.add_child(parent, self.target);
-                }
-            }
-            OP_ARR_ALLOC => {
-                self.arr_alloc(val as u16);
-            }
-            OP_BUILTIN => {
-                self.exec_builtin_varint(val as u8, ctx);
-            }
-            _ => {
-                self.state = VmState::Error;
-            }
-        }
-    }
-
-    // --- Dispatch: i16 arg instructions (wt=1) ---
-
-    fn exec_i16(&mut self, opcode: u8, val: u16) {
-        match opcode {
-            OP_JMP => {
-                self.pc = val;
-            }
-            OP_JZ => {
-                let cond = self.pop();
-                if cond == 0 {
-                    self.pc = val;
-                }
-            }
-            OP_JNZ => {
-                let cond = self.pop();
-                if cond != 0 {
-                    self.pc = val;
-                }
-            }
-            OP_CALL => {
-                if (self.call_sp as usize) < CALL_STACK_SIZE {
-                    self.call_stack[self.call_sp as usize] = self.pc;
-                    self.call_sp += 1;
-                    self.pc = val;
-                } else {
-                    self.state = VmState::Error;
-                }
-            }
-            _ => {
-                self.state = VmState::Error;
-            }
-        }
-    }
-
-    // --- Dispatch: LEN payload instructions (wt=2) ---
-
-    fn exec_len(&mut self, opcode: u8, payload: &[u8], ctx: &mut Ctx) {
-        match opcode {
-            OP_W_SET => {
-                if payload.is_empty() {
-                    self.state = VmState::Error;
-                    return;
-                }
-                let prop_id = payload[0];
-                let data = &payload[1..];
-                if self.target.is_some() {
-                    self.set_compound_prop(prop_id, data, ctx);
-                }
-            }
-            OP_F_READ => {
-                if payload.len() < 6 {
-                    self.state = VmState::Error;
-                    return;
-                }
-                let addr =
-                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
-                if len > (STACK_SIZE - self.sp as usize) {
-                    self.state = VmState::Error;
-                    return;
-                }
-                let mut buf = [0u8; STACK_SIZE];
-                let read_len = if len > STACK_SIZE { STACK_SIZE } else { len };
-                ctx.flash.read(addr, &mut buf[..read_len]);
-                for i in 0..read_len {
-                    self.push(buf[i] as i32);
-                }
-            }
-            OP_F_WRITE => {
-                if payload.len() < 4 {
-                    self.state = VmState::Error;
-                    return;
-                }
-                let addr =
-                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let data = &payload[4..];
-                if !data.is_empty() {
-                    ctx.flash.write(addr, data);
-                }
-            }
-            OP_ARR_ALLOC => {
-                self.arr_alloc_init(payload);
-            }
-            OP_BUILTIN => {
-                if payload.is_empty() {
-                    self.state = VmState::Error;
-                    return;
-                }
-                let method_id = payload[0];
-                let data = &payload[1..];
-                self.exec_builtin_len(method_id, data, ctx);
-            }
-            _ => {
-                self.state = VmState::Error;
-            }
         }
     }
 
@@ -747,27 +811,9 @@ impl Vm {
             PROP_LOC_Y => w.location.y as i32,
             PROP_SIZE_W => w.size.w as i32,
             PROP_SIZE_H => w.size.h as i32,
-            PROP_VISIBLE => {
-                if w.flags & FLAG_VISIBLE != 0 {
-                    1
-                } else {
-                    0
-                }
-            }
-            PROP_ENABLED => {
-                if w.flags & FLAG_ENABLED != 0 {
-                    1
-                } else {
-                    0
-                }
-            }
-            PROP_CLICKABLE => {
-                if w.flags & FLAG_CLICKABLE != 0 {
-                    1
-                } else {
-                    0
-                }
-            }
+            PROP_VISIBLE => if w.flags & FLAG_VISIBLE != 0 { 1 } else { 0 },
+            PROP_ENABLED => if w.flags & FLAG_ENABLED != 0 { 1 } else { 0 },
+            PROP_CLICKABLE => if w.flags & FLAG_CLICKABLE != 0 { 1 } else { 0 },
             PROP_BG_COLOR => w.background_color as i32,
             PROP_BORDER_COLOR => w.border_color as i32,
             PROP_MARGIN_T => w.margin.top as i32,
@@ -796,7 +842,6 @@ impl Vm {
     }
 
     fn set_compound_prop(&mut self, prop_id: u8, data: &[u8], ctx: &mut Ctx) {
-        // PROP_TEXT: payload = raw text bytes → allocate in StringPool, set text_id
         if prop_id == PROP_TEXT {
             if self.target.is_some() {
                 if let Some(str_id) = ctx.strpool.alloc(data) {
@@ -813,228 +858,28 @@ impl Vm {
         let w = ctx.tree.get_mut(self.target);
         match prop_id {
             PROP_LOCATION if count >= 2 => {
-                w.location = Offset {
-                    x: vals[0] as i16,
-                    y: vals[1] as i16,
-                };
+                w.location = Offset { x: vals[0] as i16, y: vals[1] as i16 };
             }
             PROP_SIZE if count >= 2 => {
-                w.size = Size {
-                    w: vals[0] as u16,
-                    h: vals[1] as u16,
-                };
+                w.size = Size { w: vals[0] as u16, h: vals[1] as u16 };
             }
             PROP_MARGIN if count >= 4 => {
-                w.margin = Edges::new(
-                    vals[0] as u8,
-                    vals[1] as u8,
-                    vals[2] as u8,
-                    vals[3] as u8,
-                );
+                w.margin = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
             }
             PROP_BORDER_EDGES if count >= 4 => {
-                w.border = Edges::new(
-                    vals[0] as u8,
-                    vals[1] as u8,
-                    vals[2] as u8,
-                    vals[3] as u8,
-                );
+                w.border = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
             }
             PROP_PADDING if count >= 4 => {
-                w.padding = Edges::new(
-                    vals[0] as u8,
-                    vals[1] as u8,
-                    vals[2] as u8,
-                    vals[3] as u8,
-                );
+                w.padding = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
             }
             _ => {}
-        }
-    }
-
-    // --- Built-in methods (varint variant: stack-only args) ---
-
-    fn exec_builtin_varint(&mut self, method_id: u8, ctx: &mut Ctx) {
-        match method_id {
-            BUILTIN_FILL_RECT => {
-                // stack: [color, size, loc]
-                let color = self.pop() as u16;
-                let (w, h) = unpack_pair(self.pop());
-                let (x, y) = unpack_pair(self.pop());
-                ctx.lcd.fill_rect(x, y, w, h, color);
-            }
-            BUILTIN_RECT => {
-                // stack: [color, size, loc]
-                let color = self.pop() as u16;
-                let (w, h) = unpack_pair(self.pop());
-                let (x, y) = unpack_pair(self.pop());
-                ctx.lcd.draw_rect(x, y, w, h, color);
-            }
-            BUILTIN_LINE => {
-                // stack: [color, end, start]
-                let color = self.pop() as u16;
-                let (x1, y1) = unpack_pair(self.pop());
-                let (x0, y0) = unpack_pair(self.pop());
-                ctx.lcd.draw_line(x0 as i16, y0 as i16, x1 as i16, y1 as i16, color);
-            }
-            BUILTIN_CIRCLE => {
-                // stack: [color, radius, center]
-                let color = self.pop() as u16;
-                let radius = self.pop() as i16;
-                let (cx, cy) = unpack_pair(self.pop());
-                ctx.lcd.draw_circle(cx as i16, cy as i16, radius, color);
-            }
-            BUILTIN_FILL_CIRCLE => {
-                // stack: [color, radius, center]
-                let color = self.pop() as u16;
-                let radius = self.pop() as i16;
-                let (cx, cy) = unpack_pair(self.pop());
-                ctx.lcd.fill_circle(cx as i16, cy as i16, radius, color);
-            }
-            BUILTIN_DRAW_IMAGE => {
-                // stack: [image_id, loc]
-                let image_id = self.pop() as u8;
-                let (x, y) = unpack_pair(self.pop());
-                if let Some(img) = ctx.images.find(image_id) {
-                    img.draw(&ctx.lcd, &ctx.flash, x, y);
-                }
-            }
-            BUILTIN_DELAY => {
-                // stack: [ms]
-                let ms = self.pop() as u32;
-                self.wait_until = systick::millis().wrapping_add(ms);
-                self.state = VmState::Waiting;
-            }
-            BUILTIN_ITOS => {
-                let val = self.pop();
-                match strpool::itos(&mut ctx.strpool,val) {
-                    Some(id) => self.push(id as i32),
-                    None => self.state = VmState::Error,
-                }
-            }
-            BUILTIN_FTOS => {
-                let bits = self.pop() as u32;
-                match strpool::ftos(&mut ctx.strpool,bits) {
-                    Some(id) => self.push(id as i32),
-                    None => self.state = VmState::Error,
-                }
-            }
-            BUILTIN_CONCAT => {
-                let b = self.pop() as u16;
-                let a = self.pop() as u16;
-                match ctx.strpool.concat(a, b) {
-                    Some(id) => self.push(id as i32),
-                    None => self.state = VmState::Error,
-                }
-            }
-            BUILTIN_PARSE_INT => {
-                let id = self.pop() as u16;
-                self.push(strpool::parse_int(&ctx.strpool,id));
-            }
-            BUILTIN_PARSE_FLOAT => {
-                let id = self.pop() as u16;
-                self.push(strpool::parse_float(&ctx.strpool,id) as i32);
-            }
-            BUILTIN_STR_LEN => {
-                let id = self.pop() as u16;
-                self.push(ctx.strpool.len(id) as i32);
-            }
-            BUILTIN_SET_TEXT => {
-                let str_id = self.pop() as u16;
-                if self.target.is_some() {
-                    ctx.tree.get_mut(self.target).text_id = str_id;
-                }
-            }
-            BUILTIN_DRAW_STR => {
-                // stack: [str_id, colors, font_id, loc]
-                let str_id = self.pop() as u16;
-                let colors = self.pop();
-                let (fg, bg) = unpack_pair(colors);
-                let font_id = self.pop() as u8;
-                let (x, y) = unpack_pair(self.pop());
-                let data = ctx.strpool.get(str_id);
-                if let Some(font) = ctx.fonts.resolve(font_id) {
-                    let bg_opt = if bg == 0 { None } else { Some(bg) };
-                    font.draw_str(&ctx.lcd, &ctx.flash,data, x as i16, y as i16, fg, bg_opt);
-                }
-            }
-            BUILTIN_STR_CLEAR => {
-                ctx.strpool.smart_clear(&mut ctx.tree);
-            }
-            BUILTIN_STR_FREE => {
-                let str_id = self.pop() as u16;
-                ctx.strpool.free(str_id);
-            }
-            BUILTIN_ROUNDED_RECT => {
-                // stack: [color, r, size, loc]
-                let color = self.pop() as u16;
-                let r = self.pop() as u16;
-                let (w, h) = unpack_pair(self.pop());
-                let (x, y) = unpack_pair(self.pop());
-                ctx.lcd.draw_rounded_rect(x, y, w, h, r, color);
-            }
-            BUILTIN_FILL_ROUNDED_RECT => {
-                let color = self.pop() as u16;
-                let r = self.pop() as u16;
-                let (w, h) = unpack_pair(self.pop());
-                let (x, y) = unpack_pair(self.pop());
-                ctx.lcd.fill_rounded_rect(x, y, w, h, r, color);
-            }
-            BUILTIN_ARC => {
-                // stack: [color, end, start, radius, center]
-                let color = self.pop() as u16;
-                let end = self.pop() as i16;
-                let start = self.pop() as i16;
-                let radius = self.pop() as i16;
-                let (cx, cy) = unpack_pair(self.pop());
-                ctx.lcd.draw_arc(cx as i16, cy as i16, radius, start, end, color);
-            }
-            BUILTIN_BEGIN_FRAME => {
-                ctx.lcd.begin_frame();
-            }
-            BUILTIN_END_FRAME => {
-                ctx.lcd.end_frame();
-            }
-            _ => {
-                self.state = VmState::Error;
-            }
-        }
-    }
-
-    // --- Built-in methods (LEN variant: payload + stack args) ---
-
-    fn exec_builtin_len(&mut self, method_id: u8, data: &[u8], ctx: &mut Ctx) {
-        match method_id {
-            BUILTIN_DRAW_TEXT => {
-                // stack: [colors, font_id, loc], payload: text bytes
-                let colors = self.pop();
-                let (fg, bg) = unpack_pair(colors);
-                let font_id = self.pop() as u8;
-                let (x, y) = unpack_pair(self.pop());
-                if let Some(font) = ctx.fonts.resolve(font_id) {
-                    let bg_opt = if bg == 0 { None } else { Some(bg) };
-                    font.draw_str(&ctx.lcd, &ctx.flash,data, x as i16, y as i16, fg, bg_opt);
-                }
-            }
-            BUILTIN_STR => {
-                // LEN payload = string bytes → allocate in pool, push str_id
-                match ctx.strpool.alloc(data) {
-                    Some(id) => self.push(id as i32),
-                    None => self.state = VmState::Error,
-                }
-            }
-            _ => {
-                self.state = VmState::Error;
-            }
         }
     }
 
     // --- Array operations ---
 
     fn find_array(&self, arr_id: i32) -> Option<usize> {
-        if arr_id < 0 {
-            return None;
-        }
+        if arr_id < 0 { return None; }
         let id = arr_id as u16;
         self.arrays.iter().position(|a| a.id == id)
     }
@@ -1043,23 +888,6 @@ impl Vm {
         let id = self.next_arr_id;
         let data = Vec::from(alloc::vec![0i32; size as usize]);
         self.arrays.push(VmArray { id, data });
-        self.next_arr_id = self.next_arr_id.wrapping_add(1);
-        self.push(id as i32);
-    }
-
-    fn arr_alloc_init(&mut self, data: &[u8]) {
-        let mut values: Vec<i32> = Vec::new();
-        let mut pos = 0;
-        while pos < data.len() {
-            if let Some((v, consumed)) = proto::decode_signed_varint(data, pos) {
-                values.push(v);
-                pos += consumed;
-            } else {
-                break;
-            }
-        }
-        let id = self.next_arr_id;
-        self.arrays.push(VmArray { id, data: values });
         self.next_arr_id = self.next_arr_id.wrapping_add(1);
         self.push(id as i32);
     }
@@ -1103,8 +931,6 @@ impl Vm {
 
 // --- Packed u32 helper ---
 
-/// Unpack a packed i32 into two u16 values: (high, low).
-/// Convention: location=(x, y), size=(w, h), colors=(fg, bg).
 #[inline]
 fn unpack_pair(packed: i32) -> (u16, u16) {
     let val = packed as u32;

@@ -1,0 +1,58 @@
+
+var root = alloc();
+target(root);
+set(size, 800, 480);
+set(bg_color, 0x0000);
+dirty();
+
+var panel = alloc();
+target(panel);
+set(location, 150, 100);
+set(size, 500, 280);
+set(bg_color, 0x001F);
+set(border, 3, 3, 3, 3);
+set(border_color, 0xFFFF);
+
+parent(root);
+
+// Btn1 ve Btn2
+var btn1 = alloc();
+target(btn1);
+set(location, 20, 20);
+set(size, 100, 60);
+set(bg_color, 0xF800);
+set(press_color, rgb565(0,0,255));
+set(clickable, 1);
+parent(panel);
+
+render();
+
+while(true) {
+
+}
+
+fn click() {
+
+}
+
+fn rgb565(r, g, b) {
+    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
+}
+
+//fn on_touch_down ( x, y ) {
+    //var a = itos(x);
+    //var b = itos(y);
+    //var c = concat(str("X: "), a);
+    //var d = concat(str("Y: "), b);
+    //var e = concat(c,d);
+    //target(lbl1);
+    //set(text, e);    
+    //buf[0] = x;
+    //buf[1] = y;
+    //sendUsart(buf);
+    //strFree(a);
+    //strFree(b);
+    //strFree(c);
+    //strFree(d);
+    //strFree(e);
+//}
