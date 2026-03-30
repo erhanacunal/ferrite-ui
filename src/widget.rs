@@ -82,6 +82,9 @@ pub struct Widget {
     pub text_align: u8,
     pub text_id: u16, // StringPool str_id (0xFFFF = no text)
 
+    // Rounded border radius (0 = sharp corners)
+    pub border_radius: u16,
+
     // Button fields
     pub press_color: Color,
 
@@ -113,6 +116,7 @@ impl Widget {
             size: Size { w: 0, h: 0 },
             background_color: 0x0000,
             border_color: 0x0000,
+            border_radius: 0,
             text_color: 0xFFFF,
             font_id: 0xFF,
             text_align: ALIGN_LEFT,

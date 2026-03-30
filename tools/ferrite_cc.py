@@ -205,6 +205,7 @@ class Prop:
     ON_CLICK = 0x20
     ON_PAINT = 0x21
     ON_TAP = 0x22
+    BORDER_RADIUS = 0x23
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -882,7 +883,7 @@ PROP_NAMES = {
     0x14: 'BORDER_T', 0x15: 'BORDER_R', 0x16: 'BORDER_B', 0x17: 'BORDER_L',
     0x18: 'PADDING_T', 0x19: 'PADDING_R', 0x1A: 'PADDING_B', 0x1B: 'PADDING_L',
     0x1F: 'IMAGE_ID',
-    0x20: 'ON_CLICK', 0x21: 'ON_PAINT', 0x22: 'ON_TAP',
+    0x20: 'ON_CLICK', 0x21: 'ON_PAINT', 0x22: 'ON_TAP', 0x23: 'BORDER_RADIUS',
     0x40: 'LOCATION', 0x41: 'SIZE', 0x42: 'MARGIN',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -897,12 +898,20 @@ _NO_ARG_OPS = (
 )
 
 
-def disassemble(data):
-    """Disassemble bytecode to human-readable text."""
+def disassemble(data, labels=None):
+    """Disassemble bytecode to human-readable text.
+
+    labels: optional dict {offset: "label"} — inserts '; --- label ---'
+            comment lines before the instruction at that offset.
+    """
+    labels = labels or {}
     lines = []
     pos = 0
     while pos < len(data):
         addr = pos
+        if addr in labels:
+            lines.append(f'')
+            lines.append(f'; --- {labels[addr]} ---')
         op = data[pos]
         pos += 1
         name = OP_NAMES.get(op, f'??? (0x{op:02X})')
@@ -1070,6 +1079,8 @@ PROP_MAP = {
     'on_click': (Prop.ON_CLICK, False),
     'on_paint': (Prop.ON_PAINT, False),
     'on_tap': (Prop.ON_TAP, False),
+    'border_radius': (Prop.BORDER_RADIUS, False),
+    'radius': (Prop.BORDER_RADIUS, False),
     'text': (Prop.TEXT, True),
     'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }
@@ -1088,6 +1099,34 @@ def _resolve_prop(name):
 # ============================================================
 # Compiler (high-level API)
 # ============================================================
+
+
+class FunctionKind:
+    """Function kind enum — matches Rust FunctionKind."""
+    SETUP = 0
+    LOOP = 1
+    USER_FUNCTION = 2
+    ON_PROGRAM_START = 3
+    ON_PAGE_CHANGING = 4
+    ON_PAGE_CHANGED = 5
+    ON_USER_MESSAGE = 6
+    ON_TOUCH_DOWN = 7
+    ON_TOUCH_UP = 8
+    ON_TOUCH_MOVE = 9
+
+
+# Map system callback names to FunctionKind values
+SYSTEM_CALLBACK_KINDS = {
+    'setup':            FunctionKind.SETUP,
+    'loop':             FunctionKind.LOOP,
+    'on_program_start': FunctionKind.ON_PROGRAM_START,
+    'on_page_changing': FunctionKind.ON_PAGE_CHANGING,
+    'on_page_changed':  FunctionKind.ON_PAGE_CHANGED,
+    'on_user_message':  FunctionKind.ON_USER_MESSAGE,
+    'on_touch_down':    FunctionKind.ON_TOUCH_DOWN,
+    'on_touch_up':      FunctionKind.ON_TOUCH_UP,
+    'on_touch_move':    FunctionKind.ON_TOUCH_MOVE,
+}
 
 
 class Compiler:
@@ -1124,15 +1163,8 @@ class Compiler:
         self._next_id = base_id
         self._vars = {}         # name -> var slot (0-15)
         self._next_var = 0
-        self._funcs = {}        # name -> (func_id, arg_count, offset)
+        self._funcs = {}        # name -> (func_id, kind, offset, length)
         self._next_func_id = 1
-        self._on_program_start = 0xFFFF
-        self._on_page_changing = 0xFFFF
-        self._on_page_changed = 0xFFFF
-        self._on_user_message = 0xFFFF
-        self._on_touch_down = 0xFFFF
-        self._on_touch_up = 0xFFFF
-        self._on_touch_move = 0xFFFF
 
     # --- Widget management ---
 
@@ -1280,103 +1312,62 @@ class Compiler:
         self.asm.jmp(start)
         self.asm.patch(cond_handle)
 
-    # --- Callback functions ---
+    # --- Functions ---
 
-    def define_func(self, name, arg_count=0):
-        """Define a callback function at current bytecode position.
+    def define_func(self, name, kind=FunctionKind.USER_FUNCTION):
+        """Define a function at current bytecode position.
 
         Returns func_id (1-based). The function body follows this call
         and should end with cc.ret() or cc.halt().
 
+        kind: FunctionKind constant. Auto-detected from name if in
+              SYSTEM_CALLBACK_KINDS.
+
         Example:
-            fid = cc.define_func("on_btn_click", arg_count=1)
-            # widget_id is on stack as argument
-            cc.asm.store(0)   # save to var 0
+            fid = cc.define_func("on_btn_click")
+            cc.asm.store(0)   # save widget_id arg to var 0
             # ... callback body ...
             cc.ret()
         """
+        # Auto-detect kind from name
+        if name in SYSTEM_CALLBACK_KINDS:
+            kind = SYSTEM_CALLBACK_KINDS[name]
+
         func_id = self._next_func_id
         offset = self.asm.pos
-        self._funcs[name] = (func_id, arg_count, offset)
+        # length will be set later via set_func_length or build_image_header
+        self._funcs[name] = (func_id, kind, offset, 0)
         self._next_func_id += 1
         return func_id
 
-    def on_program_start(self, func_name):
-        """Register a function as the on_program_start system callback."""
-        if func_name not in self._funcs:
-            raise ValueError(f"Unknown function: {func_name}")
-        self._on_program_start = self._funcs[func_name][2]  # offset
+    def set_func_length(self, name, length):
+        """Set the bytecode length for a previously defined function."""
+        if name not in self._funcs:
+            raise ValueError(f"Unknown function: {name}")
+        fid, kind, offset, _ = self._funcs[name]
+        self._funcs[name] = (fid, kind, offset, length)
 
-    def on_page_changing(self, func_name):
-        """Register on_page_changing callback. Function receives (old_index, new_index),
-        must return 0 to prevent or non-zero to allow."""
-        if func_name not in self._funcs:
-            raise ValueError(f"Unknown function: {func_name}")
-        self._on_page_changing = self._funcs[func_name][2]
-
-    def on_page_changed(self, func_name):
-        """Register on_page_changed callback. Function receives (index)."""
-        if func_name not in self._funcs:
-            raise ValueError(f"Unknown function: {func_name}")
-        self._on_page_changed = self._funcs[func_name][2]
-
-    def on_user_message(self, func_name):
-        """Register on_user_message callback. Function receives (array_id).
-        Fires when a UserMessage (field 6) is received via USART."""
-        if func_name not in self._funcs:
-            raise ValueError(f"Unknown function: {func_name}")
-        self._on_user_message = self._funcs[func_name][2]
-
-    def on_touch_down(self, func_name):
-        """Register on_touch_down callback. Function receives (x, y).
-        Fires on touch press event."""
-        if func_name not in self._funcs:
-            raise ValueError(f"Unknown function: {func_name}")
-        self._on_touch_down = self._funcs[func_name][2]
-
-    def on_touch_up(self, func_name):
-        """Register on_touch_up callback. Function receives no arguments.
-        Fires on touch release event."""
-        if func_name not in self._funcs:
-            raise ValueError(f"Unknown function: {func_name}")
-        self._on_touch_up = self._funcs[func_name][2]
-
-    def on_touch_move(self, func_name):
-        """Register on_touch_move callback. Function receives (x, y).
-        Fires while touch is held and moving."""
-        if func_name not in self._funcs:
-            raise ValueError(f"Unknown function: {func_name}")
-        self._on_touch_move = self._funcs[func_name][2]
-
-    def build_meta(self):
-        """Build callback metadata binary.
+    def build_image_header(self):
+        """Build VM image header binary.
 
         Format:
-          Header (16 bytes):
-            func_count(u16) + on_program_start(u16) + on_page_changing(u16)
-            + on_page_changed(u16) + on_user_message(u16) + on_touch_down(u16)
-            + on_touch_up(u16) + on_touch_move(u16)
-          Function table:
-            [func_id(u16) + offset(u16) + arg_count(u8)] x N
+          version(u8) + function_count(u16 LE) + reserved(u16)
+          + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
+
+        Each function entry is 12 bytes.
         """
         func_list = list(self._funcs.values())
         buf = bytearray()
-        # Header (16 bytes)
+        buf.append(1)  # version
         buf.extend(struct.pack('<H', len(func_list)))
-        buf.extend(struct.pack('<H', self._on_program_start))
-        buf.extend(struct.pack('<H', self._on_page_changing))
-        buf.extend(struct.pack('<H', self._on_page_changed))
-        buf.extend(struct.pack('<H', self._on_user_message))
-        buf.extend(struct.pack('<H', self._on_touch_down))
-        buf.extend(struct.pack('<H', self._on_touch_up))
-        buf.extend(struct.pack('<H', self._on_touch_move))
-        # Function table
-        for func_id, arg_count, offset in func_list:
-            buf.extend(struct.pack('<HHB', func_id, offset, arg_count))
+        buf.extend(struct.pack('<H', 0))  # reserved
+        for func_id, kind, offset, length in func_list:
+            buf.extend(struct.pack('<HBBI', func_id, kind, 0, offset))
+            buf.extend(struct.pack('<I', length))
         return bytes(buf)
 
-    def has_callbacks(self):
-        """Check if any callback functions have been defined."""
+    def has_functions(self):
+        """Check if any functions have been defined."""
         return len(self._funcs) > 0
 
     # --- Output ---

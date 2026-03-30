@@ -106,8 +106,9 @@ impl PageManager {
 
         if code_size > 0 && code_size <= PAGE_CODE_BUF {
             let mut vm = Vm::new();
+            vm.load_raw(&code[..code_size]);
             vm.set_target(page_id);
-            vm.run(&crate::vm::RamCode::new(&code[..code_size]), ctx);
+            vm.run(ctx);
         }
 
         Some(index)
@@ -151,8 +152,9 @@ impl PageManager {
                 if let Some((_index, page_id)) = self.create_page(&mut ctx.tree, bg_color) {
                     if code_size > 0 && code_size <= PAGE_CODE_BUF {
                         let mut vm = Vm::new();
+                        vm.load_raw(&code[..code_size]);
                         vm.set_target(page_id);
-                        vm.run(&crate::vm::RamCode::new(&code[..code_size]), ctx);
+                        vm.run(ctx);
                     }
                 }
             }

@@ -6,9 +6,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use ctx::Ctx;
 use panic_halt as _;
-//use alloc::format;
 mod backlight;
-mod callback;
 mod clip;
 mod config;
 mod ctx;
@@ -33,7 +31,6 @@ mod usart;
 mod vm;
 mod widget;
 
-use callback::{CallbackMeta, NO_CALLBACK};
 use cortex_m_rt::entry;
 use flash::Flash;
 use font::Font;
@@ -46,7 +43,7 @@ use strpool::StringPool;
 use touch::Touch;
 use types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE, Size};
 use usart::Usart;
-use vm::{Vm, VmState};
+use vm::{Vm, VmState, FunctionKind};
 
 use crate::systick::delay_ms;
 
@@ -431,16 +428,6 @@ fn error_description(code: u8) -> &'static [u8] {
     }
 }
 
-// === Callback helper ===
-
-/// Run a callback function on the callback VM.
-/// Resets the VM, sets PC to the function offset, and runs to completion.
-fn run_callback(cb_vm: &mut Vm, code: &dyn vm::CodeSource, offset: u16, ctx: &mut Ctx) {
-    cb_vm.reset();
-    cb_vm.set_pc(offset);
-    cb_vm.run(code, ctx);
-}
-
 // === Entry Point ===
 
 #[entry]
@@ -499,24 +486,14 @@ fn main() -> ! {
 
     delay_ms(500);
 
-    ctx.lcd.begin_frame();
+    // draw current buffer
     ctx.lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
-    ctx.lcd.end_frame();
+    
     ctx.lcd.begin_frame();
     ctx.lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
     ctx.lcd.end_frame();
 
     backlight.set_brightness(100);
-    // 3. Splash text
-    // ctx.fonts.embedded().draw_str(
-    //     &ctx.lcd,
-    //     &ctx.flash,
-    //     b"ferrite-ui",
-    //     10,
-    //     24,
-    //     COLOR_WHITE,
-    //     Some(COLOR_BLACK),
-    // );
 
     // 4. Flash filesystem
     let mut error_code: u8 = 0;
@@ -536,30 +513,34 @@ fn main() -> ! {
     ctx.tree.root = root;
 
     let mut pm = PageManager::new();
-    let mut code_buf = Box::new([0u8; MAX_CODE_SIZE]);
-    let mut code_len: usize = 0;
-    let mut flash_addr: u32 = 0; // flash base address when flash_exec = true
-    let mut flash_exec = false;
 
     // 6. Load page_main (optional — program can run without pages)
     if error_code == 0 {
         pm.load_page(&mut ctx, b"page_main");
     }
 
-    // 7. Load main program (if no error)
+    // 7. Single VM — heap allocated, owns code and function table
+    let mut vm = Box::new(Vm::new());
+
+    // 8. Load main program into VM (image header + opcodes)
     if error_code == 0 {
         if let Some(fs_ref) = ctx.fs.as_ref() {
             match fs_ref.find(&ctx.flash, b"main") {
                 Some(entry) => {
                     if entry.flags & fs::RES_FLAG_FLASH_EXEC != 0 {
-                        // Flash execution: VM reads from flash on demand
-                        flash_exec = true;
-                        flash_addr = entry.offset;
-                        code_len = entry.size as usize;
+                        // Flash execution: VM reads opcodes from flash on demand
+                        if !vm.load_flash(&ctx.flash, entry.offset, entry.size as usize) {
+                            error_code = ERR_PROGRAM_ERROR;
+                        }
                     } else {
-                        // RAM execution: copy bytecode to RAM buffer
-                        code_len = entry.size.min(MAX_CODE_SIZE as u32) as usize;
-                        fs_ref.read_resource(&ctx.flash, &entry, 0, &mut code_buf[..code_len]);
+                        // RAM execution: read full image into temp buffer, parse header
+                        let img_len = entry.size.min(MAX_CODE_SIZE as u32) as usize;
+                        let mut img_buf = alloc::vec![0u8; img_len];
+                        fs_ref.read_resource(&ctx.flash, &entry, 0, &mut img_buf);
+                        if !vm.load_ram(&img_buf) {
+                            error_code = ERR_PROGRAM_ERROR;
+                        }
+                        // img_buf freed here — VM owns the opcodes via VmCode::Ram
                     }
                 }
                 None => {
@@ -569,43 +550,40 @@ fn main() -> ! {
         }
     }
 
-    // 8. Load callback metadata
-    let mut cb_meta = Box::new(if error_code == 0 {
-        if let Some(fs_ref) = ctx.fs.as_ref() {
-            CallbackMeta::load(fs_ref, &ctx.flash, b"main").unwrap_or(CallbackMeta::new())
-        } else {
-            CallbackMeta::new()
-        }
-    } else {
-        CallbackMeta::new()
-    });
-
-    // 9. Prepare VMs — heap allocated
-    let mut vm = Box::new(Vm::new());
-    let mut cb_vm = Box::new(Vm::new());
-
-    if error_code == 0 && code_len > 0 {
+    if error_code == 0 && vm.has_code() {
         // Show first page (if any was loaded)
         if pm.count() > 0 {
             pm.show(0, &mut ctx);
         }
 
-        // Run on_program_start callback
-        if cb_meta.on_program_start != NO_CALLBACK {
-            if flash_exec {
-                let fc = vm::FlashCode::new(flash_addr, code_len);
-                run_callback(&mut cb_vm, &fc, cb_meta.on_program_start, &mut ctx);
-            } else {
-                let rc = vm::RamCode::new(&code_buf[..code_len]);
-                run_callback(&mut cb_vm, &rc, cb_meta.on_program_start, &mut ctx);
+        // Run setup() function — must return 0 for success
+        if let Some(entry) = vm.find_by_kind(FunctionKind::Setup) {
+            let offset = entry.offset as u16;
+            vm.run_callback(offset, &mut ctx);
+            let result = vm.pop_result();
+            if result != 0 {
+                error_code = ERR_PROGRAM_ERROR;
+            }
+        }
+
+        // Run on_program_start callback (if defined and setup succeeded)
+        if error_code == 0 {
+            if let Some(entry) = vm.find_by_kind(FunctionKind::OnProgramStart) {
+                let offset = entry.offset as u16;
+                vm.run_callback(offset, &mut ctx);
             }
         }
 
         // Full initial render
-        render::render_all(&mut ctx);
+        if error_code == 0 {
+            render::render_all(&mut ctx);
 
-        // Start main VM
-        vm.state = VmState::Running;
+            // Start loop() function (compiler wraps body in while(1){...yield;})
+            if let Some(entry) = vm.find_by_kind(FunctionKind::Loop) {
+                vm.set_pc(entry.offset as u16);
+                vm.state = VmState::Running;
+            }
+        }
     }
 
     // Show error if any
@@ -624,31 +602,12 @@ fn main() -> ! {
 
     let mut protocol = Protocol::new();
 
-    // Flash code source (persistent when flash_exec=true)
-    let mut fc = vm::FlashCode::new(flash_addr, code_len);
-
-    // Run callback VM with the active code source
-    macro_rules! cb_run {
-        ($cb_vm:expr, $ctx:expr) => {
-            if flash_exec {
-                $cb_vm.run(&fc, $ctx)
-            } else {
-                let src = vm::RamCode::new(&code_buf[..code_len]);
-                $cb_vm.run(&src, $ctx)
-            }
-        };
-    }
-
     loop {
         // --- VM step (only when Running or Yielded) ---
         match vm.state {
             VmState::Running | VmState::Yielded => {
                 vm.state = VmState::Running;
-                if flash_exec {
-                    vm.step(&fc, &mut ctx);
-                } else {
-                    vm.step(&vm::RamCode::new(&code_buf[..code_len]), &mut ctx);
-                }
+                vm.step(&mut ctx);
 
                 if vm.state == VmState::Error {
                     error_code = ERR_PROGRAM_ERROR;
@@ -661,6 +620,8 @@ fn main() -> ! {
                         Some(vm.pc()),
                     );
                 }
+
+                // loop() is compiler-wrapped in while(1){...yield;} — never halts
             }
             VmState::Waiting => {
                 // Non-blocking delay: check if target tick has passed
@@ -691,22 +652,18 @@ fn main() -> ! {
 
                 RxEvent::TouchCalibrate => {
                     let cal = touch::run_calibration(&mut touch, &ctx.lcd);
-                    // Save to flash config
                     cfg.write(&ctx.flash, config::KEY_TOUCH_CAL, &cal.to_bytes());
                     protocol::send_touch_cal(&usart, &cal);
-                    // Re-render after calibration clears the screen
                     render::render_all(&mut ctx);
                 }
 
                 RxEvent::ProgramReady => {
-                    // Clear previous state: widgets, strings, VM arrays
+                    // Clear previous state
                     ctx.tree.clear();
                     ctx.strpool.clear();
                     vm.reset();
-                    cb_vm.reset();
-                    flash_exec = false; // Dynamic programs always use RAM
 
-                    // Re-create root widget (id=0, full screen, black)
+                    // Re-create root widget
                     let root = ctx.tree.alloc().unwrap();
                     {
                         let w = ctx.tree.get_mut(root);
@@ -715,39 +672,44 @@ fn main() -> ! {
                     }
                     ctx.tree.root = root;
 
+                    // Load new program (new image format)
                     let prog = protocol.program_code();
+                    if !vm.load_ram(prog) {
+                        // Fallback: treat as raw bytecode (no header)
+                        vm.load_raw(prog);
+                    }
+                    protocol.free_program();
 
-                    if prog.len() >= 12 && prog[0] == b'F' && prog[1] == b'X' {
-                        let prog_size = u16::from_le_bytes([prog[4], prog[5]]) as usize;
-                        let meta_size = u16::from_le_bytes([prog[6], prog[7]]) as usize;
-                        let prog_start: usize = 12;
-                        let meta_start = prog_start + prog_size;
+                    error_code = 0;
 
-                        let new_len = prog_size.min(protocol::MAX_PROGRAM_SIZE);
-                        if prog_start + new_len <= prog.len() {
-                            code_buf[..new_len]
-                                .copy_from_slice(&prog[prog_start..prog_start + new_len]);
-                            code_len = new_len;
+                    // Run setup() if present
+                    if let Some(entry) = vm.find_by_kind(FunctionKind::Setup) {
+                        let offset = entry.offset as u16;
+                        vm.run_callback(offset, &mut ctx);
+                        let result = vm.pop_result();
+                        if result != 0 {
+                            error_code = ERR_PROGRAM_ERROR;
+                            show_error(
+                                &mut ctx.lcd,
+                                ctx.fonts.embedded(),
+                                &ctx.flash,
+                                &usart,
+                                error_code,
+                                None,
+                            );
                         }
-
-                        if meta_size > 0 && meta_start + meta_size <= prog.len() {
-                            *cb_meta =
-                                CallbackMeta::from_bytes(&prog[meta_start..meta_start + meta_size])
-                                    .unwrap_or(CallbackMeta::new());
-                        } else {
-                            *cb_meta = CallbackMeta::new();
-                        }
-                    } else {
-                        let new_len = prog.len().min(protocol::MAX_PROGRAM_SIZE);
-                        code_buf[..new_len].copy_from_slice(&prog[..new_len]);
-                        code_len = new_len;
-                        *cb_meta = CallbackMeta::new();
                     }
 
-                    protocol.free_program();
-                    vm.reset();
-                    vm.state = VmState::Running;
-                    error_code = 0;
+                    // Start loop() if present and setup succeeded
+                    if error_code == 0 {
+                        if let Some(entry) = vm.find_by_kind(FunctionKind::Loop) {
+                            vm.set_pc(entry.offset as u16);
+                            vm.state = VmState::Running;
+                        } else {
+                            // No loop — just run opcodes from beginning (legacy compat)
+                            vm.state = VmState::Running;
+                        }
+                    }
                 }
 
                 RxEvent::ProgramTooLarge => {
@@ -755,7 +717,6 @@ fn main() -> ! {
                 }
 
                 RxEvent::FsReady => {
-                    // Pause VM during flash write to avoid ring buffer overflow
                     let vm_was_running = vm.state == VmState::Running
                         || vm.state == VmState::Waiting
                         || vm.state == VmState::Yielded;
@@ -776,13 +737,13 @@ fn main() -> ! {
                 }
 
                 RxEvent::UserMessage => {
-                    if cb_meta.on_user_message != NO_CALLBACK && code_len > 0 {
-                        let msg = protocol.user_message();
-                        cb_vm.reset();
-                        if let Some(arr_id) = cb_vm.alloc_array_from(msg) {
-                            cb_vm.set_pc(cb_meta.on_user_message);
-                            cb_vm.push_arg(arr_id);
-                            cb_run!(cb_vm, &mut ctx);
+                    if vm.has_code() {
+                        if let Some(entry) = vm.find_by_kind(FunctionKind::OnUserMessage) {
+                            let offset = entry.offset as u16;
+                            let msg = protocol.user_message();
+                            if let Some(arr_id) = vm.alloc_array_from(msg) {
+                                vm.enqueue_callback(offset, &[arr_id]);
+                            }
                         }
                     }
                 }
@@ -792,33 +753,30 @@ fn main() -> ! {
         // --- Touch handling (if no error) ---
         if error_code == 0 {
             if let Some(event) = touch.poll() {
-                // Write touch event to uart 
-                //usart::dbg(format!("Touch at {}, {}, {:?}\n", event.x, event.y, event.kind).as_bytes());
-
-                if event.kind == touch::TouchEventKind::Press {                
-                    
-                    let hit = touch::hit_test(&ctx.tree, event.x, event.y);                    
+                if event.kind == touch::TouchEventKind::Press {
+                    let hit = touch::hit_test(&ctx.tree, event.x, event.y);
                     if hit.is_some() {
-                        //usart::dbg(format!("Hit widget {}\n", hit.0).as_bytes());
                         ctx.tree.get_mut(hit).flags |= widget::FLAG_PRESSED;
                         ctx.tree.mark_dirty(hit);
                         render::render_dirty(&mut ctx);
                     }
 
-                    if cb_meta.on_touch_down != NO_CALLBACK && code_len > 0 {
-                        cb_vm.reset();
-                        cb_vm.set_pc(cb_meta.on_touch_down);
-                        cb_vm.push_arg(event.x as i32);
-                        cb_vm.push_arg(event.y as i32);
-                        cb_run!(cb_vm, &mut ctx);
+                    if vm.has_code() {
+                        if let Some(entry) = vm.find_by_kind(FunctionKind::OnTouchDown) {
+                            vm.enqueue_callback(
+                                entry.offset as u16,
+                                &[event.x as i32, event.y as i32],
+                            );
+                        }
                     }
                 } else if event.kind == touch::TouchEventKind::Hold {
-                    if cb_meta.on_touch_move != NO_CALLBACK && code_len > 0 {
-                        cb_vm.reset();
-                        cb_vm.set_pc(cb_meta.on_touch_move);
-                        cb_vm.push_arg(event.x as i32);
-                        cb_vm.push_arg(event.y as i32);
-                        cb_run!(cb_vm, &mut ctx);
+                    if vm.has_code() {
+                        if let Some(entry) = vm.find_by_kind(FunctionKind::OnTouchMove) {
+                            vm.enqueue_callback(
+                                entry.offset as u16,
+                                &[event.x as i32, event.y as i32],
+                            );
+                        }
                     }
                 } else if event.kind == touch::TouchEventKind::Release {
                     let mut clicked_id = widget::WidgetId::NONE;
@@ -840,41 +798,40 @@ fn main() -> ! {
 
                     render::render_dirty(&mut ctx);
 
-                    // Fire on_click callback
-                    if clicked_id.is_some() && clicked_func > 0 && code_len > 0 {
-                        if let Some((offset, _arg_count)) = cb_meta.find_func(clicked_func) {
-                            cb_vm.reset();
-                            cb_vm.set_pc(offset);
-                            cb_vm.push_arg(clicked_id.0 as i32);
-                            cb_run!(cb_vm, &mut ctx);
+                    // Enqueue on_click callback
+                    if clicked_id.is_some() && clicked_func > 0 && vm.has_code() {
+                        if let Some(entry) = vm.find_func(clicked_func) {
+                            vm.enqueue_callback(
+                                entry.offset as u16,
+                                &[clicked_id.0 as i32],
+                            );
                         }
                     }
 
-                    // Fire on_tap callback (widget_id, packed x|y)
-                    if clicked_id.is_some() && code_len > 0 {
+                    // Enqueue on_tap callback (widget_id, packed x|y)
+                    if clicked_id.is_some() && vm.has_code() {
                         let tap_func = ctx.tree.get(clicked_id).on_tap;
                         if tap_func > 0 {
-                            if let Some((offset, _arg_count)) = cb_meta.find_func(tap_func) {
-                                cb_vm.reset();
-                                cb_vm.set_pc(offset);
-                                cb_vm.push_arg(clicked_id.0 as i32);
+                            if let Some(entry) = vm.find_func(tap_func) {
                                 let packed_xy = ((event.x as u32) << 16 | event.y as u32) as i32;
-                                cb_vm.push_arg(packed_xy);
-                                cb_run!(cb_vm, &mut ctx);
+                                vm.enqueue_callback(
+                                    entry.offset as u16,
+                                    &[clicked_id.0 as i32, packed_xy],
+                                );
                             }
                         }
                     }
 
-                    if cb_meta.on_touch_up != NO_CALLBACK && code_len > 0 {
-                        cb_vm.reset();
-                        cb_vm.set_pc(cb_meta.on_touch_up);
-                        cb_run!(cb_vm, &mut ctx);
+                    if vm.has_code() {
+                        if let Some(entry) = vm.find_by_kind(FunctionKind::OnTouchUp) {
+                            vm.enqueue_callback(entry.offset as u16, &[]);
+                        }
                     }
                 }
             }
         }
 
-        // --- Render dirty widgets + on_paint callbacks ---
+        // --- Render dirty widgets + enqueue on_paint callbacks ---
         if error_code == 0 {
             let mut paint_ids = [widget::WidgetId::NONE; 8];
             let mut paint_count: usize = 0;
@@ -891,20 +848,25 @@ fn main() -> ! {
 
             render::render_dirty(&mut ctx);
 
-            if code_len > 0 {
+            if vm.has_code() {
                 for i in 0..paint_count {
                     let id = paint_ids[i];
                     let paint_func = ctx.tree.get(id).on_paint;
                     if paint_func > 0 {
-                        if let Some((offset, _arg_count)) = cb_meta.find_func(paint_func) {
-                            cb_vm.reset();
-                            cb_vm.set_pc(offset);
-                            cb_vm.push_arg(id.0 as i32);
-                            cb_run!(cb_vm, &mut ctx);
+                        if let Some(entry) = vm.find_func(paint_func) {
+                            vm.enqueue_callback(
+                                entry.offset as u16,
+                                &[id.0 as i32],
+                            );
                         }
                     }
                 }
             }
+        }
+
+        // --- Drain callback queue (runs each to completion, FIFO order) ---
+        if vm.has_pending_callbacks() {
+            vm.drain_callbacks(&mut ctx);
         }
     }
 }

@@ -3,7 +3,7 @@
 // Demonstrates: arc, line, fillCircle, fillRoundedRect,
 //               drawText, drawStr, itos, concat, delay, strClear
 
-// === Hand lookup tables ===
+// === Hand lookup tables (global) ===
 // Second/minute: 60 positions (6° steps), hour: 12 positions (30° steps)
 
 // Second hand (R=120, 60 positions)
@@ -19,25 +19,26 @@ var hdx[12] = [0, 35, 61, 70, 61, 35, 0, -35, -61, -70, -61, -35];
 var hdy[12] = [-70, -61, -35, 0, 35, 61, 70, 61, 35, 0, -35, -61];
 
 // Time state (simulated)
-var h = 10;
-var m = 10;
-var s = 0;
+var h;
+var m;
+var s;
 
 // Reusable temps
-var i = 0;
-var a = 0;
-var b = 0;
-var c = 0;
-var d = 0;
-var e = 0;
-var t = 0;
+var i;
+var a;
+var b;
+var c;
+var d;
+var e;
+var t;
 
-t = 2;
-// Draw on all buffers
-while( t > 0 ) {
-    beginFrame();
-    // === Draw static face ===
+var fullRedraw = 2;
 
+fn draw_face() {
+    if (fullRedraw <= 0) {
+        return;
+    }
+    fullRedraw = fullRedraw - 1;
     fillRect(0, 0, 800, 480, 0x1082);
     fillCircle(400, 210, 170, 0x2945);
     arc(400, 210, 170, 0, 359, 0x4A69);
@@ -64,17 +65,20 @@ while( t > 0 ) {
     // Digital panel
     fillRoundedRect(250, 420, 300, 50, 12, 0x2945);
     roundedRect(250, 420, 300, 50, 12, 0x4A69);
-
-    endFrame();
-    t = t - 1;
 }
 
-// === Animation loop ===
+fn setup() {
+    h = 10;
+    m = 10;
+    s = 0;
 
-while (true) {
-    
+    return 0;
+}
+
+fn loop() {
     beginFrame();
-    
+
+    draw_face();
 
     // Erase hands
     fillCircle(400, 210, 140, 0x2945);
@@ -144,5 +148,3 @@ while (true) {
         }
     }
 }
-
-

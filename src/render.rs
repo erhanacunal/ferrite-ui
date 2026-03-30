@@ -167,59 +167,87 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
     let widget = ctx.tree.get(id);
     let b = &widget.border;
     let bg_color = effective_bg(&ctx.tree, id);
+    let r = widget.border_radius;
 
-    // Border
-    if b.top > 0 {
-        fill_rect_screen(
-            &ctx.lcd,
-            Rect::new(abs.x, abs.y, abs.w, b.top as u16),
-            widget.border_color,
-        );
-    }
-    if b.bottom > 0 {
-        fill_rect_screen(
-            &ctx.lcd,
-            Rect::new(
-                abs.x,
-                abs.bottom() - b.bottom as i16,
-                abs.w,
-                b.bottom as u16,
-            ),
-            widget.border_color,
-        );
-    }
-    if b.left > 0 {
-        let inner_y = abs.y + b.top as i16;
-        let inner_h = abs.h.saturating_sub(b.top as u16 + b.bottom as u16);
-        fill_rect_screen(
-            &ctx.lcd,
-            Rect::new(abs.x, inner_y, b.left as u16, inner_h),
-            widget.border_color,
-        );
-    }
-    if b.right > 0 {
-        let inner_y = abs.y + b.top as i16;
-        let inner_h = abs.h.saturating_sub(b.top as u16 + b.bottom as u16);
-        fill_rect_screen(
-            &ctx.lcd,
-            Rect::new(
-                abs.right() - b.right as i16,
-                inner_y,
-                b.right as u16,
-                inner_h,
-            ),
-            widget.border_color,
-        );
-    }
-
-    // Background (inside border)
-    let bg = inner_rect(abs, b);
-    if !bg.is_empty() {
-        fill_rect_screen(&ctx.lcd, bg, bg_color);
+    if r > 0 {
+        // Rounded mode: draw border as rounded_rect, background as fill_rounded_rect
+        let bw = b.top.max(b.bottom).max(b.left).max(b.right);
+        if bw > 0 {
+            // Draw border outline(s)
+            for i in 0..bw {
+                rounded_rect_screen(
+                    &ctx.lcd,
+                    Rect::new(
+                        abs.x + i as i16,
+                        abs.y + i as i16,
+                        abs.w.saturating_sub(i as u16 * 2),
+                        abs.h.saturating_sub(i as u16 * 2),
+                    ),
+                    r.saturating_sub(i as u16),
+                    widget.border_color,
+                );
+            }
+        }
+        // Background (inside border)
+        let bg = inner_rect(abs, b);
+        if !bg.is_empty() {
+            let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
+            fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+        }
+    } else {
+        // Sharp corners: original rect-based drawing
+        if b.top > 0 {
+            fill_rect_screen(
+                &ctx.lcd,
+                Rect::new(abs.x, abs.y, abs.w, b.top as u16),
+                widget.border_color,
+            );
+        }
+        if b.bottom > 0 {
+            fill_rect_screen(
+                &ctx.lcd,
+                Rect::new(
+                    abs.x,
+                    abs.bottom() - b.bottom as i16,
+                    abs.w,
+                    b.bottom as u16,
+                ),
+                widget.border_color,
+            );
+        }
+        if b.left > 0 {
+            let inner_y = abs.y + b.top as i16;
+            let inner_h = abs.h.saturating_sub(b.top as u16 + b.bottom as u16);
+            fill_rect_screen(
+                &ctx.lcd,
+                Rect::new(abs.x, inner_y, b.left as u16, inner_h),
+                widget.border_color,
+            );
+        }
+        if b.right > 0 {
+            let inner_y = abs.y + b.top as i16;
+            let inner_h = abs.h.saturating_sub(b.top as u16 + b.bottom as u16);
+            fill_rect_screen(
+                &ctx.lcd,
+                Rect::new(
+                    abs.right() - b.right as i16,
+                    inner_y,
+                    b.right as u16,
+                    inner_h,
+                ),
+                widget.border_color,
+            );
+        }
+        // Background (inside border)
+        let bg = inner_rect(abs, b);
+        if !bg.is_empty() {
+            fill_rect_screen(&ctx.lcd, bg, bg_color);
+        }
     }
 
     // Background image
     if widget.image_id != 0 {
+        let bg = inner_rect(abs, b);
         draw_bg_image(ctx, widget.image_id, &bg);
     }
 
@@ -234,43 +262,73 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     let widget = ctx.tree.get(id);
     let b = &widget.border;
     let bg_color = effective_bg(&ctx.tree, id);
+    let r = widget.border_radius;
 
-    let border_rects = [
-        Rect::new(abs.x, abs.y, abs.w, b.top as u16),
-        Rect::new(
-            abs.x,
-            abs.bottom() - b.bottom as i16,
-            abs.w,
-            b.bottom as u16,
-        ),
-        Rect::new(
-            abs.x,
-            abs.y + b.top as i16,
-            b.left as u16,
-            abs.h.saturating_sub(b.top as u16 + b.bottom as u16),
-        ),
-        Rect::new(
-            abs.right() - b.right as i16,
-            abs.y + b.top as i16,
-            b.right as u16,
-            abs.h.saturating_sub(b.top as u16 + b.bottom as u16),
-        ),
-    ];
-
-    for br in &border_rects {
-        if !br.is_empty() {
-            fill_clipped(&ctx.lcd, br, widget.border_color, clip);
+    if r > 0 {
+        // Rounded mode: fallback to unclipped rounded draw.
+        // Rounded rects can't be trivially rect-clipped, so we draw the
+        // full rounded shape. The painter's algorithm ensures correctness.
+        let bw = b.top.max(b.bottom).max(b.left).max(b.right);
+        if bw > 0 {
+            for i in 0..bw {
+                rounded_rect_screen(
+                    &ctx.lcd,
+                    Rect::new(
+                        abs.x + i as i16,
+                        abs.y + i as i16,
+                        abs.w.saturating_sub(i as u16 * 2),
+                        abs.h.saturating_sub(i as u16 * 2),
+                    ),
+                    r.saturating_sub(i as u16),
+                    widget.border_color,
+                );
+            }
         }
-    }
+        let bg = inner_rect(abs, b);
+        if !bg.is_empty() {
+            let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
+            fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+        }
+    } else {
+        // Sharp corners: rect-clipped drawing
+        let border_rects = [
+            Rect::new(abs.x, abs.y, abs.w, b.top as u16),
+            Rect::new(
+                abs.x,
+                abs.bottom() - b.bottom as i16,
+                abs.w,
+                b.bottom as u16,
+            ),
+            Rect::new(
+                abs.x,
+                abs.y + b.top as i16,
+                b.left as u16,
+                abs.h.saturating_sub(b.top as u16 + b.bottom as u16),
+            ),
+            Rect::new(
+                abs.right() - b.right as i16,
+                abs.y + b.top as i16,
+                b.right as u16,
+                abs.h.saturating_sub(b.top as u16 + b.bottom as u16),
+            ),
+        ];
 
-    // Background (inside border)
-    let bg = inner_rect(abs, b);
-    if !bg.is_empty() {
-        fill_clipped(&ctx.lcd, &bg, bg_color, clip);
+        for br in &border_rects {
+            if !br.is_empty() {
+                fill_clipped(&ctx.lcd, br, widget.border_color, clip);
+            }
+        }
+
+        // Background (inside border)
+        let bg = inner_rect(abs, b);
+        if !bg.is_empty() {
+            fill_clipped(&ctx.lcd, &bg, bg_color, clip);
+        }
     }
 
     // Background image (drawn unclipped — painter's algorithm covers it)
     if widget.image_id != 0 {
+        let bg = inner_rect(abs, b);
         draw_bg_image(ctx, widget.image_id, &bg);
     }
 
@@ -351,6 +409,20 @@ fn fill_clipped(lcd: &Lcd, rect: &Rect, color: Color, clip: &ClipRegion) {
 fn fill_rect_screen(lcd: &Lcd, rect: Rect, color: Color) {
     if let Some(r) = rect.intersection(&SCREEN) {
         lcd.fill_rect(r.x as u16, r.y as u16, r.w, r.h, color);
+    }
+}
+
+/// Draw rounded rect outline clipped to screen bounds.
+fn rounded_rect_screen(lcd: &Lcd, rect: Rect, radius: u16, color: Color) {
+    if let Some(r) = rect.intersection(&SCREEN) {
+        lcd.draw_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, color);
+    }
+}
+
+/// Fill rounded rect clipped to screen bounds.
+fn fill_rounded_rect_screen(lcd: &Lcd, rect: Rect, radius: u16, color: Color) {
+    if let Some(r) = rect.intersection(&SCREEN) {
+        lcd.fill_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, color);
     }
 }
 

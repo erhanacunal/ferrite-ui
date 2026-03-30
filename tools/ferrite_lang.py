@@ -16,6 +16,7 @@ Python API:
 import sys
 import struct
 from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
+                        FunctionKind as CcFunctionKind,
                         disassemble, encode_svarint,
                         _resolve_prop, PROP_MAP, pack_pair, float_bits)
 
@@ -673,21 +674,27 @@ class CodeGen:
     def __init__(self):
         self.asm = Asm()
         self.vars = {}          # name -> slot
+        self.global_vars = {}   # name -> slot (global variables visible to all functions)
         self.next_slot = 0
-        self.functions = {}     # name -> {params, addr, patches}
+        self.functions = {}     # name -> {params, addr, end_addr, patches}
         self.widget_ids = {}    # name -> predicted widget ID
         self.next_widget_id = 0
         self._loop_stack = []   # {continue_target, continue_patches, break_patches}
         self._fn_base = 0       # function vars start here
         self.array_vars = set() # names that hold array_ids
+        self._global_init_stmts = None  # set during generate_image()
 
     def generate(self, program):
+        """Compile program to bytecode (raw, no image header).
+
+        Used for page bytecode and legacy compilation.
+        Top-level statements are compiled as before.
+        """
         # Phase 1: Pre-allocate main variable slots (count only)
         main_slots = self._count_var_slots(program.statements)
         self._fn_base = main_slots
 
         # Phase 1b: Pre-scan main statements for alloc() calls to populate widget_ids.
-        # This allows functions (compiled in Phase 3) to reference widgets by name.
         for stmt in program.statements:
             if isinstance(stmt, VarDecl) and stmt.init is not None:
                 if isinstance(stmt.init, CallExpr) and stmt.init.name == 'alloc':
@@ -699,6 +706,7 @@ class CodeGen:
             self.functions[fn.name] = {
                 'params': fn.params,
                 'addr': None,
+                'end_addr': None,
                 'patches': [],
             }
 
@@ -729,6 +737,79 @@ class CodeGen:
 
         return self.asm.build()
 
+    def generate_image(self, program):
+        """Compile program to bytecode for the new VM image format.
+
+        Requires fn setup() and fn loop(). Top-level var declarations
+        become global variables accessible from all functions.
+        Top-level imperative statements are not allowed.
+        """
+        # Phase 1: Collect global variable declarations
+        global_var_stmts = []
+        for stmt in program.statements:
+            if isinstance(stmt, VarDecl):
+                global_var_stmts.append(stmt)
+            else:
+                raise CompileError(
+                    "only global variable declarations are allowed at top level "
+                    "(use fn setup() for initialization code)",
+                    getattr(stmt, 'line', 0))
+
+        # Count global var slots
+        global_slots = len(global_var_stmts)
+        self._fn_base = global_slots
+
+        # Pre-scan for alloc() in global var inits
+        for stmt in global_var_stmts:
+            if stmt.init is not None:
+                if isinstance(stmt.init, CallExpr) and stmt.init.name == 'alloc':
+                    self.widget_ids[stmt.name] = self.next_widget_id
+                    self.next_widget_id += 1
+
+        # Pre-scan function bodies for alloc() assignments to global vars
+        # This enables target()/parent() with widgets allocated in setup()
+        for fn in program.functions:
+            self._scan_alloc_in_stmts(fn.body, global_var_stmts)
+
+        # Phase 2: Register all functions
+        for fn in program.functions:
+            self.functions[fn.name] = {
+                'params': fn.params,
+                'addr': None,
+                'end_addr': None,
+                'patches': [],
+            }
+
+        # Validate: setup and loop must exist
+        if 'setup' not in self.functions:
+            raise CompileError("missing required function: fn setup()")
+        if 'loop' not in self.functions:
+            raise CompileError("missing required function: fn loop()")
+
+        # Phase 3: Emit all functions (no JMP-over needed — functions are the code)
+        # Allocate global variable slots first (visible to all functions)
+        self.vars = {}
+        self.next_slot = 0
+        for stmt in global_var_stmts:
+            slot = self._alloc_var(stmt.name)
+            self.global_vars[stmt.name] = slot
+            if stmt.array_size is not None:
+                self.array_vars.add(stmt.name)
+
+        # Emit functions. Global var init code is injected at the start of setup().
+        self._global_init_stmts = global_var_stmts
+        for fn in program.functions:
+            self._gen_fn(fn)
+        self._global_init_stmts = None
+
+        # Patch forward function calls
+        for info in self.functions.values():
+            for patch_pos in info['patches']:
+                if info['addr'] is not None:
+                    self.asm.patch(patch_pos, info['addr'])
+
+        return self.asm.build()
+
     def _count_var_slots(self, stmts):
         """Recursively count variable slots needed by statements."""
         count = 0
@@ -746,6 +827,31 @@ class CodeGen:
                     count += stmt.init.array_size if stmt.init.array_size else 1
                 count += self._count_var_slots(stmt.body)
         return count
+
+    def _scan_alloc_in_stmts(self, stmts, global_var_stmts):
+        """Scan statements for `global_var = alloc()` patterns to track widget IDs."""
+        global_names = {s.name for s in global_var_stmts}
+        for stmt in stmts:
+            # x = alloc() where x is a global var
+            if isinstance(stmt, Assign) and stmt.name in global_names:
+                if isinstance(stmt.value, CallExpr) and stmt.value.name == 'alloc':
+                    if stmt.name not in self.widget_ids:
+                        self.widget_ids[stmt.name] = self.next_widget_id
+                        self.next_widget_id += 1
+            # var x = alloc() (local that shadows — still track)
+            elif isinstance(stmt, VarDecl) and stmt.init is not None:
+                if isinstance(stmt.init, CallExpr) and stmt.init.name == 'alloc':
+                    if stmt.name not in self.widget_ids:
+                        self.widget_ids[stmt.name] = self.next_widget_id
+                        self.next_widget_id += 1
+            elif isinstance(stmt, IfStmt):
+                self._scan_alloc_in_stmts(stmt.then_body, global_var_stmts)
+                if stmt.else_body:
+                    self._scan_alloc_in_stmts(stmt.else_body, global_var_stmts)
+            elif isinstance(stmt, WhileStmt):
+                self._scan_alloc_in_stmts(stmt.body, global_var_stmts)
+            elif isinstance(stmt, ForStmt):
+                self._scan_alloc_in_stmts(stmt.body, global_var_stmts)
 
     # --- Variable management ---
 
@@ -771,9 +877,10 @@ class CodeGen:
         info['addr'] = self.asm.pos
 
         # Function vars start from _fn_base, reset between functions
+        # Global vars remain visible (merged into local scope)
         saved_vars = dict(self.vars)
         saved_slot = self.next_slot
-        self.vars = {}
+        self.vars = dict(self.global_vars)  # globals visible in all functions
         self.next_slot = self._fn_base
 
         # Allocate param slots and pop args (reverse order)
@@ -784,14 +891,30 @@ class CodeGen:
         for slot in reversed(param_slots):
             self.asm.store(slot)
 
-        # Body
-        for stmt in fn.body:
-            self._gen_stmt(stmt)
+        # Inject global var init code at the start of setup()
+        if fn.name == 'setup' and self._global_init_stmts:
+            for stmt in self._global_init_stmts:
+                self._gen_global_init(stmt)
 
-        # Implicit return 0
-        if not fn.body or not isinstance(fn.body[-1], ReturnStmt):
-            self.asm.push(0)
-            self.asm.ret()
+        if fn.name == 'loop' and self._global_init_stmts is not None:
+            # Compiler-generated: while(1) { <user body>; yield; }
+            loop_top = self.asm.pos
+            for stmt in fn.body:
+                self._gen_stmt(stmt)
+            self.asm.yield_()
+            self.asm.jmp(loop_top)
+            # No implicit return — loop never exits
+        else:
+            # Body
+            for stmt in fn.body:
+                self._gen_stmt(stmt)
+
+            # Implicit return 0
+            if not fn.body or not isinstance(fn.body[-1], ReturnStmt):
+                self.asm.push(0)
+                self.asm.ret()
+
+        info['end_addr'] = self.asm.pos
 
         # Restore
         self.vars = saved_vars
@@ -851,6 +974,42 @@ class CodeGen:
                 self.asm.arr_alloc(node.array_size)
         else:
             # Scalar variable
+            if node.init is not None:
+                if isinstance(node.init, CallExpr) and node.init.name == 'alloc':
+                    if node.name not in self.widget_ids:
+                        self.widget_ids[node.name] = self.next_widget_id
+                        self.next_widget_id += 1
+                self._gen_expr(node.init)
+            else:
+                self.asm.push(0)
+        self.asm.store(slot)
+
+    def _gen_global_init(self, node):
+        """Emit init code for a global variable whose slot is already allocated."""
+        slot = self.global_vars[node.name]
+        if node.array_size is not None:
+            if node.init is not None:
+                if not isinstance(node.init, ArrayLit):
+                    raise CompileError("array must be initialized with [...]", node.line)
+                if len(node.init.elements) != node.array_size:
+                    raise CompileError(
+                        f"array size mismatch: {node.name}[{node.array_size}] vs [{len(node.init.elements)}]",
+                        node.line)
+                all_const = all(isinstance(e, NumLit) for e in node.init.elements)
+                if all_const:
+                    self.asm.arr_alloc_init([e.value for e in node.init.elements])
+                else:
+                    self.asm.arr_alloc(node.array_size)
+                    self.asm.store(slot)
+                    for i, elem in enumerate(node.init.elements):
+                        self.asm.load(slot)
+                        self.asm.push(i)
+                        self._gen_expr(elem)
+                        self.asm.arr_store()
+                    return
+            else:
+                self.asm.arr_alloc(node.array_size)
+        else:
             if node.init is not None:
                 if isinstance(node.init, CallExpr) and node.init.name == 'alloc':
                     if node.name not in self.widget_ids:
@@ -1489,62 +1648,75 @@ def compile(source, filename="<input>"):
         raise CompileError(f"internal error: {e}")
 
 
-# System callback name → (registration_method, expected_arg_count)
+# System callback name → expected_arg_count
 SYSTEM_CALLBACKS = {
-    'on_program_start': ('on_program_start', 0),
-    'on_page_changing':  ('on_page_changing', 2),
-    'on_page_changed':   ('on_page_changed', 1),
-    'on_user_message':   ('on_user_message', 1),
-    'on_touch_down':     ('on_touch_down', 2),
-    'on_touch_up':       ('on_touch_up', 0),
-    'on_touch_move':     ('on_touch_move', 2),
+    'setup':            0,
+    'loop':             0,
+    'on_program_start': 0,
+    'on_page_changing': 2,
+    'on_page_changed':  1,
+    'on_user_message':  1,
+    'on_touch_down':    2,
+    'on_touch_up':      0,
+    'on_touch_move':    2,
 }
 
 
 def compile_with_meta(source, filename="<input>"):
     """Compile source code to (bytecode, metadata_or_None).
 
-    Detects functions named as system callbacks (on_program_start, on_touch_down, etc.)
-    and automatically generates callback metadata.
+    Legacy API — wraps build_image internally.
+    Returns (image_bytes, None) since metadata is now embedded.
+    """
+    return build_image(source, filename), None
+
+
+def build_image(source, filename="<input>"):
+    """Compile source to VM image format (new unified header).
+
+    Image format:
+      version(u8) + function_count(u16 LE) + reserved(u16)
+      + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
+      + opcodes...
+
+    Requires fn setup() and fn loop() in the source.
+    Global variables (top-level var) are supported.
     """
     try:
         tokens = tokenize(source)
         parser = Parser(tokens)
         program = parser.parse()
 
-        sys_cbs = {}
+        # Validate system callback arg counts
         for fn in program.functions:
             if fn.name in SYSTEM_CALLBACKS:
-                method, expected_args = SYSTEM_CALLBACKS[fn.name]
-                if len(fn.params) != expected_args:
+                expected = SYSTEM_CALLBACKS[fn.name]
+                if len(fn.params) != expected:
                     raise CompileError(
-                        f"{fn.name}() expects {expected_args} parameter(s), got {len(fn.params)}",
+                        f"{fn.name}() expects {expected} parameter(s), got {len(fn.params)}",
                         fn.line if hasattr(fn, 'line') else 0)
-                sys_cbs[fn.name] = method
 
         codegen = CodeGen()
-        bytecode = codegen.generate(program)
+        bytecode = codegen.generate_image(program)
 
-        if not sys_cbs and not any(
-            info['addr'] is not None for info in codegen.functions.values()
-        ):
-            return bytecode, None
-
+        # Build the image header with function table
         cc = CcCompiler()
+        func_names = {}  # offset -> name
         for fn_name, info in codegen.functions.items():
             if info['addr'] is not None:
-                cc.define_func(fn_name, arg_count=len(
-                    [fn for fn in program.functions if fn.name == fn_name][0].params
-                ))
-                cc._funcs[fn_name] = (cc._funcs[fn_name][0], len(
-                    [fn for fn in program.functions if fn.name == fn_name][0].params
-                ), info['addr'])
+                func_id = cc.define_func(fn_name)
+                fid, kind, _, _ = cc._funcs[fn_name]
+                offset = info['addr']
+                length = (info['end_addr'] or offset) - offset
+                cc._funcs[fn_name] = (fid, kind, offset, length)
+                func_names[offset] = fn_name
 
-        for fn_name, method in sys_cbs.items():
-            getattr(cc, method)(fn_name)
+        header = cc.build_image_header()
+        image = header + bytecode
 
-        metadata = cc.build_meta() if cc.has_callbacks() else None
-        return bytecode, metadata
+        # Stash function name map on the bytes object for CLI use
+        image = _ImageBytes(image, func_names)
+        return image
 
     except CompileError:
         raise
@@ -1552,28 +1724,12 @@ def compile_with_meta(source, filename="<input>"):
         raise CompileError(f"internal error: {e}")
 
 
-def build_image(source, filename="<input>"):
-    """Compile source to execute image format: header + bytecode + metadata.
-
-    Image format (12-byte header):
-      [0..2]  magic: "FX"
-      [2..4]  version: u16 LE (1)
-      [4..6]  program_size: u16 LE
-      [6..8]  metadata_size: u16 LE (0 = no metadata)
-      [8..12] reserved (zeros)
-      [12..]  program bytecode
-      [12+program_size..] metadata (if any)
-    """
-    bytecode, metadata = compile_with_meta(source, filename)
-    meta_bytes = metadata if metadata else b''
-
-    header = bytearray(12)
-    header[0:2] = b'FX'
-    struct.pack_into('<H', header, 2, 1)
-    struct.pack_into('<H', header, 4, len(bytecode))
-    struct.pack_into('<H', header, 6, len(meta_bytes))
-
-    return bytes(header) + bytecode + meta_bytes
+class _ImageBytes(bytes):
+    """bytes subclass that carries function name metadata for disassembly."""
+    def __new__(cls, data, func_names=None):
+        obj = super().__new__(cls, data)
+        obj.func_names = func_names or {}
+        return obj
 
 
 def compile_page(source, bg_color=0x0000, filename="<input>"):
@@ -1585,6 +1741,50 @@ def compile_page(source, bg_color=0x0000, filename="<input>"):
 # ============================================================
 # CLI
 # ============================================================
+
+
+_KIND_NAMES = {
+    0: 'setup', 1: 'loop', 2: 'func', 3: 'on_program_start',
+    4: 'on_page_changing', 5: 'on_page_changed', 6: 'on_user_message',
+    7: 'on_touch_down', 8: 'on_touch_up', 9: 'on_touch_move',
+}
+
+
+def _extract_labels(image):
+    """Build {offset: "fn_name()"} labels dict from image header."""
+    # Use real function names if available (from _ImageBytes)
+    real_names = getattr(image, 'func_names', {})
+    func_count = struct.unpack_from('<H', image, 1)[0]
+    labels = {}
+    for i in range(func_count):
+        base = 5 + i * 12
+        kind = image[base + 2]
+        offset = struct.unpack_from('<I', image, base + 4)[0]
+        if offset in real_names:
+            name = real_names[offset]
+        else:
+            name = _KIND_NAMES.get(kind, f'func_{kind}')
+        labels[offset] = f'{name}()'
+    return labels
+
+
+def _print_image_header(output):
+    """Print image header summary to stdout."""
+    real_names = getattr(output, 'func_names', {})
+    func_count = struct.unpack_from('<H', output, 1)[0]
+    opcode_start = 5 + func_count * 12
+    print(f'; image v1: {func_count} functions, opcodes={len(output) - opcode_start}B')
+    for i in range(func_count):
+        base = 5 + i * 12
+        fid = struct.unpack_from('<H', output, base)[0]
+        kind = output[base + 2]
+        offset = struct.unpack_from('<I', output, base + 4)[0]
+        length = struct.unpack_from('<I', output, base + 8)[0]
+        if offset in real_names:
+            name = real_names[offset]
+        else:
+            name = _KIND_NAMES.get(kind, f'kind={kind}')
+        print(f';   #{fid} {name}  offset={offset} length={length}')
 
 
 def main():
@@ -1607,7 +1807,13 @@ def main():
     try:
         if args.image:
             output = build_image(source, args.source)
-            raw_code = output[12:12 + struct.unpack_from('<H', output, 4)[0]]
+            # New image format: header(5 + 12*N) + opcodes
+            if len(output) >= 5:
+                func_count = struct.unpack_from('<H', output, 1)[0]
+                opcode_start = 5 + func_count * 12
+                raw_code = output[opcode_start:]
+            else:
+                raw_code = output
         elif args.page is not None:
             bg = int(args.page, 0)
             output = compile_page(source, bg, args.source)
@@ -1619,14 +1825,19 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Build function labels for disassembly
+    labels = {}
+    if args.image and len(output) >= 5:
+        labels = _extract_labels(output)
+
     if args.output:
         with open(args.output, 'wb') as f:
             f.write(output)
         msg = f"{args.source} -> {args.output} ({len(output)} bytes)"
         if args.image:
-            prog_sz = struct.unpack_from('<H', output, 4)[0]
-            meta_sz = struct.unpack_from('<H', output, 6)[0]
-            msg += f" (program: {prog_sz}B, metadata: {meta_sz}B)"
+            func_count = struct.unpack_from('<H', output, 1)[0]
+            opcode_start = 5 + func_count * 12
+            msg += f" (header: {opcode_start}B, opcodes: {len(output) - opcode_start}B, {func_count} functions)"
         print(msg)
 
     if args.disasm:
@@ -1634,10 +1845,8 @@ def main():
             bg = struct.unpack_from('<H', output)[0]
             print(f'; page bg_color: 0x{bg:04X}')
         if args.image:
-            prog_sz = struct.unpack_from('<H', output, 4)[0]
-            meta_sz = struct.unpack_from('<H', output, 6)[0]
-            print(f'; image v1: program={prog_sz}B metadata={meta_sz}B')
-        print(disassemble(raw_code))
+            _print_image_header(output)
+        print(disassemble(raw_code, labels=labels))
 
     if args.hexdump:
         a = Asm()
@@ -1646,10 +1855,8 @@ def main():
 
     if not args.output and not args.disasm and not args.hexdump:
         if args.image:
-            prog_sz = struct.unpack_from('<H', output, 4)[0]
-            meta_sz = struct.unpack_from('<H', output, 6)[0]
-            print(f'; image v1: program={prog_sz}B metadata={meta_sz}B')
-        print(disassemble(raw_code))
+            _print_image_header(output)
+        print(disassemble(raw_code, labels=labels))
 
 
 if __name__ == '__main__':

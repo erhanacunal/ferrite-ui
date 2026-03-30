@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use crate::ctx::Ctx;
 use crate::flash::Flash;
@@ -10,7 +11,7 @@ use crate::proto::{
     PROP_BORDER_COLOR, PROP_BORDER_EDGES, PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_T,
     PROP_CLICKABLE, PROP_ENABLED, PROP_FONT_ID, PROP_KIND, PROP_LOCATION, PROP_LOC_X, PROP_LOC_Y,
     PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L, PROP_MARGIN_R, PROP_MARGIN_T, PROP_PADDING,
-    PROP_IMAGE_ID, PROP_ON_CLICK, PROP_ON_PAINT, PROP_ON_TAP,
+    PROP_IMAGE_ID, PROP_ON_CLICK, PROP_ON_PAINT, PROP_ON_TAP, PROP_BORDER_RADIUS,
     PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
     PROP_PRESS_COLOR, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W,
     PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VISIBLE,
@@ -19,101 +20,121 @@ use crate::render;
 use crate::types::{Edges, Offset, Size};
 use crate::widget::{WidgetId, FLAG_CLICKABLE, FLAG_ENABLED, FLAG_VISIBLE};
 
-// === Code source abstraction ===
+// === Code source — owned by VM ===
 
-/// Trait for reading bytecode — either from RAM or flash.
-pub trait CodeSource {
-    /// Total bytecode length in bytes.
-    fn len(&self) -> usize;
-    /// Read a single byte at absolute position. Returns 0 if out of bounds.
-    fn byte_at(&self, pos: usize) -> u8;
-    /// Read a slice of bytes into buf. Returns number of bytes actually read.
-    fn read_bytes(&self, pos: usize, buf: &mut [u8]) -> usize;
+/// Code source enum — VM owns its bytecode source.
+pub enum VmCode {
+    /// No code loaded.
+    None,
+    /// RAM-backed: VM owns the bytecode buffer.
+    Ram(Vec<u8>),
+    /// Flash-backed: reads bytecode from SPI flash on demand.
+    Flash {
+        flash: Flash,
+        base_addr: u32,
+        code_len: usize,
+    },
 }
 
-/// RAM-backed code source — wraps a &[u8] slice (zero-cost).
-pub struct RamCode<'a> {
-    data: &'a [u8],
-}
-
-impl<'a> RamCode<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data }
-    }
-}
-
-impl CodeSource for RamCode<'_> {
+impl VmCode {
     #[inline]
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[inline]
-    fn byte_at(&self, pos: usize) -> u8 {
-        if pos < self.data.len() { self.data[pos] } else { 0 }
-    }
-
-    #[inline]
-    fn read_bytes(&self, pos: usize, buf: &mut [u8]) -> usize {
-        if pos >= self.data.len() {
-            return 0;
+    pub fn len(&self) -> usize {
+        match self {
+            VmCode::None => 0,
+            VmCode::Ram(data) => data.len(),
+            VmCode::Flash { code_len, .. } => *code_len,
         }
-        let avail = self.data.len() - pos;
-        let n = buf.len().min(avail);
-        buf[..n].copy_from_slice(&self.data[pos..pos + n]);
-        n
-    }
-}
-
-
-/// Flash-backed code source — reads bytecode directly from SPI flash.
-/// Each read goes straight to flash via SPI (13.5MHz, ~1μs per byte).
-/// No RAM buffer needed — saves 4KB code_buf for large programs.
-///
-/// Flash is a zero-sized hardware accessor (no state), so FlashCode
-/// owns its own instance to avoid borrow conflicts with Ctx.
-pub struct FlashCode {
-    flash: Flash,
-    base_addr: u32,
-    code_len: usize,
-}
-
-impl FlashCode {
-    /// Create a flash code source. `base_addr` is the absolute flash address
-    /// of the bytecode resource. `code_len` is the size in bytes.
-    pub fn new(base_addr: u32, code_len: usize) -> Self {
-        Self { flash: Flash::new(), base_addr, code_len }
-    }
-}
-
-impl CodeSource for FlashCode {
-    #[inline]
-    fn len(&self) -> usize {
-        self.code_len
     }
 
     #[inline]
-    fn byte_at(&self, pos: usize) -> u8 {
-        if pos >= self.code_len {
-            return 0;
+    pub fn byte_at(&self, pos: usize) -> u8 {
+        match self {
+            VmCode::None => 0,
+            VmCode::Ram(data) => {
+                if pos < data.len() { data[pos] } else { 0 }
+            }
+            VmCode::Flash { flash, base_addr, code_len } => {
+                if pos >= *code_len { return 0; }
+                let mut b = [0u8; 1];
+                flash.read(base_addr + pos as u32, &mut b);
+                b[0]
+            }
         }
-        let mut b = [0u8; 1];
-        self.flash.read(self.base_addr + pos as u32, &mut b);
-        b[0]
     }
 
-    fn read_bytes(&self, pos: usize, buf: &mut [u8]) -> usize {
-        if pos >= self.code_len {
-            return 0;
+    #[inline]
+    pub fn read_bytes(&self, pos: usize, buf: &mut [u8]) -> usize {
+        match self {
+            VmCode::None => 0,
+            VmCode::Ram(data) => {
+                if pos >= data.len() { return 0; }
+                let avail = data.len() - pos;
+                let n = buf.len().min(avail);
+                buf[..n].copy_from_slice(&data[pos..pos + n]);
+                n
+            }
+            VmCode::Flash { flash, base_addr, code_len } => {
+                if pos >= *code_len { return 0; }
+                let avail = *code_len - pos;
+                let n = buf.len().min(avail);
+                if n > 0 {
+                    flash.read(base_addr + pos as u32, &mut buf[..n]);
+                }
+                n
+            }
         }
-        let avail = self.code_len - pos;
-        let n = buf.len().min(avail);
-        if n > 0 {
-            self.flash.read(self.base_addr + pos as u32, &mut buf[..n]);
-        }
-        n
     }
 }
+
+// === Function metadata (embedded in image header) ===
+
+/// Function kind — determines how the VM dispatches the function.
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum FunctionKind {
+    Setup = 0,
+    Loop = 1,
+    UserFunction = 2,
+    OnProgramStart = 3,
+    OnPageChanging = 4,
+    OnPageChanged = 5,
+    OnUserMessage = 6,
+    OnTouchDown = 7,
+    OnTouchUp = 8,
+    OnTouchMove = 9,
+}
+
+impl FunctionKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Setup),
+            1 => Some(Self::Loop),
+            2 => Some(Self::UserFunction),
+            3 => Some(Self::OnProgramStart),
+            4 => Some(Self::OnPageChanging),
+            5 => Some(Self::OnPageChanged),
+            6 => Some(Self::OnUserMessage),
+            7 => Some(Self::OnTouchDown),
+            8 => Some(Self::OnTouchUp),
+            9 => Some(Self::OnTouchMove),
+            _ => None,
+        }
+    }
+}
+
+/// Function entry from the image header.
+#[derive(Clone, Copy)]
+pub struct FuncEntry {
+    pub func_id: u16,
+    pub kind: FunctionKind,
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// Image header size: version(1) + function_count(2) + reserved(2) = 5 bytes.
+const IMAGE_HEADER_SIZE: usize = 5;
+/// Each function entry: func_id(2) + kind(1) + pad(1) + offset(4) + length(4) = 12 bytes.
+const FUNC_ENTRY_SIZE: usize = 12;
 
 // --- 1-byte opcode map (IL-style) ---
 
@@ -237,6 +258,14 @@ pub enum VmState {
     Error,
 }
 
+// --- VM Mode ---
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum VmMode {
+    Normal,
+    Callback,
+}
+
 // --- VM ---
 
 const STACK_SIZE: usize = 16;
@@ -247,6 +276,31 @@ const CALL_STACK_SIZE: usize = 8;
 struct VmArray {
     id: u16,
     data: Vec<i32>,
+}
+
+/// Saved VM state for callback push/pop.
+struct VmSnapshot {
+    pc: u16,
+    sp: u8,
+    stack: [i32; STACK_SIZE],
+    call_sp: u8,
+    call_stack: [u16; CALL_STACK_SIZE],
+    target: WidgetId,
+    state: VmState,
+    wait_until: u32,
+}
+
+/// Maximum number of arguments per queued callback.
+const CB_MAX_ARGS: usize = 3;
+/// Maximum number of queued callbacks.
+const CB_QUEUE_SIZE: usize = 8;
+
+/// A queued callback request.
+#[derive(Clone, Copy)]
+struct CbRequest {
+    offset: u16,
+    arg_count: u8,
+    args: [i32; CB_MAX_ARGS],
 }
 
 pub struct Vm {
@@ -261,10 +315,25 @@ pub struct Vm {
     arrays: Vec<VmArray>,
     next_arr_id: u16,
     pub wait_until: u32,
+    // Code source — owned by VM
+    code: VmCode,
+    // Function table from image header
+    functions: Vec<FuncEntry>,
+    // Normal or callback execution mode
+    pub mode: VmMode,
+    // Saved state while a callback is running
+    saved: Option<Box<VmSnapshot>>,
+    // Callback queue — FIFO ring buffer
+    cb_queue: [CbRequest; CB_QUEUE_SIZE],
+    cb_head: u8,
+    cb_tail: u8,
 }
 
 impl Vm {
     pub fn new() -> Self {
+        const EMPTY_CB: CbRequest = CbRequest {
+            offset: 0, arg_count: 0, args: [0; CB_MAX_ARGS],
+        };
         Self {
             pc: 0,
             stack: [0; STACK_SIZE],
@@ -277,8 +346,167 @@ impl Vm {
             arrays: Vec::new(),
             next_arr_id: 0,
             wait_until: 0,
+            code: VmCode::None,
+            functions: Vec::new(),
+            mode: VmMode::Normal,
+            saved: None,
+            cb_queue: [EMPTY_CB; CB_QUEUE_SIZE],
+            cb_head: 0,
+            cb_tail: 0,
         }
     }
+
+    // === Code loading ===
+
+    /// Load a VM image from RAM bytes. Parses the image header and keeps
+    /// opcodes in a Vec<u8>. Returns false if the header is invalid.
+    pub fn load_ram(&mut self, image: &[u8]) -> bool {
+        if let Some((funcs, opcode_start)) = parse_image_header(image) {
+            let opcodes = image[opcode_start..].to_vec();
+            self.code = VmCode::Ram(opcodes);
+            self.functions = funcs;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Load a VM image from flash. Reads only the header into RAM;
+    /// opcodes are read on demand from flash via SPI.
+    pub fn load_flash(&mut self, flash: &Flash, base: u32, total_len: usize) -> bool {
+        // Read header into a stack buffer
+        let hdr_max = IMAGE_HEADER_SIZE + FUNC_ENTRY_SIZE * 64; // max 64 functions
+        let read_len = total_len.min(hdr_max);
+        let mut hdr_buf = [0u8; 5 + 12 * 64]; // 773 bytes on stack
+        flash.read(base, &mut hdr_buf[..read_len]);
+
+        if let Some((funcs, opcode_start)) = parse_image_header(&hdr_buf[..read_len]) {
+            let opcode_base = base + opcode_start as u32;
+            let opcode_len = total_len.saturating_sub(opcode_start);
+            self.code = VmCode::Flash {
+                flash: Flash::new(),
+                base_addr: opcode_base,
+                code_len: opcode_len,
+            };
+            self.functions = funcs;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Load raw bytecode (no image header). Used for page bytecode.
+    pub fn load_raw(&mut self, data: &[u8]) {
+        self.code = VmCode::Ram(data.to_vec());
+        self.functions.clear();
+    }
+
+    // === Function table lookup ===
+
+    /// Find a function by kind. Returns the first match.
+    pub fn find_by_kind(&self, kind: FunctionKind) -> Option<&FuncEntry> {
+        self.functions.iter().find(|f| f.kind as u8 == kind as u8)
+    }
+
+    /// Find a function by func_id (for widget on_click/on_tap/on_paint callbacks).
+    pub fn find_func(&self, func_id: u16) -> Option<&FuncEntry> {
+        self.functions.iter().find(|f| f.func_id == func_id)
+    }
+
+    // === Callback queue ===
+
+    /// Enqueue a callback to be executed later via drain_callbacks().
+    /// Dropped silently if the queue is full.
+    pub fn enqueue_callback(&mut self, offset: u16, args: &[i32]) {
+        let next_tail = (self.cb_tail + 1) % CB_QUEUE_SIZE as u8;
+        if next_tail == self.cb_head {
+            return; // queue full — drop
+        }
+        let mut req = CbRequest {
+            offset,
+            arg_count: args.len().min(CB_MAX_ARGS) as u8,
+            args: [0; CB_MAX_ARGS],
+        };
+        for i in 0..req.arg_count as usize {
+            req.args[i] = args[i];
+        }
+        self.cb_queue[self.cb_tail as usize] = req;
+        self.cb_tail = next_tail;
+    }
+
+    /// Returns true if there are pending callbacks in the queue.
+    pub fn has_pending_callbacks(&self) -> bool {
+        self.cb_head != self.cb_tail
+    }
+
+    /// Run one queued callback to completion. Saves/restores VM state.
+    /// Returns false if the queue was empty.
+    pub fn run_next_callback(&mut self, ctx: &mut Ctx) -> bool {
+        if self.cb_head == self.cb_tail {
+            return false;
+        }
+        let req = self.cb_queue[self.cb_head as usize];
+        self.cb_head = (self.cb_head + 1) % CB_QUEUE_SIZE as u8;
+
+        self.push_state(req.offset);
+        for i in 0..req.arg_count as usize {
+            self.push_arg(req.args[i]);
+        }
+        self.run(ctx);
+        self.pop_state();
+        true
+    }
+
+    /// Drain all queued callbacks, executing each to completion.
+    pub fn drain_callbacks(&mut self, ctx: &mut Ctx) {
+        while self.run_next_callback(ctx) {}
+    }
+
+    /// Run a callback immediately (not queued). Used during startup
+    /// when the main loop is not yet running.
+    pub fn run_callback(&mut self, offset: u16, ctx: &mut Ctx) {
+        self.push_state(offset);
+        self.run(ctx);
+        self.pop_state();
+    }
+
+    // --- Internal: save/restore VM state for callback execution ---
+
+    fn push_state(&mut self, offset: u16) {
+        let snapshot = VmSnapshot {
+            pc: self.pc,
+            sp: self.sp,
+            stack: self.stack,
+            call_sp: self.call_sp,
+            call_stack: self.call_stack,
+            target: self.target,
+            state: self.state,
+            wait_until: self.wait_until,
+        };
+        self.saved = Some(Box::new(snapshot));
+        self.pc = offset;
+        self.sp = 0;
+        self.call_sp = 0;
+        self.target = WidgetId::NONE;
+        self.mode = VmMode::Callback;
+        self.state = VmState::Running;
+    }
+
+    fn pop_state(&mut self) {
+        if let Some(snap) = self.saved.take() {
+            self.pc = snap.pc;
+            self.sp = snap.sp;
+            self.stack = snap.stack;
+            self.call_sp = snap.call_sp;
+            self.call_stack = snap.call_stack;
+            self.target = snap.target;
+            self.state = snap.state;
+            self.wait_until = snap.wait_until;
+            self.mode = VmMode::Normal;
+        }
+    }
+
+    // === Public API ===
 
     pub fn set_target(&mut self, id: WidgetId) {
         self.target = id;
@@ -317,6 +545,16 @@ impl Vm {
         self.arrays.clear();
         self.next_arr_id = 0;
         self.wait_until = 0;
+        self.code = VmCode::None;
+        self.functions.clear();
+        self.mode = VmMode::Normal;
+        self.saved = None;
+        self.cb_head = 0;
+        self.cb_tail = 0;
+    }
+
+    pub fn has_code(&self) -> bool {
+        self.code.len() > 0
     }
 
     pub fn alloc_array_from(&mut self, data: &[u8]) -> Option<i32> {
@@ -330,21 +568,21 @@ impl Vm {
         Some(id as i32)
     }
 
-    pub fn run(&mut self, code: &dyn CodeSource, ctx: &mut Ctx) {
+    pub fn run(&mut self, ctx: &mut Ctx) {
         self.state = VmState::Running;
         while self.state == VmState::Running {
-            self.step(code, ctx);
+            self.step(ctx);
         }
     }
 
-    // --- Byte reading helpers ---
+    // --- Byte reading helpers (read from self.code) ---
 
     #[inline]
-    fn read_u8(&mut self, code: &dyn CodeSource) -> u8 {
+    fn read_u8(&mut self) -> u8 {
         let pos = self.pc as usize;
-        if pos < code.len() {
+        if pos < self.code.len() {
             self.pc += 1;
-            code.byte_at(pos)
+            self.code.byte_at(pos)
         } else {
             self.state = VmState::Error;
             0
@@ -352,17 +590,17 @@ impl Vm {
     }
 
     #[inline]
-    fn read_i8(&mut self, code: &dyn CodeSource) -> i8 {
-        self.read_u8(code) as i8
+    fn read_i8(&mut self) -> i8 {
+        self.read_u8() as i8
     }
 
     #[inline]
-    fn read_u16(&mut self, code: &dyn CodeSource) -> u16 {
+    fn read_u16(&mut self) -> u16 {
         let pos = self.pc as usize;
-        if pos + 2 <= code.len() {
+        if pos + 2 <= self.code.len() {
             self.pc += 2;
             let mut buf = [0u8; 2];
-            code.read_bytes(pos, &mut buf);
+            self.code.read_bytes(pos, &mut buf);
             u16::from_le_bytes(buf)
         } else {
             self.state = VmState::Error;
@@ -371,17 +609,17 @@ impl Vm {
     }
 
     #[inline]
-    fn read_i16(&mut self, code: &dyn CodeSource) -> i16 {
-        self.read_u16(code) as i16
+    fn read_i16(&mut self) -> i16 {
+        self.read_u16() as i16
     }
 
     #[inline]
-    fn read_i32(&mut self, code: &dyn CodeSource) -> i32 {
+    fn read_i32(&mut self) -> i32 {
         let pos = self.pc as usize;
-        if pos + 4 <= code.len() {
+        if pos + 4 <= self.code.len() {
             self.pc += 4;
             let mut buf = [0u8; 4];
-            code.read_bytes(pos, &mut buf);
+            self.code.read_bytes(pos, &mut buf);
             i32::from_le_bytes(buf)
         } else {
             self.state = VmState::Error;
@@ -390,14 +628,14 @@ impl Vm {
     }
 
     #[inline]
-    fn read_u32(&mut self, code: &dyn CodeSource) -> u32 {
-        self.read_i32(code) as u32
+    fn read_u32(&mut self) -> u32 {
+        self.read_i32() as u32
     }
 
     // --- Execute a single instruction ---
 
-    pub fn step(&mut self, code: &dyn CodeSource, ctx: &mut Ctx) {
-        let op = self.read_u8(code);
+    pub fn step(&mut self, ctx: &mut Ctx) {
+        let op = self.read_u8();
         if self.state == VmState::Error {
             return;
         }
@@ -435,6 +673,9 @@ impl Vm {
                 if self.call_sp > 0 {
                     self.call_sp -= 1;
                     self.pc = self.call_stack[self.call_sp as usize];
+                } else if self.mode == VmMode::Callback {
+                    // Callback complete — halt cleanly
+                    self.state = VmState::Halted;
                 } else {
                     self.state = VmState::Error;
                 }
@@ -485,19 +726,19 @@ impl Vm {
 
             // --- With arguments ---
             OP_PUSH_I8 => {
-                let val = self.read_i8(code) as i32;
+                let val = self.read_i8() as i32;
                 self.push(val);
             }
             OP_PUSH_I16 => {
-                let val = self.read_i16(code) as i32;
+                let val = self.read_i16() as i32;
                 self.push(val);
             }
             OP_PUSH_I32 => {
-                let val = self.read_i32(code);
+                let val = self.read_i32();
                 self.push(val);
             }
             OP_LOAD => {
-                let slot = self.read_u8(code) as usize;
+                let slot = self.read_u8() as usize;
                 if slot < VAR_COUNT {
                     self.push(self.vars[slot]);
                 } else {
@@ -505,7 +746,7 @@ impl Vm {
                 }
             }
             OP_STORE => {
-                let slot = self.read_u8(code) as usize;
+                let slot = self.read_u8() as usize;
                 if slot < VAR_COUNT {
                     self.vars[slot] = self.pop();
                 } else {
@@ -513,19 +754,19 @@ impl Vm {
                 }
             }
             OP_JMP => {
-                let target = self.read_u16(code);
+                let target = self.read_u16();
                 self.pc = target;
             }
             OP_JZ => {
-                let target = self.read_u16(code);
+                let target = self.read_u16();
                 if self.pop() == 0 { self.pc = target; }
             }
             OP_JNZ => {
-                let target = self.read_u16(code);
+                let target = self.read_u16();
                 if self.pop() != 0 { self.pc = target; }
             }
             OP_CALL => {
-                let target = self.read_u16(code);
+                let target = self.read_u16();
                 if (self.call_sp as usize) < CALL_STACK_SIZE {
                     self.call_stack[self.call_sp as usize] = self.pc;
                     self.call_sp += 1;
@@ -535,11 +776,11 @@ impl Vm {
                 }
             }
             OP_W_TARGET => {
-                let wid = self.read_u8(code);
+                let wid = self.read_u8();
                 self.target = WidgetId(wid);
             }
             OP_W_SET => {
-                let prop_id = self.read_u8(code);
+                let prop_id = self.read_u8();
                 let val = self.pop();
                 if self.target.is_some() {
                     self.set_scalar_prop(ctx, prop_id, val);
@@ -556,7 +797,7 @@ impl Vm {
                 }
             }
             OP_W_GET => {
-                let prop_id = self.read_u8(code);
+                let prop_id = self.read_u8();
                 if self.target.is_some() {
                     let v = self.get_scalar_prop(ctx, prop_id);
                     self.push(v);
@@ -565,20 +806,20 @@ impl Vm {
                 }
             }
             OP_W_PARENT => {
-                let parent = self.read_u8(code);
+                let parent = self.read_u8();
                 if self.target.is_some() {
                     ctx.tree.add_child(WidgetId(parent), self.target);
                 }
             }
             OP_W_SET_LEN => {
-                let prop_id = self.read_u8(code);
-                let len = self.read_u8(code) as usize;
+                let prop_id = self.read_u8();
+                let len = self.read_u8() as usize;
                 let start = self.pc as usize;
                 let end = start + len;
-                if end <= code.len() {
+                if end <= self.code.len() {
                     let mut buf = [0u8; 32];
                     let n = len.min(buf.len());
-                    code.read_bytes(start, &mut buf[..n]);
+                    self.code.read_bytes(start, &mut buf[..n]);
                     self.pc = end as u16;
                     if self.target.is_some() {
                         self.set_compound_prop(prop_id, &buf[..n], ctx);
@@ -588,18 +829,18 @@ impl Vm {
                 }
             }
             OP_ARR_ALLOC => {
-                let size = self.read_u8(code) as u16;
+                let size = self.read_u8() as u16;
                 self.arr_alloc(size);
             }
             OP_ARR_INIT => {
-                let count = self.read_u8(code) as usize;
+                let count = self.read_u8() as usize;
                 let start = self.pc as usize;
                 let byte_len = count * 4;
-                if start + byte_len <= code.len() {
+                if start + byte_len <= self.code.len() {
                     let mut values: Vec<i32> = Vec::with_capacity(count);
                     let mut tmp = [0u8; 4];
                     for i in 0..count {
-                        code.read_bytes(start + i * 4, &mut tmp);
+                        self.code.read_bytes(start + i * 4, &mut tmp);
                         values.push(i32::from_le_bytes(tmp));
                     }
                     self.pc = (start + byte_len) as u16;
@@ -612,8 +853,8 @@ impl Vm {
                 }
             }
             OP_F_READ => {
-                let addr = self.read_u32(code);
-                let len = self.read_u16(code) as usize;
+                let addr = self.read_u32();
+                let len = self.read_u16() as usize;
                 if len > (STACK_SIZE - self.sp as usize) {
                     self.state = VmState::Error;
                     return;
@@ -626,13 +867,13 @@ impl Vm {
                 }
             }
             OP_F_WRITE => {
-                let addr = self.read_u32(code);
-                let len = self.read_u8(code) as usize;
+                let addr = self.read_u32();
+                let len = self.read_u8() as usize;
                 let start = self.pc as usize;
-                if start + len <= code.len() {
+                if start + len <= self.code.len() {
                     let mut buf = [0u8; 64];
                     let n = len.min(buf.len());
-                    code.read_bytes(start, &mut buf[..n]);
+                    self.code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as u16;
                     if n > 0 {
                         ctx.flash.write(addr, &buf[..n]);
@@ -682,12 +923,12 @@ impl Vm {
             }
             OP_DRAW_TEXT_LIT => {
                 // Inline text: u8 len + text bytes, stack: [colors, font_id, loc]
-                let len = self.read_u8(code) as usize;
+                let len = self.read_u8() as usize;
                 let start = self.pc as usize;
-                if start + len <= code.len() {
+                if start + len <= self.code.len() {
                     let mut buf = [0u8; 64];
                     let n = len.min(buf.len());
-                    code.read_bytes(start, &mut buf[..n]);
+                    self.code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as u16;
                     let colors = self.pop();
                     let (fg, bg) = unpack_pair(colors);
@@ -708,12 +949,12 @@ impl Vm {
             }
             OP_STR_LIT => {
                 // Inline text: u8 len + text bytes → allocate in pool, push str_id
-                let len = self.read_u8(code) as usize;
+                let len = self.read_u8() as usize;
                 let start = self.pc as usize;
-                if start + len <= code.len() {
+                if start + len <= self.code.len() {
                     let mut buf = [0u8; 64];
                     let n = len.min(buf.len());
-                    code.read_bytes(start, &mut buf[..n]);
+                    self.code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as u16;
                     match ctx.strpool.alloc(&buf[..n]) {
                         Some(id) => self.push(id as i32),
@@ -904,6 +1145,7 @@ impl Vm {
             PROP_TEXT_ALIGN => w.text_align = val as u8,
             PROP_PRESS_COLOR => w.press_color = val as u16,
             PROP_IMAGE_ID => w.image_id = val as u8,
+            PROP_BORDER_RADIUS => w.border_radius = val as u16,
             PROP_ON_CLICK => w.on_click = val as u16,
             PROP_ON_PAINT => w.on_paint = val as u16,
             PROP_ON_TAP => w.on_tap = val as u16,
@@ -941,6 +1183,7 @@ impl Vm {
             PROP_TEXT_ALIGN => w.text_align as i32,
             PROP_PRESS_COLOR => w.press_color as i32,
             PROP_IMAGE_ID => w.image_id as i32,
+            PROP_BORDER_RADIUS => w.border_radius as i32,
             PROP_ON_CLICK => w.on_click as i32,
             PROP_ON_PAINT => w.on_paint as i32,
             PROP_ON_TAP => w.on_tap as i32,
@@ -1034,6 +1277,59 @@ impl Vm {
             None => self.state = VmState::Error,
         }
     }
+}
+
+// === Image header parser ===
+
+/// Parse VM image header. Returns (function table, opcode start offset).
+///
+/// Format:
+///   version(u8) + function_count(u16 LE) + reserved(u16)
+///   + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
+fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize)> {
+    if data.len() < IMAGE_HEADER_SIZE {
+        return None;
+    }
+
+    let version = data[0];
+    if version != 1 {
+        return None;
+    }
+
+    let func_count = u16::from_le_bytes([data[1], data[2]]) as usize;
+    // reserved = data[3..5]
+
+    let table_size = func_count * FUNC_ENTRY_SIZE;
+    let opcode_start = IMAGE_HEADER_SIZE + table_size;
+
+    if data.len() < opcode_start {
+        return None;
+    }
+
+    let mut functions = Vec::with_capacity(func_count);
+    for i in 0..func_count {
+        let base = IMAGE_HEADER_SIZE + i * FUNC_ENTRY_SIZE;
+        let func_id = u16::from_le_bytes([data[base], data[base + 1]]);
+        let kind_byte = data[base + 2];
+        // data[base + 3] = pad
+        let offset = u32::from_le_bytes([
+            data[base + 4], data[base + 5], data[base + 6], data[base + 7],
+        ]);
+        let length = u32::from_le_bytes([
+            data[base + 8], data[base + 9], data[base + 10], data[base + 11],
+        ]);
+
+        let kind = FunctionKind::from_u8(kind_byte).unwrap_or(FunctionKind::UserFunction);
+
+        functions.push(FuncEntry {
+            func_id,
+            kind,
+            offset,
+            length,
+        });
+    }
+
+    Some((functions, opcode_start))
 }
 
 // --- Packed u32 helper ---
