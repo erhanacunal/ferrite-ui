@@ -120,6 +120,8 @@ class Op:
     END_FRAME       = 0x97
     SEND_USART      = 0x98
     SEND_USART_STR  = 0x99
+    RTC_READ        = 0x9A
+    RTC_WRITE       = 0x9B
 
     # Float ops (all no-arg)
     ITOF = 0xC0
@@ -166,6 +168,8 @@ class Builtin:
     END_FRAME = 23
     SEND_USART = 24
     SEND_USART_STR = 25
+    RTC_READ = 26
+    RTC_WRITE = 27
 
 
 class Prop:
@@ -865,6 +869,7 @@ OP_NAMES = {
     0x93: 'roundedRect', 0x94: 'fillRoundedRect', 0x95: 'arc',
     0x96: 'beginFrame', 0x97: 'endFrame',
     0x98: 'sendUsart', 0x99: 'sendUsartStr',
+    0x9A: 'rtcRead', 0x9B: 'rtcWrite',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -892,7 +897,7 @@ PROP_NAMES = {
 _NO_ARG_OPS = (
     set(range(0x00, 0x1B)) |           # 0x00-0x1A
     set(range(0x20, 0x2E)) |           # 0x20-0x2D
-    {op for op in range(0x80, 0x9A)    # 0x80-0x99 except 0x86, 0x88
+    {op for op in range(0x80, 0x9C)    # 0x80-0x9B except 0x86, 0x88
      if op not in (0x86, 0x88)} |
     set(range(0xC0, 0xCD))             # 0xC0-0xCC
 )

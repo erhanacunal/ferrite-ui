@@ -5,13 +5,13 @@ Ferrite Language (`.fl`) is a simple C-like language that compiles to VM bytecod
 ## Toolchain
 
 ```bash
-# Compile and print disassembly
-python ferrite_lang.py source.fl --disasm
+# Compile to VM image and print disassembly
+python ferrite_lang.py source.fl --image --disasm
 
-# Compile to binary
-python ferrite_lang.py source.fl -o program.bin
+# Compile to VM image binary
+python ferrite_lang.py source.fl --image -o program.bin
 
-# Compile as page (with background color)
+# Compile as page (with background color, no image header)
 python ferrite_lang.py source.fl --page 0x0000 -o page_main.bin
 
 # Upload to device
@@ -20,20 +20,64 @@ python ferrite_cli.py -p COM3 execute program.bin
 
 ## Program Structure
 
-A ferrite program consists of **function definitions** and **top-level statements**. Functions are defined first (order doesn't matter), then top-level statements execute sequentially as the main program.
+A ferrite program requires two functions: `fn setup()` and `fn loop()`. Global variables are declared at the top level. No top-level imperative code is allowed outside of function bodies.
 
 ```c
-// Functions are defined at the top
-fn helper(x, y) {
-    return x + y;
+// Global variables (accessible from all functions)
+var counter;
+var label;
+
+// setup() runs once at startup. Must return 0 for success.
+fn setup() {
+    counter = 0;
+    label = alloc();
+    target(label);
+    set(kind, 1);
+    set(size, 200, 40);
+    set(text_color, 0xFFFF);
+    set(font_id, 0);
+    parent(0);
+    render();
+    return 0;
 }
 
-// Top-level statements = main program
-var result = helper(10, 20);
-halt();
+// loop() runs repeatedly. The compiler wraps it in while(1){...yield;}
+fn loop() {
+    counter = counter + 1;
+    var s = itos(counter);
+    target(label);
+    setText(s);
+    dirty();
+    render();
+    delay(100);
+    strClear();
+}
+
+// Helper functions
+fn rgb565(r, g, b) {
+    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
+}
 ```
 
-The program runs on a stack-based VM with 16 variable slots (shared between main code and function calls) and a 16-deep eval stack.
+### setup()
+
+Called once at startup after global variable initialization. Widget creation and initial UI layout go here. **Must return 0** for success — any other return value stops execution and shows an error on screen.
+
+### loop()
+
+Called repeatedly in an infinite loop. The compiler automatically wraps the body in `while(1) { <body>; yield; }`, so the function never returns. The `yield` allows the main loop to process touch events, USART messages, and callbacks between iterations.
+
+### Global Variables
+
+Variables declared at the top level are global — visible from `setup()`, `loop()`, all callbacks, and helper functions. Global variable initializers (including array literals) are automatically emitted at the start of `setup()`.
+
+```c
+var x;                  // initialized to 0 in setup
+var color = 0xF800;     // initialized to 0xF800 in setup
+var lut[4] = [10, 20, 30, 40];  // array initialized in setup
+```
+
+The VM has 32 variable slots total. Global variables use slots 0..N, function locals use slots N+.
 
 ## Comments
 
@@ -46,8 +90,6 @@ The program runs on a stack-based VM with 16 variable slots (shared between main
 
 ## Variables
 
-Variables are declared with `var`. The VM has 16 variable slots total (shared between main program and function parameters).
-
 ```c
 var x = 0;          // integer, initialized to 0
 var color = 0xF800;  // hex literal (red in RGB565)
@@ -58,8 +100,6 @@ var big = 1_000_000; // underscores for readability
 All values are **signed 32-bit integers** (`i32`).
 
 ### Arrays
-
-Arrays are allocated from a fixed pool (64 elements total, max 8 arrays).
 
 ```c
 var colors[4] = [0xF800, 0x07E0, 0x001F, 0xFFE0];  // init with values
@@ -82,23 +122,20 @@ There is only one data type: **i32** (signed 32-bit integer). Colors are RGB565 
 0xFF00      // hexadecimal
 0b1100_0011 // binary
 1_000_000   // decimal with underscores
+3.14159     // float (stored as f32 bit pattern)
 ```
 
 ### Boolean Values
 
 `true` evaluates to `1`, `false` to `0`. Any non-zero value is truthy.
 
-```c
-var enabled = true;   // 1
-var disabled = false;  // 0
-```
-
 ### String Literals
 
-String literals are only used as arguments to `drawText()`. They cannot be assigned to variables.
+String literals are used as arguments to `drawText()` and `str()`.
 
 ```c
 drawText(10, 20, 0, 0xFFFF, 0x0000, "Hello World");
+var s = str("Hello");
 ```
 
 Escape sequences: `\\`, `\"`, `\n`, `\t`.
@@ -107,65 +144,49 @@ Escape sequences: `\\`, `\"`, `\n`, `\t`.
 
 The display uses 16-bit RGB565 color format. Common colors:
 
-| Color   | Value    | RGB565 |
-|---------|----------|--------|
-| Black   | `0x0000` | R=0, G=0, B=0 |
-| White   | `0xFFFF` | R=31, G=63, B=31 |
-| Red     | `0xF800` | R=31, G=0, B=0 |
-| Green   | `0x07E0` | R=0, G=63, B=0 |
-| Blue    | `0x001F` | R=0, G=0, B=31 |
-| Yellow  | `0xFFE0` | R=31, G=63, B=0 |
-| Cyan    | `0x07FF` | R=0, G=63, B=31 |
-| Magenta | `0xF81F` | R=31, G=0, B=31 |
-
-You can write a helper to compute RGB565 at runtime:
-
-```c
-fn rgb565(r, g, b) {
-    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
-}
-
-var orange = rgb565(255, 165, 0);
-```
+| Color   | Value    |
+|---------|----------|
+| Black   | `0x0000` |
+| White   | `0xFFFF` |
+| Red     | `0xF800` |
+| Green   | `0x07E0` |
+| Blue    | `0x001F` |
+| Yellow  | `0xFFE0` |
+| Cyan    | `0x07FF` |
+| Magenta | `0xF81F` |
 
 ## Operators
 
 ### Arithmetic
 
-| Operator | Description | Example |
-|----------|-------------|---------|
-| `+` | Addition | `a + b` |
-| `-` | Subtraction | `a - b` |
-| `*` | Multiplication | `a * b` |
-| `/` | Division (integer) | `a / b` |
-| `%` | Modulo | `a % b` |
-| `-` | Negation (unary) | `-x` |
+| Operator | Description |
+|----------|-------------|
+| `+` | Addition |
+| `-` | Subtraction / Negation |
+| `*` | Multiplication |
+| `/` | Integer division |
+| `%` | Modulo |
 
 ### Comparison
 
-| Operator | Description | Example |
-|----------|-------------|---------|
-| `==` | Equal | `a == b` |
-| `!=` | Not equal | `a != b` |
-| `<`  | Less than | `a < b` |
-| `<=` | Less or equal | `a <= b` |
-| `>`  | Greater than | `a > b` |
-| `>=` | Greater or equal | `a >= b` |
+| Operator | Description |
+|----------|-------------|
+| `==` | Equal |
+| `!=` | Not equal |
+| `<`  | Less than |
+| `<=` | Less or equal |
+| `>`  | Greater than |
+| `>=` | Greater or equal |
 
-### Logical
+### Logical / Bitwise
 
-| Operator | Description | Example |
-|----------|-------------|---------|
-| `&&` | Logical AND (short-circuit) | `a && b` |
-| `\|\|` | Logical OR (short-circuit) | `a \|\| b` |
-| `!`  | Logical NOT | `!a` |
-
-### Bitwise
-
-| Operator | Description | Example |
-|----------|-------------|---------|
-| `&` | Bitwise AND | `a & b` |
-| `\|` | Bitwise OR | `a \| b` |
+| Operator | Description |
+|----------|-------------|
+| `&&` | Logical AND (short-circuit) |
+| `\|\|` | Logical OR (short-circuit) |
+| `!`  | Logical NOT |
+| `&` | Bitwise AND |
+| `\|` | Bitwise OR |
 
 ## Control Flow
 
@@ -174,18 +195,7 @@ var orange = rgb565(255, 165, 0);
 ```c
 if (x > 10) {
     set(bg_color, 0xF800);
-}
-
-if (count == 0) {
-    set(visible, 0);
-} else {
-    set(visible, 1);
-}
-
-// Chained
-if (mode == 1) {
-    set(bg_color, 0xF800);
-} else if (mode == 2) {
+} else if (x > 5) {
     set(bg_color, 0x07E0);
 } else {
     set(bg_color, 0x001F);
@@ -197,11 +207,6 @@ if (mode == 1) {
 ```c
 var i = 0;
 while (i < 10) {
-    target(btn);
-    set(bg_color, colors[i]);
-    dirty();
-    render();
-    delay(100);
     i = i + 1;
 }
 ```
@@ -212,29 +217,22 @@ while (i < 10) {
 for (var i = 0; i < 4; i = i + 1) {
     target(btn);
     set(bg_color, colors[i]);
-    dirty();
-    render();
 }
 ```
 
 ### break / continue
 
 ```c
-var i = 0;
 while (true) {
     if (i >= 10) { break; }
-    if (i % 2 == 0) {
-        i = i + 1;
-        continue;
-    }
-    // odd numbers only
+    if (i % 2 == 0) { i = i + 1; continue; }
     i = i + 1;
 }
 ```
 
 ## Functions
 
-Functions are defined with `fn`. Parameters are passed by value. Functions can return a value with `return` (implicit `return 0` if omitted).
+Functions are defined with `fn`. Parameters are passed by value. Implicit `return 0` if omitted.
 
 ```c
 fn clamp(val, lo, hi) {
@@ -247,98 +245,75 @@ fn max(a, b) {
     if (a > b) { return a; }
     return b;
 }
-
-var x = clamp(500, 0, 255);
-var bigger = max(10, 20);
 ```
 
-The VM has an 8-deep call stack, so recursion depth is limited.
+The VM has an 8-deep call stack.
 
 ## Widget System
 
-Widgets are the UI building blocks. They form a tree structure (parent-child) and use a CSS-like box model with margin, border, padding, and content area.
+Widgets form a tree structure (parent-child) with a CSS-like box model.
 
 ### Widget Lifecycle
 
 ```c
-// 1. Allocate
-var btn = alloc();
+var btn;
 
-// 2. Set target (all property operations apply to the target)
-target(btn);
-
-// 3. Configure properties
-set(location, 100, 50);
-set(size, 200, 60);
-set(bg_color, 0x001F);
-set(border, 2, 2, 2, 2);
-set(border_color, 0xFFFF);
-
-// 4. Attach to parent
-parent(root);
-
-// 5. Mark dirty and render
-dirty();
-render();
+fn setup() {
+    btn = alloc();
+    target(btn);
+    set(location, 100, 50);
+    set(size, 200, 60);
+    set(bg_color, 0x001F);
+    set(border, 2, 2, 2, 2);
+    set(border_color, 0xFFFF);
+    set(border_radius, 8);
+    set(clickable, 1);
+    parent(0);  // root widget is always id 0
+    render();
+    return 0;
+}
 ```
 
 ### alloc()
 
-Allocates a new widget from the arena (max 64 widgets). Returns the widget ID.
-
-```c
-var panel = alloc();
-```
+Allocates a new widget (max 254). Returns the widget ID.
 
 ### target(widget)
 
-Sets the target widget. All subsequent `set()`, `get()`, `dirty()`, `parent()` calls operate on this target.
-
-```c
-target(panel);
-set(bg_color, 0xF800);  // sets panel's background to red
-```
+Sets the target widget for subsequent `set()`, `get()`, `dirty()`, `parent()` calls.
 
 ### parent(widget)
 
-Attaches the current target widget as a child of the given parent.
-
-```c
-var root = alloc();
-target(root);
-set(size, 800, 480);
-
-var child = alloc();
-target(child);
-set(location, 10, 10);
-set(size, 100, 50);
-parent(root);  // child is now inside root
-```
+Attaches the current target as a child of the given parent.
 
 ### set(property, value...)
 
 Sets a property on the current target widget.
 
-**Scalar properties** (single value):
+**Scalar properties:**
 
 ```c
-set(bg_color, 0xF800);     // background color
-set(border_color, 0xFFFF);  // border color
-set(text_color, 0x0000);    // text color (for labels)
-set(visible, 1);            // show/hide
-set(enabled, 1);            // enable/disable
-set(clickable, 1);          // make clickable (receives touch events)
-set(kind, 1);               // 0=base, 1=label, 2=button
-set(font_id, 0);            // font index (0 = embedded font)
-set(text_align, 1);         // 0=left, 1=center, 2=right
-set(press_color, 0x7BEF);   // button press highlight color
-set(image_id, 1);           // background image (from flash)
+set(bg_color, 0xF800);       // background color
+set(border_color, 0xFFFF);    // border color
+set(border_radius, 12);       // rounded corners (0 = sharp)
+set(text_color, 0x0000);      // text color (labels)
+set(visible, 1);              // show/hide
+set(enabled, 1);              // enable/disable
+set(clickable, 1);            // receives touch events
+set(kind, 1);                 // 0=base, 1=label, 2=button
+set(font_id, 0);              // font index (0=embedded)
+set(text_align, 1);           // 0=left, 1=center, 2=right
+set(press_color, 0x7BEF);     // pressed highlight color
+set(image_id, 1);             // background image from flash
+set(on_click, 1);             // click callback func_id
+set(on_paint, 2);             // custom paint callback func_id
+set(on_tap, 3);               // tap-with-coords callback func_id
 ```
 
-**Compound properties** (multiple values):
+**Compound properties:**
 
 ```c
-set(location, 100, 50);         // x, y position
+set(location, 100, 50);         // x, y
 set(size, 200, 60);             // width, height
 set(margin, 5, 5, 5, 5);       // top, right, bottom, left
 set(border, 2, 2, 2, 2);       // top, right, bottom, left
@@ -349,638 +324,255 @@ set(padding, 10, 10, 10, 10);  // top, right, bottom, left
 
 ```c
 set(margin_top, 10);
-set(margin_right, 5);
 set(border_left, 3);
 set(padding_bottom, 8);
 ```
 
+### border_radius
+
+When `border_radius > 0`, the widget background and border are drawn as rounded rectangles instead of sharp-cornered rectangles. The radius is in pixels.
+
+```c
+set(border, 2, 2, 2, 2);
+set(border_color, 0xFFFF);
+set(border_radius, 12);    // 12px rounded corners
+```
+
 ### get(property)
 
-Reads a property value from the current target widget. Returns the value.
+Reads a property value from the current target widget.
 
 ```c
-target(btn);
 var w = get(width);
-var h = get(height);
 var color = get(bg_color);
+var r = get(border_radius);
 ```
 
-### dirty()
+### dirty() / render()
 
-Marks the current target widget (and its subtree) as needing redraw.
+`dirty()` marks the target widget subtree for redraw. `render()` redraws all dirty widgets.
 
-```c
-target(btn);
-set(bg_color, 0xF800);
-dirty();   // mark for redraw
-render();  // actually redraw dirty widgets
-```
+### halt() / yield_op()
 
-### render()
-
-Triggers a partial redraw of all dirty widgets using the clip-based painter's algorithm.
-
-```c
-dirty();
-render();  // only redraws what changed
-```
-
-### halt()
-
-Stops the VM. Use at the end of page-building programs.
-
-```c
-// Build UI...
-halt();
-```
-
-### yield_op()
-
-Yields execution back to the main loop for one cycle. The VM resumes next iteration. Useful in long-running programs to allow touch handling and USART processing.
-
-```c
-while (true) {
-    // do work...
-    yield_op();  // let main loop handle events
-}
-```
+`halt()` stops the VM. `yield_op()` yields to the main loop for one cycle.
 
 ## Drawing Primitives
 
-Drawing primitives render directly to the LCD framebuffer, bypassing the widget system. They are useful for custom graphics in `on_paint` callbacks or standalone drawing programs.
-
-All coordinates are in screen pixels (0,0 = top-left, 799x479 = bottom-right).
+Drawing primitives render directly to the LCD framebuffer. All coordinates are screen pixels (0,0 = top-left, 799x479 = bottom-right).
 
 ### fillRect(x, y, w, h, color)
 
-Draws a filled rectangle.
-
 ```c
-// Black background
-fillRect(0, 0, 800, 480, 0x0000);
-
-// Red square at center
-fillRect(350, 190, 100, 100, 0xF800);
+fillRect(0, 0, 800, 480, 0x0000);   // clear screen
+fillRect(350, 190, 100, 100, 0xF800); // red square
 ```
 
 ### rect(x, y, w, h, color)
 
-Draws a rectangle outline (1px border).
-
-```c
-// White border rectangle
-rect(50, 50, 200, 100, 0xFFFF);
-
-// Selection highlight
-rect(10, 10, 780, 460, 0x07E0);
-```
+Rectangle outline (1px).
 
 ### line(x0, y0, x1, y1, color)
 
-Draws a line between two points using Bresenham's algorithm.
+Line between two points (Bresenham's algorithm).
 
-```c
-// Diagonal line
-line(0, 0, 799, 479, 0xFFFF);
+### circle(cx, cy, r, color) / fillCircle(cx, cy, r, color)
 
-// Horizontal line
-line(100, 240, 700, 240, 0xF800);
+Circle outline / filled circle (midpoint algorithm).
 
-// Vertical line
-line(400, 50, 400, 430, 0x07E0);
-```
+### roundedRect(x, y, w, h, r, color) / fillRoundedRect(x, y, w, h, r, color)
 
-### circle(cx, cy, r, color)
-
-Draws a circle outline using the midpoint circle algorithm.
-
-```c
-// Circle at center of screen
-circle(400, 240, 100, 0xFFFF);
-
-// Small indicator dot outline
-circle(50, 50, 10, 0x07E0);
-```
-
-### fillCircle(cx, cy, r, color)
-
-Draws a filled circle.
-
-```c
-// Filled circle
-fillCircle(400, 240, 100, 0x001F);
-
-// Small dot
-fillCircle(50, 50, 5, 0xF800);
-```
-
-### roundedRect(x, y, w, h, r, color)
-
-Draws a rounded rectangle outline (1px border with quarter-circle corners).
-
-```c
-// Panel with rounded corners
-roundedRect(50, 50, 300, 200, 15, 0xFFFF);
-
-// Button outline
-roundedRect(100, 100, 160, 50, 8, 0x07E0);
-```
-
-### fillRoundedRect(x, y, w, h, r, color)
-
-Draws a filled rounded rectangle.
-
-```c
-// Filled button background
-fillRoundedRect(100, 100, 160, 50, 8, 0x001F);
-
-// Card-style panel
-fillRoundedRect(50, 50, 700, 380, 20, 0x10A2);
-roundedRect(50, 50, 700, 380, 20, 0xFFFF);  // border on top
-```
-
-If the radius is larger than half the width or height, it is clamped automatically. A radius of 0 draws a regular rectangle.
+Rounded rectangle outline / filled. Radius clamped to half the smallest dimension.
 
 ### arc(cx, cy, r, start, end, color)
 
-Draws an arc (portion of a circle outline). Angles are in degrees:
-- **0** = right (3 o'clock)
-- **90** = down (6 o'clock)
-- **180** = left (9 o'clock)
-- **270** = up (12 o'clock)
-
-Wraps around: `arc(cx, cy, r, 350, 10, color)` draws through 0.
-
-```c
-// Top half-circle (gauge background)
-arc(400, 300, 100, 180, 360, 0xFFFF);
-
-// Quarter arc (top-right)
-arc(400, 240, 80, 270, 360, 0xF800);
-
-// Small 60-degree arc
-arc(400, 240, 120, 30, 90, 0x07E0);
-
-// Full circle (same as circle())
-arc(400, 240, 50, 0, 359, 0xFFFF);
-```
-
-Typical use: gauge displays, progress indicators, clock faces.
-
-```c
-// Speedometer gauge: 180-degree arc with tick marks
-var cx = 400;
-var cy = 350;
-
-// Background arc
-arc(cx, cy, 100, 180, 360, 0x4208);
-
-// Value arc (green, 75% of 180 degrees = 135 degrees)
-arc(cx, cy, 100, 180, 315, 0x07E0);
-
-// Center dot
-fillCircle(cx, cy, 5, 0xFFFF);
-```
+Arc (portion of circle). Angles in degrees: 0=right, 90=down, 180=left, 270=up.
 
 ### drawImage(x, y, image_id)
 
-Draws a flash-stored image at the given position. The `image_id` must match an image loaded in the flash filesystem (Ferrite Image format).
-
-```c
-// Draw image #1 at top-left
-drawImage(0, 0, 1);
-
-// Draw icon at button position
-drawImage(110, 55, 2);
-```
+Draw a flash-stored image at the given position.
 
 ### drawText(x, y, font_id, fg, bg, "text")
 
-Draws a text string at the given position. The text argument must be a string literal (quoted).
-
-- `font_id`: 0 = embedded font (FreeMono 9pt), 1+ = flash-loaded fonts
-- `fg`: foreground (text) color
-- `bg`: background color, 0 = transparent
+Draw a string literal. `bg=0` for transparent.
 
 ```c
-// White text on black background
 drawText(10, 30, 0, 0xFFFF, 0x0000, "Hello World");
-
-// Red text, transparent background
-drawText(100, 100, 0, 0xF800, 0, "Warning!");
-
-// Using flash font #1
-drawText(200, 200, 1, 0x07E0, 0x0000, "Status: OK");
 ```
 
 ### delay(ms)
 
-Pauses the VM for the given number of milliseconds. **This is non-blocking** -- the main loop continues to process touch events and USART messages while the VM waits.
+Non-blocking pause. Touch and USART continue processing during delay.
+
+### Double Buffering
 
 ```c
-// Simple animation: flash a rectangle
-for (var i = 0; i < 5; i = i + 1) {
-    fillRect(300, 200, 200, 80, 0xF800);  // red
-    delay(500);
-    fillRect(300, 200, 200, 80, 0x0000);  // black
-    delay(500);
-}
+beginFrame();  // start drawing to back buffer
+// ... draw operations ...
+endFrame();    // swap buffers (tear-free)
 ```
 
 ## Float32 Operations
 
-The VM supports 32-bit floating-point arithmetic via software emulation (Cortex-M3 has no FPU). Floats are stored on the i32 stack as their IEEE 754 bit representation.
-
-### Float Literals
-
-Float literals use a decimal point:
+Software-emulated 32-bit float (Cortex-M3 has no FPU). Floats stored as IEEE 754 bit patterns in i32 variables.
 
 ```c
-var pi = 3.14159;
-var half = 0.5;
-var temp = 23.7;
+var pi = 3.14159;              // float literal
+var f = itof(42);              // int → float
+var i = ftoi(3.14);            // float → int (truncate)
+var sum = fadd(1.5, 2.3);     // 3.8
+var diff = fsub(10.0, 3.5);   // 6.5
+var prod = fmul(pi, fmul(r, r)); // pi*r^2
+var quot = fdiv(5.0, 9.0);    // 0.555...
+var neg = fneg(3.14);          // -3.14
 ```
 
-Float literals are automatically converted to their f32 bit pattern at compile time. They can be stored in regular variables and passed to float functions.
-
-### Conversion
-
-#### itof(value)
-
-Converts an integer to a float.
+Float comparisons return i32 (0 or 1):
 
 ```c
-var count = 42;
-var f_count = itof(count);    // 42 -> 42.0 (as f32 bits)
+if (fgt(temp, 30.0)) { /* hot */ }
+if (flt(temp, 10.0)) { /* cold */ }
+// Also: feq, fne, fle, fge
 ```
-
-#### ftoi(value)
-
-Converts a float to an integer (truncates toward zero).
-
-```c
-var f = 3.14159;
-var i = ftoi(f);   // -> 3
-
-var neg = ftoi(-2.7);  // -> -2
-```
-
-### Arithmetic
-
-#### fadd(a, b)
-
-Float addition.
-
-```c
-var a = 1.5;
-var b = 2.3;
-var sum = fadd(a, b);   // 3.8
-```
-
-#### fsub(a, b)
-
-Float subtraction (a - b).
-
-```c
-var delta = fsub(10.0, 3.5);   // 6.5
-```
-
-#### fmul(a, b)
-
-Float multiplication.
-
-```c
-var area = fmul(3.14159, fmul(r, r));   // pi * r^2
-
-// Scale an integer value
-var pct = 0.75;
-var scaled = ftoi(fmul(itof(total), pct));
-```
-
-#### fdiv(a, b)
-
-Float division (a / b). Returns 0.0 if b is zero.
-
-```c
-var ratio = fdiv(itof(part), itof(whole));
-
-// Temperature conversion: C = (F - 32) * 5/9
-var celsius = fmul(fsub(fahrenheit, 32.0), fdiv(5.0, 9.0));
-```
-
-#### fneg(a)
-
-Float negation.
-
-```c
-var x = 3.14;
-var neg_x = fneg(x);   // -3.14
-```
-
-### Comparison
-
-Float comparisons return an integer (0 or 1) that can be used directly in `if` and `while` conditions.
-
-#### feq(a, b) / fne(a, b)
-
-```c
-if (feq(x, 0.0)) {
-    // x is exactly zero
-}
-
-if (fne(a, b)) {
-    // a and b differ
-}
-```
-
-#### flt(a, b) / fle(a, b) / fgt(a, b) / fge(a, b)
-
-```c
-var temp = 23.7;
-
-if (fgt(temp, 30.0)) {
-    set(bg_color, 0xF800);  // red = hot
-} else if (flt(temp, 10.0)) {
-    set(bg_color, 0x001F);  // blue = cold
-} else {
-    set(bg_color, 0x07E0);  // green = ok
-}
-```
-
-### Complete Float Example
-
-A gauge that interpolates color from green to red based on a percentage:
-
-```c
-fn lerp(a, b, t) {
-    // a + (b - a) * t  where t is 0.0..1.0
-    return fadd(a, fmul(fsub(b, a), t));
-}
-
-fn gauge_color(pct) {
-    // pct: 0.0 = green, 1.0 = red
-    var r = ftoi(fmul(lerp(0.0, 31.0, pct), 1.0));
-    var g = ftoi(lerp(63.0, 0.0, pct));
-    // RGB565: (r << 11) | (g << 5)
-    return r * 2048 + g * 32;
-}
-
-// Draw gauge at 75%
-var pct = 0.75;
-var color = gauge_color(pct);
-var bar_w = ftoi(fmul(itof(400), pct));
-fillRect(100, 200, bar_w, 30, color);
-```
-
-### Performance Note
-
-All float operations use software emulation (~20-70 cycles per op at 108MHz). This is fast enough for UI calculations but avoid tight inner loops with heavy float math.
 
 ## String Operations
 
-The VM has a static string pool (2KB buffer, 16 string slots) for runtime string manipulation. Strings are immutable once created. The pool is append-only -- use `strClear()` to reset it when needed.
-
-String IDs are regular integers stored in variables. They reference data in the global pool.
-
-### str("literal")
-
-Creates a string from a literal and returns a string ID.
+Runtime string pool for dynamic text. Strings are immutable, referenced by ID.
 
 ```c
-var greeting = str("Hello");
-var unit = str(" C");
-```
+var s = str("Hello");          // create from literal
+var n = itos(42);              // int → string "42"
+var f = ftos(3.14);            // float → string "3.14"
+var msg = concat(s, n);        // concatenate
+var len = strLen(s);           // byte length
+var val = parseInt(str("42")); // parse int
+var fv = parseFloat(str("3.14")); // parse float
 
-### itos(value)
-
-Converts an integer to its decimal string representation.
-
-```c
-var count = 42;
-var s = itos(count);     // "42"
-
-var neg = itos(-7);      // "-7"
-```
-
-### ftos(value)
-
-Converts a float to its string representation (2 decimal places).
-
-```c
-var temp = 23.7;
-var s = ftos(temp);      // "23.70"
-
-var pi = 3.14159;
-var s2 = ftos(pi);       // "3.14"
-```
-
-### concat(a, b)
-
-Concatenates two strings. Returns a new string ID.
-
-```c
-var name = str("Temperature: ");
-var val = itos(25);
-var unit = str(" C");
-
-var temp_str = concat(name, val);      // "Temperature: 25"
-var full = concat(temp_str, unit);     // "Temperature: 25 C"
-```
-
-### parseInt(str_id)
-
-Parses a string as an integer. Supports decimal and hex (`0x` prefix). Returns 0 on failure.
-
-```c
-var s = str("42");
-var n = parseInt(s);       // 42
-
-var hex = str("0xFF");
-var h = parseInt(hex);     // 255
-```
-
-### parseFloat(str_id)
-
-Parses a string as a float. Returns f32 bits (use with float operations).
-
-```c
-var s = str("3.14");
-var f = parseFloat(s);     // f32 bits of 3.14
-
-var temp = fmul(f, 2.0);  // 6.28
-```
-
-### strLen(str_id)
-
-Returns the byte length of a string.
-
-```c
-var s = str("Hello");
-var len = strLen(s);       // 5
-```
-
-### setText(str_id)
-
-Sets the text of the current target widget (label) from a string ID. The string data is copied to the widget's text pool, so the string ID can be reused or freed.
-
-```c
-// Display a counter on a label widget
-var label = alloc();
+// Display on widget
 target(label);
-set(kind, 1);  // KIND_LABEL
-set(font_id, 0);
-set(text_color, 0xFFFF);
-set(size, 200, 30);
-parent(root);
+setText(msg);
 
-// Update label text dynamically
-var count = 0;
-while (count < 100) {
-    var s = itos(count);
-    target(label);
-    setText(s);
-    dirty();
-    render();
-    delay(100);
-    count = count + 1;
-    strClear();  // reclaim pool space each iteration
-}
-```
+// Draw directly to screen
+drawStr(10, 460, 0, 0x07E0, 0x0000, msg);
 
-### drawStr(x, y, font_id, fg, bg, str_id)
-
-Draws a string from the pool directly to the LCD at the given position. Unlike `drawText()` which takes a string literal, `drawStr()` takes a string ID for dynamic content.
-
-- `font_id`: 0 = embedded font, 1+ = flash fonts
-- `fg`: foreground color
-- `bg`: background color (0 = transparent)
-
-```c
-var fps = itos(60);
-var label = concat(fps, str(" FPS"));
-drawStr(10, 460, 0, 0x07E0, 0x0000, label);   // "60 FPS" in green
-```
-
-### strClear()
-
-Clears the string pool while **preserving strings referenced by widget text**. Temporary strings (from `itos`, `concat`, etc.) are freed, but any string assigned to a widget via `set(text, ...)` or `setText()` survives.
-
-This works by scanning all widget `text_id` fields, compacting survivors to the front of the pool, and updating widget references. It's safe to call in a loop without losing label text.
-
-```c
-// Label text survives strClear — no need to re-set it each iteration
-var label = alloc();
-target(label);
-set(kind, 1);
-set(text, "Permanent title");  // this string survives strClear
-
-var i = 0;
-while (true) {
-    var s = concat(str("Count: "), itos(i));  // temp strings
-    drawStr(10, 50, 0, 0xFFFF, 0x0000, s);
-    delay(100);
-    i = i + 1;
-    strClear();  // frees "Count: ", itos result, concat result
-                 // keeps "Permanent title" on the label
-}
-```
-
-### Complete String Example
-
-A real-time counter display:
-
-```c
-var root = alloc();
-target(root);
-set(size, 800, 480);
-set(bg_color, 0x0000);
-
-var label = alloc();
-target(label);
-set(kind, 1);
-set(location, 300, 200);
-set(size, 200, 40);
-set(bg_color, 0x0000);
-set(text_color, 0xFFFF);
-set(font_id, 0);
-set(text_align, 1);
-parent(root);
-
-dirty();
-render();
-
-var i = 0;
-while (true) {
-    var prefix = str("Count: ");
-    var num = itos(i);
-    var text = concat(prefix, num);
-
-    target(label);
-    setText(text);
-    dirty();
-    render();
-
-    delay(50);
-    i = i + 1;
-    strClear();
-}
-```
-
-### strFree(str_id)
-
-Marks a single string for reclamation. The string is discarded on the next `strClear()` call, even if a widget references it. Use this to explicitly release strings you no longer need.
-
-```c
-var tmp1 = itos(sensor_value);
-var tmp2 = str(" mV");
-var msg = concat(tmp1, tmp2);
-
-// Done with intermediates, mark them for cleanup
-strFree(tmp1);
-strFree(tmp2);
-
-// msg is still usable until strClear
-drawStr(10, 10, 0, 0xFFFF, 0x0000, msg);
-
-// Now reclaim — msg stays if not freed, tmp1/tmp2 are gone
-strFree(msg);
+// Reclaim pool (preserves widget text)
 strClear();
+
+// Free individual string
+strFree(s);
 ```
 
-`strFree` only marks the string — actual space is reclaimed when `strClear()` compacts the pool. Between calls, freed strings still occupy buffer space but their slots are flagged for removal.
+## RTC (Real-Time Clock)
 
-### Pool Limits
+Read and set the AT8563T hardware clock.
 
-| Resource | Limit |
-|----------|-------|
-| Pool buffer | 2,048 bytes |
-| Max strings | 32 simultaneous |
-| ftos precision | 2 decimal places |
+### rtcRead()
 
-When the pool is full, string operations set the VM error state. Call `strClear()` in loops to reclaim space -- widget text is automatically preserved.
+Reads the current date/time. Returns an array ID with 7 elements:
+
+| Index | Field   | Range  |
+|-------|---------|--------|
+| 0     | second  | 0-59   |
+| 1     | minute  | 0-59   |
+| 2     | hour    | 0-23   |
+| 3     | day     | 1-31   |
+| 4     | weekday | 0-6 (0=Sunday) |
+| 5     | month   | 1-12   |
+| 6     | year    | 0-99 (from 2000) |
+
+```c
+var time = rtcRead();
+var hour = time[2];
+var minute = time[1];
+var second = time[0];
+```
+
+### rtcWrite(arr)
+
+Sets the date/time from an array with the same 7-element layout.
+
+```c
+// Set to 2025-06-15 14:30:00 (Sunday)
+var t[7] = [0, 30, 14, 15, 0, 6, 25];
+rtcWrite(t);
+```
+
+### Example: Digital Clock
+
+```c
+var time;
+var h;
+var m;
+var s;
+
+fn setup() {
+    return 0;
+}
+
+fn loop() {
+    time = rtcRead();
+    h = time[2];
+    m = time[1];
+    s = time[0];
+
+    beginFrame();
+    fillRect(300, 200, 200, 50, 0x0000);
+
+    var hs = itos(h);
+    var ms = itos(m);
+    var ss = itos(s);
+    if (h < 10) { hs = concat(str("0"), hs); }
+    if (m < 10) { ms = concat(str("0"), ms); }
+    if (s < 10) { ss = concat(str("0"), ss); }
+    var text = concat(hs, concat(str(":"), concat(ms, concat(str(":"), ss))));
+    drawStr(340, 235, 0, 0xFFFF, 0x0000, text);
+    strClear();
+    endFrame();
+
+    delay(1000);
+}
+```
 
 ## Events and Callbacks
 
-Callbacks are functions that the system calls in response to events. They are registered using the Compiler API (ferrite_cc.py) and stored in the `.meta` file alongside the program bytecode.
+Callbacks are functions called by the system in response to events. They are defined as regular functions with special names. The compiler automatically detects them and assigns the correct function kind in the VM image header.
 
-### Widget Properties for Events
+### System Callbacks
 
-Set these on widgets to link them to callback functions:
+Define these functions to handle system events:
+
+| Function | Trigger | Arguments |
+|----------|---------|-----------|
+| `fn on_program_start()` | After setup, before loop starts | none |
+| `fn on_touch_down(x, y)` | Touch press | screen x, y |
+| `fn on_touch_up()` | Touch release | none |
+| `fn on_touch_move(x, y)` | Touch held + moving | screen x, y |
+| `fn on_user_message(arr_id)` | USART message received | array of bytes |
+| `fn on_page_changing(old, new)` | Before page switch | indices |
+| `fn on_page_changed(index)` | After page switch | new index |
 
 ```c
-set(on_click, 1);   // func_id for click event
-set(on_paint, 2);   // func_id for custom paint event
-set(on_tap, 3);     // func_id for tap-with-coordinates event
+fn on_touch_down(x, y) {
+    fillCircle(x, y, 5, 0xF800);
+}
+
+fn on_user_message(arr_id) {
+    var cmd = arr_id[0];
+    if (cmd == 1) {
+        target(0);
+        set(bg_color, arr_id[1] * 256 + arr_id[2]);
+        dirty();
+        render();
+    }
+}
 ```
 
-The `func_id` values are assigned by the compiler when functions are defined in the callback metadata.
+### Widget Callbacks
 
-### on_click
-
-Fires when a clickable widget is pressed and released (touch press + release on the same widget). The callback receives the **widget_id** as an argument.
+Widget event handlers are regular functions whose `func_id` (assigned by the compiler) is set on widgets via `set(on_click, ...)` etc.
 
 ```c
-// In the .fl file, the callback function:
+var btn;
+
 fn handle_click(widget_id) {
     target(widget_id);
     var color = get(bg_color);
@@ -991,222 +583,160 @@ fn handle_click(widget_id) {
     }
     dirty();
     render();
+}
+
+fn setup() {
+    btn = alloc();
+    target(btn);
+    set(size, 200, 80);
+    set(bg_color, 0xF800);
+    set(clickable, 1);
+    set(on_click, 1);  // func_id 1 = handle_click
+    parent(0);
+    render();
     return 0;
 }
+
+fn loop() {}
 ```
 
-The widget must have `set(clickable, 1)` and the `on_click` property set to the function's ID.
+**Widget event properties:**
 
-### on_paint
+| Property | Event | Callback args |
+|----------|-------|---------------|
+| `on_click` | Press + release on same widget | `(widget_id)` |
+| `on_paint` | After widget is rendered | `(widget_id)` |
+| `on_tap` | Tap with coordinates | `(widget_id, packed_xy)` |
 
-Fires after a widget is rendered (background, border, image drawn), allowing custom drawing on top. The callback receives the **widget_id** as an argument.
+For `on_tap`, extract coordinates: `x = coords / 65536`, `y = coords & 0xFFFF`.
 
-Use drawing primitives (`fillRect`, `line`, `circle`, etc.) inside `on_paint` to draw custom content within the widget's area.
+### Callback Queue
+
+All callbacks are queued and executed in FIFO order between main loop iterations. This ensures callbacks never nest and the VM state remains predictable. The queue holds up to 8 pending callbacks.
+
+## USART Communication
+
+### sendUsart(data)
+
+Send data via USART. Accepts an array (sends raw bytes) or a string ID (sends text).
 
 ```c
-fn draw_gauge(widget_id) {
-    // Draw a custom gauge on the widget
-    // Get widget position from target
-    target(widget_id);
-    var x = get(loc_x);
-    var y = get(loc_y);
-    var w = get(width);
-    var h = get(height);
+var buf[3] = [0x01, 0x02, 0x03];
+sendUsart(buf);
 
-    // Draw gauge background
-    fillRect(x + 10, y + 20, w - 20, 30, 0x4208);
-
-    // Draw gauge fill (60%)
-    var fill_w = (w - 20) * 60 / 100;
-    fillRect(x + 10, y + 20, fill_w, 30, 0x07E0);
-
-    return 0;
-}
+var msg = str("hello");
+sendUsart(msg);
 ```
 
-### on_tap
+## VM Image Format
 
-Fires when a widget is tapped, providing the touch coordinates. The callback receives two arguments: **widget_id** and a **packed coordinate** value.
+The compiler produces a binary image with an embedded function table header:
 
-The packed coordinate encodes `(x << 16) | y` -- extract with bitwise operations:
-
-```c
-fn handle_tap(widget_id, coords) {
-    var x = coords / 65536;       // upper 16 bits
-    var y = coords & 0xFFFF;      // lower 16 bits
-
-    // Draw a dot where the user tapped
-    fillCircle(x, y, 5, 0xF800);
-
-    return 0;
-}
+```
+version:        u8 (= 1)
+function_count: u16 LE
+reserved:       u16
+[func_id: u16, kind: u8, pad: u8, offset: u32, length: u32] × N
+opcodes...
 ```
 
-### on_user_message
+Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnPageChanging=4, OnPageChanged=5, OnUserMessage=6, OnTouchDown=7, OnTouchUp=8, OnTouchMove=9.
 
-A system-level callback that fires when a UserMessage (USART field 6) is received from the host. The callback receives an **array_id** containing the message bytes.
-
-```c
-fn handle_message(arr_id) {
-    // Read first byte as command
-    var cmd = arr_id[0];
-
-    if (cmd == 1) {
-        // Command 1: change background color
-        // Bytes 1-2: RGB565 color (high byte, low byte)
-        var color = arr_id[1] * 256 + arr_id[2];
-        target(0);  // root widget
-        set(bg_color, color);
-        dirty();
-        render();
-    }
-
-    return 0;
-}
-```
-
-The host sends messages using the CLI:
-
-```bash
-# Send raw bytes
-python ferrite_cli.py -p COM3 send 0x01 0xF8 0x00
-
-# Send text
-python ferrite_cli.py -p COM3 send "hello"
-```
-
-### System Callbacks
-
-These are registered in the callback metadata (via the Compiler API), not in the `.fl` language directly:
-
-| Callback | Trigger | Arguments |
-|----------|---------|-----------|
-| `on_program_start` | Program loaded and first page shown | none |
-| `on_page_changing` | Before page switch | old_index, new_index |
-| `on_page_changed` | After page switch | new_index |
-| `on_user_message` | USART field 6 received | array_id |
-
-## Compiler API (Python)
-
-For advanced use cases (callback registration, page building, meta generation), use the Python Compiler class directly:
-
-```python
-from ferrite_cc import Compiler, Prop, rgb565
-
-cc = Compiler(base_id=1)  # base_id=1: root is widget 0
-
-# Define callback functions FIRST (before main code)
-fid_click = cc.define_func("on_btn_click", arg_count=1)
-# ... callback body (use cc.asm for low-level ops) ...
-cc.ret()
-
-fid_paint = cc.define_func("on_custom_paint", arg_count=1)
-cc.ret()
-
-fid_msg = cc.define_func("on_msg", arg_count=1)
-cc.ret()
-
-# Main code: build widgets
-cc.alloc("panel")
-cc.target("panel")
-cc.set_prop("size", 800, 480)
-cc.set_prop("bg_color", 0x0000)
-cc.set_prop("on_click", fid_click)
-cc.set_prop("on_paint", fid_paint)
-
-cc.halt()
-
-# Register system callbacks
-cc.on_program_start("on_btn_click")
-cc.on_user_message("on_msg")
-
-# Save bytecode and metadata
-cc.save("main.bin")
-with open("main.meta", "wb") as f:
-    f.write(cc.build_meta())
-```
-
-## Complete Example
-
-A full program that creates a button panel with click handling and custom drawing:
-
-```c
-// Color helper
-fn rgb565(r, g, b) {
-    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
-}
-
-// --- Build UI ---
-
-// Root widget (full screen)
-var root = alloc();
-target(root);
-set(size, 800, 480);
-set(bg_color, 0x0000);
-
-// Header bar
-var header = alloc();
-target(header);
-set(location, 0, 0);
-set(size, 800, 60);
-set(bg_color, 0x10A2);
-parent(root);
-
-// Title label
-var title = alloc();
-target(title);
-set(kind, 1);  // KIND_LABEL
-set(location, 10, 5);
-set(size, 780, 50);
-set(bg_color, 0x10A2);
-set(text_color, 0xFFFF);
-set(font_id, 0);
-set(text_align, 1);  // center
-parent(header);
-
-// Button row
-var btn1 = alloc();
-target(btn1);
-set(kind, 2);  // KIND_BUTTON
-set(location, 50, 150);
-set(size, 200, 80);
-set(bg_color, 0xF800);
-set(press_color, 0x7800);
-set(border, 2, 2, 2, 2);
-set(border_color, 0xFFFF);
-set(clickable, 1);
-parent(root);
-
-var btn2 = alloc();
-target(btn2);
-set(kind, 2);
-set(location, 300, 150);
-set(size, 200, 80);
-set(bg_color, 0x07E0);
-set(press_color, 0x03E0);
-set(border, 2, 2, 2, 2);
-set(border_color, 0xFFFF);
-set(clickable, 1);
-parent(root);
-
-// Draw some custom graphics below buttons
-fillRect(50, 300, 700, 2, 0x4208);  // separator line
-circle(400, 400, 50, 0xFFFF);
-drawText(350, 440, 0, 0xFFFF, 0, "ferrite-ui");
-
-halt();
-```
+Page bytecode (compiled with `--page`) does not use this format — it is raw bytecode prefixed with a 2-byte background color.
 
 ## VM Limits
 
 | Resource | Limit |
 |----------|-------|
-| Widget arena | 64 widgets |
-| Text pool | 256 bytes |
-| Variable slots | 32 (shared main + functions) |
+| Widget arena | 254 widgets |
+| Variable slots | 32 (shared globals + function locals) |
 | Eval stack | 16 deep |
 | Call stack | 8 deep |
-| Array pool | 128 elements, max 16 arrays |
-| Bytecode size | 4096 bytes (flash) / 1024 bytes (USART execute) |
-| Flash code | limited by flash resource size |
+| Callback queue | 8 pending |
+| String pool | 2,048 bytes, 32 slots |
+| Bytecode | limited by flash resource or 2KB via USART |
 | Clip rects | 32 rectangles |
+
+## Complete Example
+
+```c
+// Global state
+var root;
+var panel;
+var btn;
+var counter;
+
+fn setup() {
+    counter = 0;
+
+    root = alloc();
+    target(root);
+    set(size, 800, 480);
+    set(bg_color, 0x0000);
+
+    panel = alloc();
+    target(panel);
+    set(location, 100, 100);
+    set(size, 600, 280);
+    set(bg_color, 0x10A2);
+    set(border, 2, 2, 2, 2);
+    set(border_color, 0x4A69);
+    set(border_radius, 16);
+    parent(root);
+
+    btn = alloc();
+    target(btn);
+    set(location, 200, 80);
+    set(size, 200, 80);
+    set(bg_color, 0xF800);
+    set(press_color, 0x7800);
+    set(border, 2, 2, 2, 2);
+    set(border_color, 0xFFFF);
+    set(border_radius, 8);
+    set(clickable, 1);
+    set(on_click, 1);  // func_id for handle_click
+    parent(panel);
+
+    render();
+    return 0;
+}
+
+fn loop() {
+    // Update display every second
+    var time = rtcRead();
+    var h = time[2];
+    var m = time[1];
+
+    beginFrame();
+    var hs = itos(h);
+    var ms = itos(m);
+    if (h < 10) { hs = concat(str("0"), hs); }
+    if (m < 10) { ms = concat(str("0"), ms); }
+    var text = concat(hs, concat(str(":"), ms));
+    drawStr(360, 30, 0, 0xFFFF, 0x0000, text);
+    strClear();
+    endFrame();
+
+    delay(1000);
+}
+
+fn handle_click(widget_id) {
+    counter = counter + 1;
+    target(widget_id);
+    if (counter % 2 == 0) {
+        set(bg_color, 0xF800);
+    } else {
+        set(bg_color, 0x07E0);
+    }
+    dirty();
+    render();
+}
+
+fn on_touch_down(x, y) {
+    fillCircle(x, y, 3, 0xFFE0);
+}
+
+fn rgb565(r, g, b) {
+    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
+}
+```

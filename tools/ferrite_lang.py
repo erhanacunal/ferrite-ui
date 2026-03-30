@@ -667,6 +667,7 @@ NO_VALUE_BUILTINS = {
     'roundedRect', 'fillRoundedRect', 'arc',
     'beginFrame', 'endFrame',
     'sendUsart',
+    'rtcWrite',
 }
 
 
@@ -1029,6 +1030,9 @@ class CodeGen:
             self._gen_expr(node.value)  # value
             self.asm.arr_store()
         else:
+            # Track array-returning builtins
+            if isinstance(node.value, CallExpr) and node.value.name == 'rtcRead':
+                self.array_vars.add(node.name)
             self._gen_expr(node.value)
             slot = self._var_slot(node.name, node.line)
             self.asm.store(slot)
@@ -1529,6 +1533,21 @@ class CodeGen:
                 # String expression (str_id) — use string builtin
                 self._gen_expr(arg)
                 self.asm.builtin(Builtin.SEND_USART_STR)
+            return
+
+        if name == 'rtcRead':
+            # rtcRead() → arr_id [sec, min, hour, day, weekday, month, year]
+            if len(node.args) != 0:
+                raise CompileError("rtcRead() takes no arguments", node.line)
+            self.asm.builtin(Builtin.RTC_READ)
+            return
+
+        if name == 'rtcWrite':
+            # rtcWrite(arr_id) — set RTC from [sec, min, hour, day, weekday, month, year]
+            if len(node.args) != 1:
+                raise CompileError("rtcWrite() takes 1 argument: array", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.RTC_WRITE)
             return
 
         # --- User-defined function ---

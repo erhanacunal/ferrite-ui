@@ -230,6 +230,8 @@ const OP_BEGIN_FRAME: u8 = 0x96;
 const OP_END_FRAME: u8 = 0x97;
 const OP_SEND_USART: u8 = 0x98;
 const OP_SEND_USART_STR: u8 = 0x99;
+const OP_RTC_READ: u8 = 0x9A;
+const OP_RTC_WRITE: u8 = 0x9B;
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -1057,6 +1059,45 @@ impl Vm {
                 let str_id = self.pop() as u16;
                 let bytes = ctx.strpool.get(str_id);
                 crate::usart::dbg(bytes);
+            }
+            OP_RTC_READ => {
+                // Read RTC → allocate array [sec, min, hour, day, weekday, month, year]
+                let rtc = crate::rtc::Rtc::init();
+                let dt = rtc.read_time();
+                let data = alloc::vec![
+                    dt.second as i32, dt.minute as i32, dt.hour as i32,
+                    dt.day as i32, dt.weekday as i32, dt.month as i32,
+                    dt.year as i32,
+                ];
+                let id = self.next_arr_id;
+                self.arrays.push(VmArray { id, data });
+                self.next_arr_id = self.next_arr_id.wrapping_add(1);
+                self.push(id as i32);
+            }
+            OP_RTC_WRITE => {
+                // Pop arr_id, read [sec, min, hour, day, weekday, month, year], set RTC
+                let arr_id = self.pop();
+                match self.find_array(arr_id) {
+                    Some(pos) => {
+                        let arr = &self.arrays[pos];
+                        if arr.data.len() >= 7 {
+                            let dt = crate::rtc::DateTime {
+                                second: arr.data[0] as u8,
+                                minute: arr.data[1] as u8,
+                                hour: arr.data[2] as u8,
+                                day: arr.data[3] as u8,
+                                weekday: arr.data[4] as u8,
+                                month: arr.data[5] as u8,
+                                year: arr.data[6] as u8,
+                            };
+                            let rtc = crate::rtc::Rtc::init();
+                            rtc.set_time(&dt);
+                        } else {
+                            self.state = VmState::Error;
+                        }
+                    }
+                    None => self.state = VmState::Error,
+                }
             }
 
             // --- Float32 (soft-float) ---

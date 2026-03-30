@@ -23,6 +23,7 @@ mod page;
 mod proto;
 mod protocol;
 mod render;
+mod rtc;
 mod strpool;
 mod systick;
 mod touch;
