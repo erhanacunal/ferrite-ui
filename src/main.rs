@@ -11,6 +11,7 @@ mod clip;
 mod config;
 mod ctx;
 mod embedded_font;
+mod fat;
 mod flash;
 mod font;
 mod fs;
@@ -24,6 +25,7 @@ mod proto;
 mod protocol;
 mod render;
 mod rtc;
+mod sdcard;
 mod strpool;
 mod systick;
 mod touch;
@@ -429,6 +431,18 @@ fn error_description(code: u8) -> &'static [u8] {
     }
 }
 
+/// Convert touch X position to slider value (0-100) relative to widget rect.
+fn touch_to_slider_value(abs: &types::Rect, touch_x: u16) -> i16 {
+    let x = touch_x as i16;
+    if x <= abs.x {
+        0
+    } else if x >= abs.x + abs.w as i16 {
+        100
+    } else {
+        (((x - abs.x) as u32) * 100 / abs.w as u32) as i16
+    }
+}
+
 // === Entry Point ===
 
 #[entry]
@@ -758,6 +772,25 @@ fn main() -> ! {
                     let hit = touch::hit_test(&ctx.tree, event.x, event.y);
                     if hit.is_some() {
                         ctx.tree.get_mut(hit).flags |= widget::FLAG_PRESSED;
+
+                        // Slider: update value from touch position
+                        if ctx.tree.get(hit).kind == widget::KIND_SLIDER {
+                            let abs = ctx.tree.absolute_rect(hit);
+                            let new_val = touch_to_slider_value(&abs, event.x);
+                            ctx.tree.get_mut(hit).value = new_val;
+                            if vm.has_code() {
+                                let on_click = ctx.tree.get(hit).on_click;
+                                if on_click > 0 {
+                                    if let Some(entry) = vm.find_func(on_click) {
+                                        vm.enqueue_callback(
+                                            entry.offset as u16,
+                                            &[hit.0 as i32, new_val as i32],
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         ctx.tree.mark_dirty(hit);
                         render::render_dirty(&mut ctx);
                     }
@@ -771,6 +804,34 @@ fn main() -> ! {
                         }
                     }
                 } else if event.kind == touch::TouchEventKind::Hold {
+                    // Slider drag: update pressed slider value
+                    let dfs = ctx.tree.dfs_order();
+                    for i in 0..dfs.len() {
+                        let w = ctx.tree.get(dfs[i]);
+                        if w.flags & widget::FLAG_PRESSED != 0
+                            && w.kind == widget::KIND_SLIDER
+                        {
+                            let abs = ctx.tree.absolute_rect(dfs[i]);
+                            let new_val = touch_to_slider_value(&abs, event.x);
+                            ctx.tree.get_mut(dfs[i]).value = new_val;
+                            ctx.tree.mark_dirty(dfs[i]);
+                            render::render_dirty(&mut ctx);
+
+                            if vm.has_code() {
+                                let on_click = ctx.tree.get(dfs[i]).on_click;
+                                if on_click > 0 {
+                                    if let Some(entry) = vm.find_func(on_click) {
+                                        vm.enqueue_callback(
+                                            entry.offset as u16,
+                                            &[dfs[i].0 as i32, new_val as i32],
+                                        );
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+
                     if vm.has_code() {
                         if let Some(entry) = vm.find_by_kind(FunctionKind::OnTouchMove) {
                             vm.enqueue_callback(

@@ -663,7 +663,8 @@ NO_VALUE_BUILTINS = {
     'target', 'set', 'parent', 'dirty', 'render', 'halt', 'yield_op',
     'fillRect', 'rect', 'line', 'circle', 'fillCircle',
     'drawImage', 'drawText', 'delay',
-    'setText', 'drawStr', 'strClear', 'strFree',
+    'setText', 'drawStr', 'strClear', 'strFree', 'arrFree',
+    'fpgaCmd', 'fpgaData',
     'roundedRect', 'fillRoundedRect', 'arc',
     'beginFrame', 'endFrame',
     'sendUsart',
@@ -1471,6 +1472,18 @@ class CodeGen:
             self.asm.str_free()
             return
 
+        if name == 'arrFree':
+            if len(node.args) != 1:
+                raise CompileError("arrFree() takes 1 argument: arr_id", node.line)
+            arg = node.args[0]
+            if isinstance(arg, VarRef) and arg.name in self.array_vars:
+                slot = self._var_slot(arg.name, node.line)
+                self.asm.load(slot)
+            else:
+                self._gen_expr(arg)
+            self.asm.arr_free()
+            return
+
         # --- Built-in: rounded rect & arc ---
 
         if name == 'roundedRect':
@@ -1533,6 +1546,30 @@ class CodeGen:
                 # String expression (str_id) — use string builtin
                 self._gen_expr(arg)
                 self.asm.builtin(Builtin.SEND_USART_STR)
+            return
+
+        if name == 'millis':
+            # millis() → u32 millisecond tick count
+            if len(node.args) != 0:
+                raise CompileError("millis() takes no arguments", node.line)
+            self.asm.builtin(Builtin.MILLIS)
+            return
+
+        if name == 'fpgaCmd':
+            # fpgaCmd(cmd, data) — raw FPGA command + data word
+            if len(node.args) != 2:
+                raise CompileError("fpgaCmd() takes 2 arguments: cmd, data", node.line)
+            self._gen_expr(node.args[0])
+            self._gen_expr(node.args[1])
+            self.asm.builtin(Builtin.FPGA_CMD)
+            return
+
+        if name == 'fpgaData':
+            # fpgaData(data) — raw FPGA data word (after a fpgaCmd)
+            if len(node.args) != 1:
+                raise CompileError("fpgaData() takes 1 argument: data", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.FPGA_DAT)
             return
 
         if name == 'rtcRead':
@@ -1823,8 +1860,12 @@ def main():
     with open(args.source, 'r', encoding='utf-8') as f:
         source = f.read()
 
+    # Auto-detect image mode: if source has fn setup() and fn loop(), use --image
+    has_setup_loop = ('fn setup()' in source and 'fn loop()' in source)
+    use_image = args.image or (has_setup_loop and args.page is None)
+
     try:
-        if args.image:
+        if use_image:
             output = build_image(source, args.source)
             # New image format: header(5 + 12*N) + opcodes
             if len(output) >= 5:
@@ -1846,14 +1887,14 @@ def main():
 
     # Build function labels for disassembly
     labels = {}
-    if args.image and len(output) >= 5:
+    if use_image and len(output) >= 5:
         labels = _extract_labels(output)
 
     if args.output:
         with open(args.output, 'wb') as f:
             f.write(output)
         msg = f"{args.source} -> {args.output} ({len(output)} bytes)"
-        if args.image:
+        if use_image:
             func_count = struct.unpack_from('<H', output, 1)[0]
             opcode_start = 5 + func_count * 12
             msg += f" (header: {opcode_start}B, opcodes: {len(output) - opcode_start}B, {func_count} functions)"
@@ -1863,7 +1904,7 @@ def main():
         if args.page is not None:
             bg = struct.unpack_from('<H', output)[0]
             print(f'; page bg_color: 0x{bg:04X}')
-        if args.image:
+        if use_image:
             _print_image_header(output)
         print(disassemble(raw_code, labels=labels))
 

@@ -16,6 +16,8 @@ pub const FLAG_PRESSED: u8 = 1 << 4;
 pub const KIND_BASE: u8 = 0;
 pub const KIND_LABEL: u8 = 1;
 pub const KIND_BUTTON: u8 = 2;
+pub const KIND_PROGRESS: u8 = 3;
+pub const KIND_SLIDER: u8 = 4;
 
 // --- Text Alignment ---
 
@@ -99,6 +101,9 @@ pub struct Widget {
 
     // Callback: tap with coordinates event (0 = no callback, 1+ = func_id)
     pub on_tap: u16,
+
+    // Progress/slider value (0-100)
+    pub value: i16,
 }
 
 impl Widget {
@@ -126,6 +131,7 @@ impl Widget {
             on_click: 0,
             on_paint: 0,
             on_tap: 0,
+            value: 0,
         }
     }
 

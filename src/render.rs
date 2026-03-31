@@ -3,7 +3,8 @@ use crate::ctx::Ctx;
 use crate::lcd::{self, Lcd};
 use crate::types::{Color, Rect};
 use crate::widget::{
-    WidgetId, WidgetTree, ALIGN_CENTER, ALIGN_RIGHT, FLAG_PRESSED, KIND_BUTTON, KIND_LABEL,
+    WidgetId, WidgetTree, ALIGN_CENTER, ALIGN_RIGHT, FLAG_PRESSED,
+    KIND_BUTTON, KIND_LABEL, KIND_PROGRESS, KIND_SLIDER,
 };
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
@@ -255,6 +256,12 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
     if widget.kind == KIND_LABEL {
         draw_label_text(ctx, id, abs);
     }
+
+    // Progress bar / slider fill
+    if widget.kind == KIND_PROGRESS || widget.kind == KIND_SLIDER {
+        let inner = inner_rect(abs, b);
+        draw_value_fill(&ctx.lcd, widget, &inner);
+    }
 }
 
 /// Draw widget with clip region (dirty render path).
@@ -335,6 +342,12 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     // Label text (drawn unclipped — upper widgets cover it via painter's algorithm)
     if widget.kind == KIND_LABEL {
         draw_label_text(ctx, id, abs);
+    }
+
+    // Progress bar / slider fill (drawn unclipped)
+    if widget.kind == KIND_PROGRESS || widget.kind == KIND_SLIDER {
+        let inner = inner_rect(abs, b);
+        draw_value_fill(&ctx.lcd, widget, &inner);
     }
 }
 
@@ -436,6 +449,49 @@ fn inner_rect(abs: &Rect, border: &crate::types::Edges) -> Rect {
         abs.h
             .saturating_sub(border.top as u16 + border.bottom as u16),
     )
+}
+
+/// Draw progress bar / slider fill inside the inner rect.
+/// press_color = fill color, background_color = track color (already drawn).
+/// For slider: also draws a thumb indicator using border_color.
+fn draw_value_fill(lcd: &Lcd, widget: &crate::widget::Widget, inner: &Rect) {
+    if inner.is_empty() || widget.press_color == 0 {
+        return;
+    }
+
+    let val = widget.value.clamp(0, 100) as u32;
+    let fill_w = ((inner.w as u32) * val / 100) as u16;
+    let r = widget.border_radius;
+
+    if fill_w > 0 {
+        let fill = Rect::new(inner.x, inner.y, fill_w, inner.h);
+        if r > 0 {
+            // Rounded fill: use fill_rounded_rect, clamp radius to fill width
+            let fill_r = r.min(fill_w / 2).min(inner.h / 2);
+            fill_rounded_rect_screen(lcd, fill, fill_r, widget.press_color);
+        } else {
+            fill_rect_screen(lcd, fill, widget.press_color);
+        }
+    }
+
+    // Slider thumb
+    if widget.kind == KIND_SLIDER && inner.w > 0 {
+        let thumb_w: u16 = 6;
+        let thumb_x = inner.x + fill_w as i16 - (thumb_w as i16 / 2);
+        let thumb_x = thumb_x.max(inner.x).min(inner.x + inner.w as i16 - thumb_w as i16);
+        let thumb = Rect::new(thumb_x, inner.y, thumb_w, inner.h);
+        let thumb_color = if widget.border_color != 0 {
+            widget.border_color
+        } else {
+            0xFFFF
+        };
+        if r > 0 {
+            let thumb_r = r.min(thumb_w / 2).min(inner.h / 2);
+            fill_rounded_rect_screen(lcd, thumb, thumb_r, thumb_color);
+        } else {
+            fill_rect_screen(lcd, thumb, thumb_color);
+        }
+    }
 }
 
 /// Clear dirty flag on all widgets.

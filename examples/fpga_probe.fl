@@ -1,0 +1,157 @@
+// fpga_probe.fl — Probe unknown FPGA commands (0x00-0x0E)
+//
+// Tests each unknown command by:
+// 1. Drawing a known pattern (colored rect)
+// 2. Setting an address window
+// 3. Sending the unknown command with various data values
+// 4. Waiting for visual inspection
+//
+// Usage: load via USART, watch screen for each command's effect.
+// Press touch or wait 3s to advance to next command.
+
+var cmd;
+var i;
+var t;
+var a;
+var b;
+
+fn setup() {
+    return 0;
+}
+
+fn draw_label(c) {
+    // Clear top bar and show current command number
+    fillRect(0, 0, 800, 20, 0x0000);
+    a = itos(c);
+    b = concat(str("CMD 0x0"), a);
+    drawStr(10, 16, 0, 0xFFFF, 0, b);
+    strClear();
+}
+
+fn draw_test_pattern() {
+    // Draw colored bars so we can see if anything changes
+    fillRect(100, 100, 200, 80, 0xF800);  // red
+    fillRect(300, 100, 200, 80, 0x07E0);  // green
+    fillRect(500, 100, 200, 80, 0x001F);  // blue
+    fillRect(100, 200, 200, 80, 0xFFFF);  // white
+    fillRect(300, 200, 200, 80, 0xFFE0);  // yellow
+    fillRect(500, 200, 200, 80, 0xF81F);  // magenta
+}
+
+fn show_test(n, c, msg) {
+    fillRect(0, 22, 800, 458, 0x0000);
+    a = concat(str("Test "), concat(itos(n), concat(str(": "), msg)));
+    drawStr(10, 36, 0, 0x7BEF, 0, a);
+    strClear();
+    draw_test_pattern();
+}
+
+fn test_cmd(c) {
+    // === Test 1: cmd + data=0 ===
+    show_test(1, c, str("cmd + data=0x0000"));
+    fpgaCmd(c, 0x0000);
+    delay(2000);
+
+    // === Test 2: cmd + data=0xF800 (red) ===
+    show_test(2, c, str("cmd + data=0xF800"));
+    fpgaCmd(c, 0xF800);
+    delay(2000);
+
+    // === Test 3: set address window first, then cmd ===
+    show_test(3, c, str("setAddr + cmd + data=0xF800"));
+    fpgaCmd(0x03, 200);   // X start
+    fpgaCmd(0x02, 150);   // Y start
+    fpgaCmd(0x07, 600);   // X end
+    fpgaCmd(0x06, 350);   // Y end
+    fpgaCmd(c, 0xF800);   // unknown cmd with red
+    delay(2000);
+
+    // === Test 4: set window + cmd + then send pixel data ===
+    show_test(4, c, str("setAddr + cmd + pixels"));
+    fpgaCmd(0x03, 200);   // X start
+    fpgaCmd(0x02, 150);   // Y start
+    fpgaCmd(0x07, 600);   // X end
+    fpgaCmd(0x06, 350);   // Y end
+    fpgaCmd(c, 0xF800);   // unknown cmd
+    i = 0;
+    while (i < 100) {
+        fpgaData(0x07E0);  // green pixels
+        i = i + 1;
+    }
+    delay(2000);
+
+    // === Test 5: cmd mid pixel-write stream ===
+    show_test(5, c, str("pixelWrite + cmd mid-stream"));
+    fpgaCmd(0x03, 200);   // X start
+    fpgaCmd(0x02, 150);   // Y start
+    fpgaCmd(0x07, 600);   // X end
+    fpgaCmd(0x06, 350);   // Y end
+    fpgaCmd(0x0F, 0);     // PIXEL_WRITE mode
+    i = 0;
+    while (i < 50) {
+        fpgaData(0x001F);  // blue
+        i = i + 1;
+    }
+    fpgaCmd(c, 0xFFFF);   // inject unknown cmd
+    i = 0;
+    while (i < 50) {
+        fpgaData(0xF800);  // red
+        i = i + 1;
+    }
+    delay(2000);
+}
+
+fn loop() {
+    fillRect(0, 0, 800, 480, 0x0000);
+    t = 14;
+    while(t >= 8) {
+        
+        fpgaCmd(0x03, 200);   // X start
+        fpgaCmd(0x02, 150);   // Y start
+        fpgaCmd(0x07, 250);   // X end
+        fpgaCmd(0x06, 150);   // Y end
+
+        fpgaCmd(t, 0xFFFF);
+
+        i = 0;
+        while (i < 50) {
+            fpgaData(0x07E0);  // green pixels
+            i = i + 1;
+        }
+        delay(2000);
+        t = t - 1;
+    }
+
+    delay(5000);
+
+    // Test CMD 0x00 and 0x01 first
+    //draw_label(0);
+    //test_cmd(0x00);
+
+    //fillRect(0, 60, 800, 420, 0x0000);
+    //draw_label(1);
+    //test_cmd(0x01);
+
+    //// Test the gap: 0x08 through 0x0E
+    //cmd = 0x08;
+    //while (cmd <= 0x0E) {
+    //    fillRect(0, 60, 800, 420, 0x0000);
+    //    draw_label(cmd);
+    //    test_cmd(cmd);
+    //    cmd = cmd + 1;
+    //}
+
+    //// Test 0x10+ (a few beyond pixel write)
+    //cmd = 0x10;
+    //while (cmd <= 0x1F) {
+    //    fillRect(0, 60, 800, 420, 0x0000);
+    //    draw_label(cmd);
+    //    test_cmd(cmd);
+    //    cmd = cmd + 1;
+    //}
+
+    // Done
+    fillRect(0, 0, 800, 480, 0x0000);
+    drawText(300, 250, 0, 0x07E0, 0, "PROBE COMPLETE");
+    delay(5000);
+}

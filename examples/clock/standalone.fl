@@ -1,7 +1,7 @@
-// clock.fl — Analog clock face with animated hands
+// clock.fl — Analog clock face with animated hands (RTC)
 //
 // Demonstrates: arc, line, fillCircle, fillRoundedRect,
-//               drawText, drawStr, itos, concat, delay, strClear
+//               drawText, drawStr, itos, concat, delay, strClear, rtcRead, millis
 
 // === Hand lookup tables (global) ===
 // Second/minute: 60 positions (6° steps), hour: 12 positions (30° steps)
@@ -18,10 +18,14 @@ var mdy[60] = [-100, -99, -98, -95, -91, -87, -81, -74, -67, -59, -50, -41, -31,
 var hdx[12] = [0, 35, 61, 70, 61, 35, 0, -35, -61, -70, -61, -35];
 var hdy[12] = [-70, -61, -35, 0, 35, 61, 70, 61, 35, 0, -35, -61];
 
-// Time state (simulated)
+// Time state (from RTC)
+var time;
 var h;
 var m;
 var s;
+
+// Previous second (skip redraw if unchanged)
+var ps = -1;
 
 // Reusable temps
 var i;
@@ -33,6 +37,8 @@ var e;
 var t;
 
 var fullRedraw = 2;
+var t0;
+var dt;
 
 fn draw_face() {
     if (fullRedraw <= 0) {
@@ -68,83 +74,97 @@ fn draw_face() {
 }
 
 fn setup() {
-    h = 10;
-    m = 10;
-    s = 0;
-
     return 0;
 }
 
 fn loop() {
-    beginFrame();
+    // Read real time from RTC
+    time = rtcRead();
+    t0 = millis();
+    h = time[2];
+    m = time[1];
+    s = time[0];
 
-    draw_face();
+    // Only redraw when second changes
+    if (s != ps) {
+        ps = s;
 
-    // Erase hands
-    fillCircle(400, 210, 140, 0x2945);
+        beginFrame();
 
-    // Redraw ticks + brand
-    i = 0;
-    while (i < 60) {
-        a = 400 + sdx[i];
-        b = 210 + sdy[i];
-        c = 400 + mdx[i];
-        d = 210 + mdy[i];
-        line(c, d, a, b, 0x7BEF);
-        i = i + 5;
-    }
-    drawText(370, 265, 0, 0x7BEF, 0, "ferrite");
+        draw_face();
 
-    // Hour hand (3px, white)
-    i = h % 12;
-    a = 400 + hdx[i];
-    b = 210 + hdy[i];
-    line(400, 210, a, b, 0xFFFF);
-    line(399, 210, a - 1, b, 0xFFFF);
-    line(401, 210, a + 1, b, 0xFFFF);
+        // Erase hands
+        fillCircle(400, 210, 140, 0x2945);
 
-    // Minute hand (2px, light gray)
-    a = 400 + mdx[m];
-    b = 210 + mdy[m];
-    line(400, 210, a, b, 0xBDF7);
-    line(401, 210, a + 1, b, 0xBDF7);
-
-    // Second hand (1px, red)
-    a = 400 + sdx[s];
-    b = 210 + sdy[s];
-    line(400, 210, a, b, 0xF800);
-
-    // Center dot
-    fillCircle(400, 210, 6, 0xF800);
-    fillCircle(400, 210, 3, 0xFFFF);
-
-    // Digital time "HH:MM:SS"
-    a = itos(h);
-    b = itos(m);
-    c = itos(s);
-    if (h < 10) { a = concat(str("0"), a); }
-    if (m < 10) { b = concat(str("0"), b); }
-    if (s < 10) { c = concat(str("0"), c); }
-    t = concat(a, concat(str(":"), concat(b, concat(str(":"), c))));
-
-    fillRoundedRect(251, 421, 298, 48, 12, 0x2945);
-    drawStr(345, 450, 0, 0xFFFF, 0, t);
-    strClear();
-
-    endFrame();
-
-    // Tick
-    delay(1000);
-    s = s + 1;
-    if (s >= 60) {
-        s = 0;
-        m = m + 1;
-        if (m >= 60) {
-            m = 0;
-            h = h + 1;
-            if (h >= 24) {
-                h = 0;
-            }
+        // Redraw ticks + brand
+        i = 0;
+        while (i < 60) {
+            a = 400 + sdx[i];
+            b = 210 + sdy[i];
+            c = 400 + mdx[i];
+            d = 210 + mdy[i];
+            line(c, d, a, b, 0x7BEF);
+            i = i + 5;
         }
+        drawText(370, 265, 0, 0x7BEF, 0, "ferrite");
+
+        // Hour hand (3px, white)
+        i = h % 12;
+        a = 400 + hdx[i];
+        b = 210 + hdy[i];
+        line(400, 210, a, b, 0xFFFF);
+        line(399, 210, a - 1, b, 0xFFFF);
+        line(401, 210, a + 1, b, 0xFFFF);
+
+        // Minute hand (2px, light gray)
+        a = 400 + mdx[m];
+        b = 210 + mdy[m];
+        line(400, 210, a, b, 0xBDF7);
+        line(401, 210, a + 1, b, 0xBDF7);
+
+        // Second hand (1px, red)
+        a = 400 + sdx[s];
+        b = 210 + sdy[s];
+        line(400, 210, a, b, 0xF800);
+
+        // Center dot
+        fillCircle(400, 210, 6, 0xF800);
+        fillCircle(400, 210, 3, 0xFFFF);
+
+        // Digital time "HH:MM:SS"
+        a = itos(h);
+        b = itos(m);
+        c = itos(s);
+        if (h < 10) { a = concat(str("0"), a); }
+        if (m < 10) { b = concat(str("0"), b); }
+        if (s < 10) { c = concat(str("0"), c); }
+        t = concat(a, concat(str(":"), concat(b, concat(str(":"), c))));
+
+        fillRoundedRect(251, 421, 298, 48, 12, 0x2945);
+        drawStr(345, 440, 0, 0xFFFF, 0, t);
+        strClear();
+
+        // Date "DD.MM.YYYY"
+        var dy = itos(time[3]);
+        var mo = itos(time[5]);
+        var yr = itos(2000 + time[6]);
+        if (time[3] < 10) { dy = concat(str("0"), dy); }
+        if (time[5] < 10) { mo = concat(str("0"), mo); }
+        t = concat(dy, concat(str("."), concat(mo, concat(str("."), yr))));
+        drawStr(335, 465, 0, 0xFFFF, 0, t);
+
+        // Render time (top right)
+        dt = millis() - t0;
+        t = concat(itos(dt), str("ms"));
+        fillRect(700, 15, 95, 18, 0x1082);
+        drawStr(700, 15 + 15, 0, 0x7BEF, 0, t);
+
+        strClear();
+
+        endFrame();
     }
+
+    arrFree(time);
+
+    delay(100);
 }

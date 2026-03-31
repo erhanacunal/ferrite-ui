@@ -56,6 +56,7 @@ class Op:
     ARR_STORE  = 0x18
     ARR_LEN    = 0x19
     W_ALLOC    = 0x1A
+    ARR_FREE   = 0x1B
 
     # Specialized short forms (1 byte, no args)
     PUSH_0     = 0x20
@@ -170,6 +171,9 @@ class Builtin:
     SEND_USART_STR = 25
     RTC_READ = 26
     RTC_WRITE = 27
+    MILLIS = 28
+    FPGA_CMD = 29
+    FPGA_DAT = 30
 
 
 class Prop:
@@ -210,6 +214,7 @@ class Prop:
     ON_PAINT = 0x21
     ON_TAP = 0x22
     BORDER_RADIUS = 0x23
+    VALUE = 0x24
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -451,6 +456,10 @@ class Asm:
 
     def w_alloc(self):
         self._emit(Op.W_ALLOC)
+
+    def arr_free(self):
+        """Pop arr_id, free the array."""
+        self._emit(Op.ARR_FREE)
 
     # --- Specialized short forms + general forms ---
 
@@ -847,7 +856,7 @@ OP_NAMES = {
     0x10: 'LE', 0x11: 'GT', 0x12: 'GE', 0x13: 'RET',
     0x14: 'YIELD', 0x15: 'W_DIRTY', 0x16: 'W_RENDER',
     0x17: 'ARR_LOAD', 0x18: 'ARR_STORE', 0x19: 'ARR_LEN',
-    0x1A: 'W_ALLOC',
+    0x1A: 'W_ALLOC', 0x1B: 'arrFree',
 
     0x20: 'PUSH_0', 0x21: 'PUSH_1', 0x22: 'PUSH_2', 0x23: 'PUSH_M1',
     0x24: 'LOAD_0', 0x25: 'LOAD_1', 0x26: 'LOAD_2', 0x27: 'LOAD_3', 0x28: 'LOAD_4',
@@ -869,7 +878,8 @@ OP_NAMES = {
     0x93: 'roundedRect', 0x94: 'fillRoundedRect', 0x95: 'arc',
     0x96: 'beginFrame', 0x97: 'endFrame',
     0x98: 'sendUsart', 0x99: 'sendUsartStr',
-    0x9A: 'rtcRead', 0x9B: 'rtcWrite',
+    0x9A: 'rtcRead', 0x9B: 'rtcWrite', 0x9C: 'millis',
+    0x9D: 'fpgaCmd', 0x9E: 'fpgaData',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -888,16 +898,16 @@ PROP_NAMES = {
     0x14: 'BORDER_T', 0x15: 'BORDER_R', 0x16: 'BORDER_B', 0x17: 'BORDER_L',
     0x18: 'PADDING_T', 0x19: 'PADDING_R', 0x1A: 'PADDING_B', 0x1B: 'PADDING_L',
     0x1F: 'IMAGE_ID',
-    0x20: 'ON_CLICK', 0x21: 'ON_PAINT', 0x22: 'ON_TAP', 0x23: 'BORDER_RADIUS',
+    0x20: 'ON_CLICK', 0x21: 'ON_PAINT', 0x22: 'ON_TAP', 0x23: 'BORDER_RADIUS', 0x24: 'VALUE',
     0x40: 'LOCATION', 0x41: 'SIZE', 0x42: 'MARGIN',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
 
 # Set of no-arg opcodes for disassembler
 _NO_ARG_OPS = (
-    set(range(0x00, 0x1B)) |           # 0x00-0x1A
+    set(range(0x00, 0x1C)) |           # 0x00-0x1B
     set(range(0x20, 0x2E)) |           # 0x20-0x2D
-    {op for op in range(0x80, 0x9C)    # 0x80-0x9B except 0x86, 0x88
+    {op for op in range(0x80, 0x9F)    # 0x80-0x9E except 0x86, 0x88
      if op not in (0x86, 0x88)} |
     set(range(0xC0, 0xCD))             # 0xC0-0xCC
 )
@@ -1086,6 +1096,7 @@ PROP_MAP = {
     'on_tap': (Prop.ON_TAP, False),
     'border_radius': (Prop.BORDER_RADIUS, False),
     'radius': (Prop.BORDER_RADIUS, False),
+    'value': (Prop.VALUE, False),
     'text': (Prop.TEXT, True),
     'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }

@@ -11,7 +11,7 @@ use crate::proto::{
     PROP_BORDER_COLOR, PROP_BORDER_EDGES, PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_T,
     PROP_CLICKABLE, PROP_ENABLED, PROP_FONT_ID, PROP_KIND, PROP_LOCATION, PROP_LOC_X, PROP_LOC_Y,
     PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L, PROP_MARGIN_R, PROP_MARGIN_T, PROP_PADDING,
-    PROP_IMAGE_ID, PROP_ON_CLICK, PROP_ON_PAINT, PROP_ON_TAP, PROP_BORDER_RADIUS,
+    PROP_IMAGE_ID, PROP_ON_CLICK, PROP_ON_PAINT, PROP_ON_TAP, PROP_BORDER_RADIUS, PROP_VALUE,
     PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
     PROP_PRESS_COLOR, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W,
     PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VISIBLE,
@@ -166,6 +166,7 @@ const OP_ARR_LOAD: u8 = 0x17;
 const OP_ARR_STORE: u8 = 0x18;
 const OP_ARR_LEN: u8 = 0x19;
 const OP_W_ALLOC: u8 = 0x1A;
+const OP_ARR_FREE: u8 = 0x1B;
 
 // Specialized short forms (1 byte, no args)
 const OP_PUSH_0: u8 = 0x20;
@@ -232,6 +233,9 @@ const OP_SEND_USART: u8 = 0x98;
 const OP_SEND_USART_STR: u8 = 0x99;
 const OP_RTC_READ: u8 = 0x9A;
 const OP_RTC_WRITE: u8 = 0x9B;
+const OP_MILLIS: u8 = 0x9C;
+const OP_FPGA_CMD: u8 = 0x9D; // pop cmd, pop data → send_command(cmd), send_data(data)
+const OP_FPGA_DAT: u8 = 0x9E; // pop data → send_data(data)
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -709,6 +713,10 @@ impl Vm {
                     self.state = VmState::Error;
                 }
             }
+            OP_ARR_FREE => {
+                let arr_id = self.pop();
+                self.arr_free(arr_id);
+            }
 
             // --- Specialized short forms ---
             OP_PUSH_0  => self.push(0),
@@ -1100,6 +1108,22 @@ impl Vm {
                 }
             }
 
+            OP_MILLIS => {
+                self.push(systick::millis() as i32);
+            }
+            OP_FPGA_CMD => {
+                // fpgaCmd(cmd, data) — raw FPGA command + data
+                let data = self.pop() as u16;
+                let cmd = self.pop() as u16;
+                ctx.lcd.send_command(cmd);
+                ctx.lcd.send_data(data);
+            }
+            OP_FPGA_DAT => {
+                // fpgaData(data) — raw FPGA data (after a cmd)
+                let data = self.pop() as u16;
+                ctx.lcd.send_data(data);
+            }
+
             // --- Float32 (soft-float) ---
             OP_ITOF => {
                 let i = self.pop();
@@ -1187,6 +1211,7 @@ impl Vm {
             PROP_PRESS_COLOR => w.press_color = val as u16,
             PROP_IMAGE_ID => w.image_id = val as u8,
             PROP_BORDER_RADIUS => w.border_radius = val as u16,
+            PROP_VALUE => w.value = val as i16,
             PROP_ON_CLICK => w.on_click = val as u16,
             PROP_ON_PAINT => w.on_paint = val as u16,
             PROP_ON_TAP => w.on_tap = val as u16,
@@ -1225,6 +1250,7 @@ impl Vm {
             PROP_PRESS_COLOR => w.press_color as i32,
             PROP_IMAGE_ID => w.image_id as i32,
             PROP_BORDER_RADIUS => w.border_radius as i32,
+            PROP_VALUE => w.value as i32,
             PROP_ON_CLICK => w.on_click as i32,
             PROP_ON_PAINT => w.on_paint as i32,
             PROP_ON_TAP => w.on_tap as i32,
@@ -1273,6 +1299,12 @@ impl Vm {
         if arr_id < 0 { return None; }
         let id = arr_id as u16;
         self.arrays.iter().position(|a| a.id == id)
+    }
+
+    fn arr_free(&mut self, arr_id: i32) {
+        if let Some(pos) = self.find_array(arr_id) {
+            self.arrays.remove(pos);
+        }
     }
 
     fn arr_alloc(&mut self, size: u16) {
