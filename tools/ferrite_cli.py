@@ -133,6 +133,21 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             ser.timeout = orig_timeout
             return ("pong", None)
 
+        if tag == TAG_MEMINFO_RESP:
+            # Varint type — read free heap bytes
+            varint_bytes = bytearray()
+            while True:
+                b = ser.read(1)
+                if not b:
+                    ser.timeout = orig_timeout
+                    return ("timeout", None)
+                varint_bytes.append(b[0])
+                if b[0] & 0x80 == 0:
+                    break
+            free_bytes, _ = decode_varint(bytes(varint_bytes))
+            ser.timeout = orig_timeout
+            return ("meminfo", free_bytes)
+
         if tag == TAG_ERROR or tag == TAG_TOUCHCAL_RESP:
             # Read length varint
             length_bytes = bytearray()
@@ -187,6 +202,24 @@ def cmd_restart(ser: serial.Serial) -> bool:
     ser.flush()
     print("restart sent")
     return True
+
+
+def cmd_meminfo(ser: serial.Serial) -> bool:
+    """Query free heap memory from device."""
+    ser.write(build_varint_msg(TAG_MEMINFO))
+    ser.flush()
+
+    resp_type, resp_val = read_response(ser)
+    if resp_type == "meminfo":
+        print(f"free: {resp_val} bytes ({resp_val / 1024:.1f} KB)")
+        return True
+    elif resp_type == "error":
+        desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
+        print(f"error: code {resp_val} — {desc}", file=sys.stderr)
+        return False
+    else:
+        print("no response (timeout)", file=sys.stderr)
+        return False
 
 
 def cmd_execute(ser: serial.Serial, path: str) -> bool:
@@ -412,6 +445,7 @@ def main():
 
     sub.add_parser("ping", help="Ping device (expects pong)")
     sub.add_parser("restart", help="Restart device")
+    sub.add_parser("meminfo", help="Query free heap memory")
 
     p_exec = sub.add_parser("execute", help="Send bytecode for execution")
     p_exec.add_argument("file", help="Bytecode binary file")
@@ -437,6 +471,8 @@ def main():
             ok = cmd_ping(ser)
         elif args.command == "restart":
             ok = cmd_restart(ser)
+        elif args.command == "meminfo":
+            ok = cmd_meminfo(ser)
         elif args.command == "execute":
             ok = cmd_execute(ser, args.file)
         elif args.command == "writefs":

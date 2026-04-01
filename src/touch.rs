@@ -46,8 +46,9 @@ const RAW_ERROR: u16 = 50;
 const RELEASE_DEBOUNCE: u8 = 5;
 
 /// Z1 pressure threshold. Below this = no touch.
-/// When touched Z1 is typically 200-4000. When not touched Z1 is near 0.
-const Z_THRESHOLD: u16 = 100;
+/// Finger touch can produce Z1 as low as 30-50 (wide contact area).
+/// Nail/stylus produces Z1 200-4000. Idle noise is near 0.
+const Z_THRESHOLD: u16 = 50;
 
 // --- Screen ---
 
@@ -234,7 +235,7 @@ pub fn hit_test(tree: &WidgetTree, x: u16, y: u16) -> WidgetId {
     for i in 0..dfs.len() {
         let id = dfs[i];
         let w = tree.get(id);
-        if w.flags & FLAG_CLICKABLE == 0 || w.flags & FLAG_VISIBLE == 0 {
+        if w.flags & FLAG_CLICKABLE == 0 || !tree.is_tree_visible(id) {
             continue;
         }
         let abs = tree.absolute_rect(id);

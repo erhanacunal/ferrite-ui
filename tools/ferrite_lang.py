@@ -13,6 +13,8 @@ Python API:
   bytecode = compile(source_code)
 """
 
+import os
+import re
 import sys
 import struct
 from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
@@ -30,6 +32,52 @@ class CompileError(Exception):
     def __init__(self, msg, line=0):
         super().__init__(f"line {line}: {msg}" if line else msg)
         self.line = line
+
+
+# ============================================================
+# Preprocessor — #include "file.fl"
+# ============================================================
+
+_INCLUDE_RE = re.compile(r'^[ \t]*#include\s+"([^"]+)"', re.MULTILINE)
+
+
+def preprocess(source, filename="<input>", include_dirs=None, _included=None):
+    """Expand #include directives. Resolves paths relative to the
+    including file, then searches include_dirs. Detects circular includes."""
+    if _included is None:
+        _included = set()
+    if include_dirs is None:
+        include_dirs = []
+
+    filepath = os.path.abspath(filename)
+    if filepath in _included:
+        raise CompileError(f'circular include: {filename}')
+    _included.add(filepath)
+    base_dir = os.path.dirname(filepath)
+
+    def _resolve(inc_path):
+        """Resolve include path: relative to current file first, then include_dirs."""
+        candidate = os.path.normpath(os.path.join(base_dir, inc_path))
+        if os.path.isfile(candidate):
+            return candidate
+        for d in include_dirs:
+            candidate = os.path.normpath(os.path.join(d, inc_path))
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _replace(m):
+        inc_path = m.group(1)
+        full_path = _resolve(inc_path)
+        if full_path is None:
+            searched = [base_dir] + list(include_dirs)
+            raise CompileError(f'include file not found: {inc_path} (searched: {searched})')
+        with open(full_path, 'r', encoding='utf-8') as f:
+            inc_source = f.read()
+        # Recursively preprocess the included file
+        return preprocess(inc_source, full_path, include_dirs, _included)
+
+    return _INCLUDE_RE.sub(_replace, source)
 
 
 # ============================================================
@@ -664,7 +712,8 @@ NO_VALUE_BUILTINS = {
     'fillRect', 'rect', 'line', 'circle', 'fillCircle',
     'drawImage', 'drawText', 'delay',
     'setText', 'drawStr', 'strClear', 'strFree', 'arrFree',
-    'fpgaCmd', 'fpgaData',
+    'fpgaCmd', 'fpgaData', 'critical',
+    'setBrightness',
     'roundedRect', 'fillRoundedRect', 'arc',
     'beginFrame', 'endFrame',
     'sendUsart',
@@ -680,7 +729,7 @@ class CodeGen:
         self.next_slot = 0
         self.functions = {}     # name -> {params, addr, end_addr, patches}
         self.widget_ids = {}    # name -> predicted widget ID
-        self.next_widget_id = 0
+        self.next_widget_id = 1 # 0 = pre-created root widget
         self._loop_stack = []   # {continue_target, continue_patches, break_patches}
         self._fn_base = 0       # function vars start here
         self.array_vars = set() # names that hold array_ids
@@ -768,10 +817,14 @@ class CodeGen:
                     self.widget_ids[stmt.name] = self.next_widget_id
                     self.next_widget_id += 1
 
-        # Pre-scan function bodies for alloc() assignments to global vars
-        # This enables target()/parent() with widgets allocated in setup()
+        # Pre-scan function bodies for alloc() calls to populate widget_ids.
+        # This enables target()/parent() in callbacks generated before setup().
         for fn in program.functions:
             self._scan_alloc_in_stmts(fn.body, global_var_stmts)
+
+        # Reset counter — codegen will re-count in the same order,
+        # producing identical IDs while also tracking local reassignment.
+        self.next_widget_id = 1  # 0 = pre-created root widget
 
         # Phase 2: Register all functions
         for fn in program.functions:
@@ -831,21 +884,22 @@ class CodeGen:
         return count
 
     def _scan_alloc_in_stmts(self, stmts, global_var_stmts):
-        """Scan statements for `global_var = alloc()` patterns to track widget IDs."""
-        global_names = {s.name for s in global_var_stmts}
+        """Pre-scan statements for alloc() calls to track widget IDs.
+
+        Counts ALL allocs (globals, locals, reassignments) in execution order
+        so that global widget IDs are correct for callbacks generated before setup().
+        """
         for stmt in stmts:
-            # x = alloc() where x is a global var
-            if isinstance(stmt, Assign) and stmt.name in global_names:
+            # x = alloc() (any assignment — global or local reassignment)
+            if isinstance(stmt, Assign):
                 if isinstance(stmt.value, CallExpr) and stmt.value.name == 'alloc':
-                    if stmt.name not in self.widget_ids:
-                        self.widget_ids[stmt.name] = self.next_widget_id
-                        self.next_widget_id += 1
-            # var x = alloc() (local that shadows — still track)
+                    self.widget_ids[stmt.name] = self.next_widget_id
+                    self.next_widget_id += 1
+            # var x = alloc() (local declaration)
             elif isinstance(stmt, VarDecl) and stmt.init is not None:
                 if isinstance(stmt.init, CallExpr) and stmt.init.name == 'alloc':
-                    if stmt.name not in self.widget_ids:
-                        self.widget_ids[stmt.name] = self.next_widget_id
-                        self.next_widget_id += 1
+                    self.widget_ids[stmt.name] = self.next_widget_id
+                    self.next_widget_id += 1
             elif isinstance(stmt, IfStmt):
                 self._scan_alloc_in_stmts(stmt.then_body, global_var_stmts)
                 if stmt.else_body:
@@ -978,9 +1032,8 @@ class CodeGen:
             # Scalar variable
             if node.init is not None:
                 if isinstance(node.init, CallExpr) and node.init.name == 'alloc':
-                    if node.name not in self.widget_ids:
-                        self.widget_ids[node.name] = self.next_widget_id
-                        self.next_widget_id += 1
+                    self.widget_ids[node.name] = self.next_widget_id
+                    self.next_widget_id += 1
                 self._gen_expr(node.init)
             else:
                 self.asm.push(0)
@@ -1014,9 +1067,8 @@ class CodeGen:
         else:
             if node.init is not None:
                 if isinstance(node.init, CallExpr) and node.init.name == 'alloc':
-                    if node.name not in self.widget_ids:
-                        self.widget_ids[node.name] = self.next_widget_id
-                        self.next_widget_id += 1
+                    self.widget_ids[node.name] = self.next_widget_id
+                    self.next_widget_id += 1
                 self._gen_expr(node.init)
             else:
                 self.asm.push(0)
@@ -1034,6 +1086,10 @@ class CodeGen:
             # Track array-returning builtins
             if isinstance(node.value, CallExpr) and node.value.name == 'rtcRead':
                 self.array_vars.add(node.name)
+            # Track widget ID reassignment: lbl = alloc()
+            if isinstance(node.value, CallExpr) and node.value.name == 'alloc':
+                self.widget_ids[node.name] = self.next_widget_id
+                self.next_widget_id += 1
             self._gen_expr(node.value)
             slot = self._var_slot(node.name, node.line)
             self.asm.store(slot)
@@ -1572,6 +1628,28 @@ class CodeGen:
             self.asm.builtin(Builtin.FPGA_DAT)
             return
 
+        if name == 'critical':
+            # critical() — enter critical section, VM runs until next yield
+            if len(node.args) != 0:
+                raise CompileError("critical() takes no arguments", node.line)
+            self.asm.builtin(Builtin.CRITICAL)
+            return
+
+        if name == 'setBrightness':
+            # setBrightness(percent) — set LCD backlight 0..100
+            if len(node.args) != 1:
+                raise CompileError("setBrightness() takes 1 argument: percent (0-100)", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.SET_BRIGHTNESS)
+            return
+
+        if name == 'brightness':
+            # brightness() → current backlight percent (0..100)
+            if len(node.args) != 0:
+                raise CompileError("brightness() takes no arguments", node.line)
+            self.asm.builtin(Builtin.BRIGHTNESS)
+            return
+
         if name == 'rtcRead':
             # rtcRead() → arr_id [sec, min, hour, day, weekday, month, year]
             if len(node.args) != 0:
@@ -1690,9 +1768,10 @@ class CodeGen:
 # ============================================================
 
 
-def compile(source, filename="<input>"):
+def compile(source, filename="<input>", include_dirs=None):
     """Compile source code to bytecode. Returns bytes."""
     try:
+        source = preprocess(source, filename, include_dirs)
         tokens = tokenize(source)
         parser = Parser(tokens)
         program = parser.parse()
@@ -1718,16 +1797,16 @@ SYSTEM_CALLBACKS = {
 }
 
 
-def compile_with_meta(source, filename="<input>"):
+def compile_with_meta(source, filename="<input>", include_dirs=None):
     """Compile source code to (bytecode, metadata_or_None).
 
     Legacy API — wraps build_image internally.
     Returns (image_bytes, None) since metadata is now embedded.
     """
-    return build_image(source, filename), None
+    return build_image(source, filename, include_dirs), None
 
 
-def build_image(source, filename="<input>"):
+def build_image(source, filename="<input>", include_dirs=None):
     """Compile source to VM image format (new unified header).
 
     Image format:
@@ -1739,6 +1818,7 @@ def build_image(source, filename="<input>"):
     Global variables (top-level var) are supported.
     """
     try:
+        source = preprocess(source, filename, include_dirs)
         tokens = tokenize(source)
         parser = Parser(tokens)
         program = parser.parse()
@@ -1788,9 +1868,9 @@ class _ImageBytes(bytes):
         return obj
 
 
-def compile_page(source, bg_color=0x0000, filename="<input>"):
+def compile_page(source, bg_color=0x0000, filename="<input>", include_dirs=None):
     """Compile source to page format: bg_color(u16 LE) + bytecode."""
-    bytecode = compile(source, filename)
+    bytecode = compile(source, filename, include_dirs)
     return struct.pack('<H', bg_color) + bytecode
 
 
@@ -1855,10 +1935,17 @@ def main():
                         help='Output execute image (header + bytecode + metadata)')
     parser.add_argument('--disasm', action='store_true', help='Print disassembly')
     parser.add_argument('--hexdump', action='store_true', help='Print hex dump')
+    parser.add_argument('-I', '--include', action='append', default=[],
+                        metavar='DIR', help='Add include search directory (repeatable)')
     args = parser.parse_args()
 
     with open(args.source, 'r', encoding='utf-8') as f:
         source = f.read()
+
+    include_dirs = [os.path.abspath(d) for d in args.include]
+
+    # Expand #include directives before auto-detection
+    source = preprocess(source, args.source, include_dirs)
 
     # Auto-detect image mode: if source has fn setup() and fn loop(), use --image
     has_setup_loop = ('fn setup()' in source and 'fn loop()' in source)

@@ -174,6 +174,9 @@ class Builtin:
     MILLIS = 28
     FPGA_CMD = 29
     FPGA_DAT = 30
+    CRITICAL = 31
+    SET_BRIGHTNESS = 32
+    BRIGHTNESS = 33
 
 
 class Prop:
@@ -879,7 +882,8 @@ OP_NAMES = {
     0x96: 'beginFrame', 0x97: 'endFrame',
     0x98: 'sendUsart', 0x99: 'sendUsartStr',
     0x9A: 'rtcRead', 0x9B: 'rtcWrite', 0x9C: 'millis',
-    0x9D: 'fpgaCmd', 0x9E: 'fpgaData',
+    0x9D: 'fpgaCmd', 0x9E: 'fpgaData', 0x9F: 'critical',
+    0xA0: 'setBrightness', 0xA1: 'brightness',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -907,7 +911,7 @@ PROP_NAMES = {
 _NO_ARG_OPS = (
     set(range(0x00, 0x1C)) |           # 0x00-0x1B
     set(range(0x20, 0x2E)) |           # 0x20-0x2D
-    {op for op in range(0x80, 0x9F)    # 0x80-0x9E except 0x86, 0x88
+    {op for op in range(0x80, 0xA2)    # 0x80-0xA1 except 0x86, 0x88
      if op not in (0x86, 0x88)} |
     set(range(0xC0, 0xCD))             # 0xC0-0xCC
 )

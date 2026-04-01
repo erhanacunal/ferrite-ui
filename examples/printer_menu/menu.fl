@@ -1,0 +1,373 @@
+// menu.fl — 3D Printer Menu (800x480 touchscreen)
+//
+// Main Menu: Print, Auto Home, Auto Level, Preheat, Control, Settings, Info
+// Sub Menu:  Preheat → ABS / PLA
+//
+// Demonstrates: widget tree, big buttons, on_click callbacks,
+//               sub-menus via show/hide, fade transitions, critical sections
+
+// ── Colors (RGB565) ──
+var C_BG        = 0x1082;
+var C_BTN       = 0x3186;
+var C_BTN_PRESS = 0x4A69;
+var C_BORDER    = 0x5ACB;
+
+// ── Widget IDs ──
+var main_panel;
+var sub_panel;
+var title_lbl;
+var sub_title;
+var btn_print;
+var btn_home;
+var btn_level;
+var btn_preheat;
+var btn_control;
+var btn_settings;
+var btn_info;
+var btn_abs;
+var btn_pla;
+var btn_back;
+
+// ── Callbacks ──
+//
+// func_id assignment (1-based, source order):
+//   1=on_main_click, 2=on_sub_click,
+//   3=show_submenu, 4=show_mainmenu,
+//   5=fade_in, 6=setup, 7=loop
+
+fn on_main_click(widget_id) {
+    if (widget_id == btn_preheat) {
+        show_submenu();
+    }
+}
+
+fn on_sub_click(widget_id) {
+    if (widget_id == btn_back) {
+        show_mainmenu();
+    }
+}
+
+fn show_submenu() {
+    critical();
+
+    target(title_lbl);
+    set(text, "PREHEAT");
+    dirty();
+
+    target(main_panel);
+    set(visible, 0);
+    dirty();
+
+    target(sub_panel);
+    set(visible, 1);
+    dirty();
+
+    render();
+}
+
+fn show_mainmenu() {
+    critical();
+
+    target(title_lbl);
+    set(text, "3D PRINTER");
+    dirty();
+
+    target(sub_panel);
+    set(visible, 0);
+    dirty();
+
+    target(main_panel);
+    set(visible, 1);
+    dirty();
+
+    render();
+}
+
+fn fade_in(step, wait) {
+    var br = 0;
+    while (br <= 100) {
+        setBrightness(br);
+        br = br + step;
+        delay(wait);
+    }
+    setBrightness(100);
+}
+
+// ── Setup ──
+
+fn setup() {
+    // ── Title bar ──
+    title_lbl = alloc();
+    target(title_lbl);
+    set(kind, 1);
+    set(location, 0, 0);
+    set(size, 800, 60);
+    set(bg_color, 0x2C9F);
+    set(text_color, 0xFFFF);
+    set(font_id, 0);
+    set(text_align, 1);
+    set(text, "3D PRINTER");
+    parent(0);
+
+    // ════════════════════════════════
+    //  MAIN MENU PANEL
+    // ════════════════════════════════
+
+    main_panel = alloc();
+    target(main_panel);
+    set(location, 0, 60);
+    set(size, 800, 420);
+    set(bg_color, C_BG);
+    parent(0);
+
+    // --- Row 0: Print, Auto Home, Auto Level ---
+
+    btn_print = alloc();
+    target(btn_print);
+    set(location, 40, 20);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_BTN_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BORDER);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(main_panel);
+    var lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "PRINT");
+    parent(btn_print);
+
+    btn_home = alloc();
+    target(btn_home);
+    set(location, 285, 20);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_BTN_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BORDER);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(main_panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "AUTO HOME");
+    parent(btn_home);
+
+    btn_level = alloc();
+    target(btn_level);
+    set(location, 530, 20);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_BTN_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BORDER);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(main_panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "AUTO LEVEL");
+    parent(btn_level);
+
+    // --- Row 1: Preheat, Control, Settings ---
+
+    btn_preheat = alloc();
+    target(btn_preheat);
+    set(location, 40, 160);
+    set(size, 230, 120);
+    set(bg_color, 0xFB20);
+    set(press_color, 0xFC60);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BORDER);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(main_panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "PREHEAT");
+    parent(btn_preheat);
+
+    btn_control = alloc();
+    target(btn_control);
+    set(location, 285, 160);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_BTN_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BORDER);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(main_panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "CONTROL");
+    parent(btn_control);
+
+    btn_settings = alloc();
+    target(btn_settings);
+    set(location, 530, 160);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_BTN_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BORDER);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(main_panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "SETTINGS");
+    parent(btn_settings);
+
+    // --- Row 2: Info (centered) ---
+
+    btn_info = alloc();
+    target(btn_info);
+    set(location, 285, 300);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_BTN_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BORDER);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(main_panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "INFO");
+    parent(btn_info);
+
+    // ════════════════════════════════
+    //  PREHEAT SUB-MENU PANEL
+    // ════════════════════════════════
+
+    sub_panel = alloc();
+    target(sub_panel);
+    set(location, 0, 60);
+    set(size, 800, 420);
+    set(bg_color, C_BG);
+    set(visible, 0);
+    parent(0);
+
+    // Sub-menu title label
+    sub_title = alloc();
+    target(sub_title);
+    set(kind, 1);
+    set(location, 0, 20);
+    set(size, 800, 40);
+    set(text_color, 0xBDF7);
+    set(font_id, 0);
+    set(text_align, 1);
+    set(text, "SELECT MATERIAL");
+    parent(sub_panel);
+
+    // ABS button (big, red)
+    btn_abs = alloc();
+    target(btn_abs);
+    set(location, 80, 90);
+    set(size, 280, 200);
+    set(bg_color, 0xF800);
+    set(press_color, 0x8000);
+    set(border, 3, 3, 3, 3);
+    set(border_color, 0xFBE0);
+    set(border_radius, 20);
+    set(clickable, 1);
+    set(on_click, 2);
+    parent(sub_panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 280, 200);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "ABS");
+    parent(btn_abs);
+
+    // PLA button (big, green)
+    btn_pla = alloc();
+    target(btn_pla);
+    set(location, 440, 90);
+    set(size, 280, 200);
+    set(bg_color, 0x07E0);
+    set(press_color, 0x0320);
+    set(border, 3, 3, 3, 3);
+    set(border_color, 0xB7E0);
+    set(border_radius, 20);
+    set(clickable, 1);
+    set(on_click, 2);
+    parent(sub_panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 280, 200);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "PLA");
+    parent(btn_pla);
+
+    // Back button
+    btn_back = alloc();
+    target(btn_back);
+    set(location, 280, 330);
+    set(size, 240, 60);
+    set(bg_color, 0x2945);
+    set(press_color, C_BTN_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BORDER);
+    set(border_radius, 12);
+    set(clickable, 1);
+    set(on_click, 2);
+    parent(sub_panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 240, 60);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "< BACK");
+    parent(btn_back);
+
+    // ── Render + fade in ──
+    render();
+    return 0;
+}
+
+fn loop() {
+    delay(50);
+}

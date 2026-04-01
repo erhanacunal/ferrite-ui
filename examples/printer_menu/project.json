@@ -8,7 +8,7 @@
   "programs": [
     {
       "name": "main",
-      "source": "standalone.fl"
+      "source": "menu.fl"
     }
   ]
 }

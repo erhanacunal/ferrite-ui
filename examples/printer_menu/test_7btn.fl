@@ -1,0 +1,183 @@
+// test_7btn.fl — 7 buttons with labels, no sub-panel
+
+var C_BG = 0x1082;
+var C_BTN = 0x3186;
+var C_PRESS = 0x4A69;
+var C_BRD = 0x5ACB;
+var panel;
+var btn_a;
+var btn_b;
+var btn_c;
+var btn_d;
+var btn_e;
+var btn_f;
+var btn_g;
+
+fn on_click(widget_id) {
+    // just show press feedback
+}
+
+fn setup() {
+    panel = alloc();
+    target(panel);
+    set(size, 800, 480);
+    set(bg_color, C_BG);
+    parent(0);
+
+    // Row 0
+    btn_a = alloc();
+    target(btn_a);
+    set(location, 40, 20);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BRD);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(panel);
+    var lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "PRINT");
+    parent(btn_a);
+
+    btn_b = alloc();
+    target(btn_b);
+    set(location, 285, 20);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BRD);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "AUTO HOME");
+    parent(btn_b);
+
+    btn_c = alloc();
+    target(btn_c);
+    set(location, 530, 20);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BRD);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "AUTO LEVEL");
+    parent(btn_c);
+
+    // Row 1
+    btn_d = alloc();
+    target(btn_d);
+    set(location, 40, 160);
+    set(size, 230, 120);
+    set(bg_color, 0xFB20);
+    set(press_color, 0xFC60);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BRD);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "PREHEAT");
+    parent(btn_d);
+
+    btn_e = alloc();
+    target(btn_e);
+    set(location, 285, 160);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BRD);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "CONTROL");
+    parent(btn_e);
+
+    btn_f = alloc();
+    target(btn_f);
+    set(location, 530, 160);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BRD);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "SETTINGS");
+    parent(btn_f);
+
+    // Row 2
+    btn_g = alloc();
+    target(btn_g);
+    set(location, 285, 300);
+    set(size, 230, 120);
+    set(bg_color, C_BTN);
+    set(press_color, C_PRESS);
+    set(border, 2, 2, 2, 2);
+    set(border_color, C_BRD);
+    set(border_radius, 16);
+    set(clickable, 1);
+    set(on_click, 1);
+    parent(panel);
+    lbl = alloc();
+    target(lbl);
+    set(kind, 1);
+    set(size, 230, 120);
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(text, "INFO");
+    parent(btn_g);
+
+    render();
+    return 0;
+}
+
+fn loop() {
+    delay(50);
+}

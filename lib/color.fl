@@ -1,0 +1,31 @@
+// color.fl — RGB565 color constants
+// Usage: #include "color.fl"
+
+// Basic colors
+var BLACK   = 0x0000;
+var WHITE   = 0xFFFF;
+var RED     = 0xF800;
+var GREEN   = 0x07E0;
+var BLUE    = 0x001F;
+var YELLOW  = 0xFFE0;
+var CYAN    = 0x07FF;
+var MAGENTA = 0xF81F;
+
+// Grays
+var DARK_GRAY  = 0x4208;
+var GRAY       = 0x8410;
+var LIGHT_GRAY = 0xC618;
+
+// Extended colors
+var ORANGE     = 0xFD20;
+var PINK       = 0xFC18;
+var PURPLE     = 0x8010;
+var BROWN      = 0x8200;
+var NAVY       = 0x0010;
+var DARK_GREEN = 0x0320;
+var DARK_RED   = 0x8000;
+var OLIVE      = 0x8400;
+var TEAL       = 0x0410;
+var SKY_BLUE   = 0x867D;
+var LIME       = 0xB7E0;
+var GOLD       = 0xFEA0;

@@ -3,6 +3,7 @@
 /// Avoids threading 6+ individual parameters through every call chain.
 /// Allocated on the heap via Box in main.
 
+use crate::backlight::Backlight;
 use crate::flash::Flash;
 use crate::font::FontList;
 use crate::fs::Fs;
@@ -19,4 +20,5 @@ pub struct Ctx {
     pub images: ImageList,
     pub strpool: StringPool,
     pub fs: Option<Fs>,
+    pub backlight: Backlight,
 }

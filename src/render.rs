@@ -63,7 +63,7 @@ pub fn render_dirty(ctx: &mut Ctx) {
     for di in 0..dfs.len() {
         let id = dfs[di];
 
-        if !ctx.tree.get(id).is_dirty() || !ctx.tree.get(id).is_visible() {
+        if !ctx.tree.get(id).is_dirty() || !ctx.tree.is_tree_visible(id) {
             continue;
         }
 
@@ -81,8 +81,7 @@ pub fn render_dirty(ctx: &mut Ctx) {
                 }
             }
             if after_subtree {
-                let other = ctx.tree.get(dfs[j]);
-                if other.is_visible() {
+                if ctx.tree.is_tree_visible(dfs[j]) {
                     let other_abs = ctx.tree.absolute_rect(dfs[j]);
                     if abs.intersects(&other_abs) && occ_count < 32 {
                         occluders[occ_count] = other_abs;
@@ -169,6 +168,8 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
     let b = &widget.border;
     let bg_color = effective_bg(&ctx.tree, id);
     let r = widget.border_radius;
+    // Labels with bg_color 0 are transparent — parent background shows through
+    let draw_bg = bg_color != 0 || widget.kind != KIND_LABEL;
 
     if r > 0 {
         // Rounded mode: draw border as rounded_rect, background as fill_rounded_rect
@@ -190,10 +191,12 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
             }
         }
         // Background (inside border)
-        let bg = inner_rect(abs, b);
-        if !bg.is_empty() {
-            let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
-            fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+        if draw_bg {
+            let bg = inner_rect(abs, b);
+            if !bg.is_empty() {
+                let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
+                fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+            }
         }
     } else {
         // Sharp corners: original rect-based drawing
@@ -240,9 +243,11 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
             );
         }
         // Background (inside border)
-        let bg = inner_rect(abs, b);
-        if !bg.is_empty() {
-            fill_rect_screen(&ctx.lcd, bg, bg_color);
+        if draw_bg {
+            let bg = inner_rect(abs, b);
+            if !bg.is_empty() {
+                fill_rect_screen(&ctx.lcd, bg, bg_color);
+            }
         }
     }
 
@@ -270,6 +275,7 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     let b = &widget.border;
     let bg_color = effective_bg(&ctx.tree, id);
     let r = widget.border_radius;
+    let draw_bg = bg_color != 0 || widget.kind != KIND_LABEL;
 
     if r > 0 {
         // Rounded mode: fallback to unclipped rounded draw.
@@ -291,10 +297,12 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
                 );
             }
         }
-        let bg = inner_rect(abs, b);
-        if !bg.is_empty() {
-            let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
-            fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+        if draw_bg {
+            let bg = inner_rect(abs, b);
+            if !bg.is_empty() {
+                let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
+                fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+            }
         }
     } else {
         // Sharp corners: rect-clipped drawing
@@ -327,9 +335,11 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
         }
 
         // Background (inside border)
-        let bg = inner_rect(abs, b);
-        if !bg.is_empty() {
-            fill_clipped(&ctx.lcd, &bg, bg_color, clip);
+        if draw_bg {
+            let bg = inner_rect(abs, b);
+            if !bg.is_empty() {
+                fill_clipped(&ctx.lcd, &bg, bg_color, clip);
+            }
         }
     }
 
@@ -406,7 +416,8 @@ fn draw_label_text(ctx: &Ctx, id: WidgetId, abs: &Rect) {
     let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
 
     let bg_color = effective_bg(&ctx.tree, id);
-    font.draw_str(&ctx.lcd, &ctx.flash, text, tx, ty, widget.text_color, Some(bg_color));
+    let bg = if bg_color == 0 && widget.kind == KIND_LABEL { None } else { Some(bg_color) };
+    font.draw_str(&ctx.lcd, &ctx.flash, text, tx, ty, widget.text_color, bg);
 }
 
 /// Draw rect clipped against clip region.

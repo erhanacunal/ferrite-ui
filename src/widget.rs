@@ -123,7 +123,7 @@ impl Widget {
             border_color: 0x0000,
             border_radius: 0,
             text_color: 0xFFFF,
-            font_id: 0xFF,
+            font_id: 0,
             text_align: ALIGN_LEFT,
             text_id: 0xFFFF,
             press_color: 0,
@@ -295,6 +295,24 @@ impl WidgetTree {
             current = self.widgets[current.index()].parent;
         }
         false
+    }
+
+    /// Check if this widget and all its ancestors are visible.
+    pub fn is_tree_visible(&self, id: WidgetId) -> bool {
+        let max = self.widgets.len();
+        let mut depth = 0usize;
+        let mut current = id;
+        while current.is_some() {
+            if !self.widgets[current.index()].is_visible() {
+                return false;
+            }
+            depth += 1;
+            if depth > max {
+                return false;
+            }
+            current = self.widgets[current.index()].parent;
+        }
+        true
     }
 
     /// Mark widget and all descendants as dirty.

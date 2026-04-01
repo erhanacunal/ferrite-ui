@@ -9,7 +9,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 
-const HEAP_SIZE: usize = 16 * 1024;
+const HEAP_SIZE: usize = 14 * 1024;
 
 /// Minimum block size (header + at least 1 usable byte, aligned)
 const MIN_BLOCK: usize = HEADER_SIZE + 4;

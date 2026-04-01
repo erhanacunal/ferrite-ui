@@ -73,14 +73,62 @@ fn draw_face() {
     roundedRect(250, 420, 300, 50, 12, 0x4A69);
 }
 
+fn fade_in(step, wait) {
+    var br = 0;
+    while (br <= 100) {
+        setBrightness(br);
+        br = br + step;
+        delay(wait);
+    }
+    setBrightness(100);
+}
+
+fn fade_out(step, wait) {
+    var br = 100;
+    while (br > 0) {
+        br = br - step;
+        if (br < 0) { br = 0; }
+        setBrightness(br);
+        delay(wait);
+    }
+    setBrightness(0);
+}
+
 fn setup() {
+    // --- Intro animation ---
+    setBrightness(0);
+
+    // "THE CLOCK" centered on black screen
+    beginFrame();
+    fillRect(0, 0, 800, 480, 0x0000);
+    drawText(310, 220, 0, 0xFFFF, 0, "THE CLOCK");
+    endFrame();
+
+    // Fade in title
+    fade_in(2, 20);
+
+    delay(800);
+
+    // Fade out title
+    fade_out(2, 20);
+
+    delay(300);
+
+    // Draw clock face while screen is dark
+    fullRedraw = 2;
+            
+    // Fade in clock
+    fade_in(2, 20);
+
     return 0;
 }
 
 fn loop() {
     // Read real time from RTC
     time = rtcRead();
+    
     t0 = millis();
+
     h = time[2];
     m = time[1];
     s = time[0];
@@ -88,6 +136,8 @@ fn loop() {
     // Only redraw when second changes
     if (s != ps) {
         ps = s;
+
+        critical();
 
         beginFrame();
 
@@ -162,6 +212,7 @@ fn loop() {
         strClear();
 
         endFrame();
+        yield_op();
     }
 
     arrFree(time);

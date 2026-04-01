@@ -236,6 +236,9 @@ const OP_RTC_WRITE: u8 = 0x9B;
 const OP_MILLIS: u8 = 0x9C;
 const OP_FPGA_CMD: u8 = 0x9D; // pop cmd, pop data → send_command(cmd), send_data(data)
 const OP_FPGA_DAT: u8 = 0x9E; // pop data → send_data(data)
+const OP_CRITICAL: u8 = 0x9F; // enter critical section — run until next yield
+const OP_SET_BRIGHTNESS: u8 = 0xA0; // pop percent → set backlight
+const OP_BRIGHTNESS: u8 = 0xA1; // push current backlight percent
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -294,6 +297,7 @@ struct VmSnapshot {
     target: WidgetId,
     state: VmState,
     wait_until: u32,
+    critical: bool,
 }
 
 /// Maximum number of arguments per queued callback.
@@ -333,6 +337,8 @@ pub struct Vm {
     cb_queue: [CbRequest; CB_QUEUE_SIZE],
     cb_head: u8,
     cb_tail: u8,
+    // Critical section — when true, VM runs until next YIELD without returning to main loop
+    critical: bool,
 }
 
 impl Vm {
@@ -359,6 +365,7 @@ impl Vm {
             cb_queue: [EMPTY_CB; CB_QUEUE_SIZE],
             cb_head: 0,
             cb_tail: 0,
+            critical: false,
         }
     }
 
@@ -488,6 +495,7 @@ impl Vm {
             target: self.target,
             state: self.state,
             wait_until: self.wait_until,
+            critical: self.critical,
         };
         self.saved = Some(Box::new(snapshot));
         self.pc = offset;
@@ -496,6 +504,7 @@ impl Vm {
         self.target = WidgetId::NONE;
         self.mode = VmMode::Callback;
         self.state = VmState::Running;
+        self.critical = false;
     }
 
     fn pop_state(&mut self) {
@@ -508,6 +517,7 @@ impl Vm {
             self.target = snap.target;
             self.state = snap.state;
             self.wait_until = snap.wait_until;
+            self.critical = snap.critical;
             self.mode = VmMode::Normal;
         }
     }
@@ -524,6 +534,10 @@ impl Vm {
 
     pub fn pc(&self) -> u16 {
         self.pc
+    }
+
+    pub fn is_critical(&self) -> bool {
+        self.critical
     }
 
     pub fn pop_result(&mut self) -> i32 {
@@ -557,6 +571,7 @@ impl Vm {
         self.saved = None;
         self.cb_head = 0;
         self.cb_tail = 0;
+        self.critical = false;
     }
 
     pub fn has_code(&self) -> bool {
@@ -576,8 +591,17 @@ impl Vm {
 
     pub fn run(&mut self, ctx: &mut Ctx) {
         self.state = VmState::Running;
-        while self.state == VmState::Running {
-            self.step(ctx);
+        loop {
+            match self.state {
+                VmState::Running => self.step(ctx),
+                VmState::Waiting => {
+                    // Busy-wait for delay to expire (used during setup/callbacks)
+                    if systick::millis().wrapping_sub(self.wait_until) < 0x8000_0000 {
+                        self.state = VmState::Running;
+                    }
+                }
+                _ => break, // Halted, Yielded, Error → exit
+            }
         }
     }
 
@@ -686,7 +710,10 @@ impl Vm {
                     self.state = VmState::Error;
                 }
             }
-            OP_YIELD => self.state = VmState::Yielded,
+            OP_YIELD => {
+                self.critical = false;
+                self.state = VmState::Yielded;
+            }
             OP_W_DIRTY => {
                 if self.target.is_some() { ctx.tree.mark_dirty(self.target); }
             }
@@ -1122,6 +1149,17 @@ impl Vm {
                 // fpgaData(data) — raw FPGA data (after a cmd)
                 let data = self.pop() as u16;
                 ctx.lcd.send_data(data);
+            }
+
+            OP_CRITICAL => {
+                self.critical = true;
+            }
+            OP_SET_BRIGHTNESS => {
+                let percent = self.pop() as u8;
+                ctx.backlight.set_brightness(percent);
+            }
+            OP_BRIGHTNESS => {
+                self.push(ctx.backlight.brightness() as i32);
             }
 
             // --- Float32 (soft-float) ---

@@ -366,12 +366,12 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
 
 # --- Program compilation ---
 
-def compile_program(source_path: str) -> bytes:
+def compile_program(source_path: str, include_dirs=None) -> bytes:
     """Ferrite lang source → VM image (header + opcodes)."""
     try:
         from ferrite_lang import build_image
         source = Path(source_path).read_text(encoding="utf-8")
-        return build_image(source, filename=source_path)
+        return build_image(source, filename=source_path, include_dirs=include_dirs)
     except ImportError:
         print(f"Warning: ferrite_lang not available, reading {source_path} as raw binary",
               file=sys.stderr)
@@ -446,6 +446,9 @@ def build(project_path: str, output_path: str) -> dict:
     """JSON proje → flash binary."""
     project_dir = Path(project_path).parent
     project = json.loads(Path(project_path).read_text(encoding="utf-8"))
+
+    # Resolve include directories relative to project dir
+    include_dirs = [str(project_dir / d) for d in project.get("include_dirs", [])]
 
     resources = []  # (name, kind, data)
 
@@ -535,7 +538,7 @@ def build(project_path: str, output_path: str) -> dict:
             bg_color = parse_color(page.get("background", "0x0000"))
             source_path = project_dir / page["source"]
             source = source_path.read_text(encoding="utf-8")
-            page_data = fl_compile_page(source, bg_color, str(source_path))
+            page_data = fl_compile_page(source, bg_color, str(source_path), include_dirs=include_dirs)
             # Count alloc() calls in bytecode to track widget IDs
             widget_count = source.count("alloc(")
             next_id += widget_count
@@ -550,7 +553,7 @@ def build(project_path: str, output_path: str) -> dict:
     for prog in project.get("programs", []):
         name = prog["name"]
         source = project_dir / prog["source"]
-        image_data = compile_program(str(source))
+        image_data = compile_program(str(source), include_dirs=include_dirs)
         exec_mode = prog.get("exec_mode", "ram")
         prog_flags = RES_FLAG_FLASH_EXEC if exec_mode == "flash" else 0
         resources.append((name, RES_PROGRAM, image_data, prog_flags))

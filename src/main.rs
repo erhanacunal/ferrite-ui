@@ -462,8 +462,6 @@ fn main() -> ! {
     let gpio = Gpio::init();
     let usart = Usart::init();
     let mut touch = Touch::init();
-    let backlight = backlight::Backlight::init();
-
     // --- Application context (heap allocated) ---
     let mut ctx = Box::new(Ctx {
         lcd: Lcd::new(gpio),
@@ -473,6 +471,7 @@ fn main() -> ! {
         images: ImageList::new(),
         strpool: StringPool::new(),
         fs: None,
+        backlight: backlight::Backlight::init(),
     });
     ctx.fonts.add(Font::from_embedded(
         &embedded_font::GLYPHS,
@@ -508,7 +507,7 @@ fn main() -> ! {
     ctx.lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
     ctx.lcd.end_frame();
 
-    backlight.set_brightness(100);
+    ctx.backlight.set_brightness(100);
 
     // 4. Flash filesystem
     let mut error_code: u8 = 0;
@@ -518,7 +517,7 @@ fn main() -> ! {
         Err(_) => error_code = ERR_NO_FILESYSTEM,
     }
 
-    // 5. Widget tree root
+    // 5. Widget tree root (widget 0 — always pre-created before program runs)
     let root = ctx.tree.alloc().unwrap();
     {
         let w = ctx.tree.get_mut(root);
@@ -589,11 +588,8 @@ fn main() -> ! {
             }
         }
 
-        // Full initial render
+        // Start loop() function (compiler wraps body in while(1){...yield;})
         if error_code == 0 {
-            render::render_all(&mut ctx);
-
-            // Start loop() function (compiler wraps body in while(1){...yield;})
             if let Some(entry) = vm.find_by_kind(FunctionKind::Loop) {
                 vm.set_pc(entry.offset as u16);
                 vm.state = VmState::Running;
@@ -623,6 +619,11 @@ fn main() -> ! {
             VmState::Running | VmState::Yielded => {
                 vm.state = VmState::Running;
                 vm.step(&mut ctx);
+
+                // Critical section: keep stepping until yield (or non-Running state)
+                while vm.is_critical() && vm.state == VmState::Running {
+                    vm.step(&mut ctx);
+                }
 
                 if vm.state == VmState::Error {
                     error_code = ERR_PROGRAM_ERROR;
@@ -678,7 +679,7 @@ fn main() -> ! {
                     ctx.strpool.clear();
                     vm.reset();
 
-                    // Re-create root widget
+                    // Re-create root widget (widget 0)
                     let root = ctx.tree.alloc().unwrap();
                     {
                         let w = ctx.tree.get_mut(root);
