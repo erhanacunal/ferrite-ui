@@ -300,11 +300,13 @@ set(text_color, 0x0000);      // text color (labels)
 set(visible, 1);              // show/hide
 set(enabled, 1);              // enable/disable
 set(clickable, 1);            // receives touch events
-set(kind, 1);                 // 0=base, 1=label, 2=button
+set(kind, 1);                 // 0=base, 1=label, 2=button, 3=progress, 4=slider, 5=checkbox, 6=radio
 set(font_id, 0);              // font index (0=embedded)
 set(text_align, 1);           // 0=left, 1=center, 2=right
 set(press_color, 0x7BEF);     // pressed highlight color
 set(image_id, 1);             // background image from flash
+set(value, 50);               // progress/slider value (0-100)
+set(checked, 1);              // checkbox/radio checked state (0 or 1)
 set(on_click, 1);             // click callback func_id
 set(on_paint, 2);             // custom paint callback func_id
 set(on_tap, 3);               // tap-with-coords callback func_id
@@ -338,6 +340,100 @@ set(border_color, 0xFFFF);
 set(border_radius, 12);    // 12px rounded corners
 ```
 
+### Progress Bar & Slider
+
+Widgets with `kind=3` (progress) or `kind=4` (slider) display a horizontal fill bar.
+
+- `value` (0-100): fill percentage
+- `press_color`: fill bar color
+- `border_color`: slider thumb color (slider only)
+
+```c
+var bar = alloc();
+target(bar);
+set(kind, 3);                // progress bar
+set(size, 200, 20);
+set(bg_color, 0x2104);       // track color
+set(press_color, 0x07E0);    // fill color (green)
+set(value, 75);              // 75% filled
+set(border_radius, 4);       // rounded fill
+parent(0);
+
+var slider = alloc();
+target(slider);
+set(kind, 4);                // slider (draggable)
+set(size, 200, 30);
+set(bg_color, 0x2104);
+set(press_color, 0x001F);    // fill color (blue)
+set(border_color, 0xFFFF);   // thumb color
+set(clickable, 1);           // required for touch drag
+set(value, 50);
+parent(0);
+```
+
+Slider `on_click` callback receives `(widget_id, new_value)` when dragged.
+
+### Checkbox & Radio
+
+Widgets with `kind=5` (checkbox) or `kind=6` (radio) display a check/radio indicator inside the widget area. Touch toggles the `checked` state automatically.
+
+- `checked` (0 or 1): current state, readable via `get(checked)`
+- `text_color`: indicator outline color
+- `press_color`: indicator fill color when checked (defaults to `text_color` if 0)
+- `border_radius`: when > 0, checkbox uses rounded indicator box
+
+**Checkbox** toggles on each tap (on/off). **Radio** buttons auto-uncheck siblings — tapping a radio unchecks all other `kind=6` widgets under the same parent, then checks itself.
+
+```c
+// Checkbox
+var cb = alloc();
+target(cb);
+set(kind, 5);                // checkbox
+set(location, 20, 20);
+set(size, 30, 30);
+set(bg_color, 0x2104);
+set(text_color, 0xFFFF);     // indicator outline
+set(press_color, 0x07E0);    // green check fill
+set(clickable, 1);
+set(checked, 1);             // start checked
+parent(0);
+
+// Radio group — children of the same parent
+var r1 = alloc();
+target(r1);
+set(kind, 6);                // radio
+set(location, 20, 60);
+set(size, 30, 30);
+set(bg_color, 0x2104);
+set(text_color, 0xFFFF);
+set(press_color, 0x001F);    // blue dot when selected
+set(clickable, 1);
+set(checked, 1);             // selected by default
+parent(0);
+
+var r2 = alloc();
+target(r2);
+set(kind, 6);
+set(location, 20, 100);
+set(size, 30, 30);
+set(bg_color, 0x2104);
+set(text_color, 0xFFFF);
+set(press_color, 0x001F);
+set(clickable, 1);
+parent(0);
+```
+
+Read checked state in callbacks:
+
+```c
+fn handle_click(widget_id) {
+    target(widget_id);
+    if (get(checked)) {
+        // widget is now checked
+    }
+}
+```
+
 ### get(property)
 
 Reads a property value from the current target widget.
@@ -346,6 +442,8 @@ Reads a property value from the current target widget.
 var w = get(width);
 var color = get(bg_color);
 var r = get(border_radius);
+var is_on = get(checked);    // checkbox/radio state
+var val = get(value);        // progress/slider value
 ```
 
 ### dirty() / render()
@@ -402,6 +500,55 @@ drawText(10, 30, 0, 0xFFFF, 0x0000, "Hello World");
 ### delay(ms)
 
 Non-blocking pause. Touch and USART continue processing during delay.
+
+### millis()
+
+Returns the system uptime in milliseconds (32-bit, wraps at ~49 days).
+
+```c
+var start = millis();
+// ... do work ...
+var elapsed = millis() - start;
+```
+
+### critical()
+
+Enter a critical section — the VM keeps stepping without yielding until the next `yield` or `delay()`. Use for atomic UI updates (e.g., hiding one panel and showing another without a visible intermediate state).
+
+```c
+critical();
+target(panel_a);
+set(visible, 0);
+dirty();
+target(panel_b);
+set(visible, 1);
+dirty();
+render();
+// yield happens at end of loop() body, ending the critical section
+```
+
+### arrFree(arr)
+
+Free a heap-allocated array. Required in loops to prevent memory exhaustion.
+
+```c
+var time = rtcRead();  // allocates a 7-element array each call
+var h = time[2];
+arrFree(time);         // free immediately after use
+```
+
+### setBrightness(percent) / brightness()
+
+Control LCD backlight (0-100%).
+
+```c
+setBrightness(100);       // full brightness
+var current = brightness(); // read current level
+```
+
+### fpgaCmd(cmd, data) / fpgaData(data)
+
+Send raw commands/data to the FPGA display controller. For advanced use only.
 
 ### Double Buffering
 
@@ -547,8 +694,6 @@ Define these functions to handle system events:
 | `fn on_touch_up()` | Touch release | none |
 | `fn on_touch_move(x, y)` | Touch held + moving | screen x, y |
 | `fn on_user_message(arr_id)` | USART message received | array of bytes |
-| `fn on_page_changing(old, new)` | Before page switch | indices |
-| `fn on_page_changed(index)` | After page switch | new index |
 
 ```c
 fn on_touch_down(x, y) {
@@ -640,9 +785,7 @@ reserved:       u16
 opcodes...
 ```
 
-Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnPageChanging=4, OnPageChanged=5, OnUserMessage=6, OnTouchDown=7, OnTouchUp=8, OnTouchMove=9.
-
-Page bytecode (compiled with `--page`) does not use this format — it is raw bytecode prefixed with a 2-byte background color.
+Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnUserMessage=6, OnTouchDown=7, OnTouchUp=8, OnTouchMove=9.
 
 ## VM Limits
 

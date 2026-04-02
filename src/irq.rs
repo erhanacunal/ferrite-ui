@@ -1,9 +1,9 @@
-/// GD32F103 interrupt vector table (minimal)
+/// GD32F103 interrupt vector table
 ///
-/// cortex-m-rt `device` feature aktif — `__INTERRUPTS` burada tanımlanır.
-/// Kullanılmayan slot'lar reserved (0) — tetiklenirse HardFault (debug'a yardımcı).
-/// Kullanılan IRQ'lar device.x'te PROVIDE ile DefaultHandler'a bağlı,
-/// #[no_mangle] handler tanımlanınca linker güçlü sembolü tercih eder.
+/// cortex-m-rt `device` feature — `__INTERRUPTS` defined here.
+/// Unused slots are reserved (0) — triggers HardFault if fired.
+/// Used IRQs are provided in device.x with DefaultHandler fallback.
+/// A #[no_mangle] handler overrides the weak PROVIDE symbol.
 
 #[derive(Copy, Clone)]
 union Vector {
@@ -17,7 +17,7 @@ unsafe extern "C" {
 
 const V0: Vector = Vector { _reserved: 0 };
 
-/// GD32F103 — 68 IRQ slotu (medium/high density)
+/// GD32F103 — 68 IRQ slots (medium/high density)
 /// IRQ 37 = USART0
 #[unsafe(link_section = ".vector_table.interrupts")]
 #[unsafe(no_mangle)]

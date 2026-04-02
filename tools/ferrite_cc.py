@@ -218,6 +218,7 @@ class Prop:
     ON_TAP = 0x22
     BORDER_RADIUS = 0x23
     VALUE = 0x24
+    CHECKED = 0x25
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -902,7 +903,7 @@ PROP_NAMES = {
     0x14: 'BORDER_T', 0x15: 'BORDER_R', 0x16: 'BORDER_B', 0x17: 'BORDER_L',
     0x18: 'PADDING_T', 0x19: 'PADDING_R', 0x1A: 'PADDING_B', 0x1B: 'PADDING_L',
     0x1F: 'IMAGE_ID',
-    0x20: 'ON_CLICK', 0x21: 'ON_PAINT', 0x22: 'ON_TAP', 0x23: 'BORDER_RADIUS', 0x24: 'VALUE',
+    0x20: 'ON_CLICK', 0x21: 'ON_PAINT', 0x22: 'ON_TAP', 0x23: 'BORDER_RADIUS', 0x24: 'VALUE', 0x25: 'CHECKED',
     0x40: 'LOCATION', 0x41: 'SIZE', 0x42: 'MARGIN',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -1101,6 +1102,7 @@ PROP_MAP = {
     'border_radius': (Prop.BORDER_RADIUS, False),
     'radius': (Prop.BORDER_RADIUS, False),
     'value': (Prop.VALUE, False),
+    'checked': (Prop.CHECKED, False),
     'text': (Prop.TEXT, True),
     'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }

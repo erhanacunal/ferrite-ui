@@ -17,6 +17,7 @@
 ///   Field 6, Payload = UserMessage (arbitrary user data, max 64 bytes)
 ///   Field 7, Varint  = MemInfo (query free heap memory)
 ///   Field 8, Varint  = TouchCalibrate (start 3-point touch calibration)
+///   Field 9, Varint  = StackInfo (query current stack usage)
 
 extern crate alloc;
 
@@ -175,6 +176,8 @@ pub enum RxEvent {
     MemInfo,
     /// Start 3-point touch calibration sequence
     TouchCalibrate,
+    /// Stack usage query — respond with current stack used/free
+    StackInfo,
     /// Program too large — exceeds MAX_PROGRAM_SIZE (2KB)
     ProgramTooLarge,
 }
@@ -233,6 +236,7 @@ impl Protocol {
                         3 => RxEvent::Restart,
                         7 => RxEvent::MemInfo,
                         8 => RxEvent::TouchCalibrate,
+                        9 => RxEvent::StackInfo,
                         _ => RxEvent::None,
                     },
                     // Payload type: tag + length varint + payload
@@ -437,6 +441,15 @@ pub fn send_meminfo(usart: &Usart, free_bytes: u32) {
             break;
         }
     }
+}
+
+/// Send stack info: Field 5, Payload type — tag + length(8) + used(u32 LE) + free(u32 LE)
+pub fn send_stackinfo(usart: &Usart, used: u32, free: u32) {
+    // tag = (5 << 3) | 2 = 0x2A, length = 8
+    usart.write_byte(0x2A);
+    usart.write_byte(8);
+    usart.write(&used.to_le_bytes());
+    usart.write(&free.to_le_bytes());
 }
 
 /// Send touch calibration result: Field 4, Payload type

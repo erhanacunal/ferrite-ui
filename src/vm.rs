@@ -11,14 +11,14 @@ use crate::proto::{
     PROP_BORDER_COLOR, PROP_BORDER_EDGES, PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_T,
     PROP_CLICKABLE, PROP_ENABLED, PROP_FONT_ID, PROP_KIND, PROP_LOCATION, PROP_LOC_X, PROP_LOC_Y,
     PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L, PROP_MARGIN_R, PROP_MARGIN_T, PROP_PADDING,
-    PROP_IMAGE_ID, PROP_ON_CLICK, PROP_ON_PAINT, PROP_ON_TAP, PROP_BORDER_RADIUS, PROP_VALUE,
+    PROP_IMAGE_ID, PROP_ON_CLICK, PROP_ON_PAINT, PROP_ON_TAP, PROP_BORDER_RADIUS, PROP_VALUE, PROP_CHECKED,
     PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
     PROP_PRESS_COLOR, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W,
     PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VISIBLE,
 };
 use crate::render;
 use crate::types::{Edges, Offset, Size};
-use crate::widget::{WidgetId, FLAG_CLICKABLE, FLAG_ENABLED, FLAG_VISIBLE};
+use crate::widget::{WidgetId, FLAG_CHECKED, FLAG_CLICKABLE, FLAG_ENABLED, FLAG_VISIBLE};
 
 // === Code source — owned by VM ===
 
@@ -1250,6 +1250,7 @@ impl Vm {
             PROP_IMAGE_ID => w.image_id = val as u8,
             PROP_BORDER_RADIUS => w.border_radius = val as u16,
             PROP_VALUE => w.value = val as i16,
+            PROP_CHECKED => set_flag(&mut w.flags, FLAG_CHECKED, val != 0),
             PROP_ON_CLICK => w.on_click = val as u16,
             PROP_ON_PAINT => w.on_paint = val as u16,
             PROP_ON_TAP => w.on_tap = val as u16,
@@ -1289,6 +1290,7 @@ impl Vm {
             PROP_IMAGE_ID => w.image_id as i32,
             PROP_BORDER_RADIUS => w.border_radius as i32,
             PROP_VALUE => w.value as i32,
+            PROP_CHECKED => if w.flags & FLAG_CHECKED != 0 { 1 } else { 0 },
             PROP_ON_CLICK => w.on_click as i32,
             PROP_ON_PAINT => w.on_paint as i32,
             PROP_ON_TAP => w.on_tap as i32,

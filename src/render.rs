@@ -3,8 +3,8 @@ use crate::ctx::Ctx;
 use crate::lcd::{self, Lcd};
 use crate::types::{Color, Rect};
 use crate::widget::{
-    WidgetId, WidgetTree, ALIGN_CENTER, ALIGN_RIGHT, FLAG_PRESSED,
-    KIND_BUTTON, KIND_LABEL, KIND_PROGRESS, KIND_SLIDER,
+    WidgetId, WidgetTree, ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_PRESSED,
+    KIND_BUTTON, KIND_CHECKBOX, KIND_LABEL, KIND_PROGRESS, KIND_RADIO, KIND_SLIDER,
 };
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
@@ -67,61 +67,50 @@ pub fn render_dirty(ctx: &mut Ctx) {
             continue;
         }
 
-        let abs = ctx.tree.absolute_rect(id);
+        // Find subtree end: contiguous descendants after di
+        let mut sub_end = di + 1;
+        while sub_end < dfs.len() && ctx.tree.is_descendant(dfs[sub_end], id) {
+            sub_end += 1;
+        }
 
-        // Collect occluder rects: visible widgets that come after this subtree in DFS
+        // Collect occluder rects: visible widgets after this subtree in DFS
         let mut occluders = [Rect::new(0, 0, 0, 0); 32];
         let mut occ_count: usize = 0;
-        let mut after_subtree = false;
+        let abs = ctx.tree.absolute_rect(id);
 
-        for j in (di + 1)..dfs.len() {
-            if !after_subtree {
-                if !ctx.tree.is_descendant(dfs[j], id) {
-                    after_subtree = true;
-                }
-            }
-            if after_subtree {
-                if ctx.tree.is_tree_visible(dfs[j]) {
-                    let other_abs = ctx.tree.absolute_rect(dfs[j]);
-                    if abs.intersects(&other_abs) && occ_count < 32 {
-                        occluders[occ_count] = other_abs;
-                        occ_count += 1;
-                    }
+        for j in sub_end..dfs.len() {
+            if ctx.tree.is_tree_visible(dfs[j]) {
+                let other_abs = ctx.tree.absolute_rect(dfs[j]);
+                if abs.intersects(&other_abs) && occ_count < 32 {
+                    occluders[occ_count] = other_abs;
+                    occ_count += 1;
                 }
             }
         }
 
-        render_subtree_clipped(ctx, id, &occluders[..occ_count]);
+        // Flat iteration over dirty widget + its descendants (replaces recursion)
+        for si in di..sub_end {
+            let sid = dfs[si];
+            if !ctx.tree.is_tree_visible(sid) {
+                continue;
+            }
+
+            let sabs = ctx.tree.absolute_rect(sid);
+
+            let mut clip = ClipRegion::from_rect(sabs);
+            clip.clip_to_bounds(&SCREEN);
+
+            for oi in 0..occ_count {
+                clip.subtract(&occluders[oi]);
+            }
+
+            if !clip.is_empty() {
+                draw_widget_clipped(ctx, sid, &sabs, &clip);
+            }
+        }
     }
 
     clear_all_dirty(ctx);
-}
-
-/// Draw subtree clipped against occluders.
-fn render_subtree_clipped(ctx: &Ctx, id: WidgetId, occluders: &[Rect]) {
-    let widget = ctx.tree.get(id);
-    if !widget.is_visible() {
-        return;
-    }
-
-    let abs = ctx.tree.absolute_rect(id);
-
-    let mut clip = ClipRegion::from_rect(abs);
-    clip.clip_to_bounds(&SCREEN);
-
-    for occ in occluders {
-        clip.subtract(occ);
-    }
-
-    if !clip.is_empty() {
-        draw_widget_clipped(ctx, id, &abs, &clip);
-    }
-
-    let mut child = widget.first_child;
-    while child.is_some() {
-        render_subtree_clipped(ctx, child, occluders);
-        child = ctx.tree.get(child).next_sibling;
-    }
 }
 
 // --- Drawing ---
@@ -267,6 +256,12 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
         let inner = inner_rect(abs, b);
         draw_value_fill(&ctx.lcd, widget, &inner);
     }
+
+    // Checkbox / radio indicator
+    if widget.kind == KIND_CHECKBOX || widget.kind == KIND_RADIO {
+        let inner = inner_rect(abs, b);
+        draw_check_indicator(&ctx.lcd, widget, &inner);
+    }
 }
 
 /// Draw widget with clip region (dirty render path).
@@ -358,6 +353,12 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     if widget.kind == KIND_PROGRESS || widget.kind == KIND_SLIDER {
         let inner = inner_rect(abs, b);
         draw_value_fill(&ctx.lcd, widget, &inner);
+    }
+
+    // Checkbox / radio indicator (drawn unclipped)
+    if widget.kind == KIND_CHECKBOX || widget.kind == KIND_RADIO {
+        let inner = inner_rect(abs, b);
+        draw_check_indicator(&ctx.lcd, widget, &inner);
     }
 }
 
@@ -506,6 +507,84 @@ fn draw_value_fill(lcd: &Lcd, widget: &crate::widget::Widget, inner: &Rect) {
 }
 
 /// Clear dirty flag on all widgets.
+/// Draw checkbox or radio indicator inside the inner rect.
+///
+/// Indicator is a square (checkbox) or circle (radio) on the left side,
+/// sized to fit the widget height. Uses text_color for the outline and
+/// press_color for the checked fill.
+fn draw_check_indicator(lcd: &Lcd, widget: &crate::widget::Widget, inner: &Rect) {
+    if inner.is_empty() {
+        return;
+    }
+
+    let p = &widget.padding;
+    let cx = inner.x + p.left as i16;
+    let cy = inner.y + p.top as i16;
+    let ch = inner.h.saturating_sub(p.top as u16 + p.bottom as u16);
+
+    if ch < 4 {
+        return;
+    }
+
+    let s = ch;
+    let outline_color = widget.text_color;
+    let checked = widget.flags & FLAG_CHECKED != 0;
+
+    let fill_color = if widget.press_color != 0 {
+        widget.press_color
+    } else {
+        outline_color
+    };
+
+    if widget.kind == KIND_CHECKBOX {
+        let r = widget.border_radius;
+        if r > 0 {
+            let br = r.min(s / 2);
+            rounded_rect_screen(lcd, Rect::new(cx, cy, s, s), br, outline_color);
+            if checked {
+                let inset: i16 = (s as i16) / 4;
+                let ir = Rect::new(
+                    cx + inset,
+                    cy + inset,
+                    s.saturating_sub(inset as u16 * 2),
+                    s.saturating_sub(inset as u16 * 2),
+                );
+                let ibr = br.saturating_sub(inset as u16);
+                fill_rounded_rect_screen(lcd, ir, ibr, fill_color);
+            }
+        } else {
+            fill_rect_screen(lcd, Rect::new(cx, cy, s, 1), outline_color);
+            fill_rect_screen(lcd, Rect::new(cx, cy + s as i16 - 1, s, 1), outline_color);
+            fill_rect_screen(lcd, Rect::new(cx, cy, 1, s), outline_color);
+            fill_rect_screen(lcd, Rect::new(cx + s as i16 - 1, cy, 1, s), outline_color);
+            if checked {
+                let x0 = cx + (s as i16) / 4;
+                let y0 = cy + (s as i16) / 2;
+                let x1 = cx + (s as i16) * 2 / 5;
+                let y1 = cy + (s as i16) * 3 / 4;
+                let x2 = cx + (s as i16) * 3 / 4;
+                let y2 = cy + (s as i16) / 4;
+                lcd.draw_line(x0, y0, x1, y1, fill_color);
+                lcd.draw_line(x1, y1, x2, y2, fill_color);
+                lcd.draw_line(x0 + 1, y0, x1 + 1, y1, fill_color);
+                lcd.draw_line(x1 + 1, y1, x2 + 1, y2, fill_color);
+            }
+        }
+    } else {
+        // Radio: circle
+        let r = (s / 2) as i16;
+        let ccx = cx + r;
+        let ccy = cy + r;
+        lcd.draw_circle(ccx, ccy, r, outline_color);
+        if checked {
+            let inner_r = r * 2 / 3;
+            if inner_r > 0 {
+                lcd.fill_circle(ccx, ccy, inner_r, fill_color);
+            }
+        }
+    }
+}
+
 fn clear_all_dirty(ctx: &mut Ctx) {
     let dfs = ctx.tree.dfs_order();
     for i in 0..dfs.len() {

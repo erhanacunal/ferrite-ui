@@ -1,2 +1,2 @@
-/* GD32F103 interrupt vectors — minimal (sadece kullanılan IRQ'lar) */
+/* GD32F103 interrupt vectors — used IRQs only */
 PROVIDE(USART0 = DefaultHandler);

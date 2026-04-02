@@ -2,7 +2,7 @@
 """ferrite-cli — Host-side tool for communicating with ferrite-ui devices.
 
 Implements the USART protobuf protocol (see protocol.rs).
-Commands: ping, restart, meminfo, execute <file>, writefs <file>, send <data...>, calibrate
+Commands: ping, restart, meminfo, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate
 
 Usage:
     python ferrite_cli.py -p COM3 ping
@@ -32,6 +32,7 @@ TAG_WRITECHUNK = (5 << 3) | 2   # 0x2A, payload (chunk data)
 TAG_USERMSG    = (6 << 3) | 2   # 0x32, payload (user message data, max 64 bytes)
 TAG_MEMINFO    = (7 << 3) | 0   # 0x38, varint
 TAG_TOUCHCAL   = (8 << 3) | 0   # 0x40, varint (start touch calibration)
+TAG_STACKINFO  = (9 << 3) | 0   # 0x48, varint (query stack usage)
 
 CHUNK_SIZE = 4096  # Must match device sector buffer size
 
@@ -40,6 +41,7 @@ TAG_ERROR    = (1 << 3) | 2   # 0x0A, payload
 TAG_PONG     = (2 << 3) | 0   # 0x10, varint
 TAG_MEMINFO_RESP = (3 << 3) | 0  # 0x18, varint (free heap bytes)
 TAG_TOUCHCAL_RESP = (4 << 3) | 2  # 0x22, payload (calibration result, 9 bytes)
+TAG_STACKINFO_RESP = (5 << 3) | 2  # 0x2A, payload (stack used + free, 8 bytes)
 
 BAUD_RATE = 115200
 DEFAULT_TIMEOUT = 5.0  # seconds
@@ -148,6 +150,26 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             ser.timeout = orig_timeout
             return ("meminfo", free_bytes)
 
+        if tag == TAG_STACKINFO_RESP:
+            # Payload type — read length + 8 bytes (used u32 LE + free u32 LE)
+            length_bytes = bytearray()
+            while True:
+                b = ser.read(1)
+                if not b:
+                    ser.timeout = orig_timeout
+                    return ("timeout", None)
+                length_bytes.append(b[0])
+                if b[0] & 0x80 == 0:
+                    break
+            length, _ = decode_varint(bytes(length_bytes))
+            payload = ser.read(length)
+            ser.timeout = orig_timeout
+            if len(payload) < length:
+                return ("timeout", None)
+            used = int.from_bytes(payload[0:4], "little")
+            free = int.from_bytes(payload[4:8], "little")
+            return ("stackinfo", (used, free))
+
         if tag == TAG_ERROR or tag == TAG_TOUCHCAL_RESP:
             # Read length varint
             length_bytes = bytearray()
@@ -212,6 +234,28 @@ def cmd_meminfo(ser: serial.Serial) -> bool:
     resp_type, resp_val = read_response(ser)
     if resp_type == "meminfo":
         print(f"free: {resp_val} bytes ({resp_val / 1024:.1f} KB)")
+        return True
+    elif resp_type == "error":
+        desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
+        print(f"error: code {resp_val} — {desc}", file=sys.stderr)
+        return False
+    else:
+        print("no response (timeout)", file=sys.stderr)
+        return False
+
+
+def cmd_stackinfo(ser: serial.Serial) -> bool:
+    """Query current stack usage from device."""
+    ser.write(build_varint_msg(TAG_STACKINFO))
+    ser.flush()
+
+    resp_type, resp_val = read_response(ser)
+    if resp_type == "stackinfo":
+        used, free = resp_val
+        total = used + free
+        print(f"stack used: {used} bytes ({used / 1024:.1f} KB)")
+        print(f"stack free: {free} bytes ({free / 1024:.1f} KB)")
+        print(f"stack total: {total} bytes ({total / 1024:.1f} KB)")
         return True
     elif resp_type == "error":
         desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
@@ -457,6 +501,7 @@ def main():
     p_send.add_argument("data", nargs="+", help="Data: hex bytes (0xFF), decimal (255), or \"text\"")
 
     sub.add_parser("calibrate", help="Start 3-point touch calibration")
+    sub.add_parser("stackinfo", help="Query current stack usage")
 
     args = parser.parse_args()
 
@@ -481,6 +526,8 @@ def main():
             ok = cmd_send(ser, args.data)
         elif args.command == "calibrate":
             ok = cmd_calibrate(ser)
+        elif args.command == "stackinfo":
+            ok = cmd_stackinfo(ser)
         else:
             ok = False
 

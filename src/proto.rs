@@ -51,6 +51,7 @@ pub const PROP_ON_PAINT: u8 = 0x21;
 pub const PROP_ON_TAP: u8 = 0x22;
 pub const PROP_BORDER_RADIUS: u8 = 0x23;
 pub const PROP_VALUE: u8 = 0x24;
+pub const PROP_CHECKED: u8 = 0x25;
 
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;

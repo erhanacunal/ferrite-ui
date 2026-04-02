@@ -25,6 +25,8 @@
 ///   0x80..0xFF: repeat run — next unit repeated (n−126) times [2..129]
 
 use crate::flash::Flash;
+extern crate alloc;
+use alloc::vec;
 use crate::fs::{Fs, ResourceEntry, RES_IMAGE};
 use crate::lcd::Lcd;
 
@@ -280,8 +282,8 @@ impl Image {
     // --- Indexed + RLE mode: palette lookup + PackBits RLE, unit = u8 index ---
 
     fn draw_indexed_rle(&self, lcd: &Lcd, flash: &Flash) {
-        // Read palette to stack (max 512 bytes)
-        let mut palette = [0u16; MAX_PALETTE];
+        // Read palette to heap (avoids 512B stack allocation)
+        let mut palette = vec![0u16; MAX_PALETTE];
         let pal_count = self.palette_count as usize;
 
         {

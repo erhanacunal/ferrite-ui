@@ -14,6 +14,19 @@ use crate::lcd::Lcd;
 use crate::systick::delay_ms;
 use crate::widget::{WidgetId, WidgetTree, FLAG_CLICKABLE, FLAG_VISIBLE};
 
+// --- PENIRQ pin (PC14) — direct GPIO read, no interrupt ---
+
+const GPIOC_IDR: u32 = 0x4001_1008;
+const PENIRQ_PIN: u32 = 14;
+
+/// Read PENIRQ pin state. Returns true if pen is DOWN (active low).
+#[inline]
+fn penirq_active() -> bool {
+    unsafe {
+        core::ptr::read_volatile(GPIOC_IDR as *const u32) & (1 << PENIRQ_PIN) == 0
+    }
+}
+
 // --- Hardware addresses ---
 
 const GPIOA_BASE: u32 = 0x4001_0800;
@@ -54,6 +67,28 @@ const Z_THRESHOLD: u16 = 50;
 
 const SCREEN_W: u16 = 800;
 const SCREEN_H: u16 = 480;
+
+// --- SPI timing (bit-bang, 108MHz CPU) ---
+// Each spin(1) ≈ 9.3ns (one NOP at 108MHz).
+// SPI clock = 1 / (2 * SPI_HALF_CLK * 9.3ns).
+//   spin(4)  → ~13.5 MHz (too fast, causes jitter on some panels)
+//   spin(27) → ~2.0 MHz  (XPT2046 datasheet max at 3.3V)
+//   spin(54) → ~1.0 MHz  (recommended for stability)
+//
+// If touch readings are jittery, increase these values.
+
+/// SPI clock half-period (nop cycles). Controls bit-bang SPI speed.
+const SPI_HALF_CLK: u32 = 54;       // ~1 MHz
+
+/// CS setup/hold time (nop cycles).
+const SPI_CS_DELAY: u32 = 10;
+
+/// ADC conversion wait (nop cycles). Must be ≥ 600 for 12-bit conversion.
+const SPI_ADC_WAIT: u32 = 600;
+
+/// Busy clock high/low time (nop cycles).
+const SPI_BUSY_LOW: u32 = 14;
+const SPI_BUSY_HIGH: u32 = SPI_HALF_CLK;
 
 // --- Calibration targets ---
 
@@ -161,7 +196,13 @@ impl Touch {
     }
 
     /// Called from main loop. Polls touch state, returns event.
+    /// When idle, skips SPI reads if PENIRQ is high (no touch).
     pub fn poll(&mut self) -> Option<TouchEvent> {
+        // In idle state, skip SPI read if PENIRQ says no touch
+        if self.state == TouchState::Idle && !penirq_active() {
+            return None;
+        }
+
         let sample = self.read_calibrated();
 
         match self.state {
@@ -177,6 +218,7 @@ impl Touch {
                         y,
                     })
                 } else {
+                    // SPI read failed but IRQ fired — keep retrying next poll
                     None
                 }
             }
@@ -458,37 +500,36 @@ fn read_raw_axis(axis: bool) -> u16 {
 ///   spin(600) → busy clock → read 16 bits → CS HIGH → shift >> 4
 fn read_raw_axis_cmd(cmd: u8) -> u16 {
     pin_high(CS_PIN);
-    spin(4);
+    spin(SPI_CS_DELAY);
 
     pin_low(CLK_PIN);
-    spin(4);
+    spin(SPI_HALF_CLK);
     pin_low(MOSI_PIN);
-    spin(2);
+    spin(SPI_CS_DELAY);
 
     pin_low(CS_PIN);
-    spin(4);
+    spin(SPI_CS_DELAY);
 
     spi_write_byte(cmd);
 
-    // ADC conversion time — critical! C uses spin(600)
-    spin(600);
+    // ADC conversion time — critical for 12-bit accuracy
+    spin(SPI_ADC_WAIT);
 
-    // Busy clock cycle (C: CLK LOW → spin(14) → CLK HIGH → spin(4) → CLK LOW)
+    // Busy clock cycle
     pin_low(CLK_PIN);
-    spin(14);
+    spin(SPI_BUSY_LOW);
     pin_high(CLK_PIN);
-    spin(4);
+    spin(SPI_BUSY_HIGH);
     pin_low(CLK_PIN);
 
-    // Read 16-bit result (C: touch_read_data)
+    // Read 16-bit result
     let mut data: u16 = 0;
     for _ in 0..16 {
         data <<= 1;
-        // Clock: LOW → HIGH (rising edge, then read)
         pin_low(CLK_PIN);
-        spin(4);
+        spin(SPI_HALF_CLK);
         pin_high(CLK_PIN);
-        spin(4);
+        spin(SPI_HALF_CLK);
         if pin_read(MISO_PIN) {
             data += 1;
         }
@@ -496,14 +537,13 @@ fn read_raw_axis_cmd(cmd: u8) -> u16 {
 
     // Deselect
     pin_high(CS_PIN);
-    spin(2);
+    spin(SPI_CS_DELAY);
 
-    // 12-bit result is in upper bits — shift down
+    // 12-bit result is in upper bits
     data >> 4
 }
 
 /// 8-bit SPI write (MSB first). Clock: LOW → HIGH (rising edge).
-/// Matches C: touch_clock_0_1 = reset then set.
 fn spi_write_byte(byte: u8) {
     let mut data = byte as u32;
     for _ in 0..8 {
@@ -513,11 +553,10 @@ fn spi_write_byte(byte: u8) {
             pin_low(MOSI_PIN);
         }
         data <<= 1;
-        // Clock: LOW → HIGH (C: touch_clock_0_1)
         pin_low(CLK_PIN);
-        spin(4);
+        spin(SPI_HALF_CLK);
         pin_high(CLK_PIN);
-        spin(4);
+        spin(SPI_HALF_CLK);
     }
 }
 
@@ -551,7 +590,7 @@ fn pin_read(pin: u32) -> bool {
     }
 }
 
-/// Kısa gecikme — SPI timing için.
+/// Short delay for SPI timing.
 #[inline(always)]
 fn spin(cycles: u32) {
     for _ in 0..cycles {

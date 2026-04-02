@@ -46,7 +46,7 @@ use strpool::StringPool;
 use touch::Touch;
 use types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE, Size};
 use usart::Usart;
-use vm::{Vm, VmState, FunctionKind};
+use vm::{FunctionKind, Vm, VmState};
 
 use crate::systick::delay_ms;
 
@@ -335,7 +335,14 @@ fn init_ports() {
 // === Error display ===
 
 /// Draw error box on screen and send error via USART.
-fn show_error(lcd: &mut Lcd, font: &Font, flash: &Flash, usart: &Usart, code: u8, vm_pc: Option<u16>) {
+fn show_error(
+    lcd: &mut Lcd,
+    font: &Font,
+    flash: &Flash,
+    usart: &Usart,
+    code: u8,
+    vm_pc: Option<u16>,
+) {
     lcd.begin_frame();
     lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
 
@@ -502,7 +509,7 @@ fn main() -> ! {
 
     // draw current buffer
     ctx.lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
-    
+
     ctx.lcd.begin_frame();
     ctx.lcd.fill_rect(0, 0, 800, 480, COLOR_BLACK);
     ctx.lcd.end_frame();
@@ -666,6 +673,15 @@ fn main() -> ! {
                     protocol::send_meminfo(&usart, free as u32);
                 }
 
+                RxEvent::StackInfo => {
+                    let sp: u32;
+                    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp) };
+                    const RAM_END: u32 = 0x2000_5000;
+                    let used = RAM_END.saturating_sub(sp);
+                    let free = sp.saturating_sub(0x2000_0000);
+                    protocol::send_stackinfo(&usart, used, free);
+                }
+
                 RxEvent::TouchCalibrate => {
                     let cal = touch::run_calibration(&mut touch, &ctx.lcd);
                     cfg.write(&ctx.flash, config::KEY_TOUCH_CAL, &cal.to_bytes());
@@ -809,9 +825,7 @@ fn main() -> ! {
                     let dfs = ctx.tree.dfs_order();
                     for i in 0..dfs.len() {
                         let w = ctx.tree.get(dfs[i]);
-                        if w.flags & widget::FLAG_PRESSED != 0
-                            && w.kind == widget::KIND_SLIDER
-                        {
+                        if w.flags & widget::FLAG_PRESSED != 0 && w.kind == widget::KIND_SLIDER {
                             let abs = ctx.tree.absolute_rect(dfs[i]);
                             let new_val = touch_to_slider_value(&abs, event.x);
                             ctx.tree.get_mut(dfs[i]).value = new_val;
@@ -859,15 +873,42 @@ fn main() -> ! {
                         }
                     }
 
+                    // Checkbox: toggle checked state on click
+                    if clicked_id.is_some()
+                        && ctx.tree.get(clicked_id).kind == widget::KIND_CHECKBOX
+                    {
+                        let w = ctx.tree.get_mut(clicked_id);
+                        w.flags ^= widget::FLAG_CHECKED;
+                        ctx.tree.mark_dirty(clicked_id);
+                    }
+
+                    // Radio: uncheck siblings, check self
+                    if clicked_id.is_some() && ctx.tree.get(clicked_id).kind == widget::KIND_RADIO {
+                        let parent = ctx.tree.get(clicked_id).parent;
+                        if parent.is_some() {
+                            let mut sib = ctx.tree.get(parent).first_child;
+                            while sib.is_some() {
+                                if sib != clicked_id
+                                    && ctx.tree.get(sib).kind == widget::KIND_RADIO
+                                    && ctx.tree.get(sib).flags & widget::FLAG_CHECKED != 0
+                                {
+                                    ctx.tree.get_mut(sib).flags &= !widget::FLAG_CHECKED;
+                                    ctx.tree.mark_dirty(sib);
+                                }
+                                sib = ctx.tree.get(sib).next_sibling;
+                            }
+                        }
+                        let w = ctx.tree.get_mut(clicked_id);
+                        w.flags |= widget::FLAG_CHECKED;
+                        ctx.tree.mark_dirty(clicked_id);
+                    }
+
                     render::render_dirty(&mut ctx);
 
                     // Enqueue on_click callback
                     if clicked_id.is_some() && clicked_func > 0 && vm.has_code() {
                         if let Some(entry) = vm.find_func(clicked_func) {
-                            vm.enqueue_callback(
-                                entry.offset as u16,
-                                &[clicked_id.0 as i32],
-                            );
+                            vm.enqueue_callback(entry.offset as u16, &[clicked_id.0 as i32]);
                         }
                     }
 
@@ -917,10 +958,7 @@ fn main() -> ! {
                     let paint_func = ctx.tree.get(id).on_paint;
                     if paint_func > 0 {
                         if let Some(entry) = vm.find_func(paint_func) {
-                            vm.enqueue_callback(
-                                entry.offset as u16,
-                                &[id.0 as i32],
-                            );
+                            vm.enqueue_callback(entry.offset as u16, &[id.0 as i32]);
                         }
                     }
                 }

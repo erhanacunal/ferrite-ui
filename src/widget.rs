@@ -10,6 +10,7 @@ pub const FLAG_ENABLED: u8 = 1 << 1;
 pub const FLAG_CLICKABLE: u8 = 1 << 2;
 pub const FLAG_DIRTY: u8 = 1 << 3;
 pub const FLAG_PRESSED: u8 = 1 << 4;
+pub const FLAG_CHECKED: u8 = 1 << 5;
 
 // --- Widget Kind ---
 
@@ -18,6 +19,8 @@ pub const KIND_LABEL: u8 = 1;
 pub const KIND_BUTTON: u8 = 2;
 pub const KIND_PROGRESS: u8 = 3;
 pub const KIND_SLIDER: u8 = 4;
+pub const KIND_CHECKBOX: u8 = 5;
+pub const KIND_RADIO: u8 = 6;
 
 // --- Text Alignment ---
 
