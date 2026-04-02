@@ -373,6 +373,11 @@ impl ImageList {
         }
     }
 
+    /// Remove all loaded images.
+    pub fn clear(&mut self) {
+        self.count = 0;
+    }
+
     /// Add an image to the list. Returns false if full.
     pub fn add(&mut self, image: Image) -> bool {
         if (self.count as usize) >= MAX_IMAGES {

@@ -132,7 +132,7 @@ fn setup() {
     set(border_color, C_BORDER);
     set(border_radius, 16);
     set(clickable, 1);
-    set(on_click, 1);
+    set(on_click, @on_main_click);
     parent(main_panel);
     var lbl = alloc();
     target(lbl);
@@ -153,7 +153,7 @@ fn setup() {
     set(border_color, C_BORDER);
     set(border_radius, 16);
     set(clickable, 1);
-    set(on_click, 1);
+    set(on_click, @on_main_click);
     parent(main_panel);
     lbl = alloc();
     target(lbl);
@@ -174,7 +174,7 @@ fn setup() {
     set(border_color, C_BORDER);
     set(border_radius, 16);
     set(clickable, 1);
-    set(on_click, 1);
+    set(on_click, @on_main_click);
     parent(main_panel);
     lbl = alloc();
     target(lbl);
@@ -197,7 +197,7 @@ fn setup() {
     set(border_color, C_BORDER);
     set(border_radius, 16);
     set(clickable, 1);
-    set(on_click, 1);
+    set(on_click, @on_main_click);
     parent(main_panel);
     lbl = alloc();
     target(lbl);
@@ -218,7 +218,7 @@ fn setup() {
     set(border_color, C_BORDER);
     set(border_radius, 16);
     set(clickable, 1);
-    set(on_click, 1);
+    set(on_click, @on_main_click);
     parent(main_panel);
     lbl = alloc();
     target(lbl);
@@ -239,7 +239,7 @@ fn setup() {
     set(border_color, C_BORDER);
     set(border_radius, 16);
     set(clickable, 1);
-    set(on_click, 1);
+    set(on_click, @on_main_click);
     parent(main_panel);
     lbl = alloc();
     target(lbl);
@@ -262,7 +262,7 @@ fn setup() {
     set(border_color, C_BORDER);
     set(border_radius, 16);
     set(clickable, 1);
-    set(on_click, 1);
+    set(on_click, @on_main_click);
     parent(main_panel);
     lbl = alloc();
     target(lbl);
@@ -308,7 +308,7 @@ fn setup() {
     set(border_color, 0xFBE0);
     set(border_radius, 20);
     set(clickable, 1);
-    set(on_click, 2);
+    set(on_click, @on_sub_click);
     parent(sub_panel);
     lbl = alloc();
     target(lbl);
@@ -330,7 +330,7 @@ fn setup() {
     set(border_color, 0xB7E0);
     set(border_radius, 20);
     set(clickable, 1);
-    set(on_click, 2);
+    set(on_click, @on_sub_click);
     parent(sub_panel);
     lbl = alloc();
     target(lbl);
@@ -352,7 +352,7 @@ fn setup() {
     set(border_color, C_BORDER);
     set(border_radius, 12);
     set(clickable, 1);
-    set(on_click, 2);
+    set(on_click, @on_sub_click);
     parent(sub_panel);
     lbl = alloc();
     target(lbl);

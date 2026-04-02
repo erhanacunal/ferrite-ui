@@ -713,13 +713,13 @@ fn on_user_message(arr_id) {
 
 ### Widget Callbacks
 
-Widget event handlers are regular functions whose `func_id` (assigned by the compiler) is set on widgets via `set(on_click, ...)` etc.
+Widget event handlers are regular functions referenced by name using the `@` syntax: `@function_name` resolves to the function's ID at compile time.
 
 ```c
 var btn;
 
 fn handle_click(widget_id) {
-    target(widget_id);
+    target(btn);
     var color = get(bg_color);
     if (color == 0xF800) {
         set(bg_color, 0x07E0);
@@ -736,7 +736,7 @@ fn setup() {
     set(size, 200, 80);
     set(bg_color, 0xF800);
     set(clickable, 1);
-    set(on_click, 1);  // func_id 1 = handle_click
+    set(on_click, @handle_click);  // @name resolves to func_id
     parent(0);
     render();
     return 0;
@@ -754,6 +754,21 @@ fn loop() {}
 | `on_tap` | Tap with coordinates | `(widget_id, packed_xy)` |
 
 For `on_tap`, extract coordinates: `x = coords / 65536`, `y = coords & 0xFFFF`.
+
+### Function References (`@name`)
+
+Use `@function_name` to reference a function by name. The compiler resolves it to the function's ID at compile time. This is the recommended way to assign callbacks — avoids fragile hardcoded numbers.
+
+```c
+fn my_handler(widget_id) { ... }
+fn my_painter(widget_id) { ... }
+
+// Reference by name — compiler resolves to func_id
+set(on_click, @my_handler);
+set(on_paint, @my_painter);
+```
+
+`@name` can be used anywhere an integer expression is expected — it evaluates to the function's numeric ID.
 
 ### Callback Queue
 
@@ -792,7 +807,7 @@ Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnUserMessage
 | Resource | Limit |
 |----------|-------|
 | Widget arena | 254 widgets |
-| Variable slots | 32 (shared globals + function locals) |
+| Variable slots | 256 (sparse map, shared globals + function locals) |
 | Eval stack | 16 deep |
 | Call stack | 8 deep |
 | Callback queue | 8 pending |

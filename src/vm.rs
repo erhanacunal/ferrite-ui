@@ -167,6 +167,7 @@ const OP_ARR_STORE: u8 = 0x18;
 const OP_ARR_LEN: u8 = 0x19;
 const OP_W_ALLOC: u8 = 0x1A;
 const OP_ARR_FREE: u8 = 0x1B;
+const OP_W_ALLTAR: u8 = 0x1C; // alloc + target + store (combined)
 
 // Specialized short forms (1 byte, no args)
 const OP_PUSH_0: u8 = 0x20;
@@ -278,7 +279,11 @@ pub enum VmMode {
 // --- VM ---
 
 const STACK_SIZE: usize = 16;
-const VAR_COUNT: usize = 32;
+/// Variable entry — sparse mapping from slot ID to value.
+struct VmVar {
+    id: u16,
+    val: i32,
+}
 const CALL_STACK_SIZE: usize = 8;
 
 /// Internal heap-allocated VM array.
@@ -317,7 +322,7 @@ pub struct Vm {
     pc: u16,
     stack: [i32; STACK_SIZE],
     sp: u8,
-    vars: [i32; VAR_COUNT],
+    vars: Vec<VmVar>,
     call_stack: [u16; CALL_STACK_SIZE],
     call_sp: u8,
     target: WidgetId,
@@ -350,7 +355,7 @@ impl Vm {
             pc: 0,
             stack: [0; STACK_SIZE],
             sp: 0,
-            vars: [0; VAR_COUNT],
+            vars: Vec::new(),
             call_stack: [0; CALL_STACK_SIZE],
             call_sp: 0,
             target: WidgetId::NONE,
@@ -367,6 +372,27 @@ impl Vm {
             cb_tail: 0,
             critical: false,
         }
+    }
+
+    // === Variable access (sparse map) ===
+
+    #[inline]
+    fn var_get(&self, slot: u16) -> i32 {
+        for v in &self.vars {
+            if v.id == slot { return v.val; }
+        }
+        0
+    }
+
+    #[inline]
+    fn var_set(&mut self, slot: u16, val: i32) {
+        for v in &mut self.vars {
+            if v.id == slot {
+                v.val = val;
+                return;
+            }
+        }
+        self.vars.push(VmVar { id: slot, val });
     }
 
     // === Code loading ===
@@ -562,6 +588,7 @@ impl Vm {
         self.call_sp = 0;
         self.target = WidgetId::NONE;
         self.state = VmState::Ready;
+        self.vars.clear();
         self.arrays.clear();
         self.next_arr_id = 0;
         self.wait_until = 0;
@@ -740,6 +767,16 @@ impl Vm {
                     self.state = VmState::Error;
                 }
             }
+            OP_W_ALLTAR => {
+                // Combined: alloc widget, store to var slot, set as target
+                let slot = self.read_u8() as u16;
+                if let Some(id) = ctx.tree.alloc() {
+                    self.var_set(slot, id.0 as i32);
+                    self.target = id;
+                } else {
+                    self.state = VmState::Error;
+                }
+            }
             OP_ARR_FREE => {
                 let arr_id = self.pop();
                 self.arr_free(arr_id);
@@ -750,16 +787,16 @@ impl Vm {
             OP_PUSH_1  => self.push(1),
             OP_PUSH_2  => self.push(2),
             OP_PUSH_M1 => self.push(-1),
-            OP_LOAD_0  => self.push(self.vars[0]),
-            OP_LOAD_1  => self.push(self.vars[1]),
-            OP_LOAD_2  => self.push(self.vars[2]),
-            OP_LOAD_3  => self.push(self.vars[3]),
-            OP_LOAD_4  => self.push(self.vars[4]),
-            OP_STORE_0 => { let v = self.pop(); self.vars[0] = v; }
-            OP_STORE_1 => { let v = self.pop(); self.vars[1] = v; }
-            OP_STORE_2 => { let v = self.pop(); self.vars[2] = v; }
-            OP_STORE_3 => { let v = self.pop(); self.vars[3] = v; }
-            OP_STORE_4 => { let v = self.pop(); self.vars[4] = v; }
+            OP_LOAD_0  => { let v = self.var_get(0); self.push(v); }
+            OP_LOAD_1  => { let v = self.var_get(1); self.push(v); }
+            OP_LOAD_2  => { let v = self.var_get(2); self.push(v); }
+            OP_LOAD_3  => { let v = self.var_get(3); self.push(v); }
+            OP_LOAD_4  => { let v = self.var_get(4); self.push(v); }
+            OP_STORE_0 => { let v = self.pop(); self.var_set(0, v); }
+            OP_STORE_1 => { let v = self.pop(); self.var_set(1, v); }
+            OP_STORE_2 => { let v = self.pop(); self.var_set(2, v); }
+            OP_STORE_3 => { let v = self.pop(); self.var_set(3, v); }
+            OP_STORE_4 => { let v = self.pop(); self.var_set(4, v); }
 
             // --- With arguments ---
             OP_PUSH_I8 => {
@@ -775,20 +812,14 @@ impl Vm {
                 self.push(val);
             }
             OP_LOAD => {
-                let slot = self.read_u8() as usize;
-                if slot < VAR_COUNT {
-                    self.push(self.vars[slot]);
-                } else {
-                    self.state = VmState::Error;
-                }
+                let slot = self.read_u8() as u16;
+                let v = self.var_get(slot);
+                self.push(v);
             }
             OP_STORE => {
-                let slot = self.read_u8() as usize;
-                if slot < VAR_COUNT {
-                    self.vars[slot] = self.pop();
-                } else {
-                    self.state = VmState::Error;
-                }
+                let slot = self.read_u8() as u16;
+                let v = self.pop();
+                self.var_set(slot, v);
             }
             OP_JMP => {
                 let target = self.read_u16();

@@ -158,9 +158,12 @@ impl Widget {
 // --- WidgetTree ---
 
 /// Heap-allocated widget tree. Grows on demand via Vec.
+/// DFS order is cached and rebuilt lazily when the tree structure changes.
 pub struct WidgetTree {
     widgets: Vec<Widget>,
     pub root: WidgetId,
+    dfs_cache: Vec<WidgetId>,
+    dfs_valid: bool,
 }
 
 impl WidgetTree {
@@ -168,24 +171,29 @@ impl WidgetTree {
         Self {
             widgets: Vec::new(),
             root: WidgetId::NONE,
+            dfs_cache: Vec::new(),
+            dfs_valid: false,
         }
     }
 
     /// Remove all widgets and reset root. Frees heap memory.
     pub fn clear(&mut self) {
         self.widgets.clear();
+        self.dfs_cache.clear();
+        self.dfs_valid = false;
         self.root = WidgetId::NONE;
     }
 
     /// Allocate a new widget. Returns None if WidgetId overflow (max 254).
     pub fn alloc(&mut self) -> Option<WidgetId> {
         if self.widgets.len() >= 254 {
-            return None; // WidgetId is u8, 0xFF is NONE sentinel
+            return None;
         }
         let id = WidgetId(self.widgets.len() as u8);
         let mut w = Widget::default();
         w.flags |= FLAG_DIRTY;
         self.widgets.push(w);
+        self.dfs_valid = false;
         Some(id)
     }
 
@@ -206,12 +214,10 @@ impl WidgetTree {
 
     /// Add child to end of parent's child list (highest z-order).
     pub fn add_child(&mut self, parent: WidgetId, child: WidgetId) {
-        // Prevent self-parenting and adding parent as its own child
         if parent == child {
             return;
         }
         self.widgets[child.index()].parent = parent;
-        // Ensure child's next_sibling is cleared (prevent stale links)
         self.widgets[child.index()].next_sibling = WidgetId::NONE;
 
         let first = self.widgets[parent.index()].first_child;
@@ -224,16 +230,17 @@ impl WidgetTree {
             while self.widgets[last.index()].next_sibling.is_some() {
                 let next = self.widgets[last.index()].next_sibling;
                 if next == child {
-                    return; // already a sibling
+                    return;
                 }
                 last = next;
                 guard += 1;
                 if guard > max {
-                    return; // sibling cycle detected
+                    return;
                 }
             }
             self.widgets[last.index()].next_sibling = child;
         }
+        self.dfs_valid = false;
     }
 
     /// Compute widget's absolute border-box rect in screen coordinates.
@@ -328,25 +335,29 @@ impl WidgetTree {
         }
     }
 
-    /// Flatten tree to DFS pre-order (z-order).
-    pub fn dfs_order(&self) -> Vec<WidgetId> {
-        let mut order = Vec::new();
+    /// Rebuild DFS cache if invalidated.
+    fn rebuild_dfs(&mut self) {
+        if self.dfs_valid {
+            return;
+        }
+
+        self.dfs_cache.clear();
         let max = self.widgets.len();
 
         if self.root.is_none() {
-            return order;
+            self.dfs_valid = true;
+            return;
         }
 
         let mut stack = Vec::new();
         stack.push(self.root);
 
         while let Some(id) = stack.pop() {
-            if order.len() >= max {
-                break; // safety: more iterations than widgets → cycle
+            if self.dfs_cache.len() >= max {
+                break;
             }
-            order.push(id);
+            self.dfs_cache.push(id);
 
-            // Collect children, push in reverse for correct DFS order
             let mut child = self.widgets[id.index()].first_child;
             let start = stack.len();
             let mut child_count = 0usize;
@@ -355,13 +366,20 @@ impl WidgetTree {
                 child = self.widgets[child.index()].next_sibling;
                 child_count += 1;
                 if child_count > max {
-                    break; // safety: sibling cycle
+                    break;
                 }
             }
-            // Reverse the children we just pushed
             stack[start..].reverse();
         }
 
-        order
+        self.dfs_valid = true;
+    }
+
+    /// Get DFS pre-order (z-order). Rebuilds cache if tree changed,
+    /// then returns a copy. The expensive tree walk only happens after
+    /// alloc/add_child/clear — otherwise returns a cheap memcpy of the cache.
+    pub fn dfs_order(&mut self) -> Vec<WidgetId> {
+        self.rebuild_dfs();
+        self.dfs_cache.clone()
     }
 }

@@ -98,15 +98,19 @@ impl FsWriter {
     }
 
     /// Parse the collected header and prepare for chunk reception.
-    /// Allocates the 4KB sector buffer from heap.
+    /// Buffer allocation is deferred — happens in FsReady handler after
+    /// the running program is freed to reclaim heap.
     fn parse_header(&mut self) {
         let b = &self.header_buf;
         self.total_size =
             (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24);
         self.addr = FS_BASE;
         self.received = 0;
-        // Allocate sector buffer on heap (4KB)
         self.buf.clear();
+    }
+
+    /// Pre-allocate sector buffer. Call after freeing program memory.
+    pub fn alloc_sector_buf(&mut self) {
         self.buf.reserve(FS_SECTOR_SIZE);
     }
 
@@ -214,6 +218,12 @@ impl Protocol {
     /// Call after copying program to code_buf.
     pub fn free_program(&mut self) {
         self.program_buf = Vec::new();
+    }
+
+    /// Pre-allocate 4KB sector buffer for flash writes.
+    /// Call after freeing program memory to ensure heap space.
+    pub fn alloc_sector_buf(&mut self) {
+        self.fs_writer.alloc_sector_buf();
     }
 
     /// Return user message data (valid after UserMessage event).

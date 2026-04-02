@@ -270,7 +270,7 @@ impl Touch {
 
 /// Ekran koordinatında (x, y) en üstteki CLICKABLE widget'ı bul.
 /// DFS pre-order = z-order (son eşleşen = en üst).
-pub fn hit_test(tree: &WidgetTree, x: u16, y: u16) -> WidgetId {
+pub fn hit_test(tree: &mut WidgetTree, x: u16, y: u16) -> WidgetId {
     let dfs = tree.dfs_order();
     let mut result = WidgetId::NONE;
 
@@ -564,7 +564,41 @@ fn abs_diff(a: u16, b: u16) -> u16 {
     if a > b { a - b } else { b - a }
 }
 
-// === GPIO yardımcıları ===
+// === Boot recovery check ===
+
+/// Check if user is holding touch in top-left 50x50 area at boot.
+/// Uses raw ADC reads with calibration — no Touch struct needed.
+/// Returns true if held for `hold_ms` milliseconds.
+pub fn check_recovery_touch(cal: &CalParams, hold_ms: u32) -> bool {
+    let start = crate::systick::millis();
+
+    loop {
+        let elapsed = crate::systick::millis().wrapping_sub(start);
+        if elapsed >= hold_ms {
+            return true; // held long enough
+        }
+
+        // Read calibrated position
+        let sample = read_raw_sample();
+        match sample {
+            Some((rx, ry)) => {
+                let (cx, cy) = if cal.xy_swap { (ry, rx) } else { (rx, ry) };
+                let x = apply_cal(cx, cal.x_min, cal.x_max, SCREEN_W, cal.x_flip);
+                let y = apply_cal(cy, cal.y_min, cal.y_max, SCREEN_H, cal.y_flip);
+
+                // Must be in top-left 50x50 area
+                if x >= 50 || y >= 50 {
+                    return false; // finger moved out of zone
+                }
+            }
+            None => {
+                return false; // finger lifted
+            }
+        }
+    }
+}
+
+// === GPIO helpers ===
 
 #[inline(always)]
 fn pin_high(pin: u32) {

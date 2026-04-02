@@ -20,7 +20,6 @@ mod heap;
 mod image;
 mod irq;
 mod lcd;
-mod page;
 mod proto;
 mod protocol;
 mod render;
@@ -40,7 +39,6 @@ use font::Font;
 use gpio::Gpio;
 use image::ImageList;
 use lcd::Lcd;
-use page::PageManager;
 use protocol::{Protocol, RxEvent};
 use strpool::StringPool;
 use touch::Touch;
@@ -79,6 +77,7 @@ const ERR_FONT_NOT_FOUND: u8 = 4;
 const ERR_NO_FILESYSTEM: u8 = 5;
 const ERR_PROGRAM_ERROR: u8 = 6;
 const ERR_INSUFFICIENT_MEMORY: u8 = 7;
+const ERR_EMPTY_RUN: u8 = 0xFE; // recovery mode — skip program load
 
 // === Max program code size ===
 
@@ -438,6 +437,100 @@ fn error_description(code: u8) -> &'static [u8] {
     }
 }
 
+/// SD card boot: check for EMPTY.BIN (recovery) or PROGRAM.BIN (flash update).
+/// Returns:
+///   ERR_EMPTY_RUN  — EMPTY.BIN found, skip program load
+///   0              — PROGRAM.BIN flashed (or no SD / no files)
+fn sd_boot_check(lcd: &Lcd, flash: &Flash, font: &Font) -> u8 {
+    // Quick probe — CMD0 only, restores SPI before returning
+    if !sdcard::SdCard::probe() {
+        return 0; // no SD card — continue normal boot
+    }
+
+    // Card detected — show status and do full init
+    font.draw_str(lcd, flash, b"SD card found...", 300, 235, 0x4208, Some(0x0000));
+
+    let sd = match sdcard::SdCard::init() {
+        Ok(sd) => sd,
+        Err(_) => return 0,
+    };
+
+    let mut fat = match fat::Fat::mount(&sd) {
+        Ok(f) => f,
+        Err(_) => { sd.release_bus(); return 0; }
+    };
+
+    // Check EMPTY.BIN — recovery mode
+    if fat.find_by_name(&sd, b"EMPTY.BIN").is_some() {
+        lcd.fill_rect(0, 200, 800, 30, 0x0000);
+        font.draw_str(lcd, flash, b"SD: recovery mode", 280, 220, COLOR_WHITE, Some(0x0000));
+        sd.release_bus();
+        delay_ms(1000);
+        return ERR_EMPTY_RUN;
+    }
+
+    // Check PROGRAM.BIN — flash update
+    let entry = match fat.find_by_name(&sd, b"PROGRAM.BIN") {
+        Some(e) => e,
+        None => { sd.release_bus(); return 0; }
+    };
+
+    let file_size = entry.size;
+    if file_size == 0 {
+        sd.release_bus();
+        return 0;
+    }
+
+    // Show progress
+    lcd.fill_rect(0, 200, 800, 60, 0x0000);
+    font.draw_str(lcd, flash, b"SD: flashing program...", 250, 220, COLOR_WHITE, Some(0x0000));
+
+    // Write file to external flash sector by sector (4KB)
+    const SECTOR: usize = 4096;
+    const PAGE: usize = 256;
+    let mut buf = alloc::vec![0u8; SECTOR];
+    let mut offset: u32 = 0;
+    let dest_base: u32 = fs::FS_BASE;
+
+    while offset < file_size {
+        let remaining = (file_size - offset) as usize;
+        let chunk = if remaining < SECTOR { remaining } else { SECTOR };
+
+        // Read from SD
+        let read = fat.read_file(&sd, &entry, offset, &mut buf[..chunk]);
+        if read == 0 {
+            break;
+        }
+
+        // Erase flash sector
+        flash.erase_sector(dest_base + offset);
+
+        // Write in 256-byte pages
+        let mut page_off = 0;
+        while page_off < read {
+            let page_len = (read - page_off).min(PAGE);
+            flash.write(dest_base + offset + page_off as u32, &buf[page_off..page_off + page_len]);
+            page_off += page_len;
+        }
+
+        offset += read as u32;
+
+        // Progress bar
+        let progress = ((offset as u32) * 700 / file_size) as u16;
+        lcd.fill_rect(50, 240, progress, 10, 0x07E0);
+    }
+
+    // Done
+    sd.release_bus();
+    // buf freed here (Vec dropped)
+
+    lcd.fill_rect(0, 200, 800, 60, 0x0000);
+    font.draw_str(lcd, flash, b"SD: flash complete!", 270, 220, 0x07E0, Some(0x0000));
+    delay_ms(1000);
+
+    0
+}
+
 /// Convert touch X position to slider value (0-100) relative to widget rect.
 fn touch_to_slider_value(abs: &types::Rect, touch_x: u16) -> i16 {
     let x = touch_x as i16;
@@ -516,12 +609,58 @@ fn main() -> ! {
 
     ctx.backlight.set_brightness(100);
 
-    // 4. Flash filesystem
+    // Recovery mode: hold top-left corner for 3 seconds at boot
     let mut error_code: u8 = 0;
+    if touch::check_recovery_touch(&touch.cal, 200) {
+        // Touch detected in top-left — animate progress bar over 3 seconds
+        let start = systick::millis();
+        let hold_ms: u32 = 3000;
+        let bar_h: u16 = 6;
+        let mut entered = false;
 
-    match fs::Fs::mount(&ctx.flash) {
-        Ok(f) => ctx.fs = Some(f),
-        Err(_) => error_code = ERR_NO_FILESYSTEM,
+        loop {
+            let elapsed = systick::millis().wrapping_sub(start);
+            if elapsed >= hold_ms {
+                entered = true;
+                break;
+            }
+
+            // Draw progress bar
+            let fill = ((elapsed as u32 * 800) / hold_ms) as u16;
+            ctx.lcd.fill_rect(0, 0, fill, bar_h, COLOR_RED);
+
+            // Check touch still in top-left
+            if !touch::check_recovery_touch(&touch.cal, 50) {
+                break; // released or moved out
+            }
+        }
+
+        if entered {
+            ctx.lcd.fill_rect(0, 0, 800, bar_h, COLOR_RED);
+            ctx.lcd.fill_rect(0, bar_h, 800, 480 - bar_h, COLOR_BLACK);
+            ctx.fonts.embedded().draw_str(
+                &ctx.lcd, &ctx.flash,
+                b"RECOVERY MODE", 290, 230,
+                COLOR_RED, Some(COLOR_BLACK),
+            );
+            ctx.fonts.embedded().draw_str(
+                &ctx.lcd, &ctx.flash,
+                b"Use writefs to flash new program", 210, 260,
+                0x4208, Some(COLOR_BLACK),
+            );
+            error_code = ERR_EMPTY_RUN;
+        } else {
+            // Released early — clear bar, continue normal boot
+            ctx.lcd.fill_rect(0, 0, 800, bar_h, COLOR_BLACK);
+        }
+    }
+
+    // 4. Flash filesystem
+    if error_code == 0 {
+        match fs::Fs::mount(&ctx.flash) {
+            Ok(f) => ctx.fs = Some(f),
+            Err(_) => error_code = ERR_NO_FILESYSTEM,
+        }
     }
 
     // 5. Widget tree root (widget 0 — always pre-created before program runs)
@@ -532,18 +671,11 @@ fn main() -> ! {
         w.background_color = COLOR_BLACK;
     }
     ctx.tree.root = root;
-
-    let mut pm = PageManager::new();
-
-    // 6. Load page_main (optional — program can run without pages)
-    if error_code == 0 {
-        pm.load_page(&mut ctx, b"page_main");
-    }
-
-    // 7. Single VM — heap allocated, owns code and function table
+    
+    // 6. Single VM — heap allocated, owns code and function table
     let mut vm = Box::new(Vm::new());
 
-    // 8. Load main program into VM (image header + opcodes)
+    // 7. Load main program into VM (image header + opcodes)
     if error_code == 0 {
         if let Some(fs_ref) = ctx.fs.as_ref() {
             match fs_ref.find(&ctx.flash, b"main") {
@@ -572,10 +704,6 @@ fn main() -> ! {
     }
 
     if error_code == 0 && vm.has_code() {
-        // Show first page (if any was loaded)
-        if pm.count() > 0 {
-            pm.show(0, &mut ctx);
-        }
 
         // Run setup() function — must return 0 for success
         if let Some(entry) = vm.find_by_kind(FunctionKind::Setup) {
@@ -604,8 +732,8 @@ fn main() -> ! {
         }
     }
 
-    // Show error if any
-    if error_code != 0 {
+    // Show error if any (ERR_EMPTY_RUN = recovery mode, no error shown)
+    if error_code != 0 && error_code != ERR_EMPTY_RUN {
         show_error(
             &mut ctx.lcd,
             ctx.fonts.embedded(),
@@ -749,12 +877,14 @@ fn main() -> ! {
                 }
 
                 RxEvent::FsReady => {
-                    let vm_was_running = vm.state == VmState::Running
-                        || vm.state == VmState::Waiting
-                        || vm.state == VmState::Yielded;
-                    if vm_was_running {
-                        vm.state = VmState::Halted;
-                    }
+                    // Free running program to reclaim heap for flash write
+                    vm.reset();
+                    ctx.tree.clear();
+                    ctx.strpool.clear();
+                    ctx.images.clear();
+                    error_code = 0;
+                    // Now allocate 4KB sector buffer (heap is free)
+                    protocol.alloc_sector_buf();
                     protocol::send_pong(&usart);
                 }
 
@@ -786,7 +916,7 @@ fn main() -> ! {
         if error_code == 0 {
             if let Some(event) = touch.poll() {
                 if event.kind == touch::TouchEventKind::Press {
-                    let hit = touch::hit_test(&ctx.tree, event.x, event.y);
+                    let hit = touch::hit_test(&mut ctx.tree, event.x, event.y);
                     if hit.is_some() {
                         ctx.tree.get_mut(hit).flags |= widget::FLAG_PRESSED;
 

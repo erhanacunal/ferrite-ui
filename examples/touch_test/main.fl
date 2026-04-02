@@ -1,15 +1,8 @@
-var root;
 var panel;
 var btn1;
 var btn2;
 
 fn setup() {
-    root = alloc();
-    target(root);
-    set(size, 800, 480);
-    set(bg_color, 0x0000);
-    dirty();
-
     panel = alloc();
     target(panel);
     set(location, 150, 100);
@@ -17,7 +10,7 @@ fn setup() {
     set(bg_color, 0x001F);
     set(border, 3, 3, 3, 3);
     set(border_color, 0xFFFF);
-    parent(root);
+    parent(0);
 
     btn1 = alloc();
     target(btn1);

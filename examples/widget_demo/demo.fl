@@ -1,0 +1,724 @@
+// demo.fl — Ferrite UI Widget Showcase (800x480)
+//
+// 4-tab demo: Buttons, Sliders, Checkbox/Radio, Canvas
+// Demonstrates all widget types and drawing primitives.
+
+// ── Globals (24 of 32 slots) ──
+var panel1;         // tab panels
+var panel2;
+var panel3;
+var panel4;
+var tab1;           // tab buttons
+var tab2;
+var tab3;
+var tab4;
+var active_tab;
+var counter;        // tab 1
+var counter_lbl;
+var status_lbl;
+var prog1;          // tab 2
+var prog2;
+var prog3;
+var prog_val;
+var s1_lbl;         // slider labels
+var s2_lbl;
+var cb1;            // tab 3
+var cb2;
+var cb3;
+var r1;
+var r2;
+var chk_lbl;
+var color_btn;      // 25 globals
+
+// ── Tab Switching ──
+
+fn switch_tab(idx) {
+    critical();
+    target(panel1); set(visible, 0); dirty();
+    target(panel2); set(visible, 0); dirty();
+    target(panel3); set(visible, 0); dirty();
+    target(panel4); set(visible, 0); dirty();
+    target(tab1); set(bg_color, 0x2945); dirty();
+    target(tab2); set(bg_color, 0x2945); dirty();
+    target(tab3); set(bg_color, 0x2945); dirty();
+    target(tab4); set(bg_color, 0x2945); dirty();
+
+    if (idx == 0) { target(panel1); set(visible, 1); dirty(); target(tab1); }
+    if (idx == 1) { target(panel2); set(visible, 1); dirty(); target(tab2); }
+    if (idx == 2) { target(panel3); set(visible, 1); dirty(); target(tab3); }
+    if (idx == 3) { target(panel4); set(visible, 1); dirty(); target(tab4); }
+    set(bg_color, 0x2C9F); dirty();
+    active_tab = idx;
+    render();
+}
+
+fn on_tab(wid) {
+    if (wid == tab1) { switch_tab(0); }
+    if (wid == tab2) { switch_tab(1); }
+    if (wid == tab3) { switch_tab(2); }
+    if (wid == tab4) { switch_tab(3); }
+}
+
+// ── Tab 1: Button callbacks ──
+
+fn on_count(wid) {
+    counter = counter + 1;
+    target(counter_lbl);
+    var s = itos(counter);
+    var t = concat(str("Tapped: "), s);
+    set(text, t);
+    dirty();
+    render();
+    strClear();
+}
+
+fn on_reset(wid) {
+    counter = 0;
+    target(counter_lbl);
+    set(text, "Tapped: 0");
+    dirty();
+    target(status_lbl);
+    set(text, "Counter reset!");
+    set(text_color, 0xFD20);
+    dirty();
+    render();
+}
+
+fn on_color(wid) {
+    target(color_btn);
+    var c = get(bg_color);
+    if (c == 0xF800) { set(bg_color, 0x07E0); }
+    else if (c == 0x07E0) { set(bg_color, 0x2C9F); }
+    else { set(bg_color, 0xF800); }
+    dirty();
+    render();
+}
+
+// ── Tab 2: Slider callbacks ──
+
+fn on_s1(wid, val) {
+    target(s1_lbl);
+    var s = itos(val);
+    var t = concat(str("Brightness: "), concat(s, str("%")));
+    set(text, t); dirty(); render();
+    strClear();
+    setBrightness(val);
+}
+
+fn on_s2(wid, val) {
+    target(s2_lbl);
+    var s = itos(val);
+    var t = concat(str("Volume: "), concat(s, str("%")));
+    set(text, t); dirty(); render();
+    strClear();
+}
+
+// ── Tab 3: Check/Radio callbacks ──
+
+fn on_check(wid) {
+    target(cb1); var c1 = get(checked);
+    target(cb2); var c2 = get(checked);
+    target(cb3); var c3 = get(checked);
+    var m = str("");
+    if (c1) { m = concat(m, str("WiFi ")); }
+    if (c2) { m = concat(m, str("BT ")); }
+    if (c3) { m = concat(m, str("Sound ")); }
+    if (!c1 && !c2 && !c3) { m = str("None"); }
+    target(chk_lbl); set(text, m); dirty(); render();
+    strClear();
+}
+
+fn on_radio(wid) {
+    target(r1); var v1 = get(checked);
+    target(r2); var v2 = get(checked);
+    var m = str("Theme: ");
+    if (v1) { m = concat(m, str("Light")); }
+    if (v2) { m = concat(m, str("Dark")); }
+    if (!v1 && !v2) { m = concat(m, str("Auto")); }
+    target(chk_lbl); set(text, m); dirty(); render();
+    strClear();
+}
+
+// ── Tab 4: Canvas paint ──
+
+fn on_paint(wid) {
+    var y = 90;
+
+    // Filled rects
+    fillRect(30, y, 70, 50, 0xF800);
+    fillRect(110, y, 70, 50, 0x07E0);
+    fillRect(190, y, 70, 50, 0x001F);
+    fillRect(270, y, 70, 50, 0xFFE0);
+
+    // Outlined rects
+    rect(30, y + 65, 70, 50, 0xFFFF);
+    rect(110, y + 65, 70, 50, 0x07FF);
+    rect(190, y + 65, 70, 50, 0xF81F);
+    rect(270, y + 65, 70, 50, 0xFD20);
+
+    // Circles
+    fillCircle(400, y + 25, 22, 0xFD20);
+    circle(400, y + 25, 25, 0xFFFF);
+    fillCircle(460, y + 25, 22, 0xFC18);
+    circle(460, y + 25, 25, 0xFFFF);
+    fillCircle(520, y + 25, 22, 0x867D);
+    circle(520, y + 25, 25, 0xFFFF);
+
+    // Star pattern with lines
+    var cx = 460;
+    var cy = y + 95;
+    line(cx - 35, cy, cx + 35, cy, 0xFFE0);
+    line(cx, cy - 35, cx, cy + 35, 0xFFE0);
+    line(cx - 25, cy - 25, cx + 25, cy + 25, 0xFEA0);
+    line(cx - 25, cy + 25, cx + 25, cy - 25, 0xFEA0);
+
+    // Rounded rects
+    fillRoundedRect(580, y, 190, 50, 10, 0x2945);
+    drawText(600, y + 28, 0, 0xFFFF, 0x2945, "Rounded Fill");
+    roundedRect(580, y + 65, 190, 50, 10, 0xB7E0);
+    drawText(600, y + 95, 0, 0xB7E0, 0, "Rounded Line");
+
+    // Color gradient
+    var gx = 580;
+    var gy = y + 140;
+    fillRect(gx, gy, 38, 18, 0xF800);
+    fillRect(gx + 38, gy, 38, 18, 0xFBE0);
+    fillRect(gx + 76, gy, 38, 18, 0xFFE0);
+    fillRect(gx + 114, gy, 38, 18, 0x07E0);
+    fillRect(gx + 152, gy, 38, 18, 0x001F);
+
+    // Arcs
+    arc(120, y + 200, 40, 0, 90, 0xF800);
+    arc(120, y + 200, 40, 90, 180, 0x07E0);
+    arc(120, y + 200, 40, 180, 270, 0x001F);
+    arc(120, y + 200, 40, 270, 360, 0xFFE0);
+    arc(120, y + 200, 35, 0, 360, 0xFFFF);
+
+    // Labels
+    drawText(30, y + 270, 0, 0xFFFF, 0, "108MHz bare-metal rendering");
+    drawText(30, y + 290, 0, 0x4208, 0, "rect, circle, line, arc, roundedRect, text");
+}
+
+// ════════════════════════════════
+//  SETUP
+// ════════════════════════════════
+
+fn setup() {
+    counter = 0;
+    active_tab = 0;
+    prog_val = 0;
+    setBrightness(100);
+
+    // ── Tab bar ──
+    var bar = alloc();
+    target(bar);
+    set(size, 800, 50);
+    set(bg_color, 0x0841);
+    parent(0);
+
+    // Tab buttons (on_click → on_tab)
+    tab1 = alloc(); target(tab1);
+    set(size, 200, 50);
+    set(bg_color, 0x2C9F); set(press_color, 0x2C9F);
+    set(border, 0, 1, 0, 0); set(border_color, 0x4208);
+    set(clickable, 1); set(on_click, @on_tab);
+    parent(bar);
+    var l = alloc(); target(l);
+    set(kind, 1); set(size, 200, 50);
+    set(text_color, 0xFFFF); set(text_align, 1); set(text, "BUTTONS");
+    parent(tab1);
+
+    tab2 = alloc(); target(tab2);
+    set(location, 200, 0);
+    set(size, 200, 50);
+    set(bg_color, 0x2945); set(press_color, 0x2C9F);
+    set(border, 0, 1, 0, 0); set(border_color, 0x4208);
+    set(clickable, 1); set(on_click, @on_tab);
+    parent(bar);
+    l = alloc(); target(l);
+    set(kind, 1); set(size, 200, 50);
+    set(text_color, 0xFFFF); set(text_align, 1); set(text, "SLIDERS");
+    parent(tab2);
+
+    tab3 = alloc(); target(tab3);
+    set(location, 400, 0);
+    set(size, 200, 50);
+    set(bg_color, 0x2945); set(press_color, 0x2C9F);
+    set(border, 0, 1, 0, 0); set(border_color, 0x4208);
+    set(clickable, 1); set(on_click, @on_tab);
+    parent(bar);
+    l = alloc(); target(l);
+    set(kind, 1); set(size, 200, 50);
+    set(text_color, 0xFFFF); set(text_align, 1); set(text, "CHECK");
+    parent(tab3);
+
+    tab4 = alloc(); target(tab4);
+    set(location, 600, 0);
+    set(size, 200, 50);
+    set(bg_color, 0x2945); set(press_color, 0x2C9F);
+    set(border, 0, 1, 0, 0); set(border_color, 0x4208);
+    set(clickable, 1); set(on_click, @on_tab);
+    parent(bar);
+    l = alloc(); target(l);
+    set(kind, 1); set(size, 200, 50);
+    set(text_color, 0xFFFF); set(text_align, 1); set(text, "CANVAS");
+    parent(tab4);
+
+    // ════════════════════════════════
+    //  PANEL 1: BUTTONS & LABELS
+    // ════════════════════════════════
+
+    panel1 = alloc(); target(panel1);
+    set(location, 0, 50); set(size, 800, 430); set(bg_color, 0x1082);
+    parent(0);
+
+    // Section title
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 30, 10); set(size, 300, 25);
+    set(text_color, 0xC618); set(text, "Buttons");
+    parent(panel1);
+
+    // Counter button
+    var b = alloc(); target(b);
+    set(location, 30, 45); set(size, 220, 65);
+    set(bg_color, 0x2C9F); set(press_color, 0x1A5F);
+    set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
+    set(border_radius, 12); set(clickable, 1); set(on_click, @on_count);
+    parent(panel1);
+    l = alloc(); target(l); set(kind, 1);
+    set(size, 220, 65); set(text_color, 0xFFFF);
+    set(text_align, 1); set(text, "TAP ME");
+    parent(b);
+
+    // Counter label
+    counter_lbl = alloc(); target(counter_lbl); set(kind, 1);
+    set(location, 270, 55); set(size, 200, 40);
+    set(text_color, 0xFFFF); set(text, "Tapped: 0");
+    parent(panel1);
+
+    // Reset button
+    b = alloc(); target(b);
+    set(location, 30, 130); set(size, 150, 45);
+    set(bg_color, 0x4208); set(press_color, 0x6B4D);
+    set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
+    set(border_radius, 8); set(clickable, 1); set(on_click, @on_reset);
+    parent(panel1);
+    l = alloc(); target(l); set(kind, 1);
+    set(size, 150, 45); set(text_color, 0xFFFF);
+    set(text_align, 1); set(text, "RESET");
+    parent(b);
+
+    // Color cycle button
+    color_btn = alloc(); target(color_btn);
+    set(location, 200, 130); set(size, 170, 45);
+    set(bg_color, 0xF800); set(press_color, 0x8000);
+    set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
+    set(border_radius, 8); set(clickable, 1); set(on_click, @on_color);
+    parent(panel1);
+    l = alloc(); target(l); set(kind, 1);
+    set(size, 170, 45); set(text_color, 0xFFFF);
+    set(text_align, 1); set(text, "CYCLE COLOR");
+    parent(color_btn);
+
+    // Status label
+    status_lbl = alloc(); target(status_lbl); set(kind, 1);
+    set(location, 30, 195); set(size, 400, 25);
+    set(text_color, 0x4208); set(text, "Tap buttons to interact");
+    parent(panel1);
+
+    // Button styles section
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 30, 240); set(size, 300, 25);
+    set(text_color, 0xC618); set(text, "Button Styles");
+    parent(panel1);
+
+    // Pill
+    b = alloc(); target(b);
+    set(location, 30, 275); set(size, 140, 38);
+    set(bg_color, 0x07E0); set(press_color, 0x0320);
+    set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
+    set(border_radius, 19); set(clickable, 1);
+    parent(panel1);
+    l = alloc(); target(l); set(kind, 1);
+    set(size, 140, 38); set(text_color, 0xFFFF); set(text_align, 1); set(text, "Pill");
+    parent(b);
+
+    // Square
+    b = alloc(); target(b);
+    set(location, 190, 275); set(size, 100, 38);
+    set(bg_color, 0xFD20); set(press_color, 0x8200);
+    set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
+    set(clickable, 1);
+    parent(panel1);
+    l = alloc(); target(l); set(kind, 1);
+    set(size, 100, 38); set(text_color, 0xFFFF); set(text_align, 1); set(text, "Square");
+    parent(b);
+
+    // Ghost (border only)
+    b = alloc(); target(b);
+    set(location, 310, 275); set(size, 130, 38);
+    set(border, 2, 2, 2, 2); set(border_color, 0x2C9F);
+    set(border_radius, 8); set(clickable, 1); set(press_color, 0x2C9F);
+    parent(panel1);
+    l = alloc(); target(l); set(kind, 1);
+    set(size, 130, 38); set(text_color, 0x2C9F); set(text_align, 1); set(text, "Ghost");
+    parent(b);
+
+    // Big button with subtitle
+    b = alloc(); target(b);
+    set(location, 500, 45); set(size, 260, 110);
+    set(bg_color, 0x18C3); set(press_color, 0x2945);
+    set(border, 3, 3, 3, 3); set(border_color, 0x2C9F);
+    set(border_radius, 16); set(clickable, 1);
+    parent(panel1);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 0, 15); set(size, 260, 40);
+    set(text_color, 0xFFFF); set(text_align, 1); set(text, "BIG BUTTON");
+    parent(b);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 0, 55); set(size, 260, 25);
+    set(text_color, 0x4208); set(text_align, 1); set(text, "with subtitle");
+    parent(b);
+
+    // Alignment demo
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 500, 185); set(size, 260, 22);
+    set(text_color, 0xC618); set(text, "Left Aligned");
+    parent(panel1);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 500, 212); set(size, 260, 22);
+    set(text_color, 0xC618); set(text_align, 1); set(text, "Center Aligned");
+    parent(panel1);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 500, 239); set(size, 260, 22);
+    set(text_color, 0xC618); set(text_align, 2); set(text, "Right Aligned");
+    parent(panel1);
+
+    // ════════════════════════════════
+    //  PANEL 2: PROGRESS & SLIDERS
+    // ════════════════════════════════
+
+    panel2 = alloc(); target(panel2);
+    set(location, 0, 50); set(size, 800, 430); set(bg_color, 0x1082);
+    set(visible, 0);
+    parent(0);
+
+    // Progress bars
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 30, 15); set(size, 300, 25);
+    set(text_color, 0xC618); set(text, "Progress Bars");
+    parent(panel2);
+
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 30, 50); set(size, 150, 20);
+    set(text_color, 0xFFFF); set(text, "Download");
+    parent(panel2);
+    prog1 = alloc(); target(prog1);
+    set(kind, 3); set(location, 30, 75); set(size, 350, 20);
+    set(bg_color, 0x2104); set(press_color, 0x07E0);
+    set(border_radius, 5); set(value, 75);
+    parent(panel2);
+
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 30, 105); set(size, 150, 20);
+    set(text_color, 0xFFFF); set(text, "Upload");
+    parent(panel2);
+    prog2 = alloc(); target(prog2);
+    set(kind, 3); set(location, 30, 130); set(size, 350, 20);
+    set(bg_color, 0x2104); set(press_color, 0xFD20);
+    set(border_radius, 5); set(value, 45);
+    parent(panel2);
+
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 30, 160); set(size, 150, 20);
+    set(text_color, 0xFFFF); set(text, "Battery");
+    parent(panel2);
+    prog3 = alloc(); target(prog3);
+    set(kind, 3); set(location, 30, 185); set(size, 350, 20);
+    set(bg_color, 0x2104); set(press_color, 0xF800);
+    set(border_radius, 5); set(value, 15);
+    parent(panel2);
+
+    // Percentage labels
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 390, 75); set(size, 50, 20);
+    set(text_color, 0x07E0); set(text, "75%");
+    parent(panel2);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 390, 130); set(size, 50, 20);
+    set(text_color, 0xFD20); set(text, "45%");
+    parent(panel2);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 390, 185); set(size, 50, 20);
+    set(text_color, 0xF800); set(text, "15%");
+    parent(panel2);
+
+    // Sliders
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 30, 230); set(size, 300, 25);
+    set(text_color, 0xC618); set(text, "Sliders (drag to adjust)");
+    parent(panel2);
+
+    s1_lbl = alloc(); target(s1_lbl); set(kind, 1);
+    set(location, 30, 265); set(size, 250, 22);
+    set(text_color, 0xFFFF); set(text, "Brightness: 100%");
+    parent(panel2);
+    var s = alloc(); target(s);
+    set(kind, 4); set(location, 30, 295); set(size, 350, 28);
+    set(bg_color, 0x2104); set(press_color, 0x2C9F);
+    set(border_color, 0xFFFF); set(border_radius, 8);
+    set(clickable, 1); set(value, 100); set(on_click, @on_s1);
+    parent(panel2);
+
+    s2_lbl = alloc(); target(s2_lbl); set(kind, 1);
+    set(location, 30, 340); set(size, 250, 22);
+    set(text_color, 0xFFFF); set(text, "Volume: 50%");
+    parent(panel2);
+    s = alloc(); target(s);
+    set(kind, 4); set(location, 30, 370); set(size, 350, 28);
+    set(bg_color, 0x2104); set(press_color, 0x07E0);
+    set(border_color, 0xFFFF); set(border_radius, 8);
+    set(clickable, 1); set(value, 50); set(on_click, @on_s2);
+    parent(panel2);
+
+    // Right: thin bars + big slider
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 470, 50); set(size, 300, 25);
+    set(text_color, 0xC618); set(text, "Thin Bars");
+    parent(panel2);
+    l = alloc(); target(l);
+    set(kind, 3); set(location, 470, 85); set(size, 300, 8);
+    set(bg_color, 0x2104); set(press_color, 0x07FF); set(value, 80);
+    parent(panel2);
+    l = alloc(); target(l);
+    set(kind, 3); set(location, 470, 100); set(size, 300, 8);
+    set(bg_color, 0x2104); set(press_color, 0xFC18); set(value, 55);
+    parent(panel2);
+    l = alloc(); target(l);
+    set(kind, 3); set(location, 470, 115); set(size, 300, 8);
+    set(bg_color, 0x2104); set(press_color, 0xFEA0); set(value, 30);
+    parent(panel2);
+
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 470, 150); set(size, 300, 25);
+    set(text_color, 0xC618); set(text, "Large Slider");
+    parent(panel2);
+    s = alloc(); target(s);
+    set(kind, 4); set(location, 470, 185); set(size, 300, 45);
+    set(bg_color, 0x2104); set(press_color, 0x8010);
+    set(border_color, 0xF81F); set(border, 2, 2, 2, 2);
+    set(border_radius, 12); set(clickable, 1); set(value, 65);
+    parent(panel2);
+
+    // ════════════════════════════════
+    //  PANEL 3: CHECKBOX & RADIO
+    // ════════════════════════════════
+
+    panel3 = alloc(); target(panel3);
+    set(location, 0, 50); set(size, 800, 430); set(bg_color, 0x1082);
+    set(visible, 0);
+    parent(0);
+
+    // Checkboxes section
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 30, 15); set(size, 350, 25);
+    set(text_color, 0xC618); set(text, "Checkboxes (toggle on tap)");
+    parent(panel3);
+
+    // WiFi checkbox row
+    b = alloc(); target(b);
+    set(location, 30, 50); set(size, 300, 35);
+    parent(panel3);
+    cb1 = alloc(); target(cb1);
+    set(kind, 5); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, 0xFFFF);
+    set(press_color, 0x07E0); set(border_radius, 4);
+    set(clickable, 1); set(checked, 1); set(on_click, @on_check);
+    parent(b);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 40, 0); set(size, 200, 35);
+    set(text_color, 0xFFFF); set(text, "WiFi");
+    parent(b);
+
+    // Bluetooth checkbox row
+    b = alloc(); target(b);
+    set(location, 30, 95); set(size, 300, 35);
+    parent(panel3);
+    cb2 = alloc(); target(cb2);
+    set(kind, 5); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, 0xFFFF);
+    set(press_color, 0x2C9F); set(border_radius, 4);
+    set(clickable, 1); set(on_click, @on_check);
+    parent(b);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 40, 0); set(size, 200, 35);
+    set(text_color, 0xFFFF); set(text, "Bluetooth");
+    parent(b);
+
+    // Sound checkbox row
+    b = alloc(); target(b);
+    set(location, 30, 140); set(size, 300, 35);
+    parent(panel3);
+    cb3 = alloc(); target(cb3);
+    set(kind, 5); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, 0xFFFF);
+    set(press_color, 0xFD20);
+    set(clickable, 1); set(checked, 1); set(on_click, @on_check);
+    parent(b);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 40, 0); set(size, 200, 35);
+    set(text_color, 0xFFFF); set(text, "Sound");
+    parent(b);
+
+    // Radio section
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 30, 200); set(size, 300, 25);
+    set(text_color, 0xC618); set(text, "Radio Group (select one)");
+    parent(panel3);
+
+    b = alloc(); target(b);
+    set(location, 30, 235); set(size, 300, 150);
+    parent(panel3);
+
+    // Light
+    b = alloc(); target(b);
+    set(location, 0, 0); set(size, 300, 35);
+    parent(b);
+    r1 = alloc(); target(r1);
+    set(kind, 6); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, 0xFFFF);
+    set(press_color, 0x2C9F);
+    set(clickable, 1); set(checked, 1); set(on_click, @on_radio);
+    parent(b);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 40, 0); set(size, 200, 35);
+    set(text_color, 0xFFFF); set(text, "Light Theme");
+    parent(b);
+
+    // Dark
+    b = alloc(); target(b);
+    set(location, 0, 45); set(size, 300, 35);
+    parent(b);
+    r2 = alloc(); target(r2);
+    set(kind, 6); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, 0xFFFF);
+    set(press_color, 0x2C9F);
+    set(clickable, 1); set(on_click, @on_radio);
+    parent(b);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 40, 0); set(size, 200, 35);
+    set(text_color, 0xFFFF); set(text, "Dark Theme");
+    parent(b);
+
+    // Auto
+    b = alloc(); target(b);
+    set(location, 0, 90); set(size, 300, 35);
+    parent(b);
+    l = alloc(); target(l);
+    set(kind, 6); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, 0xFFFF);
+    set(press_color, 0x2C9F);
+    set(clickable, 1); set(on_click, @on_radio);
+    parent(b);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 40, 0); set(size, 200, 35);
+    set(text_color, 0xFFFF); set(text, "Auto");
+    parent(b);
+
+    // Status label
+    chk_lbl = alloc(); target(chk_lbl); set(kind, 1);
+    set(location, 450, 50); set(size, 320, 28);
+    set(text_color, 0x2C9F); set(text, "WiFi Sound");
+    parent(panel3);
+
+    // Right: large checkboxes
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 450, 100); set(size, 300, 25);
+    set(text_color, 0xC618); set(text, "Large Checkboxes");
+    parent(panel3);
+
+    b = alloc(); target(b);
+    set(kind, 5); set(location, 450, 140); set(size, 45, 45);
+    set(bg_color, 0x2104); set(text_color, 0x07E0);
+    set(press_color, 0x07E0); set(border_radius, 6);
+    set(clickable, 1); set(checked, 1);
+    parent(panel3);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 505, 148); set(size, 150, 30);
+    set(text_color, 0x07E0); set(text, "Accepted");
+    parent(panel3);
+
+    b = alloc(); target(b);
+    set(kind, 5); set(location, 450, 200); set(size, 45, 45);
+    set(bg_color, 0x2104); set(text_color, 0xF800);
+    set(press_color, 0xF800); set(border_radius, 6);
+    set(clickable, 1);
+    parent(panel3);
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 505, 208); set(size, 150, 30);
+    set(text_color, 0xF800); set(text, "Rejected");
+    parent(panel3);
+
+    // Large radios
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 450, 275); set(size, 300, 25);
+    set(text_color, 0xC618); set(text, "Large Radio");
+    parent(panel3);
+
+    b = alloc(); target(b);
+    set(location, 450, 310); set(size, 250, 40);
+    parent(panel3);
+    l = alloc(); target(l);
+    set(kind, 6); set(size, 36, 36);
+    set(bg_color, 0x2104); set(text_color, 0xF81F);
+    set(press_color, 0xF81F); set(clickable, 1); set(checked, 1);
+    parent(b);
+    l = alloc(); target(l);
+    set(kind, 6); set(location, 70, 0); set(size, 36, 36);
+    set(bg_color, 0x2104); set(text_color, 0x07FF);
+    set(press_color, 0x07FF); set(clickable, 1);
+    parent(b);
+    l = alloc(); target(l);
+    set(kind, 6); set(location, 140, 0); set(size, 36, 36);
+    set(bg_color, 0x2104); set(text_color, 0xFEA0);
+    set(press_color, 0xFEA0); set(clickable, 1);
+    parent(b);
+
+    // ════════════════════════════════
+    //  PANEL 4: CANVAS
+    // ════════════════════════════════
+
+    panel4 = alloc(); target(panel4);
+    set(location, 0, 50); set(size, 800, 430); set(bg_color, 0x1082);
+    set(visible, 0); set(on_paint, @on_paint);
+    parent(0);
+
+    l = alloc(); target(l); set(kind, 1);
+    set(location, 20, 10); set(size, 760, 25);
+    set(text_color, 0xC618);
+    set(text, "Drawing Primitives (on_paint callback)");
+    parent(panel4);
+
+    // ── Done ──
+    render();
+    setBrightness(100);
+    return 0;
+}
+
+fn loop() {
+    // Animate progress bars on tab 2
+    if (active_tab == 1) {
+        prog_val = prog_val + 1;
+        if (prog_val > 100) { prog_val = 0; }
+
+        target(prog1); set(value, prog_val); dirty();
+
+        var v2 = prog_val + 30;
+        if (v2 > 100) { v2 = v2 - 100; }
+        target(prog2); set(value, v2); dirty();
+
+        target(prog3); set(value, 100 - prog_val); dirty();
+        render();
+    }
+    delay(50);
+}

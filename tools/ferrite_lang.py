@@ -200,6 +200,17 @@ def tokenize(source):
                 tokens.append(Token('IDENT', word, line))
             continue
 
+        # Function reference: @func_name
+        if ch == '@':
+            i += 1
+            if i < n and (source[i].isalpha() or source[i] == '_'):
+                start = i
+                while i < n and (source[i].isalnum() or source[i] == '_'):
+                    i += 1
+                tokens.append(Token('FUNCREF', source[start:i], line))
+                continue
+            raise CompileError("expected function name after @", line)
+
         # Two-char operators
         two = source[i:i + 2] if i + 1 < n else ''
         if two in ('==', '!=', '<=', '>=', '&&', '||'):
@@ -256,6 +267,13 @@ class FloatLit:
 
 
 class VarRef:
+    def __init__(self, name, line):
+        self.name = name
+        self.line = line
+
+
+class FuncRef:
+    """Reference to a function by name: @func_name → resolved to func_id."""
     def __init__(self, name, line):
         self.name = name
         self.line = line
@@ -675,6 +693,9 @@ class Parser:
         if self._check('FALSE'):
             tok = self._advance()
             return BoolLit(False, tok.line)
+        if self._check('FUNCREF'):
+            tok = self._advance()
+            return FuncRef(tok.value, tok.line)
         if self._check('IDENT'):
             tok = self._advance()
             return VarRef(tok.name if hasattr(tok, 'name') else tok.value, tok.line)
@@ -732,6 +753,7 @@ class CodeGen:
         self.next_widget_id = 1 # 0 = pre-created root widget
         self._loop_stack = []   # {continue_target, continue_patches, break_patches}
         self._fn_base = 0       # function vars start here
+        self._last_alltar_var = None  # peephole: skip target() after alloc+target+store
         self.array_vars = set() # names that hold array_ids
         self._global_init_stmts = None  # set during generate_image()
 
@@ -752,7 +774,9 @@ class CodeGen:
                     self.widget_ids[stmt.name] = self.next_widget_id
                     self.next_widget_id += 1
 
-        # Phase 2: Register functions
+        # Phase 2: Register functions and assign func_ids (1-based, source order)
+        self.func_ids = {}
+        next_fid = 1
         for fn in program.functions:
             self.functions[fn.name] = {
                 'params': fn.params,
@@ -760,6 +784,8 @@ class CodeGen:
                 'end_addr': None,
                 'patches': [],
             }
+            self.func_ids[fn.name] = next_fid
+            next_fid += 1
 
         # Phase 3: JMP over function bodies + emit them
         main_jmp = None
@@ -826,7 +852,9 @@ class CodeGen:
         # producing identical IDs while also tracking local reassignment.
         self.next_widget_id = 1  # 0 = pre-created root widget
 
-        # Phase 2: Register all functions
+        # Phase 2: Register all functions and assign func_ids (1-based, source order)
+        self.func_ids = {}
+        next_fid = 1
         for fn in program.functions:
             self.functions[fn.name] = {
                 'params': fn.params,
@@ -834,6 +862,8 @@ class CodeGen:
                 'end_addr': None,
                 'patches': [],
             }
+            self.func_ids[fn.name] = next_fid
+            next_fid += 1
 
         # Validate: setup and loop must exist
         if 'setup' not in self.functions:
@@ -909,13 +939,20 @@ class CodeGen:
             elif isinstance(stmt, ForStmt):
                 self._scan_alloc_in_stmts(stmt.body, global_var_stmts)
 
+    # --- Function reference resolution ---
+
+    def _resolve_func_id(self, name, line):
+        if name not in self.func_ids:
+            raise CompileError(f"unknown function '{name}' in @{name}", line)
+        return self.func_ids[name]
+
     # --- Variable management ---
 
     def _alloc_var(self, name):
         if name in self.vars:
             raise CompileError(f"variable already defined: {name}")
-        if self.next_slot >= 32:
-            raise CompileError(f"out of variable slots (max 32): {name}")
+        if self.next_slot >= 256:
+            raise CompileError(f"out of variable slots (max 256): {name}")
         slot = self.next_slot
         self.vars[name] = slot
         self.next_slot += 1
@@ -979,6 +1016,11 @@ class CodeGen:
     # --- Statements ---
 
     def _gen_stmt(self, node):
+        # ExprStmt with target() can consume _last_alltar_var, all others clear it
+        if not (isinstance(node, ExprStmt)
+                and isinstance(node.expr, CallExpr)
+                and node.expr.name == 'target'):
+            self._last_alltar_var = None
         if isinstance(node, VarDecl):
             self._gen_var_decl(node)
         elif isinstance(node, Assign):
@@ -1034,6 +1076,10 @@ class CodeGen:
                 if isinstance(node.init, CallExpr) and node.init.name == 'alloc':
                     self.widget_ids[node.name] = self.next_widget_id
                     self.next_widget_id += 1
+                    # Combined alloc+target+store
+                    self.asm.w_alltar(slot)
+                    self._last_alltar_var = node.name
+                    return
                 self._gen_expr(node.init)
             else:
                 self.asm.push(0)
@@ -1090,6 +1136,10 @@ class CodeGen:
             if isinstance(node.value, CallExpr) and node.value.name == 'alloc':
                 self.widget_ids[node.name] = self.next_widget_id
                 self.next_widget_id += 1
+                slot = self._var_slot(node.name, node.line)
+                self.asm.w_alltar(slot)
+                self._last_alltar_var = node.name
+                return
             self._gen_expr(node.value)
             slot = self._var_slot(node.name, node.line)
             self.asm.store(slot)
@@ -1200,6 +1250,9 @@ class CodeGen:
             self.asm.push(float_bits(node.value))
         elif isinstance(node, BoolLit):
             self.asm.push(1 if node.value else 0)
+        elif isinstance(node, FuncRef):
+            func_id = self._resolve_func_id(node.name, node.line)
+            self.asm.push(func_id)
         elif isinstance(node, VarRef):
             if node.name in self.array_vars:
                 raise CompileError(f"'{node.name}' is an array, use {node.name}[index]", node.line)
@@ -1276,7 +1329,15 @@ class CodeGen:
         if name == 'target':
             if len(node.args) != 1:
                 raise CompileError("target() takes 1 argument", node.line)
-            wid = self._resolve_widget_id(node.args[0])
+            # Skip if previous statement was W_ALLTAR for the same variable
+            arg = node.args[0]
+            if (self._last_alltar_var is not None
+                    and isinstance(arg, VarRef)
+                    and arg.name == self._last_alltar_var):
+                self._last_alltar_var = None
+                return
+            self._last_alltar_var = None
+            wid = self._resolve_widget_id(arg)
             self.asm.w_target(wid)
             return
 

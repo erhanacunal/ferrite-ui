@@ -64,6 +64,20 @@ pub enum SdError {
 }
 
 impl SdCard {
+    /// Quick check if an SD card is present (CMD0 only).
+    /// Returns true if card responds with idle state.
+    /// Always restores SPI0 to flash mode before returning.
+    pub fn probe() -> bool {
+        cs_high();
+        set_spi_mode0(0b111); // slow clock
+        for _ in 0..10 {
+            spi_transfer(0xFF);
+        }
+        let r1 = sd_command(CMD0, 0x00000000, 0x95);
+        release_bus();
+        r1 == 0x01
+    }
+
     /// Initialize the SD card. Reconfigures SPI0 for SD mode.
     /// Call flash operations only after calling `release_bus()`.
     pub fn init() -> Result<Self, SdError> {

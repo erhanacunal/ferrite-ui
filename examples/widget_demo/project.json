@@ -1,0 +1,12 @@
+{
+    "screen_width": 800,
+    "screen_height": 480,
+    "include_dirs": ["../../lib"],
+    "programs": [
+        {
+            "name": "main",
+            "source": "demo.fl",
+            "exec_mode": "flash"
+        }
+    ]
+}

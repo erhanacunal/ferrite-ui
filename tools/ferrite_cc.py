@@ -57,6 +57,7 @@ class Op:
     ARR_LEN    = 0x19
     W_ALLOC    = 0x1A
     ARR_FREE   = 0x1B
+    W_ALLTAR   = 0x1C  # + u8 var_slot (alloc + store + target)
 
     # Specialized short forms (1 byte, no args)
     PUSH_0     = 0x20
@@ -461,6 +462,11 @@ class Asm:
     def w_alloc(self):
         self._emit(Op.W_ALLOC)
 
+    def w_alltar(self, slot):
+        """Combined: alloc widget, store to var slot, set as target."""
+        self._emit(Op.W_ALLTAR)
+        self._emit(slot & 0xFF)
+
     def arr_free(self):
         """Pop arr_id, free the array."""
         self._emit(Op.ARR_FREE)
@@ -860,7 +866,7 @@ OP_NAMES = {
     0x10: 'LE', 0x11: 'GT', 0x12: 'GE', 0x13: 'RET',
     0x14: 'YIELD', 0x15: 'W_DIRTY', 0x16: 'W_RENDER',
     0x17: 'ARR_LOAD', 0x18: 'ARR_STORE', 0x19: 'ARR_LEN',
-    0x1A: 'W_ALLOC', 0x1B: 'arrFree',
+    0x1A: 'W_ALLOC', 0x1B: 'arrFree', 0x1C: 'W_ALLTAR',
 
     0x20: 'PUSH_0', 0x21: 'PUSH_1', 0x22: 'PUSH_2', 0x23: 'PUSH_M1',
     0x24: 'LOAD_0', 0x25: 'LOAD_1', 0x26: 'LOAD_2', 0x27: 'LOAD_3', 0x28: 'LOAD_4',
@@ -971,6 +977,11 @@ def disassemble(data, labels=None):
             target = struct.unpack_from('<H', data, pos)[0]
             pos += 2
             lines.append(f'{addr:04X}: {name} @{target:04X}')
+
+        # W_ALLTAR with u8 var slot
+        elif op == Op.W_ALLTAR:
+            slot = data[pos]; pos += 1
+            lines.append(f'{addr:04X}: W_ALLTAR var[{slot}]')
 
         # W_TARGET, W_SET, W_GET, W_PARENT with u8 arg
         elif op == Op.W_TARGET:

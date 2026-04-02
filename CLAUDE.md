@@ -62,8 +62,8 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - `padding` → iç boşluk (size'a dahil)
   - `location` → parent content area'ya göreceli offset
   - `size` → border box boyutu
-- **Flags:** `VISIBLE` (0x01), `ENABLED` (0x02), `CLICKABLE` (0x04), `DIRTY` (0x08), `PRESSED` (0x10)
-- **Widget tipleri:** `KIND_BASE` (0, container), `KIND_LABEL` (1, metin), `KIND_BUTTON` (2, tıklanabilir container)
+- **Flags:** `VISIBLE` (0x01), `ENABLED` (0x02), `CLICKABLE` (0x04), `DIRTY` (0x08), `PRESSED` (0x10), `CHECKED` (0x20)
+- **Widget tipleri:** `KIND_BASE` (0, container), `KIND_LABEL` (1, metin), `KIND_BUTTON` (2, tıklanabilir container), `KIND_PROGRESS` (3, ilerleme çubuğu), `KIND_SLIDER` (4, kaydırıcı), `KIND_CHECKBOX` (5, onay kutusu), `KIND_RADIO` (6, radyo düğmesi)
 - **Label:** text_color, font_id, text_align (LEFT/CENTER/RIGHT), text (text_pool'dan)
 - **Button:** press_color (basılıyken arka plan), child widget kabul eder
 - **Text pool:** WidgetTree'de 256 byte append-only buffer, label metinleri burada
@@ -83,7 +83,8 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   6. Alt widget'lar aynı occluder listesiyle recursive çizilir
 - **İki render modu:**
   - `render_all()` — tam ekran, DFS pre-order, clip yok (ilk açılış)
-  - `render_dirty()` — sadece dirty widget'lar, clip'li (partial update)
+  - `render_dirty()` — iteratif (recursive değil), DFS cache kullanır, clip'li (partial update)
+  - **DFS cache:** `WidgetTree.dfs_cache` — tree değişmedikçe yeniden hesaplanmaz (alloc/add_child/clear invalidate eder)
 
 ### Render
 - `fill_rect` → `set_address` + burst piksel yazma (FPGA'da donanım hızı)
@@ -96,7 +97,8 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **ZigZag varint:** signed integer encoding (protobuf uyumlu)
 - **37 opcode:** stack ops (PUSH/POP/DUP/SWAP), aritmetik (ADD/SUB/MUL/DIV/MOD/NEG), karşılaştırma (EQ/NE/LT/LE/GT/GE), mantık (AND/OR/NOT), kontrol (JMP/JZ/JNZ/CALL/RET/YIELD/HALT), widget (W_TARGET/W_SET/W_GET/W_DIRTY/W_RENDER/W_ALLOC/W_PARENT), flash (F_READ/F_WRITE)
 - **Opcode 0–15:** 1-byte tag (sık kullanılan), **16+:** 2-byte tag (nadir)
-- **Vm struct:** ~150 byte (16-deep eval stack, 16 var, 8-deep call stack)
+- **W_ALLTAR opcode (0x1C):** combined alloc + store + target (saves 5 bytes per widget)
+- **Vm struct:** eval stack (16-deep), vars (sparse Vec, max 256), call stack (8-deep)
 - **Property R/W:** scalar (W_SET wt=0, tek değer stack'ten) ve compound (W_SET wt=2, LEN payload ile çoklu zigzag varint)
 - **Builder:** RAM'de bytecode oluşturma, forward jump patching, `&mut [u8]` buffer'a yazar
 - **Çalıştırma:** `vm.run(&code[..len], &mut tree, &mut lcd, &flash)` — F_READ/F_WRITE flash üzerinden çalışır
@@ -121,14 +123,12 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **API:** `mount()`, `find(name)`, `read_resource()`, `count_by_kind()`, `find_nth_by_kind()`, `verify_checksum()`
 - **RAM maliyeti:** 12 byte (sadece header cache — tablo flash'ta kalır)
 
-### Sayfa Yönetimi (PageManager)
-- **Konsept:** Root widget altında tam ekran (800×480) sayfalar, aynı anda sadece biri görünür
-- **Max sayfa:** 8 (`MAX_PAGES`)
-- **Oluşturma:** `create_page()` (elle) veya `load_page()` / `load_all_pages()` (flash bytecode ile)
-- **Geçiş:** `show(index)` → eski gizle, yeni göster, dirty mark, render
-- **Navigasyon:** `next()` / `prev()` — döngüsel sayfa geçişi
-- **Flash format (RES_PAGE):** bg_color(u16 LE) + bytecode (VM widget oluşturma)
-- **Bytecode yükleme:** page widget target olarak set edilir, VM bytecode'u çalıştırarak alt widget'ları oluşturur
+### Recovery Mode
+- **Boot'ta sol üst köşeye 3 saniye basılı tutma** → recovery mode
+- Kırmızı progress bar dolarak gösterir, bırakırsan iptal
+- Recovery modda: program yüklenmez, sadece USART aktif
+- `writefs` ile yeni program flash'lanabilir
+- **PENIRQ (PC14):** GPIO polling ile dokunma algılama (EXTI interrupt KULLANILMAZ — SPI çakışması)
 - **RAM maliyeti:** ~18 byte (8 × WidgetId + count + active)
 
 ### Font Renderer (Adafruit GFX uyumlu)
@@ -163,17 +163,18 @@ ferrite-ui/
     ├── gpio.rs         — GPIOA/B init, 16-bit data bus, clock pulse
     ├── lcd.rs          — FPGA protokolü, fill_rect, begin_pixels/write_pixel
     ├── types.rs        — Rect, Offset, Size, Edges, Color (RGB565)
-    ├── widget.rs       — Widget struct (Base/Label/Button), WidgetId, WidgetTree
+    ├── widget.rs       — Widget struct (7 kind), WidgetId, WidgetTree (DFS cache)
     ├── clip.rs         — ClipRegion (32 rect pool, subtract algoritması)
     ├── flash.rs        — W25Q256 SPI flash driver (donanım SPI0, 4-byte addr)
     ├── font.rs         — Adafruit GFX bitmap font renderer (flash + embedded)
     ├── embedded_font.rs — Gömülü FreeMono9pt7b font verisi (ROM'da)
     ├── fs.rs           — Flash dosya sistemi (TOC, isimle resource erişimi)
     ├── image.rs        — Ferrite Image (FI) format decoder (raw/rle/indexed+rle)
-    ├── page.rs         — Sayfa yönetimi (PageManager, show/hide, flash'tan yükleme)
-    ├── render.rs       — render_all + render_dirty (painter's algorithm)
-    ├── touch.rs        — XPT2046 SPI bit-bang, hit test, debounce
-    ├── vm.rs           — Bytecode interpreter (41 opcode, protobuf tag, varint/zigzag)
+    ├── render.rs       — render_all + render_dirty (iteratif, painter's algorithm)
+    ├── touch.rs        — XPT2046 SPI bit-bang, hit test, debounce, PENIRQ GPIO, recovery
+    ├── sdcard.rs       — SD card SPI driver (SPI0 shared, Mode 0)
+    ├── fat.rs          — FAT16/32 filesystem reader
+    ├── vm.rs           — Bytecode interpreter (57+ opcode, sparse vars, W_ALLTAR)
     ├── backlight.rs    — LCD arka ışık PWM (TIMER0_CH0, PA8)
     ├── usart.rs        — USART0 serial + RX interrupt ring buffer
     ├── irq.rs          — GD32F103 interrupt vector table (__INTERRUPTS)
@@ -205,14 +206,21 @@ ferrite-ui/
 - [x] Flash driver (W25Q256 SPI bit-bang, 4-byte addr, read/write/erase, VM entegrasyonu)
 - [x] Flash dosya sistemi (TOC, isimle resource erişimi, mount/find/read)
 - [x] Font render (Adafruit GFX uyumlu, header RAM'de, bitmap flash'tan okunur)
-- [x] Widget tipleri (Label: text/font/align, Button: press_color/children, serialize/deserialize)
+- [x] Widget tipleri (Label, Button, Progress, Slider, Checkbox, Radio)
 - [x] Image format (FI: raw/rle/indexed+rle, streaming decode, Python converter)
 - [x] Backlight PWM (TIMER0_CH0, PA8, 10kHz, 0-100%)
 - [x] USART0 RX interrupt + 128B ring buffer
 - [x] Interrupt vector table (device.x + irq.rs)
 - [x] Gömülü font (FreeMono9pt7b, ROM'da, flash gerekmez)
-- [x] USART protobuf protokolü (ping/pong, execute, restart, fs write)
-- [x] Startup sequence (backlight → ekran → font → fs → page → vm)
+- [x] USART protobuf protokolü (ping/pong, execute, restart, fs write, meminfo, stackinfo)
+- [x] Startup sequence (backlight → ekran → recovery check → font → fs → vm)
 - [x] Hata protokolü (ekran + USART, 7 hata kodu)
-- [ ] Bytecode cache (4KB — şimdilik flash.read doğrudan kullanılıyor)
-- [ ] Touch event → VM callback mekanizması
+- [x] Touch event → VM callback (on_click, on_tap, on_paint, on_touch_down/up/move)
+- [x] Iteratif render (recursive yerine flat DFS, DFS cache)
+- [x] PENIRQ GPIO polling (idle'da SPI atla)
+- [x] SPI timing sabitleri (SPI_HALF_CLK=54, ~1MHz)
+- [x] Recovery mode (boot'ta sol üst köşe 3sn basılı → USART-only mod)
+- [x] @func_name syntax (compiler callback referansları)
+- [x] W_ALLTAR opcode (alloc+target+store combined)
+- [x] Sparse variable map (Vec<VmVar>, max 256, 32 limit kaldırıldı)
+- [ ] SD card boot (SPI0 bus paylaşım sorunu çözülmeli)
