@@ -611,7 +611,7 @@ fn main() -> ! {
 
     // Recovery mode: hold top-left corner for 3 seconds at boot
     let mut error_code: u8 = 0;
-    if touch::check_recovery_touch(&touch.cal, 200) {
+    if touch::penirq_active_pub() && touch::check_recovery_touch(&touch.cal, 200) {
         // Touch detected in top-left — animate progress bar over 3 seconds
         let start = systick::millis();
         let hold_ms: u32 = 3000;
@@ -1098,6 +1098,8 @@ fn main() -> ! {
         // --- Drain callback queue (runs each to completion, FIFO order) ---
         if vm.has_pending_callbacks() {
             vm.drain_callbacks(&mut ctx);
+            // Render any changes made by callbacks (visibility, color, etc.)
+            render::render_dirty(&mut ctx);
         }
     }
 }

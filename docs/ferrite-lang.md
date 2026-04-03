@@ -31,11 +31,10 @@ var label;
 fn setup() {
     counter = 0;
     label = alloc();
-    target(label);
-    set(kind, 1);
-    set(size, 200, 40);
-    set(text_color, 0xFFFF);
-    set(font_id, 0);
+    label.kind = 1;
+    label.size = [200, 40];
+    label.text_color = 0xFFFF;
+    label.font_id = 0;
     parent(0);
     render();
     return 0;
@@ -260,14 +259,13 @@ var btn;
 
 fn setup() {
     btn = alloc();
-    target(btn);
-    set(location, 100, 50);
-    set(size, 200, 60);
-    set(bg_color, 0x001F);
-    set(border, 2, 2, 2, 2);
-    set(border_color, 0xFFFF);
-    set(border_radius, 8);
-    set(clickable, 1);
+    btn.location = [100, 50];
+    btn.size = [200, 60];
+    btn.bg_color = 0x001F;
+    btn.border = [2, 2, 2, 2];
+    btn.border_color = 0xFFFF;
+    btn.border_radius = 8;
+    btn.clickable = 1;
     parent(0);  // root widget is always id 0
     render();
     return 0;
@@ -285,6 +283,63 @@ Sets the target widget for subsequent `set()`, `get()`, `dirty()`, `parent()` ca
 ### parent(widget)
 
 Attaches the current target as a child of the given parent.
+
+### Property Access (dot syntax)
+
+Widget variables support dot syntax as shorthand for `target()` + `set()`/`get()`:
+
+**Write:**
+
+```c
+var btn = alloc();
+btn.bg_color = 0x001F;         // scalar property
+btn.text_color = 0xFFFF;
+btn.size = [200, 60];          // compound property
+btn.border = [2, 2, 2, 2];
+btn.text = "Click me";         // string literal (no heap alloc)
+btn.text = str("Click me");    // also works (optimized to same as above)
+btn.on_click = @handle_click;  // callback
+btn.clickable = 1;
+```
+
+**Read:**
+
+```c
+var c = btn.bg_color;          // scalar read
+var v = slider.value;
+if (cb.checked) { /* ... */ }
+```
+
+**How it works:** `btn.bg_color = 0x001F` compiles to `target(btn)` + `set(bg_color, 0x001F)`. Consecutive property accesses on the same widget emit only one `target()` — the compiler tracks the current target and skips redundant switches.
+
+```c
+var btn = alloc();       // W_ALLTAR: alloc + target + store
+btn.bg_color = 0x001F;   // W_SET only (already targeted)
+btn.size = [200, 60];    // W_SET only (still targeted)
+
+var lbl = alloc();       // W_ALLTAR: switches target to lbl
+lbl.text = "OK";         // W_SET only
+
+btn.bg_color = 0xF800;   // W_TARGET(btn) + W_SET (target switched back)
+```
+
+Compound properties (location, size, margin, border, padding) require `[...]` array syntax. Reading compound properties directly is not supported — use the individual components instead:
+
+```c
+var w = btn.width;       // OK: reads size_w
+var h = btn.height;      // OK: reads size_h
+// var s = btn.size;     // Error: cannot read compound property
+```
+
+The dot syntax and `set()`/`get()` can be mixed freely:
+
+```c
+var btn = alloc();
+btn.bg_color = 0x001F;    // dot syntax
+target(btn);
+set(size, 200, 60);       // traditional syntax
+var c = btn.bg_color;     // dot read
+```
 
 ### set(property, value...)
 
@@ -350,24 +405,22 @@ Widgets with `kind=3` (progress) or `kind=4` (slider) display a horizontal fill 
 
 ```c
 var bar = alloc();
-target(bar);
-set(kind, 3);                // progress bar
-set(size, 200, 20);
-set(bg_color, 0x2104);       // track color
-set(press_color, 0x07E0);    // fill color (green)
-set(value, 75);              // 75% filled
-set(border_radius, 4);       // rounded fill
+bar.kind = 3;                // progress bar
+bar.size = [200, 20];
+bar.bg_color = 0x2104;       // track color
+bar.press_color = 0x07E0;    // fill color (green)
+bar.value = 75;              // 75% filled
+bar.border_radius = 4;       // rounded fill
 parent(0);
 
 var slider = alloc();
-target(slider);
-set(kind, 4);                // slider (draggable)
-set(size, 200, 30);
-set(bg_color, 0x2104);
-set(press_color, 0x001F);    // fill color (blue)
-set(border_color, 0xFFFF);   // thumb color
-set(clickable, 1);           // required for touch drag
-set(value, 50);
+slider.kind = 4;             // slider (draggable)
+slider.size = [200, 30];
+slider.bg_color = 0x2104;
+slider.press_color = 0x001F; // fill color (blue)
+slider.border_color = 0xFFFF; // thumb color
+slider.clickable = 1;        // required for touch drag
+slider.value = 50;
 parent(0);
 ```
 
@@ -387,39 +440,36 @@ Widgets with `kind=5` (checkbox) or `kind=6` (radio) display a check/radio indic
 ```c
 // Checkbox
 var cb = alloc();
-target(cb);
-set(kind, 5);                // checkbox
-set(location, 20, 20);
-set(size, 30, 30);
-set(bg_color, 0x2104);
-set(text_color, 0xFFFF);     // indicator outline
-set(press_color, 0x07E0);    // green check fill
-set(clickable, 1);
-set(checked, 1);             // start checked
+cb.kind = 5;                 // checkbox
+cb.location = [20, 20];
+cb.size = [30, 30];
+cb.bg_color = 0x2104;
+cb.text_color = 0xFFFF;      // indicator outline
+cb.press_color = 0x07E0;     // green check fill
+cb.clickable = 1;
+cb.checked = 1;              // start checked
 parent(0);
 
 // Radio group — children of the same parent
 var r1 = alloc();
-target(r1);
-set(kind, 6);                // radio
-set(location, 20, 60);
-set(size, 30, 30);
-set(bg_color, 0x2104);
-set(text_color, 0xFFFF);
-set(press_color, 0x001F);    // blue dot when selected
-set(clickable, 1);
-set(checked, 1);             // selected by default
+r1.kind = 6;                 // radio
+r1.location = [20, 60];
+r1.size = [30, 30];
+r1.bg_color = 0x2104;
+r1.text_color = 0xFFFF;
+r1.press_color = 0x001F;     // blue dot when selected
+r1.clickable = 1;
+r1.checked = 1;              // selected by default
 parent(0);
 
 var r2 = alloc();
-target(r2);
-set(kind, 6);
-set(location, 20, 100);
-set(size, 30, 30);
-set(bg_color, 0x2104);
-set(text_color, 0xFFFF);
-set(press_color, 0x001F);
-set(clickable, 1);
+r2.kind = 6;
+r2.location = [20, 100];
+r2.size = [30, 30];
+r2.bg_color = 0x2104;
+r2.text_color = 0xFFFF;
+r2.press_color = 0x001F;
+r2.clickable = 1;
 parent(0);
 ```
 
@@ -434,6 +484,14 @@ fn handle_click(widget_id) {
 }
 ```
 
+Or with dot syntax when the widget variable is known:
+
+```c
+if (cb.checked) {
+    // checkbox is checked
+}
+```
+
 ### get(property)
 
 Reads a property value from the current target widget.
@@ -444,6 +502,14 @@ var color = get(bg_color);
 var r = get(border_radius);
 var is_on = get(checked);    // checkbox/radio state
 var val = get(value);        // progress/slider value
+```
+
+With dot syntax (equivalent, but doesn't require manual `target()`):
+
+```c
+var w = btn.width;
+var color = btn.bg_color;
+var val = slider.value;
 ```
 
 ### dirty() / render()
@@ -828,31 +894,28 @@ fn setup() {
     counter = 0;
 
     root = alloc();
-    target(root);
-    set(size, 800, 480);
-    set(bg_color, 0x0000);
+    root.size = [800, 480];
+    root.bg_color = 0x0000;
 
     panel = alloc();
-    target(panel);
-    set(location, 100, 100);
-    set(size, 600, 280);
-    set(bg_color, 0x10A2);
-    set(border, 2, 2, 2, 2);
-    set(border_color, 0x4A69);
-    set(border_radius, 16);
+    panel.location = [100, 100];
+    panel.size = [600, 280];
+    panel.bg_color = 0x10A2;
+    panel.border = [2, 2, 2, 2];
+    panel.border_color = 0x4A69;
+    panel.border_radius = 16;
     parent(root);
 
     btn = alloc();
-    target(btn);
-    set(location, 200, 80);
-    set(size, 200, 80);
-    set(bg_color, 0xF800);
-    set(press_color, 0x7800);
-    set(border, 2, 2, 2, 2);
-    set(border_color, 0xFFFF);
-    set(border_radius, 8);
-    set(clickable, 1);
-    set(on_click, 1);  // func_id for handle_click
+    btn.location = [200, 80];
+    btn.size = [200, 80];
+    btn.bg_color = 0xF800;
+    btn.press_color = 0x7800;
+    btn.border = [2, 2, 2, 2];
+    btn.border_color = 0xFFFF;
+    btn.border_radius = 8;
+    btn.clickable = 1;
+    btn.on_click = @handle_click;
     parent(panel);
 
     render();
@@ -880,11 +943,10 @@ fn loop() {
 
 fn handle_click(widget_id) {
     counter = counter + 1;
-    target(widget_id);
     if (counter % 2 == 0) {
-        set(bg_color, 0xF800);
+        btn.bg_color = 0xF800;
     } else {
-        set(bg_color, 0x07E0);
+        btn.bg_color = 0x07E0;
     }
     dirty();
     render();

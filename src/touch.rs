@@ -27,6 +27,13 @@ fn penirq_active() -> bool {
     }
 }
 
+/// Public PENIRQ check for boot-time recovery gate.
+/// Only enters recovery check if the touch panel actually reports a press.
+#[inline]
+pub fn penirq_active_pub() -> bool {
+    penirq_active()
+}
+
 // --- Hardware addresses ---
 
 const GPIOA_BASE: u32 = 0x4001_0800;

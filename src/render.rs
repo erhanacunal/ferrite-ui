@@ -63,7 +63,17 @@ pub fn render_dirty(ctx: &mut Ctx) {
     for di in 0..dfs.len() {
         let id = dfs[di];
 
-        if !ctx.tree.get(id).is_dirty() || !ctx.tree.is_tree_visible(id) {
+        if !ctx.tree.get(id).is_dirty() {
+            continue;
+        }
+
+        // Widget just became invisible — erase its area with ancestor background
+        if !ctx.tree.is_tree_visible(id) {
+            let abs = ctx.tree.absolute_rect(id);
+            if !abs.is_empty() {
+                let bg = ancestor_bg(&ctx.tree, id);
+                fill_rect_screen(&ctx.lcd, abs, bg);
+            }
             continue;
         }
 
@@ -120,6 +130,26 @@ pub fn render_dirty(ctx: &mut Ctx) {
 /// If the widget is a child of a pressed button and shares the same
 /// background_color, inherits the parent button's press_color.
 #[inline]
+/// Find the nearest ancestor with a non-zero background color.
+/// Used to erase hidden widgets with the correct background.
+fn ancestor_bg(tree: &WidgetTree, id: WidgetId) -> Color {
+    let mut pid = tree.get(id).parent;
+    let max = tree.count();
+    let mut depth = 0usize;
+    while pid.is_some() {
+        let bg = tree.get(pid).background_color;
+        if bg != 0 {
+            return bg;
+        }
+        pid = tree.get(pid).parent;
+        depth += 1;
+        if depth > max {
+            break;
+        }
+    }
+    0 // black fallback
+}
+
 fn effective_bg(tree: &WidgetTree, id: WidgetId) -> Color {
     let widget = tree.get(id);
 

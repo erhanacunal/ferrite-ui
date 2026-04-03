@@ -1256,7 +1256,10 @@ impl Vm {
             PROP_LOC_Y => w.location.y = val as i16,
             PROP_SIZE_W => w.size.w = val as u16,
             PROP_SIZE_H => w.size.h = val as u16,
-            PROP_VISIBLE => set_flag(&mut w.flags, FLAG_VISIBLE, val != 0),
+            PROP_VISIBLE => {
+                set_flag(&mut w.flags, FLAG_VISIBLE, val != 0);
+                ctx.tree.mark_dirty(self.target);
+            }
             PROP_ENABLED => set_flag(&mut w.flags, FLAG_ENABLED, val != 0),
             PROP_CLICKABLE => set_flag(&mut w.flags, FLAG_CLICKABLE, val != 0),
             PROP_BG_COLOR => w.background_color = val as u16,

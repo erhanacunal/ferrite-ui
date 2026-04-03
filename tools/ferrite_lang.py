@@ -87,6 +87,7 @@ def preprocess(source, filename="<input>", include_dirs=None, _included=None):
 KEYWORDS = {
     'var', 'fn', 'if', 'else', 'while', 'for',
     'return', 'true', 'false', 'break', 'continue',
+    'not',
 }
 
 
@@ -223,7 +224,7 @@ def tokenize(source):
             '+': '+', '-': '-', '*': '*', '/': '/', '%': '%',
             '&': '&', '|': '|', '!': '!', '<': '<', '>': '>',
             '=': '=', '(': '(', ')': ')', '{': '{', '}': '}',
-            '[': '[', ']': ']', ',': ',', ';': ';',
+            '[': '[', ']': ']', ',': ',', ';': ';', '.': '.',
         }
         if ch in single_map:
             tokens.append(Token(ch, ch, line))
@@ -286,6 +287,14 @@ class IndexExpr:
         self.line = line
 
 
+class DotExpr:
+    """Property read: widget.prop → target(widget) + get(prop)."""
+    def __init__(self, obj, prop, line):
+        self.obj = obj    # str — variable name
+        self.prop = prop   # str — property name
+        self.line = line
+
+
 class BinOp:
     def __init__(self, op, left, right, line):
         self.op = op
@@ -330,6 +339,15 @@ class Assign:
         self.value = value
         self.line = line
         self.index = index
+
+
+class DotAssign:
+    """Property write: widget.prop = value → target(widget) + set(prop, value)."""
+    def __init__(self, obj, prop, value, line):
+        self.obj = obj    # str — variable name
+        self.prop = prop   # str — property name
+        self.value = value # expression
+        self.line = line
 
 
 class IfStmt:
@@ -569,7 +587,7 @@ class Parser:
 
     def _parse_assign_or_expr(self, skip_semi):
         expr = self._expression()
-        # Check for assignment: ident = expr or ident[i] = expr
+        # Check for assignment: ident = expr, ident[i] = expr, or widget.prop = expr
         if self._match('='):
             value = self._expression()
             if not skip_semi:
@@ -578,6 +596,8 @@ class Parser:
                 return Assign(expr.name, value, expr.line)
             elif isinstance(expr, IndexExpr):
                 return Assign(expr.name, value, expr.line, expr.index)
+            elif isinstance(expr, DotExpr):
+                return DotAssign(expr.obj, expr.prop, value, expr.line)
             else:
                 raise CompileError("invalid assignment target", expr.line)
         if not skip_semi:
@@ -656,6 +676,10 @@ class Parser:
             op = self._advance()
             operand = self._unary_expr()
             return UnaryOp(op.value, operand, op.line)
+        if self._check('NOT'):
+            op = self._advance()
+            operand = self._unary_expr()
+            return UnaryOp('!', operand, op.line)
         return self._postfix_expr()
 
     def _postfix_expr(self):
@@ -675,6 +699,10 @@ class Parser:
             index = self._expression()
             self._expect(']')
             return IndexExpr(expr.name, index, expr.line)
+        # Dot access: widget.prop
+        if isinstance(expr, VarRef) and self._match('.'):
+            prop = self._expect('IDENT').value
+            return DotExpr(expr.name, prop, expr.line)
         return expr
 
     def _primary_expr(self):
@@ -754,6 +782,7 @@ class CodeGen:
         self._loop_stack = []   # {continue_target, continue_patches, break_patches}
         self._fn_base = 0       # function vars start here
         self._last_alltar_var = None  # peephole: skip target() after alloc+target+store
+        self._current_target = None  # track targeted widget for dot-access optimization
         self.array_vars = set() # names that hold array_ids
         self._global_init_stmts = None  # set during generate_image()
 
@@ -1021,10 +1050,15 @@ class CodeGen:
                 and isinstance(node.expr, CallExpr)
                 and node.expr.name == 'target'):
             self._last_alltar_var = None
+        # Clear target tracking on control flow (branches may diverge)
+        if isinstance(node, (IfStmt, WhileStmt, ForStmt)):
+            self._current_target = None
         if isinstance(node, VarDecl):
             self._gen_var_decl(node)
         elif isinstance(node, Assign):
             self._gen_assign(node)
+        elif isinstance(node, DotAssign):
+            self._gen_dot_assign(node)
         elif isinstance(node, IfStmt):
             self._gen_if(node)
         elif isinstance(node, WhileStmt):
@@ -1079,6 +1113,7 @@ class CodeGen:
                     # Combined alloc+target+store
                     self.asm.w_alltar(slot)
                     self._last_alltar_var = node.name
+                    self._current_target = node.name
                     return
                 self._gen_expr(node.init)
             else:
@@ -1139,6 +1174,7 @@ class CodeGen:
                 slot = self._var_slot(node.name, node.line)
                 self.asm.w_alltar(slot)
                 self._last_alltar_var = node.name
+                self._current_target = node.name
                 return
             self._gen_expr(node.value)
             slot = self._var_slot(node.name, node.line)
@@ -1265,6 +1301,8 @@ class CodeGen:
             self.asm.load(slot)           # arr_id
             self._gen_expr(node.index)    # index (herhangi bir expression)
             self.asm.arr_load()
+        elif isinstance(node, DotExpr):
+            self._gen_dot_read(node)
         elif isinstance(node, BinOp):
             self._gen_binop(node)
         elif isinstance(node, UnaryOp):
@@ -1335,10 +1373,12 @@ class CodeGen:
                     and isinstance(arg, VarRef)
                     and arg.name == self._last_alltar_var):
                 self._last_alltar_var = None
+                self._current_target = arg.name
                 return
             self._last_alltar_var = None
             wid = self._resolve_widget_id(arg)
             self.asm.w_target(wid)
+            self._current_target = arg.name if isinstance(arg, VarRef) else None
             return
 
         # --- Built-in: parent(widget) ---
@@ -1745,6 +1785,8 @@ class CodeGen:
             self.asm._emit(Op.CALL)
             info['patches'].append(self.asm.pos)
             self.asm._emit(b'\x00\x00')
+        # User function may change target
+        self._current_target = None
 
     def _gen_set(self, node):
         if len(node.args) < 2:
@@ -1788,6 +1830,69 @@ class CodeGen:
                 raise CompileError(f"set({prop_name}) takes 1 value", node.line)
             self._gen_expr(value_args[0])
             self.asm.w_set(prop_id)
+
+    def _emit_target(self, var_name, line):
+        """Emit W_TARGET for a widget variable, skipping if already targeted."""
+        if var_name not in self.widget_ids:
+            raise CompileError(
+                f"'{var_name}' is not a widget variable (use var {var_name} = alloc())",
+                line)
+        if self._current_target != var_name:
+            wid = self.widget_ids[var_name]
+            self.asm.w_target(wid)
+            self._current_target = var_name
+
+    def _gen_dot_assign(self, node):
+        """Compile widget.prop = value → W_TARGET + W_SET."""
+        self._emit_target(node.obj, node.line)
+
+        prop_id, is_compound = _resolve_prop(node.prop)
+
+        # Special: text property
+        if prop_id == Prop.TEXT:
+            val = node.value
+            # x.text = "literal" → W_SET_TEXT (no heap alloc)
+            if isinstance(val, StrLit):
+                self.asm.w_set_text(val.value)
+            # x.text = str("literal") → optimize to W_SET_TEXT
+            elif (isinstance(val, CallExpr) and val.name == 'str'
+                    and len(val.args) == 1 and isinstance(val.args[0], StrLit)):
+                self.asm.w_set_text(val.args[0].value)
+            else:
+                # Expression (str_id) → STR_SET_TEXT builtin
+                self._gen_expr(val)
+                self.asm.str_set_text()
+            return
+
+        if is_compound:
+            if not isinstance(node.value, ArrayLit):
+                raise CompileError(
+                    f"compound property '{node.prop}' requires [...] value", node.line)
+            elements = node.value.elements
+            all_const = all(isinstance(e, NumLit) for e in elements)
+            if all_const:
+                self.asm.w_set_compound(prop_id, [e.value for e in elements])
+            else:
+                scalars = COMPOUND_SCALARS.get(prop_id)
+                if scalars is None or len(elements) != len(scalars):
+                    raise CompileError(
+                        f"'{node.prop}' expects {len(scalars) if scalars else '?'} values",
+                        node.line)
+                for scalar_id, val_expr in zip(scalars, elements):
+                    self._gen_expr(val_expr)
+                    self.asm.w_set(scalar_id)
+        else:
+            self._gen_expr(node.value)
+            self.asm.w_set(prop_id)
+
+    def _gen_dot_read(self, node):
+        """Compile widget.prop read → W_TARGET + W_GET."""
+        self._emit_target(node.obj, node.line)
+        prop_id, is_compound = _resolve_prop(node.prop)
+        if is_compound:
+            raise CompileError(
+                f"cannot read compound property '{node.prop}' directly", node.line)
+        self.asm.w_get(prop_id)
 
     def _gen_packed_pair(self, high_expr, low_expr):
         """Generate code to push a packed pair (high << 16 | low) onto stack.
