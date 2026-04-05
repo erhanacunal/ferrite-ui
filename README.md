@@ -17,6 +17,10 @@ For the some bricked Nextion Displays :)
 
 ![Ferrite Clock Example](docs/images/ferrite_clock.jpeg)
 
+### ST-Link SWD Pinout
+
+![ST-Link SWD Pins](docs/images/st-link-pins.jpeg)
+
 ## Features
 
 - **Widget system** -- HTML-like tree structure with CSS box model, split-struct design (18B base + 32B extension on demand)
@@ -32,10 +36,26 @@ For the some bricked Nextion Displays :)
 - **Flash filesystem** -- TOC-based, named resources (fonts, images, programs, pages)
 - **Font rendering** -- Adafruit GFX compatible bitmap fonts (flash + embedded)
 - **Image format** -- Ferrite Image (FI): raw/RLE/indexed+RLE, streaming decode
-- **Recovery mode** -- Hold top-left corner 3s at boot for USART-only reflash mode
+- **Recovery mode** -- Hold top-left corner 3s at boot for USART-only reflash mode (see below)
 - **USART protocol** -- Protobuf-style serial communication (ping, execute, flash write, user messages)
 - **Backlight PWM** -- 0-100% brightness via hardware timer
 - **SysTick timer** -- 1ms tick counter, blocking and non-blocking delays
+
+### Recovery Mode
+
+![Recovery Mode](docs/images/recovery_mode.jpeg)
+
+Hold the top-left corner for 3 seconds at boot. A red progress bar fills while holding. Release to cancel. In recovery mode, no program is loaded -- use `writefs` via USART to flash a new program.
+
+### Widget Demo
+
+| Buttons | Sliders |
+|---------|---------|
+| ![Buttons Tab](docs/images/widgets_demo_1.jpeg) | ![Sliders Tab](docs/images/widgets_demo_2.jpeg) |
+
+| Checkbox / Radio | Canvas (on_paint) |
+|------------------|-------------------|
+| ![Check Tab](docs/images/widgets_demo_3.jpeg) | ![Canvas Tab](docs/images/widgets_demo_4.jpeg) |
 
 ## Ferrite Language
 
