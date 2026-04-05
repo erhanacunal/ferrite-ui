@@ -19,11 +19,11 @@ For the some bricked Nextion Displays :)
 
 ## Features
 
-- **Widget system** -- HTML-like tree structure with CSS box model (margin, border, padding), heap-allocated (Vec-backed, no fixed limits)
-- **Widget types** -- Base (container), Label (text + font + alignment), Button (press state + children)
-- **Dirty redraw** -- Clip-based painter's algorithm, only repaints changed widgets
+- **Widget system** -- HTML-like tree structure with CSS box model, split-struct design (18B base + 32B extension on demand)
+- **Widget types** -- Base (container), Label, Button, Progress, Slider, Checkbox, Radio
+- **Dirty redraw** -- Two-pass clip-based painter's algorithm (erase hidden, then draw visible)
 - **Double buffering** -- FPGA back/front buffer swap for tear-free rendering
-- **Bytecode VM** -- 55 opcodes, protobuf tag encoding, 32 variables, 8-deep call stack
+- **Bytecode VM** -- 57+ opcodes, stack-based locals (FRAME prologue), 128 globals + 128 locals per frame, 8-deep call stack
 - **Drawing primitives** -- fillRect, rect, line, circle, fillCircle, roundedRect, fillRoundedRect, arc, drawImage, drawText
 - **Float32 arithmetic** -- Software float (add/sub/mul/div/neg + comparisons + conversion)
 - **String pool** -- Heap-allocated strings with auto-incrementing IDs, smart GC preserving widget text
@@ -32,7 +32,7 @@ For the some bricked Nextion Displays :)
 - **Flash filesystem** -- TOC-based, named resources (fonts, images, programs, pages)
 - **Font rendering** -- Adafruit GFX compatible bitmap fonts (flash + embedded)
 - **Image format** -- Ferrite Image (FI): raw/RLE/indexed+RLE, streaming decode
-- **Page manager** -- Multiple full-screen pages, show/hide, flash loading
+- **Recovery mode** -- Hold top-left corner 3s at boot for USART-only reflash mode
 - **USART protocol** -- Protobuf-style serial communication (ping, execute, flash write, user messages)
 - **Backlight PWM** -- 0-100% brightness via hardware timer
 - **SysTick timer** -- 1ms tick counter, blocking and non-blocking delays
@@ -104,6 +104,9 @@ python tools/ferrite_cli.py -p COM3 send 0x01 0x02 0x03
 
 # Convert PNG to Ferrite Image format
 python tools/ferrite_img.py icon.png -o icon.fi
+
+# Analyze bytecode memory and instruction profile
+python tools/ferrite_analyze.py program.fl -v
 ```
 
 ## Building
@@ -128,11 +131,11 @@ Binary output: `target/thumbv7m-none-eabi/release/ferrite-ui`
 
 | Component | Size |
 |-----------|------|
-| Heap (linked-list allocator) | 16 KB |
+| Heap (linked-list allocator) | 14 KB |
 | Clip region (32 rects) | 256 B |
 | USART RX ring buffer | 128 B |
 
-Heap-allocated: Ctx (WidgetTree, FontList, ImageList, StringPool), VMs (x2), code buffer (4KB), fonts, arrays, strings.
+Heap-allocated: Ctx (WidgetTree + extensions, FontList, ImageList, StringPool), VM (stack-based locals, arrays, callback queue), fonts.
 
 ## Project Structure
 
@@ -141,8 +144,8 @@ ferrite-ui/
 ├── src/
 │   ├── main.rs          Entry point, startup, main loop
 │   ├── ctx.rs           Shared application context (Ctx struct)
-│   ├── vm.rs            Bytecode VM (55 opcodes, builtins, f32)
-│   ├── widget.rs        Widget tree, heap-allocated, box model
+│   ├── vm.rs            Bytecode VM (57+ opcodes, stack frames, f32)
+│   ├── widget.rs        Widget + WidgetExt split, tree, box model
 │   ├── render.rs        Painter's algorithm, dirty redraw, clip
 │   ├── lcd.rs           FPGA display protocol, double buffer, drawing primitives
 │   ├── clip.rs          Clip region (rect subtract algorithm)
@@ -151,11 +154,9 @@ ferrite-ui/
 │   ├── font.rs          Adafruit GFX bitmap font renderer
 │   ├── image.rs         Ferrite Image (FI) decoder
 │   ├── fs.rs            Flash filesystem (TOC, named resources)
-│   ├── page.rs          Page manager (multi-page UI)
 │   ├── strpool.rs       Heap string pool (itos/ftos/concat/GC)
-│   ├── heap.rs          Linked-list heap allocator (16KB)
+│   ├── heap.rs          Linked-list heap allocator (14KB)
 │   ├── systick.rs       SysTick 1ms timer
-│   ├── callback.rs      Callback metadata (function table)
 │   ├── protocol.rs      USART protobuf protocol
 │   ├── usart.rs         USART0 driver + RX interrupt
 │   ├── backlight.rs     LCD backlight PWM
@@ -167,7 +168,9 @@ ferrite-ui/
 │   ├── ferrite_lang.py  Language compiler (.fl -> bytecode)
 │   ├── ferrite_cc.py    Assembler / disassembler / compiler API
 │   ├── ferrite_cli.py   Serial communication tool
-│   └── ferrite_img.py   PNG to Ferrite Image converter
+│   ├── ferrite_img.py   PNG to Ferrite Image converter
+│   ├── ferrite_analyze.py  Bytecode memory/instruction profiler
+│   └── ferrite_build.py JSON project builder (flash image)
 ├── docs/
 │   └── ferrite-lang.md  Language reference
 ├── memory.x             Linker script (128KB Flash, 20KB RAM)
@@ -176,12 +179,13 @@ ferrite-ui/
 
 ## Architecture
 
-- **Custom heap allocator** -- 16KB linked-list allocator, all large structures heap-allocated via Box/Vec
+- **Custom heap allocator** -- 14KB linked-list allocator, all large structures heap-allocated via Box/Vec
 - **No OS, no runtime** -- `#![no_std]`, `#![no_main]`, `cortex-m-rt` entry point
 - **No frame buffer in CPU RAM** -- pixels are written directly to the FPGA over a 16-bit GPIO bus
 - **Double buffered** -- FPGA handles front/back buffer swap, tear-free rendering
-- **Dirty redraw only** -- the clip-based painter's algorithm redraws only changed widgets
-- **Bytecode VM** -- UI logic runs as bytecode programs, uploaded via USART or loaded from flash
+- **Two-pass dirty redraw** -- erase hidden widgets first, then draw visible ones with clip-based painter's algorithm
+- **Split-struct widgets** -- 18B base (tree links, layout, colors) + 32B extension on demand (edges, text, callbacks)
+- **Stack-based VM locals** -- FRAME prologue per function, locals isolated across CALL/RET, supports recursion
 - **Shared context** -- Ctx struct bundles LCD, Flash, WidgetTree, FontList, ImageList, StringPool, Fs
 
 ## License
