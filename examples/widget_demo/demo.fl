@@ -32,23 +32,36 @@ var color_btn;      // 25 globals
 
 // ── Tab Switching ──
 
+fn hide_show(idx, on) {
+    if (idx == 0) {
+        target(panel1);
+    } else if (idx == 1) {
+        target(panel2);
+    } else if (idx == 2) {
+        target(panel3);
+    } else if (idx == 3) {
+        target(panel4);
+    }
+    set(visible, on);
+    dirty();
+}
+
 fn switch_tab(idx) {
     critical();
-    target(panel1); set(visible, 0); dirty();
-    target(panel2); set(visible, 0); dirty();
-    target(panel3); set(visible, 0); dirty();
-    target(panel4); set(visible, 0); dirty();
+    hide_show(active_tab, 0);
+
     target(tab1); set(bg_color, 0x2945); dirty();
     target(tab2); set(bg_color, 0x2945); dirty();
     target(tab3); set(bg_color, 0x2945); dirty();
     target(tab4); set(bg_color, 0x2945); dirty();
 
-    if (idx == 0) { target(panel1); set(visible, 1); dirty(); target(tab1); }
-    if (idx == 1) { target(panel2); set(visible, 1); dirty(); target(tab2); }
-    if (idx == 2) { target(panel3); set(visible, 1); dirty(); target(tab3); }
-    if (idx == 3) { target(panel4); set(visible, 1); dirty(); target(tab4); }
+    if (idx == 0) { target(tab1); }
+    if (idx == 1) { target(tab2); }
+    if (idx == 2) { target(tab3); }
+    if (idx == 3) { target(tab4); }
     set(bg_color, 0x2C9F); dirty();
     active_tab = idx;
+    hide_show(idx, 1);
     render();
 }
 
@@ -294,6 +307,7 @@ fn setup() {
     counter_lbl = alloc(); target(counter_lbl); set(kind, 1);
     set(location, 270, 55); set(size, 200, 40);
     set(text_color, 0xFFFF); set(text, "Tapped: 0");
+    set(bg_color, 0x1082);
     parent(panel1);
 
     // Reset button
@@ -629,6 +643,7 @@ fn setup() {
     chk_lbl = alloc(); target(chk_lbl); set(kind, 1);
     set(location, 450, 50); set(size, 320, 28);
     set(text_color, 0x2C9F); set(text, "WiFi Sound");
+    set(bg_color, 0x1082);
     parent(panel3);
 
     // Right: large checkboxes

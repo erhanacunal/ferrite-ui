@@ -924,9 +924,11 @@ fn main() -> ! {
                         if ctx.tree.get(hit).kind == widget::KIND_SLIDER {
                             let abs = ctx.tree.absolute_rect(hit);
                             let new_val = touch_to_slider_value(&abs, event.x);
-                            ctx.tree.get_mut(hit).value = new_val;
+                            if let Some(ext) = ctx.tree.ensure_ext(hit) {
+                                ext.value = new_val;
+                            }
                             if vm.has_code() {
-                                let on_click = ctx.tree.get(hit).on_click;
+                                let on_click = ctx.tree.on_click(hit);
                                 if on_click > 0 {
                                     if let Some(entry) = vm.find_func(on_click) {
                                         vm.enqueue_callback(
@@ -958,12 +960,14 @@ fn main() -> ! {
                         if w.flags & widget::FLAG_PRESSED != 0 && w.kind == widget::KIND_SLIDER {
                             let abs = ctx.tree.absolute_rect(dfs[i]);
                             let new_val = touch_to_slider_value(&abs, event.x);
-                            ctx.tree.get_mut(dfs[i]).value = new_val;
+                            if let Some(ext) = ctx.tree.ensure_ext(dfs[i]) {
+                                ext.value = new_val;
+                            }
                             ctx.tree.mark_dirty(dfs[i]);
                             render::render_dirty(&mut ctx);
 
                             if vm.has_code() {
-                                let on_click = ctx.tree.get(dfs[i]).on_click;
+                                let on_click = ctx.tree.on_click(dfs[i]);
                                 if on_click > 0 {
                                     if let Some(entry) = vm.find_func(on_click) {
                                         vm.enqueue_callback(
@@ -997,7 +1001,7 @@ fn main() -> ! {
                             let abs = ctx.tree.absolute_rect(dfs[i]);
                             if abs.contains(event.x, event.y) {
                                 clicked_id = dfs[i];
-                                clicked_func = ctx.tree.get(dfs[i]).on_click;
+                                clicked_func = ctx.tree.on_click(dfs[i]);
                             }
                             ctx.tree.mark_dirty(dfs[i]);
                         }
@@ -1044,7 +1048,7 @@ fn main() -> ! {
 
                     // Enqueue on_tap callback (widget_id, packed x|y)
                     if clicked_id.is_some() && vm.has_code() {
-                        let tap_func = ctx.tree.get(clicked_id).on_tap;
+                        let tap_func = ctx.tree.on_tap(clicked_id);
                         if tap_func > 0 {
                             if let Some(entry) = vm.find_func(tap_func) {
                                 let packed_xy = ((event.x as u32) << 16 | event.y as u32) as i32;
@@ -1073,7 +1077,8 @@ fn main() -> ! {
                 let dfs = ctx.tree.dfs_order();
                 for i in 0..dfs.len() {
                     let w = ctx.tree.get(dfs[i]);
-                    if w.is_dirty() && w.on_paint != 0 && paint_count < 8 {
+                    let on_paint = ctx.tree.on_paint(dfs[i]);
+                    if w.is_dirty() && on_paint != 0 && paint_count < 8 {
                         paint_ids[paint_count] = dfs[i];
                         paint_count += 1;
                     }
@@ -1085,7 +1090,7 @@ fn main() -> ! {
             if vm.has_code() {
                 for i in 0..paint_count {
                     let id = paint_ids[i];
-                    let paint_func = ctx.tree.get(id).on_paint;
+                    let paint_func = ctx.tree.on_paint(id);
                     if paint_func > 0 {
                         if let Some(entry) = vm.find_func(paint_func) {
                             vm.enqueue_callback(entry.offset as u16, &[id.0 as i32]);
@@ -1098,8 +1103,39 @@ fn main() -> ! {
         // --- Drain callback queue (runs each to completion, FIFO order) ---
         if vm.has_pending_callbacks() {
             vm.drain_callbacks(&mut ctx);
-            // Render any changes made by callbacks (visibility, color, etc.)
             render::render_dirty(&mut ctx);
+
+            // Callbacks (e.g. switch_tab) may have made on_paint widgets
+            // visible and already rendered them, clearing their dirty flag.
+            // Fire on_paint for those newly-visible widgets now.
+            if vm.has_code() && error_code == 0 {
+                let mut paint_count: usize = 0;
+                let mut paint_ids = [widget::WidgetId::NONE; 8];
+                {
+                    let dfs = ctx.tree.dfs_order();
+                    for i in 0..dfs.len() {
+                        let on_paint = ctx.tree.on_paint(dfs[i]);
+                        if on_paint != 0
+                            && ctx.tree.is_tree_visible(dfs[i])
+                            && !ctx.tree.get(dfs[i]).is_dirty()
+                            && paint_count < 8
+                        {
+                            paint_ids[paint_count] = dfs[i];
+                            paint_count += 1;
+                        }
+                    }
+                }
+                for i in 0..paint_count {
+                    let id = paint_ids[i];
+                    let paint_func = ctx.tree.on_paint(id);
+                    if paint_func > 0 {
+                        if let Some(entry) = vm.find_func(paint_func) {
+                            vm.enqueue_callback(entry.offset as u16, &[id.0 as i32]);
+                        }
+                    }
+                }
+                vm.drain_callbacks(&mut ctx);
+            }
         }
     }
 }

@@ -785,6 +785,7 @@ class CodeGen:
         self._current_target = None  # track targeted widget for dot-access optimization
         self.array_vars = set() # names that hold array_ids
         self._global_init_stmts = None  # set during generate_image()
+        self._in_function = False  # True when emitting function body
 
     def generate(self, program):
         """Compile program to bytecode (raw, no image header).
@@ -980,9 +981,17 @@ class CodeGen:
     def _alloc_var(self, name):
         if name in self.vars:
             raise CompileError(f"variable already defined: {name}")
-        if self.next_slot >= 256:
-            raise CompileError(f"out of variable slots (max 256): {name}")
-        slot = self.next_slot
+        if self._in_function:
+            # Local variable: high bit set, index 0-127
+            local_idx = self.next_slot - self._fn_base
+            if local_idx >= 128:
+                raise CompileError(f"too many local variables (max 128): {name}")
+            slot = 0x80 | local_idx
+        else:
+            # Global variable: no high bit, index 0-127
+            slot = self.next_slot
+            if slot >= 128:
+                raise CompileError(f"too many global variables (max 128): {name}")
         self.vars[name] = slot
         self.next_slot += 1
         return slot
@@ -998,12 +1007,18 @@ class CodeGen:
         info = self.functions[fn.name]
         info['addr'] = self.asm.pos
 
-        # Function vars start from _fn_base, reset between functions
-        # Global vars remain visible (merged into local scope)
+        # Function locals use stack frames (high bit encoding).
+        # Each function starts locals from index 0 (0x80).
         saved_vars = dict(self.vars)
         saved_slot = self.next_slot
+        saved_in_fn = self._in_function
         self.vars = dict(self.global_vars)  # globals visible in all functions
-        self.next_slot = self._fn_base
+        self.next_slot = self._fn_base  # locals start after globals
+        self._in_function = True
+
+        # Emit FRAME prologue: tells VM how many local slots this function needs
+        local_count = len(fn.params) + self._count_var_slots(fn.body)
+        self.asm.frame(local_count)
 
         # Allocate param slots and pop args (reverse order)
         param_slots = []
@@ -1041,6 +1056,7 @@ class CodeGen:
         # Restore
         self.vars = saved_vars
         self.next_slot = saved_slot
+        self._in_function = saved_in_fn
 
     # --- Statements ---
 
@@ -1975,8 +1991,8 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
 def build_image(source, filename="<input>", include_dirs=None):
     """Compile source to VM image format (new unified header).
 
-    Image format:
-      version(u8) + function_count(u16 LE) + reserved(u16)
+    Image format (v2):
+      version(u8=2) + function_count(u16 LE) + global_count(u16 LE)
       + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
       + opcodes...
 
@@ -2013,7 +2029,7 @@ def build_image(source, filename="<input>", include_dirs=None):
                 cc._funcs[fn_name] = (fid, kind, offset, length)
                 func_names[offset] = fn_name
 
-        header = cc.build_image_header()
+        header = cc.build_image_header(global_count=len(codegen.global_vars))
         image = header + bytecode
 
         # Stash function name map on the bytes object for CLI use
@@ -2073,9 +2089,11 @@ def _extract_labels(image):
 def _print_image_header(output):
     """Print image header summary to stdout."""
     real_names = getattr(output, 'func_names', {})
+    version = output[0]
     func_count = struct.unpack_from('<H', output, 1)[0]
+    global_count = struct.unpack_from('<H', output, 3)[0]
     opcode_start = 5 + func_count * 12
-    print(f'; image v1: {func_count} functions, opcodes={len(output) - opcode_start}B')
+    print(f'; image v{version}: {func_count} functions, {global_count} globals, opcodes={len(output) - opcode_start}B')
     for i in range(func_count):
         base = 5 + i * 12
         fid = struct.unpack_from('<H', output, base)[0]

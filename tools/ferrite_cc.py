@@ -58,6 +58,7 @@ class Op:
     W_ALLOC    = 0x1A
     ARR_FREE   = 0x1B
     W_ALLTAR   = 0x1C  # + u8 var_slot (alloc + store + target)
+    FRAME      = 0x1D  # + u8 local_count (function prologue)
 
     # Specialized short forms (1 byte, no args)
     PUSH_0     = 0x20
@@ -493,18 +494,25 @@ class Asm:
             self._emit_i32(val)
 
     def load(self, slot):
-        if 0 <= slot <= 4:
-            self._emit(Op.LOAD_0 + slot)
+        """Load variable. Slot high bit: 0x80 = local, 0x00 = global."""
+        if slot & 0x80 and (slot & 0x7F) <= 4:
+            self._emit(Op.LOAD_0 + (slot & 0x7F))
         else:
             self._emit(Op.LOAD)
             self._emit_u8(slot)
 
     def store(self, slot):
-        if 0 <= slot <= 4:
-            self._emit(Op.STORE_0 + slot)
+        """Store variable. Slot high bit: 0x80 = local, 0x00 = global."""
+        if slot & 0x80 and (slot & 0x7F) <= 4:
+            self._emit(Op.STORE_0 + (slot & 0x7F))
         else:
             self._emit(Op.STORE)
             self._emit_u8(slot)
+
+    def frame(self, local_count):
+        """Emit FRAME instruction (function prologue)."""
+        self._emit(Op.FRAME)
+        self._emit_u8(local_count)
 
     # --- Jump/call -- opcode + u16 LE target ---
 
@@ -866,11 +874,11 @@ OP_NAMES = {
     0x10: 'LE', 0x11: 'GT', 0x12: 'GE', 0x13: 'RET',
     0x14: 'YIELD', 0x15: 'W_DIRTY', 0x16: 'W_RENDER',
     0x17: 'ARR_LOAD', 0x18: 'ARR_STORE', 0x19: 'ARR_LEN',
-    0x1A: 'W_ALLOC', 0x1B: 'arrFree', 0x1C: 'W_ALLTAR',
+    0x1A: 'W_ALLOC', 0x1B: 'arrFree', 0x1C: 'W_ALLTAR', 0x1D: 'FRAME',
 
     0x20: 'PUSH_0', 0x21: 'PUSH_1', 0x22: 'PUSH_2', 0x23: 'PUSH_M1',
-    0x24: 'LOAD_0', 0x25: 'LOAD_1', 0x26: 'LOAD_2', 0x27: 'LOAD_3', 0x28: 'LOAD_4',
-    0x29: 'STORE_0', 0x2A: 'STORE_1', 0x2B: 'STORE_2', 0x2C: 'STORE_3', 0x2D: 'STORE_4',
+    0x24: 'LOAD L0', 0x25: 'LOAD L1', 0x26: 'LOAD L2', 0x27: 'LOAD L3', 0x28: 'LOAD L4',
+    0x29: 'STORE L0', 0x2A: 'STORE L1', 0x2B: 'STORE L2', 0x2C: 'STORE L3', 0x2D: 'STORE L4',
 
     0x30: 'PUSH_I8', 0x31: 'PUSH_I16', 0x32: 'PUSH_I32',
     0x33: 'LOAD', 0x34: 'STORE',
@@ -924,6 +932,13 @@ _NO_ARG_OPS = (
 )
 
 
+def _slot_name(slot):
+    """Format slot byte: 0x80+ = local Ln, else global Gn."""
+    if slot & 0x80:
+        return f'L{slot & 0x7F}'
+    return f'G{slot}'
+
+
 def disassemble(data, labels=None):
     """Disassemble bytecode to human-readable text.
 
@@ -964,13 +979,18 @@ def disassemble(data, labels=None):
             pos += 4
             lines.append(f'{addr:04X}: PUSH {val} (0x{val & 0xFFFFFFFF:08X})')
 
-        # LOAD / STORE with u8 slot
+        # FRAME with u8 local_count
+        elif op == Op.FRAME:
+            count = data[pos]; pos += 1
+            lines.append(f'{addr:04X}: FRAME {count}')
+
+        # LOAD / STORE with u8 slot (bit 7 = local)
         elif op == Op.LOAD:
             slot = data[pos]; pos += 1
-            lines.append(f'{addr:04X}: LOAD {slot}')
+            lines.append(f'{addr:04X}: LOAD {_slot_name(slot)}')
         elif op == Op.STORE:
             slot = data[pos]; pos += 1
-            lines.append(f'{addr:04X}: STORE {slot}')
+            lines.append(f'{addr:04X}: STORE {_slot_name(slot)}')
 
         # JMP/JZ/JNZ/CALL with u16 target
         elif op in (Op.JMP, Op.JZ, Op.JNZ, Op.CALL):
@@ -981,7 +1001,7 @@ def disassemble(data, labels=None):
         # W_ALLTAR with u8 var slot
         elif op == Op.W_ALLTAR:
             slot = data[pos]; pos += 1
-            lines.append(f'{addr:04X}: W_ALLTAR var[{slot}]')
+            lines.append(f'{addr:04X}: W_ALLTAR {_slot_name(slot)}')
 
         # W_TARGET, W_SET, W_GET, W_PARENT with u8 arg
         elif op == Op.W_TARGET:
@@ -1380,20 +1400,20 @@ class Compiler:
         fid, kind, offset, _ = self._funcs[name]
         self._funcs[name] = (fid, kind, offset, length)
 
-    def build_image_header(self):
+    def build_image_header(self, global_count=0):
         """Build VM image header binary.
 
         Format:
-          version(u8) + function_count(u16 LE) + reserved(u16)
+          version(u8) + function_count(u16 LE) + global_count(u16 LE)
           + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
 
         Each function entry is 12 bytes.
         """
         func_list = list(self._funcs.values())
         buf = bytearray()
-        buf.append(1)  # version
+        buf.append(2)  # version 2: stack-based locals
         buf.extend(struct.pack('<H', len(func_list)))
-        buf.extend(struct.pack('<H', 0))  # reserved
+        buf.extend(struct.pack('<H', global_count))
         for func_id, kind, offset, length in func_list:
             buf.extend(struct.pack('<HBBI', func_id, kind, 0, offset))
             buf.extend(struct.pack('<I', length))

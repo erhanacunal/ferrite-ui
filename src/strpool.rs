@@ -100,7 +100,7 @@ impl StringPool {
         let dfs = tree.dfs_order();
         let mut keep: Vec<u16> = Vec::new();
         for i in 0..dfs.len() {
-            let text_id = tree.get(dfs[i]).text_id;
+            let text_id = tree.text_id(dfs[i]);
             if text_id != 0xFFFF && !keep.contains(&text_id) {
                 keep.push(text_id);
             }

@@ -1,226 +1,229 @@
 # CLAUDE.md — ferrite-ui
 
-Nextion NX8048K070 ekranı için Rust ile yazılmış bare-metal HMI framework.
+Bare-metal HMI framework written in Rust for the Nextion NX8048K070 display.
 
-## Donanım
+## Hardware
 
 - **CPU:** GD32F103RBT6 (Cortex-M3, 108MHz, 128KB Flash, 20KB RAM)
-- **Ekran:** NX8048K070 (800x480)
-- **FPGA:** Display controller — CPU'dan bağımsız LCD'yi tazeliyor
-  - 2MB frame buffer FPGA'da, CPU'da frame buffer yok
-  - Double buffer: CMD 4/5 ile swap, tearing yok
+- **Display:** NX8048K070 (800x480)
+- **FPGA:** Display controller — refreshes LCD independently from CPU
+  - 2MB frame buffer on FPGA, no frame buffer on CPU
+  - Double buffer: swap via CMD 4/5, no tearing
 - **Touch:** XPT2046 (SPI)
-- **Flash:** W25Q256JVFQ 32MB (SPI) — UI bytecode, font, görseller burada
+- **Flash:** W25Q256JVFQ 32MB (SPI) — UI bytecode, fonts, images stored here
 - **RTC:** AT8563T (I2C)
 
-## FPGA Protokolü 
+## FPGA Protocol
 
 - `GPIOB[15:0]` = 16-bit data bus
 - `PA15`: 1=data, 0=command (LCD_CMD_DATA)
 - `PA12`: clock (BC=falling edge, BOP=rising edge)
-- `spin(3)` gecikme zorunlu — 108MHz CPU FPGA'yı geçiyor
+- `spin(3)` delay required — 108MHz CPU outruns the FPGA
 
-| CMD  | İşlev               | Data          |
-|------|---------------------|---------------|
-| 0x02 | Y başlangıç (y1)    | uint16 piksel |
-| 0x03 | X başlangıç (x1)    | uint16 piksel |
-| 0x06 | Y bitiş (y2)        | uint16 piksel |
-| 0x07 | X bitiş (x2)        | uint16 piksel |
-| 0x0F | Piksel write başlat | sonraki data'lar piksel rengi |
-| 0x04 | Front buffer swap   | lcd4Value = lcd5Value |
-| 0x05 | Back buffer seç     | 0 veya 1      |
+| CMD  | Function             | Data          |
+|------|----------------------|---------------|
+| 0x02 | Y start (y1)        | uint16 pixel  |
+| 0x03 | X start (x1)        | uint16 pixel  |
+| 0x06 | Y end (y2)          | uint16 pixel  |
+| 0x07 | X end (x2)          | uint16 pixel  |
+| 0x0F | Begin pixel write    | subsequent data = pixel color |
+| 0x04 | Front buffer swap    | lcd4Value = lcd5Value |
+| 0x05 | Select back buffer   | 0 or 1        |
 
-### Double Buffer Akışı
+### Double Buffer Flow
 
 ```
 begin_frame() → CMD5 (back buffer toggle)
-  → set_address() + piksel data (back buffer'a yaz)
+  → set_address() + pixel data (write to back buffer)
 end_frame()   → CMD4 (front ← back, FPGA swap)
 ```
 
-`lcd4Value` = FPGA'nın gösterdiği (front), `lcd5Value` = yazılan (back).
-`lcd4 == lcd5` iken `begin_frame` çağrılmaz — zaten fresh buffer var.
+`lcd4Value` = what FPGA displays (front), `lcd5Value` = what is written (back).
+`begin_frame` is not called when `lcd4 == lcd5` — buffer is already fresh.
 
-## Mimari Kararlar
+## Architecture Decisions
 
 ### Rust no_std
 - `#![no_std]` + `#![no_main]`
-- Rust 2024 edition (`edition = "2024"` — Rust 1.85 ile stable)
+- Rust 2024 edition (`edition = "2024"` — stable with Rust 1.85)
 - `cortex-m-rt` crate — startup, interrupt table, `#[entry]` macro
-- `panic-halt` — panic → sonsuz döngü
-- Newlib yok, hidden runtime yok, RAM tamamen kullanıcıya ait
+- `panic-halt` — panic → infinite loop
+- No newlib, no hidden runtime, RAM fully owned by user
 - Target: `thumbv7m-none-eabi`
 
-### Widget Sistemi
-- **HTML-benzeri iç içe geçme** — widget içinde widget, ağaç yapısı
-- **Arena allocator** — heap yok, `MAX_WIDGETS = 64`, statik bellek
-- **Ağaç yapısı:** left-child right-sibling (parent + first_child + next_sibling)
+### Widget System
+- **HTML-like nesting** — widgets inside widgets, tree structure
+- **Heap-allocated Vec** — widgets grow on demand, max 254 (WidgetId is u8)
+- **Tree structure:** left-child right-sibling (parent + first_child + next_sibling)
 - **WidgetId:** `u8` index, `0xFF` = NONE sentinel
-- **Kutu modeli (CSS border-box benzeri):**
-  - `margin` → dış boşluk (size'a dahil değil)
-  - `border` → kenar çizgisi (size'a dahil)
-  - `padding` → iç boşluk (size'a dahil)
-  - `location` → parent content area'ya göreceli offset
-  - `size` → border box boyutu
+- **Split struct: Widget (18B base) + WidgetExt (32B on-demand)**
+  - **Widget (base):** tree links, flags, kind, location, size, background_color, border_color, ext index
+  - **WidgetExt:** margin/border/padding edges, text fields, press_color, border_radius, image_id, callbacks, value
+  - Extensions allocated lazily via `ensure_ext()` — pure containers stay at 18B
+  - Accessed via `WidgetTree` accessor methods: `tree.margin(id)`, `tree.press_color(id)`, etc.
+- **Box model (CSS border-box style):**
+  - `margin` → outer spacing (not included in size)
+  - `border` → border line (included in size)
+  - `padding` → inner spacing (included in size)
+  - `location` → relative offset from parent content area
+  - `size` → border box dimensions
 - **Flags:** `VISIBLE` (0x01), `ENABLED` (0x02), `CLICKABLE` (0x04), `DIRTY` (0x08), `PRESSED` (0x10), `CHECKED` (0x20)
-- **Widget tipleri:** `KIND_BASE` (0, container), `KIND_LABEL` (1, metin), `KIND_BUTTON` (2, tıklanabilir container), `KIND_PROGRESS` (3, ilerleme çubuğu), `KIND_SLIDER` (4, kaydırıcı), `KIND_CHECKBOX` (5, onay kutusu), `KIND_RADIO` (6, radyo düğmesi)
-- **Label:** text_color, font_id, text_align (LEFT/CENTER/RIGHT), text (text_pool'dan)
-- **Button:** press_color (basılıyken arka plan), child widget kabul eder
-- **Text pool:** WidgetTree'de 256 byte append-only buffer, label metinleri burada
-- **Renk:** RGB565 (`background_color`, `border_color`, `text_color`, `press_color`)
-- **Painter's algorithm** — z-order: DFS pre-order (düşük index = altta)
-- **Clip region** (ReactOS Region API'sinden ilham)
-  - Statik rect pool: `MAX_CLIP_RECTS = 32`
-  - Her `subtract` işlemi max 4 yeni rect üretir (üst/alt/sol/sağ şerit)
-  - Pool doluysa fallback: dirty rect'in tamamını çiz (overdraw, tearing yok)
-- Double buffer şu an devre dışı — LCD direkt front buffer'a yazıyor
-- **Dirty redraw akışı:**
-  1. `mark_dirty(id)` → widget + tüm alt ağacı dirty işaretler
-  2. `render_dirty()` → DFS order hesaplar
-  3. Her dirty widget için occluder'ları toplar (DFS'te sonraki, soyundan olmayan)
-  4. ClipRegion'dan occluder rect'leri subtract eder
-  5. Kalan görünür rect'ler üzerinden widget çizilir
-  6. Alt widget'lar aynı occluder listesiyle recursive çizilir
-- **İki render modu:**
-  - `render_all()` — tam ekran, DFS pre-order, clip yok (ilk açılış)
-  - `render_dirty()` — iteratif (recursive değil), DFS cache kullanır, clip'li (partial update)
-  - **DFS cache:** `WidgetTree.dfs_cache` — tree değişmedikçe yeniden hesaplanmaz (alloc/add_child/clear invalidate eder)
+- **Widget types:** `KIND_BASE` (0, container), `KIND_LABEL` (1, text), `KIND_BUTTON` (2, clickable container), `KIND_PROGRESS` (3, progress bar), `KIND_SLIDER` (4, slider), `KIND_CHECKBOX` (5, checkbox), `KIND_RADIO` (6, radio button)
+- **Label:** text_color, font_id, text_align (LEFT/CENTER/RIGHT), text (from StringPool)
+- **Button:** press_color (background when pressed), accepts child widgets
+- **Color:** RGB565 (`background_color`, `border_color`, `text_color`, `press_color`)
+- **Painter's algorithm** — z-order: DFS pre-order (lower index = behind)
+- **Clip region** (inspired by ReactOS Region API)
+  - Static rect pool: `MAX_CLIP_RECTS = 32`
+  - Each `subtract` operation produces max 4 new rects (top/bottom/left/right strips)
+  - Pool full fallback: draw entire dirty rect (overdraw, no tearing)
+- Double buffer currently disabled — LCD writes directly to front buffer
+- **Dirty redraw flow:**
+  1. `mark_dirty(id)` → marks widget + entire subtree as dirty
+  2. `render_dirty()` → computes DFS order
+  3. For each dirty widget, collects occluders (later in DFS, not descendants)
+  4. Subtracts occluder rects from ClipRegion
+  5. Widget is drawn over remaining visible rects
+  6. Child widgets are drawn recursively with the same occluder list
+- **Two render modes:**
+  - `render_all()` — full screen, DFS pre-order, no clipping (initial draw)
+  - `render_dirty()` — iterative (not recursive), uses DFS cache, clipped (partial update)
+  - **DFS cache:** `WidgetTree.dfs_cache` — not recomputed unless tree changes (alloc/add_child/clear invalidate it)
 
 ### Render
-- `fill_rect` → `set_address` + burst piksel yazma (FPGA'da donanım hızı)
-- Frame buffer CPU RAM'inde yok — doğrudan FPGA'ya yazılıyor
-- Partial update: sadece dirty widget'lar redraw edilir
+- `fill_rect` → `set_address` + burst pixel write (hardware speed on FPGA)
+- No frame buffer in CPU RAM — writes directly to FPGA
+- Partial update: only dirty widgets are redrawn
 
 ### Bytecode Interpreter (VM)
 - **Protobuf tag encoding:** `tag = (opcode << 3) | wire_type`
 - **Wire types:** 0=varint, 1=i16 fixed (2B LE), 2=LEN (varint len + payload), 5=no-arg
-- **ZigZag varint:** signed integer encoding (protobuf uyumlu)
-- **37 opcode:** stack ops (PUSH/POP/DUP/SWAP), aritmetik (ADD/SUB/MUL/DIV/MOD/NEG), karşılaştırma (EQ/NE/LT/LE/GT/GE), mantık (AND/OR/NOT), kontrol (JMP/JZ/JNZ/CALL/RET/YIELD/HALT), widget (W_TARGET/W_SET/W_GET/W_DIRTY/W_RENDER/W_ALLOC/W_PARENT), flash (F_READ/F_WRITE)
-- **Opcode 0–15:** 1-byte tag (sık kullanılan), **16+:** 2-byte tag (nadir)
+- **ZigZag varint:** signed integer encoding (protobuf compatible)
+- **37 opcodes:** stack ops (PUSH/POP/DUP/SWAP), arithmetic (ADD/SUB/MUL/DIV/MOD/NEG), comparison (EQ/NE/LT/LE/GT/GE), logic (AND/OR/NOT), control (JMP/JZ/JNZ/CALL/RET/YIELD/HALT), widget (W_TARGET/W_SET/W_GET/W_DIRTY/W_RENDER/W_ALLOC/W_PARENT), flash (F_READ/F_WRITE)
+- **Opcode 0–15:** 1-byte tag (frequent), **16+:** 2-byte tag (rare)
 - **W_ALLTAR opcode (0x1C):** combined alloc + store + target (saves 5 bytes per widget)
 - **Vm struct:** eval stack (16-deep), vars (sparse Vec, max 256), call stack (8-deep)
-- **Property R/W:** scalar (W_SET wt=0, tek değer stack'ten) ve compound (W_SET wt=2, LEN payload ile çoklu zigzag varint)
-- **Builder:** RAM'de bytecode oluşturma, forward jump patching, `&mut [u8]` buffer'a yazar
-- **Çalıştırma:** `vm.run(&code[..len], &mut tree, &mut lcd, &flash)` — F_READ/F_WRITE flash üzerinden çalışır
-- **Kontrol akışı:** if/while/for — JZ/JNZ/JMP kombinasyonları ile
+- **Property R/W:** scalar (W_SET wt=0, single value from stack) and compound (W_SET wt=2, LEN payload with multiple zigzag varints)
+- **Builder:** builds bytecode in RAM, forward jump patching, writes to `&mut [u8]` buffer
+- **Execution:** `vm.run(&code[..len], &mut tree, &mut lcd, &flash)` — F_READ/F_WRITE operate via flash
+- **Control flow:** if/while/for — via JZ/JNZ/JMP combinations
 
-### Harici Flash (W25Q256, 32MB)
-- **Pin ataması:** PA4=CS, PA5=CLK, PA6=MISO, PA7=MOSI (bit-bang SPI)
-- **4-byte address mode:** init'te 0xB7 ile aktif (32MB tam erişim)
+### External Flash (W25Q256, 32MB)
+- **Pin assignment:** PA4=CS, PA5=CLK, PA6=MISO, PA7=MOSI (bit-bang SPI)
+- **4-byte address mode:** activated with 0xB7 at init (full 32MB access)
 - **API:** `read(addr, buf)`, `write(addr, data)`, `erase_sector(addr)`, `read_id()`
-- `write()` sayfa sınırlarını otomatik böler (256B page program)
-- `erase_sector()` ve `page_program()` busy wait ile bekler
+- `write()` automatically splits across page boundaries (256B page program)
+- `erase_sector()` and `page_program()` busy-wait until complete
 
-### Flash Dosya Sistemi (Fs)
-- **Basit TOC yapısı** — resource'lara isimle erişim
+### Flash Filesystem (Fs)
+- **Simple TOC structure** — access resources by name
 - **Layout:**
   - `0x000000 - 0x000FFF`: Reserved (4KB = 1 sector, erase guard)
   - `0x001000 - 0x00100F`: Header (16B: magic "FERR" + version + screen W/H + resource count + checksum)
-  - `0x001010 - 0x001FFF`: Resource Table (max 127 entry × 32B)
+  - `0x001010 - 0x001FFF`: Resource Table (max 127 entries × 32B)
   - `0x002000+`: Resource data (packed)
 - **Entry format (32B):** name[16] + kind(1) + pad(3) + offset(4) + size(4) + reserved(4)
-- **Resource tipleri:** Font=0, Image=1, Program=2, Page=3
+- **Resource types:** Font=0, Image=1, Program=2, Page=3
 - **API:** `mount()`, `find(name)`, `read_resource()`, `count_by_kind()`, `find_nth_by_kind()`, `verify_checksum()`
-- **RAM maliyeti:** 12 byte (sadece header cache — tablo flash'ta kalır)
+- **RAM cost:** 12 bytes (header cache only — table stays in flash)
 
 ### Recovery Mode
-- **Boot'ta sol üst köşeye 3 saniye basılı tutma** → recovery mode
-- Kırmızı progress bar dolarak gösterir, bırakırsan iptal
-- Recovery modda: program yüklenmez, sadece USART aktif
-- `writefs` ile yeni program flash'lanabilir
-- **PENIRQ (PC14):** GPIO polling ile dokunma algılama (EXTI interrupt KULLANILMAZ — SPI çakışması)
-- **RAM maliyeti:** ~18 byte (8 × WidgetId + count + active)
+- **Hold top-left corner for 3 seconds at boot** → recovery mode
+- Red progress bar fills to indicate progress, release to cancel
+- In recovery mode: program is not loaded, only USART is active
+- New program can be flashed via `writefs`
+- **PENIRQ (PC14):** touch detection via GPIO polling (EXTI interrupt NOT USED — SPI conflict)
+- **RAM cost:** ~18 bytes (8 × WidgetId + count + active)
 
-### Font Renderer (Adafruit GFX uyumlu)
-- **Format:** Adafruit GFX bitmap font — iki ayrı flash resource:
-  - Header: font meta (first/last/yAdvance) + glyph tablosu (7B/glyph)
-  - Data: 1-bit packed bitmap (MSB first, satır padding'i yok)
+### Font Renderer (Adafruit GFX compatible)
+- **Format:** Adafruit GFX bitmap font — two separate flash resources:
+  - Header: font meta (first/last/yAdvance) + glyph table (7B/glyph)
+  - Data: 1-bit packed bitmap (MSB first, no row padding)
 - **GfxGlyph (7B):** bitmapOffset(u16) + width + height + xAdvance + xOffset(i8) + yOffset(i8)
-- **Yükleme:** `Font::load(fs, flash, header_name, data_name)` — header tamamı RAM'e, bitmap flash'ta kalır
-- **Çizim modları:**
-  - Opaque: `begin_pixels` + stream (hızlı, fg+bg)
-  - Transparent: sadece fg pikselleri `fill_rect(1,1)` ile (yavaş, arka plan korunur)
+- **Loading:** `Font::load(fs, flash, header_name, data_name)` — header fully in RAM, bitmap stays in flash
+- **Draw modes:**
+  - Opaque: `begin_pixels` + stream (fast, fg+bg)
+  - Transparent: only fg pixels via `fill_rect(1,1)` (slow, background preserved)
 - **API:** `draw_char()`, `draw_str()`, `char_width()`, `text_width()`, `line_height()`
-- **RAM maliyeti:** ~900 byte (128 glyph × 7B + meta) — font başına
-- **Max glyph:** 128 (MAX_GLYPHS), bitmap okuma 128B chunk'larla
+- **RAM cost:** ~900 bytes (128 glyphs × 7B + meta) — per font
+- **Max glyphs:** 128 (MAX_GLYPHS), bitmap read in 128B chunks
 
-## Proje Adı
+## Project Name
 
-**ferrite-ui** — ticari marka sorunu yok.
-Nextion, ITEAD'ın tescilli markası — bu proje tamamen bağımsız, clean-room implementation.
+**ferrite-ui** — no trademark issues.
+Nextion is a registered trademark of ITEAD — this project is fully independent, clean-room implementation.
 
-## Dosya Yapısı
+## File Structure
 
 ```
 ferrite-ui/
 ├── .cargo/config.toml  — thumbv7m-none-eabi target + linker flags
 ├── Cargo.toml          — cortex-m, cortex-m-rt (device feature), panic-halt
 ├── memory.x            — GD32F103RBT6 linker script (128K Flash, 20K RAM)
-├── device.x            — Interrupt vector tanımları (USART0)
+├── device.x            — Interrupt vector definitions (USART0)
 ├── build.rs            — device.x → linker search path
 └── src/
     ├── main.rs         — entry point, startup sequence, USART command loop
     ├── gpio.rs         — GPIOA/B init, 16-bit data bus, clock pulse
-    ├── lcd.rs          — FPGA protokolü, fill_rect, begin_pixels/write_pixel
+    ├── lcd.rs          — FPGA protocol, fill_rect, begin_pixels/write_pixel
     ├── types.rs        — Rect, Offset, Size, Edges, Color (RGB565)
-    ├── widget.rs       — Widget struct (7 kind), WidgetId, WidgetTree (DFS cache)
-    ├── clip.rs         — ClipRegion (32 rect pool, subtract algoritması)
-    ├── flash.rs        — W25Q256 SPI flash driver (donanım SPI0, 4-byte addr)
+    ├── widget.rs       — Widget struct (7 kinds), WidgetId, WidgetTree (DFS cache)
+    ├── clip.rs         — ClipRegion (32 rect pool, subtract algorithm)
+    ├── flash.rs        — W25Q256 SPI flash driver (hardware SPI0, 4-byte addr)
     ├── font.rs         — Adafruit GFX bitmap font renderer (flash + embedded)
-    ├── embedded_font.rs — Gömülü FreeMono9pt7b font verisi (ROM'da)
-    ├── fs.rs           — Flash dosya sistemi (TOC, isimle resource erişimi)
+    ├── embedded_font.rs — Embedded FreeMono9pt7b font data (in ROM)
+    ├── fs.rs           — Flash filesystem (TOC, resource access by name)
     ├── image.rs        — Ferrite Image (FI) format decoder (raw/rle/indexed+rle)
-    ├── render.rs       — render_all + render_dirty (iteratif, painter's algorithm)
+    ├── render.rs       — render_all + render_dirty (iterative, painter's algorithm)
     ├── touch.rs        — XPT2046 SPI bit-bang, hit test, debounce, PENIRQ GPIO, recovery
     ├── sdcard.rs       — SD card SPI driver (SPI0 shared, Mode 0)
     ├── fat.rs          — FAT16/32 filesystem reader
-    ├── vm.rs           — Bytecode interpreter (57+ opcode, sparse vars, W_ALLTAR)
-    ├── backlight.rs    — LCD arka ışık PWM (TIMER0_CH0, PA8)
+    ├── vm.rs           — Bytecode interpreter (57+ opcodes, sparse vars, W_ALLTAR)
+    ├── backlight.rs    — LCD backlight PWM (TIMER0_CH0, PA8)
     ├── usart.rs        — USART0 serial + RX interrupt ring buffer
     ├── irq.rs          — GD32F103 interrupt vector table (__INTERRUPTS)
-    └── protocol.rs     — USART protobuf protokolü (ping/pong, execute, restart, fs write)
+    └── protocol.rs     — USART protobuf protocol (ping/pong, execute, restart, fs write)
 ```
 
-## Bellek Kullanımı
+## Memory Usage
 
-- Widget arena: 64 × ~48 byte = ~3.0KB
-- Text pool: 256 byte (label metinleri, append-only)
-- Clip region: 32 × 8 byte = 256 byte
-- VM: ~150 byte (stack + vars + call stack + array pool)
-- Fs header: 12 byte
-- Font (per font): ~900 byte (128 glyph × 7B + meta)
-- Toplam statik (1 font): ~4.6KB (20KB RAM'in %23'ü)
-- Binary: ~12.2KB Flash (128KB'nin %9.6'sı)
+- Widget base: N × 18 bytes (tree links, layout, colors)
+- Widget ext: M × 32 bytes (edges, text, callbacks — only for widgets that need them)
+- Clip region: 32 × 8 bytes = 256 bytes
+- VM: ~150 bytes (stack + vars + call stack + array pool)
+- Fs header: 12 bytes
+- Font (per font): ~900 bytes (128 glyphs × 7B + meta)
+- Example: 25 widgets, 22 with ext = 462B + 716B = 1.2KB (was 1.2KB at 48B/widget)
 
-## Mevcut Durum
+## Current Status
 
-- [x] FPGA protokolü çözüldü (Ghidra reverse engineering)
-- [x] LCD sürücüsü çalışıyor (kare çizdirme test edildi)
-- [x] Double buffer mekanizması anlaşıldı
-- [x] Rust no_std iskelet kurulumu
-- [x] GPIO sürücüsü Rust'a port
-- [x] Clip region implementasyonu
-- [x] Widget sistemi (temel: iç içe widget, border, margin, padding, dirty redraw)
-- [x] XPT2046 touch driver (SPI bit-bang, Z-pressure, median filtre, debounce)
-- [x] Bytecode interpreter (37 opcode, protobuf tag, varint/zigzag, property R/W, Builder)
-- [x] Flash driver (W25Q256 SPI bit-bang, 4-byte addr, read/write/erase, VM entegrasyonu)
-- [x] Flash dosya sistemi (TOC, isimle resource erişimi, mount/find/read)
-- [x] Font render (Adafruit GFX uyumlu, header RAM'de, bitmap flash'tan okunur)
-- [x] Widget tipleri (Label, Button, Progress, Slider, Checkbox, Radio)
+- [x] FPGA protocol decoded (Ghidra reverse engineering)
+- [x] LCD driver working (rectangle drawing tested)
+- [x] Double buffer mechanism understood
+- [x] Rust no_std skeleton setup
+- [x] GPIO driver ported to Rust
+- [x] Clip region implementation
+- [x] Widget system (core: nested widgets, border, margin, padding, dirty redraw)
+- [x] XPT2046 touch driver (SPI bit-bang, Z-pressure, median filter, debounce)
+- [x] Bytecode interpreter (37 opcodes, protobuf tag, varint/zigzag, property R/W, Builder)
+- [x] Flash driver (W25Q256 SPI bit-bang, 4-byte addr, read/write/erase, VM integration)
+- [x] Flash filesystem (TOC, resource access by name, mount/find/read)
+- [x] Font rendering (Adafruit GFX compatible, header in RAM, bitmap read from flash)
+- [x] Widget types (Label, Button, Progress, Slider, Checkbox, Radio)
 - [x] Image format (FI: raw/rle/indexed+rle, streaming decode, Python converter)
 - [x] Backlight PWM (TIMER0_CH0, PA8, 10kHz, 0-100%)
 - [x] USART0 RX interrupt + 128B ring buffer
 - [x] Interrupt vector table (device.x + irq.rs)
-- [x] Gömülü font (FreeMono9pt7b, ROM'da, flash gerekmez)
-- [x] USART protobuf protokolü (ping/pong, execute, restart, fs write, meminfo, stackinfo)
-- [x] Startup sequence (backlight → ekran → recovery check → font → fs → vm)
-- [x] Hata protokolü (ekran + USART, 7 hata kodu)
+- [x] Embedded font (FreeMono9pt7b, in ROM, no flash required)
+- [x] USART protobuf protocol (ping/pong, execute, restart, fs write, meminfo, stackinfo)
+- [x] Startup sequence (backlight → display → recovery check → font → fs → vm)
+- [x] Error protocol (display + USART, 7 error codes)
 - [x] Touch event → VM callback (on_click, on_tap, on_paint, on_touch_down/up/move)
-- [x] Iteratif render (recursive yerine flat DFS, DFS cache)
-- [x] PENIRQ GPIO polling (idle'da SPI atla)
-- [x] SPI timing sabitleri (SPI_HALF_CLK=54, ~1MHz)
-- [x] Recovery mode (boot'ta sol üst köşe 3sn basılı → USART-only mod)
-- [x] @func_name syntax (compiler callback referansları)
+- [x] Iterative render (flat DFS instead of recursive, DFS cache)
+- [x] PENIRQ GPIO polling (skip SPI when idle)
+- [x] SPI timing constants (SPI_HALF_CLK=54, ~1MHz)
+- [x] Recovery mode (hold top-left corner 3s at boot → USART-only mode)
+- [x] @func_name syntax (compiler callback references)
 - [x] W_ALLTAR opcode (alloc+target+store combined)
-- [x] Sparse variable map (Vec<VmVar>, max 256, 32 limit kaldırıldı)
-- [ ] SD card boot (SPI0 bus paylaşım sorunu çözülmeli)
+- [x] Sparse variable map (Vec<VmVar>, max 256, removed 32 limit)
+- [ ] SD card boot (SPI0 bus sharing issue needs to be resolved)

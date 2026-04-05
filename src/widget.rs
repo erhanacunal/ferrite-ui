@@ -50,92 +50,57 @@ impl WidgetId {
     }
 }
 
-// --- Widget ---
+// --- Extension index ---
 
-/// Single widget node.
+const EXT_NONE: u8 = 0xFF;
+
+// --- Widget (base: 18 bytes) ---
+
+/// Base widget node -- tree links, layout, and appearance.
 ///
-/// Tree structure: parent + first_child + next_sibling (left-child right-sibling).
-/// Size = border box (border included, margin excluded).
+/// Optional fields (edges, text, callbacks, etc.) live in WidgetExt,
+/// allocated on demand via WidgetTree::ensure_ext(). Widgets that only
+/// need position, size, and color pay 18 bytes instead of 48.
 pub struct Widget {
-    // Tree links
+    // Tree links (3 bytes)
     pub parent: WidgetId,
     pub first_child: WidgetId,
     pub next_sibling: WidgetId,
 
-    // State
+    // State + type (2 bytes)
     pub flags: u8,
-
-    // Widget type
     pub kind: u8,
 
-    // Box model
-    pub margin: Edges,
-    pub border: Edges,
-    pub padding: Edges,
+    // Extension index (1 byte) -- 0xFF = no extension
+    ext: u8,
 
-    // Position and size
+    // Position and size (8 bytes)
     pub location: Offset,
     pub size: Size,
 
-    // Appearance
+    // Appearance (4 bytes)
     pub background_color: Color,
     pub border_color: Color,
-
-    // Label fields
-    pub text_color: Color,
-    pub font_id: u8,
-    pub text_align: u8,
-    pub text_id: u16, // StringPool str_id (0xFFFF = no text)
-
-    // Rounded border radius (0 = sharp corners)
-    pub border_radius: u16,
-
-    // Button fields
-    pub press_color: Color,
-
-    // Background image (0 = no image, 1-254 = flash image_id)
-    pub image_id: u8,
-
-    // Callback: click event (0 = no callback, 1+ = func_id)
-    pub on_click: u16,
-
-    // Callback: custom paint event (0 = no callback, 1+ = func_id)
-    pub on_paint: u16,
-
-    // Callback: tap with coordinates event (0 = no callback, 1+ = func_id)
-    pub on_tap: u16,
-
-    // Progress/slider value (0-100)
-    pub value: i16,
 }
 
 impl Widget {
-    pub fn default() -> Self {
+    fn new() -> Self {
         Self {
             parent: WidgetId::NONE,
             first_child: WidgetId::NONE,
             next_sibling: WidgetId::NONE,
             flags: FLAG_VISIBLE | FLAG_ENABLED,
             kind: KIND_BASE,
-            margin: Edges::new(0, 0, 0, 0),
-            border: Edges::new(0, 0, 0, 0),
-            padding: Edges::new(0, 0, 0, 0),
+            ext: EXT_NONE,
             location: Offset { x: 0, y: 0 },
             size: Size { w: 0, h: 0 },
             background_color: 0x0000,
             border_color: 0x0000,
-            border_radius: 0,
-            text_color: 0xFFFF,
-            font_id: 0,
-            text_align: ALIGN_LEFT,
-            text_id: 0xFFFF,
-            press_color: 0,
-            image_id: 0,
-            on_click: 0,
-            on_paint: 0,
-            on_tap: 0,
-            value: 0,
         }
+    }
+
+    pub fn has_ext(&self) -> bool {
+        self.ext != EXT_NONE
     }
 
     pub fn is_visible(&self) -> bool {
@@ -155,12 +120,77 @@ impl Widget {
     }
 }
 
+// --- WidgetExt (32 bytes) ---
+
+/// Extension data for widgets that need edges, text, callbacks, etc.
+/// Allocated on demand -- simple containers skip this entirely.
+pub struct WidgetExt {
+    // Box model edges (12 bytes)
+    pub margin: Edges,
+    pub border: Edges,
+    pub padding: Edges,
+
+    // Label fields (6 bytes)
+    pub text_color: Color,
+    pub font_id: u8,
+    pub text_align: u8,
+    pub text_id: u16,
+
+    // Appearance extras (4 bytes)
+    pub border_radius: u16,
+    pub press_color: Color,
+
+    // Image + padding (2 bytes)
+    pub image_id: u8,
+    _pad: u8,
+
+    // Callbacks (6 bytes)
+    pub on_click: u16,
+    pub on_paint: u16,
+    pub on_tap: u16,
+
+    // Value (2 bytes)
+    pub value: i16,
+}
+
+impl WidgetExt {
+    /// Default extension with all fields at their zero/default values.
+    /// Used as fallback when a widget has no extension allocated.
+    pub const DEFAULT: Self = Self {
+        margin: Edges::ZERO,
+        border: Edges::ZERO,
+        padding: Edges::ZERO,
+        text_color: 0xFFFF,
+        font_id: 0,
+        text_align: ALIGN_LEFT,
+        text_id: 0xFFFF,
+        border_radius: 0,
+        press_color: 0,
+        image_id: 0,
+        _pad: 0,
+        on_click: 0,
+        on_paint: 0,
+        on_tap: 0,
+        value: 0,
+    };
+
+    fn new() -> Self {
+        Self::DEFAULT
+    }
+}
+
 // --- WidgetTree ---
 
-/// Heap-allocated widget tree. Grows on demand via Vec.
+/// Heap-allocated widget tree with on-demand extensions.
+///
+/// Base widgets (18B each) hold tree links + layout.
+/// Extensions (32B each) hold edges, text, callbacks -- allocated only
+/// when a non-default property is set. Pure containers pay 18B instead of 48B.
+///
 /// DFS order is cached and rebuilt lazily when the tree structure changes.
 pub struct WidgetTree {
     widgets: Vec<Widget>,
+    extensions: Vec<WidgetExt>,
     pub root: WidgetId,
     dfs_cache: Vec<WidgetId>,
     dfs_valid: bool,
@@ -170,6 +200,7 @@ impl WidgetTree {
     pub fn new() -> Self {
         Self {
             widgets: Vec::new(),
+            extensions: Vec::new(),
             root: WidgetId::NONE,
             dfs_cache: Vec::new(),
             dfs_valid: false,
@@ -179,6 +210,7 @@ impl WidgetTree {
     /// Remove all widgets and reset root. Frees heap memory.
     pub fn clear(&mut self) {
         self.widgets.clear();
+        self.extensions.clear();
         self.dfs_cache.clear();
         self.dfs_valid = false;
         self.root = WidgetId::NONE;
@@ -190,7 +222,7 @@ impl WidgetTree {
             return None;
         }
         let id = WidgetId(self.widgets.len() as u8);
-        let mut w = Widget::default();
+        let mut w = Widget::new();
         w.flags |= FLAG_DIRTY;
         self.widgets.push(w);
         self.dfs_valid = false;
@@ -208,6 +240,98 @@ impl WidgetTree {
     /// Widget count.
     pub fn count(&self) -> usize {
         self.widgets.len()
+    }
+
+    /// Extension count (for diagnostics).
+    pub fn ext_count(&self) -> usize {
+        self.extensions.len()
+    }
+
+    // --- Extension access ---
+
+    /// Get extension for a widget (read-only). Returns None if not allocated.
+    pub fn ext(&self, id: WidgetId) -> Option<&WidgetExt> {
+        let idx = self.widgets[id.index()].ext;
+        if idx == EXT_NONE { None } else { Some(&self.extensions[idx as usize]) }
+    }
+
+    /// Get extension for a widget (mutable). Returns None if not allocated.
+    pub fn ext_mut(&mut self, id: WidgetId) -> Option<&mut WidgetExt> {
+        let idx = self.widgets[id.index()].ext;
+        if idx == EXT_NONE { None } else { Some(&mut self.extensions[idx as usize]) }
+    }
+
+    /// Get or allocate extension for a widget. Returns None if pool full (255).
+    pub fn ensure_ext(&mut self, id: WidgetId) -> Option<&mut WidgetExt> {
+        let idx = self.widgets[id.index()].ext;
+        if idx != EXT_NONE {
+            return Some(&mut self.extensions[idx as usize]);
+        }
+        if self.extensions.len() >= 255 {
+            return None;
+        }
+        let new_idx = self.extensions.len() as u8;
+        self.extensions.push(WidgetExt::new());
+        self.widgets[id.index()].ext = new_idx;
+        Some(&mut self.extensions[new_idx as usize])
+    }
+
+    // --- Convenience accessors (return defaults when no extension) ---
+
+    pub fn margin(&self, id: WidgetId) -> Edges {
+        self.ext(id).map_or(Edges::ZERO, |e| e.margin)
+    }
+
+    pub fn border(&self, id: WidgetId) -> Edges {
+        self.ext(id).map_or(Edges::ZERO, |e| e.border)
+    }
+
+    pub fn padding(&self, id: WidgetId) -> Edges {
+        self.ext(id).map_or(Edges::ZERO, |e| e.padding)
+    }
+
+    pub fn text_color(&self, id: WidgetId) -> Color {
+        self.ext(id).map_or(0xFFFF, |e| e.text_color)
+    }
+
+    pub fn font_id(&self, id: WidgetId) -> u8 {
+        self.ext(id).map_or(0, |e| e.font_id)
+    }
+
+    pub fn text_align(&self, id: WidgetId) -> u8 {
+        self.ext(id).map_or(ALIGN_LEFT, |e| e.text_align)
+    }
+
+    pub fn text_id(&self, id: WidgetId) -> u16 {
+        self.ext(id).map_or(0xFFFF, |e| e.text_id)
+    }
+
+    pub fn border_radius(&self, id: WidgetId) -> u16 {
+        self.ext(id).map_or(0, |e| e.border_radius)
+    }
+
+    pub fn press_color(&self, id: WidgetId) -> Color {
+        self.ext(id).map_or(0, |e| e.press_color)
+    }
+
+    pub fn image_id(&self, id: WidgetId) -> u8 {
+        self.ext(id).map_or(0, |e| e.image_id)
+    }
+
+    pub fn on_click(&self, id: WidgetId) -> u16 {
+        self.ext(id).map_or(0, |e| e.on_click)
+    }
+
+    pub fn on_paint(&self, id: WidgetId) -> u16 {
+        self.ext(id).map_or(0, |e| e.on_paint)
+    }
+
+    pub fn on_tap(&self, id: WidgetId) -> u16 {
+        self.ext(id).map_or(0, |e| e.on_tap)
+    }
+
+    pub fn value(&self, id: WidgetId) -> i16 {
+        self.ext(id).map_or(0, |e| e.value)
     }
 
     // --- Tree operations ---
@@ -246,8 +370,9 @@ impl WidgetTree {
     /// Compute widget's absolute border-box rect in screen coordinates.
     pub fn absolute_rect(&self, id: WidgetId) -> Rect {
         let w = &self.widgets[id.index()];
-        let mut x = w.location.x + w.margin.left as i16;
-        let mut y = w.location.y + w.margin.top as i16;
+        let m = self.margin(id);
+        let mut x = w.location.x + m.left as i16;
+        let mut y = w.location.y + m.top as i16;
 
         let max = self.widgets.len();
         let mut depth = 0usize;
@@ -255,17 +380,20 @@ impl WidgetTree {
         while pid.is_some() {
             depth += 1;
             if depth > max {
-                break; // parent cycle detected
+                break;
             }
             let p = &self.widgets[pid.index()];
+            let pm = self.margin(pid);
+            let pb = self.border(pid);
+            let pp = self.padding(pid);
             x += p.location.x
-                + p.margin.left as i16
-                + p.border.left as i16
-                + p.padding.left as i16;
+                + pm.left as i16
+                + pb.left as i16
+                + pp.left as i16;
             y += p.location.y
-                + p.margin.top as i16
-                + p.border.top as i16
-                + p.padding.top as i16;
+                + pm.top as i16
+                + pb.top as i16
+                + pp.top as i16;
             pid = p.parent;
         }
 
@@ -275,11 +403,12 @@ impl WidgetTree {
     /// Compute widget's content area (where children are placed).
     pub fn content_rect(&self, id: WidgetId) -> Rect {
         let abs = self.absolute_rect(id);
-        let w = &self.widgets[id.index()];
-        let inset_l = w.border.left as i16 + w.padding.left as i16;
-        let inset_t = w.border.top as i16 + w.padding.top as i16;
-        let inset_r = w.border.right as u16 + w.padding.right as u16;
-        let inset_b = w.border.bottom as u16 + w.padding.bottom as u16;
+        let b = self.border(id);
+        let p = self.padding(id);
+        let inset_l = b.left as i16 + p.left as i16;
+        let inset_t = b.top as i16 + p.top as i16;
+        let inset_r = b.right as u16 + p.right as u16;
+        let inset_b = b.bottom as u16 + p.bottom as u16;
 
         Rect::new(
             abs.x + inset_l,
@@ -300,7 +429,7 @@ impl WidgetTree {
             }
             depth += 1;
             if depth > max {
-                return false; // parent cycle
+                return false;
             }
             current = self.widgets[current.index()].parent;
         }
@@ -376,8 +505,7 @@ impl WidgetTree {
     }
 
     /// Get DFS pre-order (z-order). Rebuilds cache if tree changed,
-    /// then returns a copy. The expensive tree walk only happens after
-    /// alloc/add_child/clear — otherwise returns a cheap memcpy of the cache.
+    /// then returns a copy.
     pub fn dfs_order(&mut self) -> Vec<WidgetId> {
         self.rebuild_dfs();
         self.dfs_cache.clone()

@@ -168,6 +168,7 @@ const OP_ARR_LEN: u8 = 0x19;
 const OP_W_ALLOC: u8 = 0x1A;
 const OP_ARR_FREE: u8 = 0x1B;
 const OP_W_ALLTAR: u8 = 0x1C; // alloc + target + store (combined)
+const OP_FRAME: u8 = 0x1D;   // + u8 local_count (function prologue)
 
 // Specialized short forms (1 byte, no args)
 const OP_PUSH_0: u8 = 0x20;
@@ -292,17 +293,27 @@ struct VmArray {
     data: Vec<i32>,
 }
 
+/// Call stack frame: return address + saved frame state.
+#[derive(Clone, Copy)]
+struct CallFrame {
+    ret_addr: u16,
+    frame_base: u8,
+    frame_size: u8,
+}
+
 /// Saved VM state for callback push/pop.
 struct VmSnapshot {
     pc: u16,
     sp: u8,
     stack: [i32; STACK_SIZE],
     call_sp: u8,
-    call_stack: [u16; CALL_STACK_SIZE],
+    call_stack: [CallFrame; CALL_STACK_SIZE],
     target: WidgetId,
     state: VmState,
     wait_until: u32,
     critical: bool,
+    frame_base: u8,
+    frame_size: u8,
 }
 
 /// Maximum number of arguments per queued callback.
@@ -323,7 +334,7 @@ pub struct Vm {
     stack: [i32; STACK_SIZE],
     sp: u8,
     vars: Vec<VmVar>,
-    call_stack: [u16; CALL_STACK_SIZE],
+    call_stack: [CallFrame; CALL_STACK_SIZE],
     call_sp: u8,
     target: WidgetId,
     pub state: VmState,
@@ -344,6 +355,10 @@ pub struct Vm {
     cb_tail: u8,
     // Critical section — when true, VM runs until next YIELD without returning to main loop
     critical: bool,
+    // Stack-based locals: frame_base = first local slot for current function
+    frame_base: u8,
+    frame_size: u8,
+    global_count: u8,
 }
 
 impl Vm {
@@ -351,12 +366,15 @@ impl Vm {
         const EMPTY_CB: CbRequest = CbRequest {
             offset: 0, arg_count: 0, args: [0; CB_MAX_ARGS],
         };
+        const EMPTY_FRAME: CallFrame = CallFrame {
+            ret_addr: 0, frame_base: 0, frame_size: 0,
+        };
         Self {
             pc: 0,
             stack: [0; STACK_SIZE],
             sp: 0,
             vars: Vec::new(),
-            call_stack: [0; CALL_STACK_SIZE],
+            call_stack: [EMPTY_FRAME; CALL_STACK_SIZE],
             call_sp: 0,
             target: WidgetId::NONE,
             state: VmState::Ready,
@@ -371,12 +389,24 @@ impl Vm {
             cb_head: 0,
             cb_tail: 0,
             critical: false,
+            frame_base: 0,
+            frame_size: 0,
+            global_count: 0,
         }
     }
 
     // === Variable access (sparse map) ===
 
+    /// Resolve slot byte: bit 7 set = local (frame_base + index), else global.
     #[inline]
+    fn resolve_slot(&self, slot: u8) -> u16 {
+        if slot & 0x80 != 0 {
+            self.frame_base as u16 + (slot & 0x7F) as u16
+        } else {
+            slot as u16
+        }
+    }
+
     fn var_get(&self, slot: u16) -> i32 {
         for v in &self.vars {
             if v.id == slot { return v.val; }
@@ -400,10 +430,13 @@ impl Vm {
     /// Load a VM image from RAM bytes. Parses the image header and keeps
     /// opcodes in a Vec<u8>. Returns false if the header is invalid.
     pub fn load_ram(&mut self, image: &[u8]) -> bool {
-        if let Some((funcs, opcode_start)) = parse_image_header(image) {
+        if let Some((funcs, opcode_start, gc)) = parse_image_header(image) {
             let opcodes = image[opcode_start..].to_vec();
             self.code = VmCode::Ram(opcodes);
             self.functions = funcs;
+            self.global_count = gc;
+            self.frame_base = gc;
+            self.frame_size = 0;
             true
         } else {
             false
@@ -419,7 +452,7 @@ impl Vm {
         let mut hdr_buf = [0u8; 5 + 12 * 64]; // 773 bytes on stack
         flash.read(base, &mut hdr_buf[..read_len]);
 
-        if let Some((funcs, opcode_start)) = parse_image_header(&hdr_buf[..read_len]) {
+        if let Some((funcs, opcode_start, gc)) = parse_image_header(&hdr_buf[..read_len]) {
             let opcode_base = base + opcode_start as u32;
             let opcode_len = total_len.saturating_sub(opcode_start);
             self.code = VmCode::Flash {
@@ -428,6 +461,9 @@ impl Vm {
                 code_len: opcode_len,
             };
             self.functions = funcs;
+            self.global_count = gc;
+            self.frame_base = gc;
+            self.frame_size = 0;
             true
         } else {
             false
@@ -522,6 +558,8 @@ impl Vm {
             state: self.state,
             wait_until: self.wait_until,
             critical: self.critical,
+            frame_base: self.frame_base,
+            frame_size: self.frame_size,
         };
         self.saved = Some(Box::new(snapshot));
         self.pc = offset;
@@ -531,6 +569,8 @@ impl Vm {
         self.mode = VmMode::Callback;
         self.state = VmState::Running;
         self.critical = false;
+        self.frame_base = self.global_count;
+        self.frame_size = 0;
     }
 
     fn pop_state(&mut self) {
@@ -544,6 +584,8 @@ impl Vm {
             self.state = snap.state;
             self.wait_until = snap.wait_until;
             self.critical = snap.critical;
+            self.frame_base = snap.frame_base;
+            self.frame_size = snap.frame_size;
             self.mode = VmMode::Normal;
         }
     }
@@ -596,6 +638,9 @@ impl Vm {
         self.functions.clear();
         self.mode = VmMode::Normal;
         self.saved = None;
+        self.frame_base = 0;
+        self.frame_size = 0;
+        self.global_count = 0;
         self.cb_head = 0;
         self.cb_tail = 0;
         self.critical = false;
@@ -729,7 +774,10 @@ impl Vm {
             OP_RET => {
                 if self.call_sp > 0 {
                     self.call_sp -= 1;
-                    self.pc = self.call_stack[self.call_sp as usize];
+                    let frame = self.call_stack[self.call_sp as usize];
+                    self.pc = frame.ret_addr;
+                    self.frame_base = frame.frame_base;
+                    self.frame_size = frame.frame_size;
                 } else if self.mode == VmMode::Callback {
                     // Callback complete — halt cleanly
                     self.state = VmState::Halted;
@@ -769,13 +817,18 @@ impl Vm {
             }
             OP_W_ALLTAR => {
                 // Combined: alloc widget, store to var slot, set as target
-                let slot = self.read_u8() as u16;
+                let raw = self.read_u8();
+                let slot = self.resolve_slot(raw);
                 if let Some(id) = ctx.tree.alloc() {
                     self.var_set(slot, id.0 as i32);
                     self.target = id;
                 } else {
                     self.state = VmState::Error;
                 }
+            }
+            OP_FRAME => {
+                // Function prologue: set frame_size for this function
+                self.frame_size = self.read_u8();
             }
             OP_ARR_FREE => {
                 let arr_id = self.pop();
@@ -787,16 +840,17 @@ impl Vm {
             OP_PUSH_1  => self.push(1),
             OP_PUSH_2  => self.push(2),
             OP_PUSH_M1 => self.push(-1),
-            OP_LOAD_0  => { let v = self.var_get(0); self.push(v); }
-            OP_LOAD_1  => { let v = self.var_get(1); self.push(v); }
-            OP_LOAD_2  => { let v = self.var_get(2); self.push(v); }
-            OP_LOAD_3  => { let v = self.var_get(3); self.push(v); }
-            OP_LOAD_4  => { let v = self.var_get(4); self.push(v); }
-            OP_STORE_0 => { let v = self.pop(); self.var_set(0, v); }
-            OP_STORE_1 => { let v = self.pop(); self.var_set(1, v); }
-            OP_STORE_2 => { let v = self.pop(); self.var_set(2, v); }
-            OP_STORE_3 => { let v = self.pop(); self.var_set(3, v); }
-            OP_STORE_4 => { let v = self.pop(); self.var_set(4, v); }
+            // Short forms: LOAD/STORE local slots 0-4
+            OP_LOAD_0  => { let s = self.frame_base as u16; let v = self.var_get(s); self.push(v); }
+            OP_LOAD_1  => { let s = self.frame_base as u16 + 1; let v = self.var_get(s); self.push(v); }
+            OP_LOAD_2  => { let s = self.frame_base as u16 + 2; let v = self.var_get(s); self.push(v); }
+            OP_LOAD_3  => { let s = self.frame_base as u16 + 3; let v = self.var_get(s); self.push(v); }
+            OP_LOAD_4  => { let s = self.frame_base as u16 + 4; let v = self.var_get(s); self.push(v); }
+            OP_STORE_0 => { let s = self.frame_base as u16; let v = self.pop(); self.var_set(s, v); }
+            OP_STORE_1 => { let s = self.frame_base as u16 + 1; let v = self.pop(); self.var_set(s, v); }
+            OP_STORE_2 => { let s = self.frame_base as u16 + 2; let v = self.pop(); self.var_set(s, v); }
+            OP_STORE_3 => { let s = self.frame_base as u16 + 3; let v = self.pop(); self.var_set(s, v); }
+            OP_STORE_4 => { let s = self.frame_base as u16 + 4; let v = self.pop(); self.var_set(s, v); }
 
             // --- With arguments ---
             OP_PUSH_I8 => {
@@ -812,12 +866,14 @@ impl Vm {
                 self.push(val);
             }
             OP_LOAD => {
-                let slot = self.read_u8() as u16;
+                let raw = self.read_u8();
+                let slot = self.resolve_slot(raw);
                 let v = self.var_get(slot);
                 self.push(v);
             }
             OP_STORE => {
-                let slot = self.read_u8() as u16;
+                let raw = self.read_u8();
+                let slot = self.resolve_slot(raw);
                 let v = self.pop();
                 self.var_set(slot, v);
             }
@@ -836,8 +892,15 @@ impl Vm {
             OP_CALL => {
                 let target = self.read_u16();
                 if (self.call_sp as usize) < CALL_STACK_SIZE {
-                    self.call_stack[self.call_sp as usize] = self.pc;
+                    self.call_stack[self.call_sp as usize] = CallFrame {
+                        ret_addr: self.pc,
+                        frame_base: self.frame_base,
+                        frame_size: self.frame_size,
+                    };
                     self.call_sp += 1;
+                    // Advance frame_base past caller's locals
+                    self.frame_base = self.frame_base.wrapping_add(self.frame_size);
+                    self.frame_size = 0; // callee's FRAME will set this
                     self.pc = target;
                 } else {
                     self.state = VmState::Error;
@@ -1069,7 +1132,9 @@ impl Vm {
             OP_SET_TEXT => {
                 let str_id = self.pop() as u16;
                 if self.target.is_some() {
-                    ctx.tree.get_mut(self.target).text_id = str_id;
+                    if let Some(ext) = ctx.tree.ensure_ext(self.target) {
+                        ext.text_id = str_id;
+                    }
                 }
             }
             OP_DRAW_STR => {
@@ -1250,51 +1315,60 @@ impl Vm {
     // --- Property R/W ---
 
     fn set_scalar_prop(&mut self, ctx: &mut Ctx, prop_id: u8, val: i32) {
-        let w = ctx.tree.get_mut(self.target);
+        // Base widget fields (no extension needed)
         match prop_id {
-            PROP_LOC_X => w.location.x = val as i16,
-            PROP_LOC_Y => w.location.y = val as i16,
-            PROP_SIZE_W => w.size.w = val as u16,
-            PROP_SIZE_H => w.size.h = val as u16,
+            PROP_LOC_X => { ctx.tree.get_mut(self.target).location.x = val as i16; return; }
+            PROP_LOC_Y => { ctx.tree.get_mut(self.target).location.y = val as i16; return; }
+            PROP_SIZE_W => { ctx.tree.get_mut(self.target).size.w = val as u16; return; }
+            PROP_SIZE_H => { ctx.tree.get_mut(self.target).size.h = val as u16; return; }
             PROP_VISIBLE => {
-                set_flag(&mut w.flags, FLAG_VISIBLE, val != 0);
+                set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_VISIBLE, val != 0);
                 ctx.tree.mark_dirty(self.target);
+                return;
             }
-            PROP_ENABLED => set_flag(&mut w.flags, FLAG_ENABLED, val != 0),
-            PROP_CLICKABLE => set_flag(&mut w.flags, FLAG_CLICKABLE, val != 0),
-            PROP_BG_COLOR => w.background_color = val as u16,
-            PROP_BORDER_COLOR => w.border_color = val as u16,
-            PROP_MARGIN_T => w.margin.top = val as u8,
-            PROP_MARGIN_R => w.margin.right = val as u8,
-            PROP_MARGIN_B => w.margin.bottom = val as u8,
-            PROP_MARGIN_L => w.margin.left = val as u8,
-            PROP_BORDER_T => w.border.top = val as u8,
-            PROP_BORDER_R => w.border.right = val as u8,
-            PROP_BORDER_B => w.border.bottom = val as u8,
-            PROP_BORDER_L => w.border.left = val as u8,
-            PROP_PADDING_T => w.padding.top = val as u8,
-            PROP_PADDING_R => w.padding.right = val as u8,
-            PROP_PADDING_B => w.padding.bottom = val as u8,
-            PROP_PADDING_L => w.padding.left = val as u8,
-            PROP_KIND => w.kind = val as u8,
-            PROP_TEXT_COLOR => w.text_color = val as u16,
-            PROP_FONT_ID => w.font_id = val as u8,
-            PROP_TEXT_ALIGN => w.text_align = val as u8,
-            PROP_PRESS_COLOR => w.press_color = val as u16,
-            PROP_IMAGE_ID => w.image_id = val as u8,
-            PROP_BORDER_RADIUS => w.border_radius = val as u16,
-            PROP_VALUE => w.value = val as i16,
-            PROP_CHECKED => set_flag(&mut w.flags, FLAG_CHECKED, val != 0),
-            PROP_ON_CLICK => w.on_click = val as u16,
-            PROP_ON_PAINT => w.on_paint = val as u16,
-            PROP_ON_TAP => w.on_tap = val as u16,
+            PROP_ENABLED => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_ENABLED, val != 0); return; }
+            PROP_CLICKABLE => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_CLICKABLE, val != 0); return; }
+            PROP_CHECKED => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_CHECKED, val != 0); return; }
+            PROP_BG_COLOR => { ctx.tree.get_mut(self.target).background_color = val as u16; return; }
+            PROP_BORDER_COLOR => { ctx.tree.get_mut(self.target).border_color = val as u16; return; }
+            PROP_KIND => { ctx.tree.get_mut(self.target).kind = val as u8; return; }
             _ => {}
+        }
+
+        // Extension fields (allocate on demand)
+        if let Some(ext) = ctx.tree.ensure_ext(self.target) {
+            match prop_id {
+                PROP_MARGIN_T => ext.margin.top = val as u8,
+                PROP_MARGIN_R => ext.margin.right = val as u8,
+                PROP_MARGIN_B => ext.margin.bottom = val as u8,
+                PROP_MARGIN_L => ext.margin.left = val as u8,
+                PROP_BORDER_T => ext.border.top = val as u8,
+                PROP_BORDER_R => ext.border.right = val as u8,
+                PROP_BORDER_B => ext.border.bottom = val as u8,
+                PROP_BORDER_L => ext.border.left = val as u8,
+                PROP_PADDING_T => ext.padding.top = val as u8,
+                PROP_PADDING_R => ext.padding.right = val as u8,
+                PROP_PADDING_B => ext.padding.bottom = val as u8,
+                PROP_PADDING_L => ext.padding.left = val as u8,
+                PROP_TEXT_COLOR => ext.text_color = val as u16,
+                PROP_FONT_ID => ext.font_id = val as u8,
+                PROP_TEXT_ALIGN => ext.text_align = val as u8,
+                PROP_PRESS_COLOR => ext.press_color = val as u16,
+                PROP_IMAGE_ID => ext.image_id = val as u8,
+                PROP_BORDER_RADIUS => ext.border_radius = val as u16,
+                PROP_VALUE => ext.value = val as i16,
+                PROP_ON_CLICK => ext.on_click = val as u16,
+                PROP_ON_PAINT => ext.on_paint = val as u16,
+                PROP_ON_TAP => ext.on_tap = val as u16,
+                _ => {}
+            }
         }
     }
 
     fn get_scalar_prop(&self, ctx: &Ctx, prop_id: u8) -> i32 {
         let w = ctx.tree.get(self.target);
         match prop_id {
+            // Base fields
             PROP_LOC_X => w.location.x as i32,
             PROP_LOC_Y => w.location.y as i32,
             PROP_SIZE_W => w.size.w as i32,
@@ -1302,32 +1376,33 @@ impl Vm {
             PROP_VISIBLE => if w.flags & FLAG_VISIBLE != 0 { 1 } else { 0 },
             PROP_ENABLED => if w.flags & FLAG_ENABLED != 0 { 1 } else { 0 },
             PROP_CLICKABLE => if w.flags & FLAG_CLICKABLE != 0 { 1 } else { 0 },
+            PROP_CHECKED => if w.flags & FLAG_CHECKED != 0 { 1 } else { 0 },
             PROP_BG_COLOR => w.background_color as i32,
             PROP_BORDER_COLOR => w.border_color as i32,
-            PROP_MARGIN_T => w.margin.top as i32,
-            PROP_MARGIN_R => w.margin.right as i32,
-            PROP_MARGIN_B => w.margin.bottom as i32,
-            PROP_MARGIN_L => w.margin.left as i32,
-            PROP_BORDER_T => w.border.top as i32,
-            PROP_BORDER_R => w.border.right as i32,
-            PROP_BORDER_B => w.border.bottom as i32,
-            PROP_BORDER_L => w.border.left as i32,
-            PROP_PADDING_T => w.padding.top as i32,
-            PROP_PADDING_R => w.padding.right as i32,
-            PROP_PADDING_B => w.padding.bottom as i32,
-            PROP_PADDING_L => w.padding.left as i32,
             PROP_KIND => w.kind as i32,
-            PROP_TEXT_COLOR => w.text_color as i32,
-            PROP_FONT_ID => w.font_id as i32,
-            PROP_TEXT_ALIGN => w.text_align as i32,
-            PROP_PRESS_COLOR => w.press_color as i32,
-            PROP_IMAGE_ID => w.image_id as i32,
-            PROP_BORDER_RADIUS => w.border_radius as i32,
-            PROP_VALUE => w.value as i32,
-            PROP_CHECKED => if w.flags & FLAG_CHECKED != 0 { 1 } else { 0 },
-            PROP_ON_CLICK => w.on_click as i32,
-            PROP_ON_PAINT => w.on_paint as i32,
-            PROP_ON_TAP => w.on_tap as i32,
+            // Extension fields (return defaults when no extension)
+            PROP_MARGIN_T => ctx.tree.margin(self.target).top as i32,
+            PROP_MARGIN_R => ctx.tree.margin(self.target).right as i32,
+            PROP_MARGIN_B => ctx.tree.margin(self.target).bottom as i32,
+            PROP_MARGIN_L => ctx.tree.margin(self.target).left as i32,
+            PROP_BORDER_T => ctx.tree.border(self.target).top as i32,
+            PROP_BORDER_R => ctx.tree.border(self.target).right as i32,
+            PROP_BORDER_B => ctx.tree.border(self.target).bottom as i32,
+            PROP_BORDER_L => ctx.tree.border(self.target).left as i32,
+            PROP_PADDING_T => ctx.tree.padding(self.target).top as i32,
+            PROP_PADDING_R => ctx.tree.padding(self.target).right as i32,
+            PROP_PADDING_B => ctx.tree.padding(self.target).bottom as i32,
+            PROP_PADDING_L => ctx.tree.padding(self.target).left as i32,
+            PROP_TEXT_COLOR => ctx.tree.text_color(self.target) as i32,
+            PROP_FONT_ID => ctx.tree.font_id(self.target) as i32,
+            PROP_TEXT_ALIGN => ctx.tree.text_align(self.target) as i32,
+            PROP_PRESS_COLOR => ctx.tree.press_color(self.target) as i32,
+            PROP_IMAGE_ID => ctx.tree.image_id(self.target) as i32,
+            PROP_BORDER_RADIUS => ctx.tree.border_radius(self.target) as i32,
+            PROP_VALUE => ctx.tree.value(self.target) as i32,
+            PROP_ON_CLICK => ctx.tree.on_click(self.target) as i32,
+            PROP_ON_PAINT => ctx.tree.on_paint(self.target) as i32,
+            PROP_ON_TAP => ctx.tree.on_tap(self.target) as i32,
             _ => 0,
         }
     }
@@ -1336,7 +1411,9 @@ impl Vm {
         if prop_id == PROP_TEXT {
             if self.target.is_some() {
                 if let Some(str_id) = ctx.strpool.alloc(data) {
-                    ctx.tree.get_mut(self.target).text_id = str_id;
+                    if let Some(ext) = ctx.tree.ensure_ext(self.target) {
+                        ext.text_id = str_id;
+                    }
                 } else {
                     self.state = VmState::Error;
                 }
@@ -1346,24 +1423,35 @@ impl Vm {
 
         let (vals, count) = proto::unpack_signed_varints(data);
 
-        let w = ctx.tree.get_mut(self.target);
+        // Base fields
         match prop_id {
             PROP_LOCATION if count >= 2 => {
+                let w = ctx.tree.get_mut(self.target);
                 w.location = Offset { x: vals[0] as i16, y: vals[1] as i16 };
+                return;
             }
             PROP_SIZE if count >= 2 => {
+                let w = ctx.tree.get_mut(self.target);
                 w.size = Size { w: vals[0] as u16, h: vals[1] as u16 };
-            }
-            PROP_MARGIN if count >= 4 => {
-                w.margin = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
-            }
-            PROP_BORDER_EDGES if count >= 4 => {
-                w.border = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
-            }
-            PROP_PADDING if count >= 4 => {
-                w.padding = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
+                return;
             }
             _ => {}
+        }
+
+        // Extension fields
+        if let Some(ext) = ctx.tree.ensure_ext(self.target) {
+            match prop_id {
+                PROP_MARGIN if count >= 4 => {
+                    ext.margin = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
+                }
+                PROP_BORDER_EDGES if count >= 4 => {
+                    ext.border = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
+                }
+                PROP_PADDING if count >= 4 => {
+                    ext.padding = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1433,18 +1521,23 @@ impl Vm {
 /// Format:
 ///   version(u8) + function_count(u16 LE) + reserved(u16)
 ///   + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
-fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize)> {
+fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8)> {
     if data.len() < IMAGE_HEADER_SIZE {
         return None;
     }
 
     let version = data[0];
-    if version != 1 {
+    if version != 1 && version != 2 {
         return None;
     }
 
     let func_count = u16::from_le_bytes([data[1], data[2]]) as usize;
-    // reserved = data[3..5]
+    // v1: reserved=0, v2: global_count
+    let global_count = if version >= 2 {
+        u16::from_le_bytes([data[3], data[4]]) as u8
+    } else {
+        0
+    };
 
     let table_size = func_count * FUNC_ENTRY_SIZE;
     let opcode_start = IMAGE_HEADER_SIZE + table_size;
@@ -1476,7 +1569,7 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize)> {
         });
     }
 
-    Some((functions, opcode_start))
+    Some((functions, opcode_start, global_count))
 }
 
 // --- Packed u32 helper ---

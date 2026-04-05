@@ -97,6 +97,8 @@ pub struct Edges {
 }
 
 impl Edges {
+    pub const ZERO: Self = Self { top: 0, right: 0, bottom: 0, left: 0 };
+
     pub const fn uniform(val: u8) -> Self {
         Self {
             top: val,

@@ -1,10 +1,10 @@
 use crate::clip::ClipRegion;
 use crate::ctx::Ctx;
 use crate::lcd::{self, Lcd};
-use crate::types::{Color, Rect};
+use crate::types::{Color, Edges, Rect};
 use crate::widget::{
-    WidgetId, WidgetTree, ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_PRESSED,
-    KIND_BUTTON, KIND_CHECKBOX, KIND_LABEL, KIND_PROGRESS, KIND_RADIO, KIND_SLIDER,
+    ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_PRESSED, KIND_CHECKBOX, KIND_LABEL,
+    KIND_PROGRESS, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
 };
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
@@ -38,7 +38,7 @@ fn render_subtree(ctx: &Ctx, id: WidgetId) {
         child = ctx.tree.get(child).next_sibling;
         guard += 1;
         if guard > max {
-            break; // sibling cycle
+            break;
         }
     }
 }
@@ -46,6 +46,10 @@ fn render_subtree(ctx: &Ctx, id: WidgetId) {
 // --- Dirty render (painter's algorithm + clip) ---
 
 /// Redraw only dirty widgets.
+///
+/// Two-pass approach: erase invisible widgets first, then draw visible ones.
+/// This prevents hidden panels from overwriting visible siblings that share
+/// the same screen area (e.g. tab panels stacked at the same position).
 pub fn render_dirty(ctx: &mut Ctx) {
     let dfs = ctx.tree.dfs_order();
 
@@ -60,20 +64,29 @@ pub fn render_dirty(ctx: &mut Ctx) {
         return;
     }
 
+    // Pass 1: erase dirty widgets that became invisible
     for di in 0..dfs.len() {
         let id = dfs[di];
-
         if !ctx.tree.get(id).is_dirty() {
             continue;
         }
-
-        // Widget just became invisible — erase its area with ancestor background
         if !ctx.tree.is_tree_visible(id) {
             let abs = ctx.tree.absolute_rect(id);
             if !abs.is_empty() {
                 let bg = ancestor_bg(&ctx.tree, id);
                 fill_rect_screen(&ctx.lcd, abs, bg);
             }
+        }
+    }
+
+    // Pass 2: draw dirty visible widgets with clipping
+    for di in 0..dfs.len() {
+        let id = dfs[di];
+
+        if !ctx.tree.get(id).is_dirty() {
+            continue;
+        }
+        if !ctx.tree.is_tree_visible(id) {
             continue;
         }
 
@@ -98,7 +111,7 @@ pub fn render_dirty(ctx: &mut Ctx) {
             }
         }
 
-        // Flat iteration over dirty widget + its descendants (replaces recursion)
+        // Flat iteration over dirty widget + its descendants
         for si in di..sub_end {
             let sid = dfs[si];
             if !ctx.tree.is_tree_visible(sid) {
@@ -125,13 +138,7 @@ pub fn render_dirty(ctx: &mut Ctx) {
 
 // --- Drawing ---
 
-/// Effective background color for a widget.
-/// If the widget is a pressed button, returns press_color.
-/// If the widget is a child of a pressed button and shares the same
-/// background_color, inherits the parent button's press_color.
-#[inline]
 /// Find the nearest ancestor with a non-zero background color.
-/// Used to erase hidden widgets with the correct background.
 fn ancestor_bg(tree: &WidgetTree, id: WidgetId) -> Color {
     let mut pid = tree.get(id).parent;
     let max = tree.count();
@@ -147,27 +154,29 @@ fn ancestor_bg(tree: &WidgetTree, id: WidgetId) -> Color {
             break;
         }
     }
-    0 // black fallback
+    0
 }
 
-fn effective_bg(tree: &WidgetTree, id: WidgetId) -> Color {
-    let widget = tree.get(id);
-
+/// Effective background color for a widget.
+/// If the widget is pressed and has press_color, returns press_color.
+/// If a parent is pressed and this widget shares the same background,
+/// inherits the parent's press_color.
+fn effective_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
     // This widget is pressed and has a press_color
-    if widget.flags & FLAG_PRESSED != 0 && widget.press_color != 0 {
-        return widget.press_color;
+    if widget.flags & FLAG_PRESSED != 0 && ext.press_color != 0 {
+        return ext.press_color;
     }
 
-    // Check ancestor — if a parent is pressed and this widget shares
-    // the same background, inherit press_color
+    // Check ancestor
     let mut pid = widget.parent;
     let max = tree.count();
     let mut depth = 0usize;
     while pid.is_some() {
         let p = tree.get(pid);
-        if p.flags & FLAG_PRESSED != 0 && p.press_color != 0 {
+        let p_ext = tree.ext(pid).unwrap_or(&WidgetExt::DEFAULT);
+        if p.flags & FLAG_PRESSED != 0 && p_ext.press_color != 0 {
             if widget.background_color == p.background_color {
-                return p.press_color;
+                return p_ext.press_color;
             }
             break;
         }
@@ -184,17 +193,15 @@ fn effective_bg(tree: &WidgetTree, id: WidgetId) -> Color {
 /// Draw widget without clipping (full render path).
 fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
     let widget = ctx.tree.get(id);
-    let b = &widget.border;
-    let bg_color = effective_bg(&ctx.tree, id);
-    let r = widget.border_radius;
-    // Labels with bg_color 0 are transparent — parent background shows through
+    let ext = ctx.tree.ext(id).unwrap_or(&WidgetExt::DEFAULT);
+    let b = ext.border;
+    let r = ext.border_radius;
+    let bg_color = effective_bg(&ctx.tree, widget, ext);
     let draw_bg = bg_color != 0 || widget.kind != KIND_LABEL;
 
     if r > 0 {
-        // Rounded mode: draw border as rounded_rect, background as fill_rounded_rect
         let bw = b.top.max(b.bottom).max(b.left).max(b.right);
         if bw > 0 {
-            // Draw border outline(s)
             for i in 0..bw {
                 rounded_rect_screen(
                     &ctx.lcd,
@@ -209,16 +216,14 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
                 );
             }
         }
-        // Background (inside border)
         if draw_bg {
-            let bg = inner_rect(abs, b);
+            let bg = inner_rect(abs, &b);
             if !bg.is_empty() {
                 let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
                 fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
             }
         }
     } else {
-        // Sharp corners: original rect-based drawing
         if b.top > 0 {
             fill_rect_screen(
                 &ctx.lcd,
@@ -261,9 +266,8 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
                 widget.border_color,
             );
         }
-        // Background (inside border)
         if draw_bg {
-            let bg = inner_rect(abs, b);
+            let bg = inner_rect(abs, &b);
             if !bg.is_empty() {
                 fill_rect_screen(&ctx.lcd, bg, bg_color);
             }
@@ -271,41 +275,39 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
     }
 
     // Background image
-    if widget.image_id != 0 {
-        let bg = inner_rect(abs, b);
-        draw_bg_image(ctx, widget.image_id, &bg);
+    if ext.image_id != 0 {
+        let bg = inner_rect(abs, &b);
+        draw_bg_image(ctx, ext.image_id, &bg);
     }
 
     // Label text
     if widget.kind == KIND_LABEL {
-        draw_label_text(ctx, id, abs);
+        draw_label_text(ctx, widget, abs, ext);
     }
 
     // Progress bar / slider fill
     if widget.kind == KIND_PROGRESS || widget.kind == KIND_SLIDER {
-        let inner = inner_rect(abs, b);
-        draw_value_fill(&ctx.lcd, widget, &inner);
+        let inner = inner_rect(abs, &b);
+        draw_value_fill(&ctx.lcd, widget, &inner, ext);
     }
 
     // Checkbox / radio indicator
     if widget.kind == KIND_CHECKBOX || widget.kind == KIND_RADIO {
-        let inner = inner_rect(abs, b);
-        draw_check_indicator(&ctx.lcd, widget, &inner);
+        let inner = inner_rect(abs, &b);
+        draw_check_indicator(&ctx.lcd, widget, &inner, ext);
     }
 }
 
 /// Draw widget with clip region (dirty render path).
 fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     let widget = ctx.tree.get(id);
-    let b = &widget.border;
-    let bg_color = effective_bg(&ctx.tree, id);
-    let r = widget.border_radius;
+    let ext = ctx.tree.ext(id).unwrap_or(&WidgetExt::DEFAULT);
+    let b = ext.border;
+    let r = ext.border_radius;
+    let bg_color = effective_bg(&ctx.tree, widget, ext);
     let draw_bg = bg_color != 0 || widget.kind != KIND_LABEL;
 
     if r > 0 {
-        // Rounded mode: fallback to unclipped rounded draw.
-        // Rounded rects can't be trivially rect-clipped, so we draw the
-        // full rounded shape. The painter's algorithm ensures correctness.
         let bw = b.top.max(b.bottom).max(b.left).max(b.right);
         if bw > 0 {
             for i in 0..bw {
@@ -323,14 +325,13 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
             }
         }
         if draw_bg {
-            let bg = inner_rect(abs, b);
+            let bg = inner_rect(abs, &b);
             if !bg.is_empty() {
                 let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
                 fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
             }
         }
     } else {
-        // Sharp corners: rect-clipped drawing
         let border_rects = [
             Rect::new(abs.x, abs.y, abs.w, b.top as u16),
             Rect::new(
@@ -359,36 +360,35 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
             }
         }
 
-        // Background (inside border)
         if draw_bg {
-            let bg = inner_rect(abs, b);
+            let bg = inner_rect(abs, &b);
             if !bg.is_empty() {
                 fill_clipped(&ctx.lcd, &bg, bg_color, clip);
             }
         }
     }
 
-    // Background image (drawn unclipped — painter's algorithm covers it)
-    if widget.image_id != 0 {
-        let bg = inner_rect(abs, b);
-        draw_bg_image(ctx, widget.image_id, &bg);
+    // Background image
+    if ext.image_id != 0 {
+        let bg = inner_rect(abs, &b);
+        draw_bg_image(ctx, ext.image_id, &bg);
     }
 
-    // Label text (drawn unclipped — upper widgets cover it via painter's algorithm)
+    // Label text
     if widget.kind == KIND_LABEL {
-        draw_label_text(ctx, id, abs);
+        draw_label_text(ctx, widget, abs, ext);
     }
 
-    // Progress bar / slider fill (drawn unclipped)
+    // Progress bar / slider fill
     if widget.kind == KIND_PROGRESS || widget.kind == KIND_SLIDER {
-        let inner = inner_rect(abs, b);
-        draw_value_fill(&ctx.lcd, widget, &inner);
+        let inner = inner_rect(abs, &b);
+        draw_value_fill(&ctx.lcd, widget, &inner, ext);
     }
 
-    // Checkbox / radio indicator (drawn unclipped)
+    // Checkbox / radio indicator
     if widget.kind == KIND_CHECKBOX || widget.kind == KIND_RADIO {
-        let inner = inner_rect(abs, b);
-        draw_check_indicator(&ctx.lcd, widget, &inner);
+        let inner = inner_rect(abs, &b);
+        draw_check_indicator(&ctx.lcd, widget, &inner, ext);
     }
 }
 
@@ -405,31 +405,29 @@ fn draw_bg_image(ctx: &Ctx, image_id: u8, inner: &Rect) {
 }
 
 /// Draw label text in the content area.
-fn draw_label_text(ctx: &Ctx, id: WidgetId, abs: &Rect) {
-    let widget = ctx.tree.get(id);
-
-    if widget.text_id == 0xFFFF || widget.font_id == 0xFF {
+fn draw_label_text(ctx: &Ctx, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    if ext.text_id == 0xFFFF || ext.font_id == 0xFF {
         return;
     }
-    let text = ctx.strpool.get(widget.text_id);
+    let text = ctx.strpool.get(ext.text_id);
     if text.is_empty() {
         return;
     }
-    let font = match ctx.fonts.resolve(widget.font_id) {
+    let font = match ctx.fonts.resolve(ext.font_id) {
         Some(f) => f,
         None => return,
     };
 
-    let b = &widget.border;
-    let p = &widget.padding;
+    let b = ext.border;
+    let p = ext.padding;
     let cx = abs.x + b.left as i16 + p.left as i16;
     let cy = abs.y + b.top as i16 + p.top as i16;
-    let cw = abs.w.saturating_sub(
-        b.left as u16 + b.right as u16 + p.left as u16 + p.right as u16,
-    );
-    let ch = abs.h.saturating_sub(
-        b.top as u16 + b.bottom as u16 + p.top as u16 + p.bottom as u16,
-    );
+    let cw = abs
+        .w
+        .saturating_sub(b.left as u16 + b.right as u16 + p.left as u16 + p.right as u16);
+    let ch = abs
+        .h
+        .saturating_sub(b.top as u16 + b.bottom as u16 + p.top as u16 + p.bottom as u16);
 
     if cw == 0 || ch == 0 {
         return;
@@ -438,7 +436,7 @@ fn draw_label_text(ctx: &Ctx, id: WidgetId, abs: &Rect) {
     let tw = font.text_width(text) as i16;
     let lh = font.line_height() as i16;
 
-    let tx = match widget.text_align {
+    let tx = match ext.text_align {
         ALIGN_CENTER => cx + (cw as i16 - tw) / 2,
         ALIGN_RIGHT => cx + cw as i16 - tw,
         _ => cx,
@@ -446,9 +444,13 @@ fn draw_label_text(ctx: &Ctx, id: WidgetId, abs: &Rect) {
 
     let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
 
-    let bg_color = effective_bg(&ctx.tree, id);
-    let bg = if bg_color == 0 && widget.kind == KIND_LABEL { None } else { Some(bg_color) };
-    font.draw_str(&ctx.lcd, &ctx.flash, text, tx, ty, widget.text_color, bg);
+    let bg_color = effective_bg(&ctx.tree, widget, ext);
+    let bg = if bg_color == 0 && widget.kind == KIND_LABEL {
+        None
+    } else {
+        Some(bg_color)
+    };
+    font.draw_str(&ctx.lcd, &ctx.flash, text, tx, ty, ext.text_color, bg);
 }
 
 /// Draw rect clipped against clip region.
@@ -482,7 +484,7 @@ fn fill_rounded_rect_screen(lcd: &Lcd, rect: Rect, radius: u16, color: Color) {
 }
 
 /// Compute inner area (background area) from border box.
-fn inner_rect(abs: &Rect, border: &crate::types::Edges) -> Rect {
+fn inner_rect(abs: &Rect, border: &Edges) -> Rect {
     Rect::new(
         abs.x + border.left as i16,
         abs.y + border.top as i16,
@@ -494,25 +496,22 @@ fn inner_rect(abs: &Rect, border: &crate::types::Edges) -> Rect {
 }
 
 /// Draw progress bar / slider fill inside the inner rect.
-/// press_color = fill color, background_color = track color (already drawn).
-/// For slider: also draws a thumb indicator using border_color.
-fn draw_value_fill(lcd: &Lcd, widget: &crate::widget::Widget, inner: &Rect) {
-    if inner.is_empty() || widget.press_color == 0 {
+fn draw_value_fill(lcd: &Lcd, widget: &Widget, inner: &Rect, ext: &WidgetExt) {
+    if inner.is_empty() || ext.press_color == 0 {
         return;
     }
 
-    let val = widget.value.clamp(0, 100) as u32;
+    let r = ext.border_radius;
+    let val = ext.value.clamp(0, 100) as u32;
     let fill_w = ((inner.w as u32) * val / 100) as u16;
-    let r = widget.border_radius;
 
     if fill_w > 0 {
         let fill = Rect::new(inner.x, inner.y, fill_w, inner.h);
         if r > 0 {
-            // Rounded fill: use fill_rounded_rect, clamp radius to fill width
             let fill_r = r.min(fill_w / 2).min(inner.h / 2);
-            fill_rounded_rect_screen(lcd, fill, fill_r, widget.press_color);
+            fill_rounded_rect_screen(lcd, fill, fill_r, ext.press_color);
         } else {
-            fill_rect_screen(lcd, fill, widget.press_color);
+            fill_rect_screen(lcd, fill, ext.press_color);
         }
     }
 
@@ -520,7 +519,9 @@ fn draw_value_fill(lcd: &Lcd, widget: &crate::widget::Widget, inner: &Rect) {
     if widget.kind == KIND_SLIDER && inner.w > 0 {
         let thumb_w: u16 = 6;
         let thumb_x = inner.x + fill_w as i16 - (thumb_w as i16 / 2);
-        let thumb_x = thumb_x.max(inner.x).min(inner.x + inner.w as i16 - thumb_w as i16);
+        let thumb_x = thumb_x
+            .max(inner.x)
+            .min(inner.x + inner.w as i16 - thumb_w as i16);
         let thumb = Rect::new(thumb_x, inner.y, thumb_w, inner.h);
         let thumb_color = if widget.border_color != 0 {
             widget.border_color
@@ -536,18 +537,14 @@ fn draw_value_fill(lcd: &Lcd, widget: &crate::widget::Widget, inner: &Rect) {
     }
 }
 
-/// Clear dirty flag on all widgets.
 /// Draw checkbox or radio indicator inside the inner rect.
-///
-/// Indicator is a square (checkbox) or circle (radio) on the left side,
-/// sized to fit the widget height. Uses text_color for the outline and
-/// press_color for the checked fill.
-fn draw_check_indicator(lcd: &Lcd, widget: &crate::widget::Widget, inner: &Rect) {
+fn draw_check_indicator(lcd: &Lcd, widget: &Widget, inner: &Rect, ext: &WidgetExt) {
     if inner.is_empty() {
         return;
     }
 
-    let p = &widget.padding;
+    let p = ext.padding;
+    let r = ext.border_radius;
     let cx = inner.x + p.left as i16;
     let cy = inner.y + p.top as i16;
     let ch = inner.h.saturating_sub(p.top as u16 + p.bottom as u16);
@@ -557,20 +554,19 @@ fn draw_check_indicator(lcd: &Lcd, widget: &crate::widget::Widget, inner: &Rect)
     }
 
     let s = ch;
-    let outline_color = widget.text_color;
+    let outline_color = ext.text_color;
     let checked = widget.flags & FLAG_CHECKED != 0;
 
-    let fill_color = if widget.press_color != 0 {
-        widget.press_color
+    let fill_color = if ext.press_color != 0 {
+        ext.press_color
     } else {
         outline_color
     };
 
     if widget.kind == KIND_CHECKBOX {
-        let r = widget.border_radius;
         if r > 0 {
             let br = r.min(s / 2);
-            rounded_rect_screen(lcd, Rect::new(cx, cy, s, s), br, outline_color);
+            rounded_rect_screen(&lcd, Rect::new(cx, cy, s, s), br, outline_color);
             if checked {
                 let inset: i16 = (s as i16) / 4;
                 let ir = Rect::new(
@@ -580,13 +576,13 @@ fn draw_check_indicator(lcd: &Lcd, widget: &crate::widget::Widget, inner: &Rect)
                     s.saturating_sub(inset as u16 * 2),
                 );
                 let ibr = br.saturating_sub(inset as u16);
-                fill_rounded_rect_screen(lcd, ir, ibr, fill_color);
+                fill_rounded_rect_screen(&lcd, ir, ibr, fill_color);
             }
         } else {
-            fill_rect_screen(lcd, Rect::new(cx, cy, s, 1), outline_color);
-            fill_rect_screen(lcd, Rect::new(cx, cy + s as i16 - 1, s, 1), outline_color);
-            fill_rect_screen(lcd, Rect::new(cx, cy, 1, s), outline_color);
-            fill_rect_screen(lcd, Rect::new(cx + s as i16 - 1, cy, 1, s), outline_color);
+            fill_rect_screen(&lcd, Rect::new(cx, cy, s, 1), outline_color);
+            fill_rect_screen(&lcd, Rect::new(cx, cy + s as i16 - 1, s, 1), outline_color);
+            fill_rect_screen(&lcd, Rect::new(cx, cy, 1, s), outline_color);
+            fill_rect_screen(&lcd, Rect::new(cx + s as i16 - 1, cy, 1, s), outline_color);
             if checked {
                 let x0 = cx + (s as i16) / 4;
                 let y0 = cy + (s as i16) / 2;
@@ -602,12 +598,12 @@ fn draw_check_indicator(lcd: &Lcd, widget: &crate::widget::Widget, inner: &Rect)
         }
     } else {
         // Radio: circle
-        let r = (s / 2) as i16;
-        let ccx = cx + r;
-        let ccy = cy + r;
-        lcd.draw_circle(ccx, ccy, r, outline_color);
+        let rc = (s / 2) as i16;
+        let ccx = cx + rc;
+        let ccy = cy + rc;
+        lcd.draw_circle(ccx, ccy, rc, outline_color);
         if checked {
-            let inner_r = r * 2 / 3;
+            let inner_r = rc * 2 / 3;
             if inner_r > 0 {
                 lcd.fill_circle(ccx, ccy, inner_r, fill_color);
             }
