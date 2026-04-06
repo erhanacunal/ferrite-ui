@@ -77,6 +77,149 @@ def qcolor_to_rgb565(qc):
 
 
 # ============================================================
+# Resource preview caches
+# ============================================================
+
+import struct as _struct
+from PySide6.QtGui import QImage, QPixmap
+
+
+class GfxFontPreview:
+    """Parses Adafruit GFX binary font data for QPainter rendering."""
+
+    def __init__(self, binary):
+        if len(binary) < 6:
+            raise ValueError("font binary too short")
+        self.first, self.last = _struct.unpack_from("<HH", binary, 0)
+        self.y_advance = binary[4]
+        # font_id at byte 5 — not needed for rendering
+        glyph_count = self.last - self.first + 1
+        self.glyphs = []  # (bitmap_offset, w, h, x_advance, x_offset, y_offset)
+        offset = 6
+        for _ in range(glyph_count):
+            if offset + 7 > len(binary):
+                break
+            bm_off = _struct.unpack_from("<H", binary, offset)[0]
+            w = binary[offset + 2]
+            h = binary[offset + 3]
+            x_adv = binary[offset + 4]
+            x_off = binary[offset + 5] if binary[offset + 5] < 128 else binary[offset + 5] - 256
+            y_off = binary[offset + 6] if binary[offset + 6] < 128 else binary[offset + 6] - 256
+            self.glyphs.append((bm_off, w, h, x_adv, x_off, y_off))
+            offset += 7
+        self.bitmap = binary[offset:]
+
+    def text_width(self, text):
+        w = 0
+        for ch in text:
+            idx = ord(ch) - self.first
+            if 0 <= idx < len(self.glyphs):
+                w += self.glyphs[idx][3]  # x_advance
+        return w
+
+    def line_height(self):
+        return self.y_advance
+
+    def draw_text(self, painter, x, y, text, color):
+        """Draw text at (x, y=baseline) using 1-bit glyph bitmaps."""
+        pen = painter.pen()
+        painter.setPen(Qt.NoPen)
+        brush = QBrush(color)
+        for ch in text:
+            idx = ord(ch) - self.first
+            if idx < 0 or idx >= len(self.glyphs):
+                continue
+            bm_off, gw, gh, x_adv, x_off, y_off = self.glyphs[idx]
+            if gw == 0 or gh == 0:
+                x += x_adv
+                continue
+            gx = x + x_off
+            gy = y + y_off
+            bit = 0
+            for row in range(gh):
+                for col in range(gw):
+                    byte_idx = bm_off + (bit >> 3)
+                    if byte_idx < len(self.bitmap):
+                        if self.bitmap[byte_idx] & (0x80 >> (bit & 7)):
+                            painter.fillRect(gx + col, gy + row, 1, 1, brush)
+                    bit += 1
+            x += x_adv
+        painter.setPen(pen)
+
+
+class ResourceCache:
+    """Lazy cache for font previews and image pixmaps."""
+
+    def __init__(self, model):
+        self.model = model
+        self._fonts = {}   # font_id -> GfxFontPreview or None
+        self._images = {}  # image_id -> QPixmap or None
+        self._gen = -1
+
+    def invalidate(self):
+        self._fonts.clear()
+        self._images.clear()
+        self._gen = -1
+
+    def _check_gen(self):
+        gen = self.model._res_gen
+        if gen != self._gen:
+            self._fonts.clear()
+            self._images.clear()
+            self._gen = gen
+
+    def get_font(self, font_id):
+        """Return GfxFontPreview for font_id, or None if not available."""
+        if font_id == 0:
+            return None
+        self._check_gen()
+        if font_id in self._fonts:
+            return self._fonts[font_id]
+        # Find font resource
+        for fres in self.model.fonts:
+            if fres.get("font_id") != font_id:
+                continue
+            try:
+                if "combined_b64" in fres:
+                    data = base64.b64decode(fres["combined_b64"])
+                elif "header_b64" in fres and "data_b64" in fres:
+                    data = base64.b64decode(fres["header_b64"]) + base64.b64decode(fres["data_b64"])
+                else:
+                    data = b""
+                if len(data) >= 6:
+                    font = GfxFontPreview(data)
+                    self._fonts[font_id] = font
+                    return font
+            except Exception:
+                pass
+            break
+        self._fonts[font_id] = None
+        return None
+
+    def get_image(self, image_id):
+        """Return QPixmap for image_id, or None if not available."""
+        if image_id == 0:
+            return None
+        self._check_gen()
+        if image_id in self._images:
+            return self._images[image_id]
+        for ires in self.model.images:
+            if ires.get("image_id") != image_id:
+                continue
+            try:
+                raw = base64.b64decode(ires["data_b64"])
+                img = QImage()
+                if img.loadFromData(raw):
+                    self._images[image_id] = QPixmap.fromImage(img)
+                    return self._images[image_id]
+            except Exception:
+                pass
+            break
+        self._images[image_id] = None
+        return None
+
+
+# ============================================================
 # Data model
 # ============================================================
 
@@ -196,6 +339,7 @@ class DesignerModel(QWidget):
         self.fonts = []     # [{"name": str, "font_id": int, "header_b64": str, "data_b64": str}]
         self.images = []    # [{"name": str, "image_id": int, "source_name": str, "mode": "auto", "max_colors": 256, "data_b64": str}]
         self.programs = []  # [{"name": str, "exec_mode": "ram"|"flash", "source_b64": str}]
+        self._res_gen = 0   # bumped when fonts/images change, for cache invalidation
         self.include_dirs = []  # extra include dirs for compilation
         self.exec_mode = "flash"  # default exec_mode for the main program
         self.main_fl = DEFAULT_MAIN_FL  # user code — embedded in .fui
@@ -418,6 +562,7 @@ class DesignerModel(QWidget):
         self.include_dirs = data.get("include_dirs", [])
         self.exec_mode = data.get("exec_mode", "flash")
         self._path = path
+        self._res_gen += 1
         self.selected = None
         self.tree_changed.emit()
         self.selection_changed.emit()
@@ -529,10 +674,11 @@ class DesignerModel(QWidget):
 class WidgetItem(QGraphicsItem):
     """Visual representation of a widget on the canvas."""
 
-    def __init__(self, node, model):
+    def __init__(self, node, model, res_cache=None):
         super().__init__()
         self.node = node
         self.model = model
+        self.res_cache = res_cache
         self._dragging = False
         self._drag_start = None
         self._orig_loc = (0, 0)
@@ -621,24 +767,65 @@ class WidgetItem(QGraphicsItem):
                 painter.setBrush(QBrush(fc))
                 painter.drawEllipse(QPointF(cx, cy), outer_r * 0.5, outer_r * 0.5)
 
+        # Image preview
+        if node.image_id and self.res_cache:
+            pixmap = self.res_cache.get_image(node.image_id)
+            if pixmap:
+                pad_l = node.border[3] + node.padding[3]
+                pad_t = node.border[0] + node.padding[0]
+                pad_r = node.border[1] + node.padding[1]
+                pad_b = node.border[2] + node.padding[2]
+                target = QRectF(pad_l, pad_t, w - pad_l - pad_r, h - pad_t - pad_b)
+                # Scale to fit while preserving aspect ratio
+                pw, ph = pixmap.width(), pixmap.height()
+                if pw > 0 and ph > 0:
+                    scale = min(target.width() / pw, target.height() / ph)
+                    sw, sh = pw * scale, ph * scale
+                    dx = target.x() + (target.width() - sw) / 2
+                    dy = target.y() + (target.height() - sh) / 2
+                    painter.drawPixmap(QRectF(dx, dy, sw, sh), pixmap, QRectF(0, 0, pw, ph))
+
         # Text (Label, Button, or any widget with text)
         if node.text:
-            painter.setPen(QPen(rgb565_to_qcolor(node.text_color)))
-            font = QFont("Courier", 10)
-            painter.setFont(font)
-            flags = Qt.AlignVCenter
-            if node.text_align == 0:
-                flags |= Qt.AlignLeft
-            elif node.text_align == 1:
-                flags |= Qt.AlignHCenter
-            else:
-                flags |= Qt.AlignRight
             pad_l = node.border[3] + node.padding[3]
             pad_r = node.border[1] + node.padding[1]
             pad_t = node.border[0] + node.padding[0]
             pad_b = node.border[2] + node.padding[2]
-            text_rect = QRectF(pad_l + 2, pad_t, w - pad_l - pad_r - 4, h - pad_t - pad_b)
-            painter.drawText(text_rect, flags, node.text)
+            text_color = rgb565_to_qcolor(node.text_color)
+            gfx_font = self.res_cache.get_font(node.font_id) if self.res_cache else None
+            if gfx_font:
+                # Render with actual Adafruit GFX bitmap font
+                tw = gfx_font.text_width(node.text)
+                lh = gfx_font.line_height()
+                content_w = w - pad_l - pad_r - 4
+                content_h = h - pad_t - pad_b
+                # Horizontal alignment
+                if node.text_align == 1:
+                    tx = pad_l + 2 + (content_w - tw) // 2
+                elif node.text_align == 2:
+                    tx = pad_l + 2 + content_w - tw
+                else:
+                    tx = pad_l + 2
+                # Vertical center — y is baseline
+                ty = pad_t + (content_h + lh) // 2 - 2
+                painter.save()
+                painter.setClipRect(QRectF(pad_l, pad_t, w - pad_l - pad_r, content_h))
+                gfx_font.draw_text(painter, int(tx), int(ty), node.text, text_color)
+                painter.restore()
+            else:
+                # Fallback: Qt font
+                painter.setPen(QPen(text_color))
+                font = QFont("Courier", 10)
+                painter.setFont(font)
+                flags = Qt.AlignVCenter
+                if node.text_align == 0:
+                    flags |= Qt.AlignLeft
+                elif node.text_align == 1:
+                    flags |= Qt.AlignHCenter
+                else:
+                    flags |= Qt.AlignRight
+                text_rect = QRectF(pad_l + 2, pad_t, w - pad_l - pad_r - 4, h - pad_t - pad_b)
+                painter.drawText(text_rect, flags, node.text)
 
         # Selection highlight
         if self.model.selected is node:
@@ -737,6 +924,7 @@ class DesignerScene(QGraphicsScene):
     def __init__(self, model):
         super().__init__()
         self.model = model
+        self.res_cache = ResourceCache(model)
         self.items_map = {}
         self.handles = []
         self.setSceneRect(-CANVAS_MARGIN, -CANVAS_MARGIN,
@@ -762,7 +950,7 @@ class DesignerScene(QGraphicsScene):
 
         dfs = self.model.dfs_order()
         for i, node in enumerate(dfs):
-            item = WidgetItem(node, self.model)
+            item = WidgetItem(node, self.model, self.res_cache)
             item.setZValue(i)
             ax, ay = node.abs_pos()
             item.setPos(ax, ay)
@@ -1493,6 +1681,7 @@ class ResourcePanel(QWidget):
                     "name": name, "font_id": fid,
                     "combined_b64": header_b64,
                 })
+                self.model._res_gen += 1
                 self.refresh()
                 self.model.notify_changed()
             except Exception as e:
@@ -1510,6 +1699,7 @@ class ResourcePanel(QWidget):
                 "name": name, "font_id": fid,
                 "header_b64": header_b64, "data_b64": data_b64,
             })
+            self.model._res_gen += 1
             self.refresh()
             self.model.notify_changed()
 
@@ -1517,6 +1707,7 @@ class ResourcePanel(QWidget):
         idx = self.font_list.indexOfTopLevelItem(self.font_list.currentItem())
         if idx >= 0 and idx < len(self.model.fonts):
             self.model.fonts.pop(idx)
+            self.model._res_gen += 1
             self.refresh()
             self.model.notify_changed()
 
@@ -1536,6 +1727,7 @@ class ResourcePanel(QWidget):
             "mode": "auto", "max_colors": 256,
             "data_b64": data_b64,
         })
+        self.model._res_gen += 1
         self.refresh()
         self.model.notify_changed()
 
@@ -1543,6 +1735,7 @@ class ResourcePanel(QWidget):
         idx = self.image_list.indexOfTopLevelItem(self.image_list.currentItem())
         if idx >= 0 and idx < len(self.model.images):
             self.model.images.pop(idx)
+            self.model._res_gen += 1
             self.refresh()
             self.model.notify_changed()
 

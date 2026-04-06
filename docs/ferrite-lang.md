@@ -76,7 +76,7 @@ var color = 0xF800;     // initialized to 0xF800 in setup
 var lut[4] = [10, 20, 30, 40];  // array initialized in setup
 ```
 
-The VM has 32 variable slots total. Global variables use slots 0..N, function locals use slots N+.
+Global variables use slots 0..127, function locals use slots 0..127 (separate namespace via high bit). Max 128 globals + 128 locals per function.
 
 ## Comments
 
@@ -90,13 +90,14 @@ The VM has 32 variable slots total. Global variables use slots 0..N, function lo
 ## Variables
 
 ```c
-var x = 0;          // integer, initialized to 0
-var color = 0xF800;  // hex literal (red in RGB565)
-var mask = 0b1010;   // binary literal
-var big = 1_000_000; // underscores for readability
+var x = 0;          // int, initialized to 0
+var color = 0xF800;  // int, hex literal (red in RGB565)
+var speed = 1.5;     // float, inferred from float literal
+var angle = 0.0;     // float, decimal point makes it float
+var count;           // int (default when no initializer)
 ```
 
-All values are **signed 32-bit integers** (`i32`).
+The compiler tracks each variable's type (`int` or `float`) based on its initializer. A variable initialized with a float literal or float expression becomes a float variable. Subsequent arithmetic on float variables automatically uses float instructions.
 
 ### Arrays
 
@@ -112,16 +113,17 @@ colors[2] = 0xFFFF;
 
 ## Data Types
 
-There is only one data type: **i32** (signed 32-bit integer). Colors are RGB565 unsigned 16-bit values stored in i32.
+Two value types: **int** (signed 32-bit integer) and **float** (IEEE 754 f32, stored as bit pattern in i32). The compiler infers types at compile time — no runtime overhead.
 
 ### Number Literals
 
 ```c
-42          // decimal
-0xFF00      // hexadecimal
-0b1100_0011 // binary
-1_000_000   // decimal with underscores
-3.14159     // float (stored as f32 bit pattern)
+42          // int: decimal
+0xFF00      // int: hexadecimal
+0b1100_0011 // int: binary
+1_000_000   // int: decimal with underscores
+3.14159     // float: decimal point makes it float
+0.0         // float: zero as float
 ```
 
 ### Boolean Values
@@ -156,26 +158,43 @@ The display uses 16-bit RGB565 color format. Common colors:
 
 ## Operators
 
+All arithmetic and comparison operators are **type-aware**: when either operand is float, the compiler automatically promotes the int operand and uses float instructions. No manual `fadd()`/`flt()` calls needed.
+
 ### Arithmetic
 
-| Operator | Description |
-|----------|-------------|
-| `+` | Addition |
-| `-` | Subtraction / Negation |
-| `*` | Multiplication |
-| `/` | Integer division |
-| `%` | Modulo |
+| Operator | int + int | float involved |
+|----------|-----------|----------------|
+| `+` | ADD | FADD (auto-promote) |
+| `-` | SUB / NEG | FSUB / FNEG |
+| `*` | MUL | FMUL |
+| `/` | integer division | FDIV |
+| `%` | modulo | not supported for float |
+
+```c
+var a = 1.0;
+var b = 2;
+var c = a + b;  // b auto-promoted to float, uses FADD → c is float
+var d = -a;     // uses FNEG
+```
 
 ### Comparison
 
-| Operator | Description |
-|----------|-------------|
-| `==` | Equal |
-| `!=` | Not equal |
-| `<`  | Less than |
-| `<=` | Less or equal |
-| `>`  | Greater than |
-| `>=` | Greater or equal |
+| Operator | int + int | float involved |
+|----------|-----------|----------------|
+| `==` | EQ | FEQ |
+| `!=` | NE | FNE |
+| `<`  | LT | FLT |
+| `<=` | LE | FLE |
+| `>`  | GT | FGT |
+| `>=` | GE | FGE |
+
+Comparisons always return int (0 or 1), even with float operands.
+
+```c
+var temp = 25.5;
+if (temp > 30.0) { /* hot */ }    // uses FGT
+if (temp < 10) { /* cold */ }     // 10 auto-promoted, uses FLT
+```
 
 ### Logical / Bitwise
 
@@ -184,8 +203,8 @@ The display uses 16-bit RGB565 color format. Common colors:
 | `&&` | Logical AND (short-circuit) |
 | `\|\|` | Logical OR (short-circuit) |
 | `!`  | Logical NOT |
-| `&` | Bitwise AND |
-| `\|` | Bitwise OR |
+| `&` | Bitwise AND (int only) |
+| `\|` | Bitwise OR (int only) |
 
 ## Control Flow
 
@@ -245,6 +264,24 @@ fn max(a, b) {
     return b;
 }
 ```
+
+### Parameter Type Annotations
+
+Parameters default to `int`. Use `: float` to declare float parameters — this enables the compiler to use float operations inside the function body:
+
+```c
+fn lerp(a: float, b: float, t: float) {
+    return a + (b - a) * t;  // compiles to FSUB, FMUL, FADD
+}
+
+fn distance(x1: float, y1: float, x2: float, y2: float) {
+    var dx = x2 - x1;  // FSUB (all params are float)
+    var dy = y2 - y1;
+    return dx * dx + dy * dy;  // FMUL, FMUL, FADD
+}
+```
+
+Int parameters don't need annotation — `fn foo(x)` and `fn foo(x: int)` are equivalent.
 
 The VM has an 8-deep call stack.
 
@@ -626,26 +663,99 @@ endFrame();    // swap buffers (tear-free)
 
 ## Float32 Operations
 
-Software-emulated 32-bit float (Cortex-M3 has no FPU). Floats stored as IEEE 754 bit patterns in i32 variables.
+Software-emulated 32-bit float (Cortex-M3 has no FPU). The compiler tracks types at compile time and automatically selects float or integer instructions — just use normal operators.
+
+### Basic Usage
 
 ```c
-var pi = 3.14159;              // float literal
-var f = itof(42);              // int → float
-var i = ftoi(3.14);            // float → int (truncate)
-var sum = fadd(1.5, 2.3);     // 3.8
-var diff = fsub(10.0, 3.5);   // 6.5
-var prod = fmul(pi, fmul(r, r)); // pi*r^2
-var quot = fdiv(5.0, 9.0);    // 0.555...
-var neg = fneg(3.14);          // -3.14
+var pi = 3.14159;       // float (decimal point)
+var r = 5.0;
+var area = pi * r * r;  // FMUL, FMUL — all float
+
+var speed = 1.5;
+var pos = 0.0;
+pos = pos + speed;      // FADD
+
+if (pos > 100.0) {      // FGT
+    pos = 0.0;
+}
 ```
 
-Float comparisons return i32 (0 or 1):
+### Mixed int/float (Auto-Promotion)
+
+When an operator has one float and one int operand, the int is automatically promoted:
 
 ```c
-if (fgt(temp, 30.0)) { /* hot */ }
-if (flt(temp, 10.0)) { /* cold */ }
-// Also: feq, fne, fle, fge
+var x = 1.0;
+var y = 2;
+var z = x + y;     // y promoted via ITOF, then FADD → z is float
+var half = y / 2.0; // y promoted, then FDIV
 ```
+
+Assignment to a float variable also auto-promotes:
+
+```c
+var angle = 0.0;   // float
+angle = 42;        // 42 auto-promoted via ITOF
+```
+
+### Conversion Functions
+
+```c
+var f = itof(42);       // int → float (explicit)
+var i = ftoi(3.14);     // float → int (truncate toward zero)
+```
+
+### Float Functions with Type Annotations
+
+```c
+fn lerp(a: float, b: float, t: float) {
+    return a + (b - a) * t;
+}
+
+fn clampf(val: float, lo: float, hi: float) {
+    if (val < lo) { return lo; }
+    if (val > hi) { return hi; }
+    return val;
+}
+
+fn setup() {
+    var mid = lerp(0.0, 100.0, 0.5);   // 50.0
+    var clamped = clampf(1.5, 0.0, 1.0); // 1.0
+}
+```
+
+### Explicit Builtins (Legacy)
+
+The explicit float builtins still work for backward compatibility:
+
+```c
+var sum = fadd(1.5, 2.3);     // same as 1.5 + 2.3
+var diff = fsub(10.0, 3.5);   // same as 10.0 - 3.5
+var prod = fmul(2.0, 3.0);    // same as 2.0 * 3.0
+var quot = fdiv(5.0, 9.0);    // same as 5.0 / 9.0
+var neg = fneg(3.14);          // same as -3.14
+
+// Comparisons: feq, fne, flt, fle, fgt, fge
+if (fgt(temp, 30.0)) { }      // same as: if (temp > 30.0) { }
+```
+
+### Type Inference Rules
+
+| Expression | Inferred type |
+|------------|---------------|
+| `42`, `0xFF` | int |
+| `3.14`, `0.0` | float |
+| `var x = 1.0;` | x is float |
+| `var x = 1;` | x is int |
+| `var x;` | x is int (default) |
+| `float + int` | float (int auto-promoted) |
+| `float + float` | float |
+| `int + int` | int |
+| `float < float` | int (comparison result) |
+| `itof(x)` | float |
+| `ftoi(x)` | int |
+| `get(prop)` | int (widget properties are int) |
 
 ## String Operations
 

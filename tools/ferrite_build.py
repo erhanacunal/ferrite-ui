@@ -369,13 +369,17 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
 def compile_program(source_path: str, include_dirs=None) -> bytes:
     """Ferrite lang source → VM image (header + opcodes)."""
     try:
-        from ferrite_lang import build_image
-        source = Path(source_path).read_text(encoding="utf-8")
-        return build_image(source, filename=source_path, include_dirs=include_dirs)
+        from ferrite_lang import build_image, CompileError
     except ImportError:
         print(f"Warning: ferrite_lang not available, reading {source_path} as raw binary",
               file=sys.stderr)
         return Path(source_path).read_bytes()
+
+    source = Path(source_path).read_text(encoding="utf-8")
+    try:
+        return build_image(source, filename=source_path, include_dirs=include_dirs)
+    except CompileError as e:
+        raise CompileError(f"{source_path}: {e}") from e
 
 
 # --- Flash filesystem builder ---
@@ -534,11 +538,14 @@ def build(project_path: str, output_path: str) -> dict:
 
         if "source" in page:
             # Compile .fl source as page (bg_color prefix + bytecode)
-            from ferrite_lang import compile_page as fl_compile_page
+            from ferrite_lang import compile_page as fl_compile_page, CompileError
             bg_color = parse_color(page.get("background", "0x0000"))
             source_path = project_dir / page["source"]
             source = source_path.read_text(encoding="utf-8")
-            page_data = fl_compile_page(source, bg_color, str(source_path), include_dirs=include_dirs)
+            try:
+                page_data = fl_compile_page(source, bg_color, str(source_path), include_dirs=include_dirs)
+            except CompileError as e:
+                raise CompileError(f"{source_path}: {e}") from e
             # Count alloc() calls in bytecode to track widget IDs
             widget_count = source.count("alloc(")
             next_id += widget_count
@@ -631,7 +638,15 @@ def main():
         if a == "-o" and i + 1 < len(args):
             output_path = args[i + 1]
 
-    stats = build(project_path, output_path)
+    try:
+        stats = build(project_path, output_path)
+    except FileNotFoundError as e:
+        print(f"error: file not found: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        # CompileError or other build errors — show clean message
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Built: {output_path}")
     print(f"  Resources: {stats['resources']}")

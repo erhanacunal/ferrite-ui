@@ -224,7 +224,7 @@ def tokenize(source):
             '+': '+', '-': '-', '*': '*', '/': '/', '%': '%',
             '&': '&', '|': '|', '!': '!', '<': '<', '>': '>',
             '=': '=', '(': '(', ')': ')', '{': '{', '}': '}',
-            '[': '[', ']': ']', ',': ',', ';': ';', '.': '.',
+            '[': '[', ']': ']', ',': ',', ';': ';', '.': '.', ':': ':',
         }
         if ch in single_map:
             tokens.append(Token(ch, ch, line))
@@ -397,9 +397,10 @@ class ExprStmt:
 
 
 class FnDef:
-    def __init__(self, name, params, body, line):
+    def __init__(self, name, params, body, line, param_types=None):
         self.name = name
         self.params = params
+        self.param_types = param_types  # ["int"|"float", ...] or None
         self.body = body
         self.line = line
 
@@ -469,13 +470,32 @@ class Parser:
         name = self._expect('IDENT').value
         self._expect('(')
         params = []
+        param_types = []
         if not self._check(')'):
-            params.append(self._expect('IDENT').value)
+            pname = self._expect('IDENT').value
+            params.append(pname)
+            param_types.append(self._parse_type_annotation())
             while self._match(','):
-                params.append(self._expect('IDENT').value)
+                pname = self._expect('IDENT').value
+                params.append(pname)
+                param_types.append(self._parse_type_annotation())
         self._expect(')')
         body = self._block()
-        return FnDef(name, params, body, line)
+        return FnDef(name, params, body, line, param_types)
+
+    def _parse_type_annotation(self):
+        """Parse optional ': float' type annotation. Returns 'int' or 'float'."""
+        if self._match(':'):
+            tok = self._expect('IDENT')
+            if tok.value == 'float':
+                return 'float'
+            elif tok.value == 'int':
+                return 'int'
+            else:
+                raise CompileError(
+                    f"unknown type '{tok.value}' (expected 'int' or 'float')",
+                    tok.line)
+        return 'int'
 
     def _block(self):
         self._expect('{')
@@ -771,12 +791,19 @@ NO_VALUE_BUILTINS = {
 
 
 class CodeGen:
+    # Type constants for compile-time type inference
+    T_INT = "int"
+    T_FLOAT = "float"
+
     def __init__(self):
         self.asm = Asm()
         self.vars = {}          # name -> slot
+        self.var_types = {}     # name -> T_INT | T_FLOAT
         self.global_vars = {}   # name -> slot (global variables visible to all functions)
+        self.global_var_types = {}  # name -> T_INT | T_FLOAT
         self.next_slot = 0
         self.functions = {}     # name -> {params, addr, end_addr, patches}
+        self.func_param_types = {}  # name -> [T_INT|T_FLOAT, ...]
         self.widget_ids = {}    # name -> predicted widget ID
         self.next_widget_id = 1 # 0 = pre-created root widget
         self._loop_stack = []   # {continue_target, continue_patches, break_patches}
@@ -831,6 +858,7 @@ class CodeGen:
 
         # Reset vars for main code emission
         self.vars = {}
+        self.var_types = {}
         self.next_slot = 0
 
         for stmt in program.statements:
@@ -904,12 +932,20 @@ class CodeGen:
         # Phase 3: Emit all functions (no JMP-over needed — functions are the code)
         # Allocate global variable slots first (visible to all functions)
         self.vars = {}
+        self.var_types = {}
         self.next_slot = 0
         for stmt in global_var_stmts:
-            slot = self._alloc_var(stmt.name)
+            slot = self._alloc_var(stmt.name, getattr(stmt, 'line', 0))
             self.global_vars[stmt.name] = slot
             if stmt.array_size is not None:
                 self.array_vars.add(stmt.name)
+            # Infer global variable type from initializer
+            if stmt.init is not None:
+                vtype = self._infer_type(stmt.init)
+            else:
+                vtype = self.T_INT
+            self.var_types[stmt.name] = vtype
+            self.global_var_types[stmt.name] = vtype
 
         # Emit functions. Global var init code is injected at the start of setup().
         self._global_init_stmts = global_var_stmts
@@ -978,20 +1014,20 @@ class CodeGen:
 
     # --- Variable management ---
 
-    def _alloc_var(self, name):
+    def _alloc_var(self, name, line=0):
         if name in self.vars:
-            raise CompileError(f"variable already defined: {name}")
+            raise CompileError(f"variable already defined: {name}", line)
         if self._in_function:
             # Local variable: high bit set, index 0-127
             local_idx = self.next_slot - self._fn_base
             if local_idx >= 128:
-                raise CompileError(f"too many local variables (max 128): {name}")
+                raise CompileError(f"too many local variables (max 128): {name}", line)
             slot = 0x80 | local_idx
         else:
             # Global variable: no high bit, index 0-127
             slot = self.next_slot
             if slot >= 128:
-                raise CompileError(f"too many global variables (max 128): {name}")
+                raise CompileError(f"too many global variables (max 128): {name}", line)
         self.vars[name] = slot
         self.next_slot += 1
         return slot
@@ -1000,6 +1036,67 @@ class CodeGen:
         if name not in self.vars:
             raise CompileError(f"undefined variable: {name}", line)
         return self.vars[name]
+
+    # --- Compile-time type inference (no code emission) ---
+
+    # Builtins that return float
+    _FLOAT_RETURNING = {
+        'itof', 'fadd', 'fsub', 'fmul', 'fdiv', 'fneg',
+        'parseFloat',
+    }
+    # Builtins that return int regardless of argument types
+    _INT_RETURNING = {
+        'ftoi', 'feq', 'fne', 'flt', 'fle', 'fgt', 'fge',
+        'alloc', 'get', 'str', 'itos', 'ftos', 'concat',
+        'parseInt', 'strLen', 'millis', 'brightness',
+        'arrFree', 'strFree', 'strClear',
+    }
+
+    def _infer_type(self, node):
+        """Infer compile-time type of an expression (T_INT or T_FLOAT).
+        Pure analysis — does not emit any code."""
+        if isinstance(node, NumLit):
+            return self.T_INT
+        if isinstance(node, FloatLit):
+            return self.T_FLOAT
+        if isinstance(node, BoolLit):
+            return self.T_INT
+        if isinstance(node, StrLit):
+            return self.T_INT  # str_id
+        if isinstance(node, FuncRef):
+            return self.T_INT  # func_id
+        if isinstance(node, VarRef):
+            return self.var_types.get(node.name, self.T_INT)
+        if isinstance(node, IndexExpr):
+            return self.T_INT  # array elements are untyped
+        if isinstance(node, DotExpr):
+            return self.T_INT  # widget properties are int
+        if isinstance(node, UnaryOp):
+            if node.op == '!':
+                return self.T_INT
+            return self._infer_type(node.operand)  # - preserves type
+        if isinstance(node, BinOp):
+            if node.op in ('&&', '||', '&', '|'):
+                return self.T_INT
+            # Comparison operators always return int (boolean)
+            if node.op in ('==', '!=', '<', '<=', '>', '>='):
+                return self.T_INT
+            # Arithmetic: float if either side is float
+            lt = self._infer_type(node.left)
+            rt = self._infer_type(node.right)
+            if lt == self.T_FLOAT or rt == self.T_FLOAT:
+                return self.T_FLOAT
+            return self.T_INT
+        if isinstance(node, CallExpr):
+            if node.name in self._FLOAT_RETURNING:
+                return self.T_FLOAT
+            if node.name in self._INT_RETURNING:
+                return self.T_INT
+            # User-defined function: default to int
+            return self.T_INT
+        if isinstance(node, ArrayLit):
+            return self.T_INT
+        return self.T_INT
 
     # --- Functions ---
 
@@ -1010,9 +1107,11 @@ class CodeGen:
         # Function locals use stack frames (high bit encoding).
         # Each function starts locals from index 0 (0x80).
         saved_vars = dict(self.vars)
+        saved_types = dict(self.var_types)
         saved_slot = self.next_slot
         saved_in_fn = self._in_function
         self.vars = dict(self.global_vars)  # globals visible in all functions
+        self.var_types = dict(self.global_var_types)
         self.next_slot = self._fn_base  # locals start after globals
         self._in_function = True
 
@@ -1021,9 +1120,12 @@ class CodeGen:
         self.asm.frame(local_count)
 
         # Allocate param slots and pop args (reverse order)
+        # Set parameter types from annotations (default: int)
+        param_types = getattr(fn, 'param_types', None) or [self.T_INT] * len(fn.params)
         param_slots = []
-        for p in fn.params:
-            slot = self._alloc_var(p)
+        for i, p in enumerate(fn.params):
+            slot = self._alloc_var(p, getattr(fn, 'line', 0))
+            self.var_types[p] = param_types[i] if i < len(param_types) else self.T_INT
             param_slots.append(slot)
         for slot in reversed(param_slots):
             self.asm.store(slot)
@@ -1055,6 +1157,7 @@ class CodeGen:
 
         # Restore
         self.vars = saved_vars
+        self.var_types = saved_types
         self.next_slot = saved_slot
         self._in_function = saved_in_fn
 
@@ -1093,10 +1196,11 @@ class CodeGen:
             raise CompileError(f"unknown statement: {type(node).__name__}")
 
     def _gen_var_decl(self, node):
-        slot = self._alloc_var(node.name)
+        slot = self._alloc_var(node.name, node.line)
         if node.array_size is not None:
             # Array: VM pool'da oluştur, arr_id'yi var slot'a sakla
             self.array_vars.add(node.name)
+            self.var_types[node.name] = self.T_INT
             if node.init is not None:
                 if not isinstance(node.init, ArrayLit):
                     raise CompileError("array must be initialized with [...]", node.line)
@@ -1106,10 +1210,8 @@ class CodeGen:
                         node.line)
                 all_const = all(isinstance(e, NumLit) for e in node.init.elements)
                 if all_const:
-                    # Tek instruction ile oluştur + başlat
                     self.asm.arr_alloc_init([e.value for e in node.init.elements])
                 else:
-                    # Boş oluştur, sonra tek tek yaz
                     self.asm.arr_alloc(node.array_size)
                     self.asm.store(slot)
                     for i, elem in enumerate(node.init.elements):
@@ -1117,22 +1219,24 @@ class CodeGen:
                         self.asm.push(i)       # index
                         self._gen_expr(elem)   # value
                         self.asm.arr_store()
-                    return  # slot'a zaten yazdık
+                    return
             else:
                 self.asm.arr_alloc(node.array_size)
         else:
-            # Scalar variable
+            # Scalar variable — infer type from initializer
             if node.init is not None:
+                vtype = self._infer_type(node.init)
+                self.var_types[node.name] = vtype
                 if isinstance(node.init, CallExpr) and node.init.name == 'alloc':
                     self.widget_ids[node.name] = self.next_widget_id
                     self.next_widget_id += 1
-                    # Combined alloc+target+store
                     self.asm.w_alltar(slot)
                     self._last_alltar_var = node.name
                     self._current_target = node.name
                     return
                 self._gen_expr(node.init)
             else:
+                self.var_types[node.name] = self.T_INT
                 self.asm.push(0)
         self.asm.store(slot)
 
@@ -1193,6 +1297,14 @@ class CodeGen:
                 self._current_target = node.name
                 return
             self._gen_expr(node.value)
+            var_type = self.var_types.get(node.name, self.T_INT)
+            val_type = self._infer_type(node.value)
+            # Auto-promote int→float if variable is typed float
+            if var_type == self.T_FLOAT and val_type == self.T_INT:
+                self.asm.itof()
+            # Update variable type if RHS is float (for uninitialized vars)
+            if val_type == self.T_FLOAT and var_type == self.T_INT:
+                self.var_types[node.name] = self.T_FLOAT
             slot = self._var_slot(node.name, node.line)
             self.asm.store(slot)
 
@@ -1328,8 +1440,21 @@ class CodeGen:
         else:
             raise CompileError(f"unknown expression: {type(node).__name__}")
 
+    # Float-aware operator maps
+    _INT_OPS = {
+        '+': 'add', '-': 'sub', '*': 'mul', '/': 'div', '%': 'modulo',
+        '==': 'eq', '!=': 'ne', '<': 'lt', '<=': 'le', '>': 'gt', '>=': 'ge',
+        '&': 'and_', '|': 'or_',
+    }
+    _FLOAT_ARITH = {
+        '+': 'fadd', '-': 'fsub', '*': 'fmul', '/': 'fdiv',
+    }
+    _FLOAT_CMP = {
+        '==': 'feq', '!=': 'fne', '<': 'flt', '<=': 'fle', '>': 'fgt', '>=': 'fge',
+    }
+
     def _gen_binop(self, node):
-        # Short-circuit logical operators
+        # Short-circuit logical operators — always int
         if node.op == '&&':
             self._gen_expr(node.left)
             self.asm.dup()
@@ -1347,25 +1472,53 @@ class CodeGen:
             self.asm.patch(patch)
             return
 
+        # Bitwise — always int, no float promotion
+        if node.op in ('&', '|'):
+            self._gen_expr(node.left)
+            self._gen_expr(node.right)
+            getattr(self.asm, self._INT_OPS[node.op])()
+            return
+
+        # Infer operand types
+        lt = self._infer_type(node.left)
+        rt = self._infer_type(node.right)
+        use_float = (lt == self.T_FLOAT or rt == self.T_FLOAT)
+
+        # Arithmetic or comparison with float promotion
+        if use_float and (node.op in self._FLOAT_ARITH or node.op in self._FLOAT_CMP):
+            # Generate left, promote if needed
+            self._gen_expr(node.left)
+            if lt == self.T_INT:
+                self.asm.itof()
+            # Generate right, promote if needed
+            self._gen_expr(node.right)
+            if rt == self.T_INT:
+                self.asm.itof()
+            # Emit float op
+            if node.op in self._FLOAT_ARITH:
+                getattr(self.asm, self._FLOAT_ARITH[node.op])()
+            else:
+                getattr(self.asm, self._FLOAT_CMP[node.op])()
+            return
+
+        # Modulo with floats is not supported — fall through to int
+        if use_float and node.op == '%':
+            raise CompileError("modulo (%) is not supported for float operands", node.line)
+
+        # Pure int path
         self._gen_expr(node.left)
         self._gen_expr(node.right)
-
-        ops = {
-            '+': self.asm.add, '-': self.asm.sub,
-            '*': self.asm.mul, '/': self.asm.div, '%': self.asm.modulo,
-            '==': self.asm.eq, '!=': self.asm.ne,
-            '<': self.asm.lt, '<=': self.asm.le,
-            '>': self.asm.gt, '>=': self.asm.ge,
-            '&': self.asm.and_, '|': self.asm.or_,
-        }
-        if node.op not in ops:
+        if node.op not in self._INT_OPS:
             raise CompileError(f"unknown operator: {node.op}", node.line)
-        ops[node.op]()
+        getattr(self.asm, self._INT_OPS[node.op])()
 
     def _gen_unary(self, node):
         self._gen_expr(node.operand)
         if node.op == '-':
-            self.asm.neg()
+            if self._infer_type(node.operand) == self.T_FLOAT:
+                self.asm.fneg()
+            else:
+                self.asm.neg()
         elif node.op == '!':
             self.asm.not_()
         else:
@@ -1962,7 +2115,7 @@ def compile(source, filename="<input>", include_dirs=None):
     except CompileError:
         raise
     except Exception as e:
-        raise CompileError(f"internal error: {e}")
+        raise CompileError(f"internal error: {e}") from e
 
 
 # System callback name → expected_arg_count
@@ -2039,7 +2192,7 @@ def build_image(source, filename="<input>", include_dirs=None):
     except CompileError:
         raise
     except Exception as e:
-        raise CompileError(f"internal error: {e}")
+        raise CompileError(f"internal error: {e}") from e
 
 
 class _ImageBytes(bytes):
@@ -2123,19 +2276,26 @@ def main():
                         metavar='DIR', help='Add include search directory (repeatable)')
     args = parser.parse_args()
 
-    with open(args.source, 'r', encoding='utf-8') as f:
-        source = f.read()
+    try:
+        with open(args.source, 'r', encoding='utf-8') as f:
+            source = f.read()
+    except FileNotFoundError:
+        print(f"error: file not found: {args.source}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"error: cannot read {args.source}: {e}", file=sys.stderr)
+        sys.exit(1)
 
     include_dirs = [os.path.abspath(d) for d in args.include]
 
-    # Expand #include directives before auto-detection
-    source = preprocess(source, args.source, include_dirs)
-
-    # Auto-detect image mode: if source has fn setup() and fn loop(), use --image
-    has_setup_loop = ('fn setup()' in source and 'fn loop()' in source)
-    use_image = args.image or (has_setup_loop and args.page is None)
-
     try:
+        # Expand #include directives before auto-detection
+        source = preprocess(source, args.source, include_dirs)
+
+        # Auto-detect image mode: if source has fn setup() and fn loop(), use --image
+        has_setup_loop = ('fn setup()' in source and 'fn loop()' in source)
+        use_image = args.image or (has_setup_loop and args.page is None)
+
         if use_image:
             output = build_image(source, args.source)
             # New image format: header(5 + 12*N) + opcodes
@@ -2153,7 +2313,7 @@ def main():
             output = compile(source, args.source)
             raw_code = output
     except CompileError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
     # Build function labels for disassembly
