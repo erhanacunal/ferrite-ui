@@ -47,7 +47,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - `#![no_std]` + `#![no_main]`
 - Rust 2024 edition (`edition = "2024"` — stable with Rust 1.85)
 - `cortex-m-rt` crate — startup, interrupt table, `#[entry]` macro
-- `panic-halt` — panic → infinite loop
+- Custom panic handler — displays error on LCD + sends via USART (no heap, ROM font only)
 - No newlib, no hidden runtime, RAM fully owned by user
 - Target: `thumbv7m-none-eabi`
 
@@ -77,7 +77,6 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - Static rect pool: `MAX_CLIP_RECTS = 32`
   - Each `subtract` operation produces max 4 new rects (top/bottom/left/right strips)
   - Pool full fallback: draw entire dirty rect (overdraw, no tearing)
-- Double buffer currently disabled — LCD writes directly to front buffer
 - **Dirty redraw flow:**
   1. `mark_dirty(id)` → marks widget + entire subtree as dirty
   2. `render_dirty()` → computes DFS order
@@ -85,15 +84,22 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   4. Subtracts occluder rects from ClipRegion
   5. Widget is drawn over remaining visible rects
   6. Child widgets are drawn recursively with the same occluder list
-- **Two render modes:**
+- **Three render functions:**
   - `render_all()` — full screen, DFS pre-order, no clipping (initial draw)
   - `render_dirty()` — iterative (not recursive), uses DFS cache, clipped (partial update)
+  - `render_buffered()` — double-buffered full redraw: begin_frame + render_all + end_frame (flicker-free, only fires when dirty)
   - **DFS cache:** `WidgetTree.dfs_cache` — not recomputed unless tree changes (alloc/add_child/clear invalidate it)
+- **Render mode** (per-program, stored in image header v3):
+  - `dirty` (default): partial update, direct front buffer writes
+  - `buffered`: double-buffered full redraw every dirty frame, no tearing
+  - Set via `"render_mode": "dirty"|"buffered"` in project.json
+  - In buffered mode: OP_BEGIN_FRAME/OP_END_FRAME are no-ops (framework handles buffer management)
 
 ### Render
 - `fill_rect` → `set_address` + burst pixel write (hardware speed on FPGA)
 - No frame buffer in CPU RAM — writes directly to FPGA
-- Partial update: only dirty widgets are redrawn
+- **Dirty mode:** partial update — only dirty widgets are redrawn (front buffer)
+- **Buffered mode:** full redraw to back buffer, FPGA atomic swap (no tearing)
 
 ### Bytecode Interpreter (VM)
 - **Protobuf tag encoding:** `tag = (opcode << 3) | wire_type`
@@ -107,6 +113,9 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Builder:** builds bytecode in RAM, forward jump patching, writes to `&mut [u8]` buffer
 - **Execution:** `vm.run(&code[..len], &mut tree, &mut lcd, &flash)` — F_READ/F_WRITE operate via flash
 - **Control flow:** if/while/for — via JZ/JNZ/JMP combinations
+- **Image header v3:** version(u8=3) + func_count(u16) + global_count(u16) + flags(u16) + func_table
+  - flags bit 0: render_mode (0=dirty, 1=buffered)
+  - Backward compatible: v1/v2 images parsed with 5-byte header, v3 with 7-byte header
 
 ### External Flash (W25Q256, 32MB)
 - **Pin assignment:** PA4=CS, PA5=CLK, PA6=MISO, PA7=MOSI (bit-bang SPI)
@@ -158,7 +167,7 @@ Nextion is a registered trademark of ITEAD — this project is fully independent
 ```
 ferrite-ui/
 ├── .cargo/config.toml  — thumbv7m-none-eabi target + linker flags
-├── Cargo.toml          — cortex-m, cortex-m-rt (device feature), panic-halt
+├── Cargo.toml          — cortex-m, cortex-m-rt (device feature)
 ├── memory.x            — GD32F103RBT6 linker script (128K Flash, 20K RAM)
 ├── device.x            — Interrupt vector definitions (USART0)
 ├── build.rs            — device.x → linker search path
@@ -174,7 +183,8 @@ ferrite-ui/
     ├── embedded_font.rs — Embedded FreeMono9pt7b font data (in ROM)
     ├── fs.rs           — Flash filesystem (TOC, resource access by name)
     ├── image.rs        — Ferrite Image (FI) format decoder (raw/rle/indexed+rle)
-    ├── render.rs       — render_all + render_dirty (iterative, painter's algorithm)
+    ├── render.rs       — render_all + render_dirty + render_buffered (painter's algorithm)
+    ├── panic.rs        — Custom panic handler (LCD error display + USART output)
     ├── touch.rs        — XPT2046 SPI bit-bang, hit test, debounce, PENIRQ GPIO, recovery
     ├── sdcard.rs       — SD card SPI driver (SPI0 shared, Mode 0)
     ├── fat.rs          — FAT16/32 filesystem reader
@@ -226,4 +236,10 @@ ferrite-ui/
 - [x] @func_name syntax (compiler callback references)
 - [x] W_ALLTAR opcode (alloc+target+store combined)
 - [x] Sparse variable map (Vec<VmVar>, max 256, removed 32 limit)
+- [x] Compound assignments (+=, -=, *=, /=, %=) in compiler
+- [x] Pre/post increment/decrement (++i, i++, --i, i--) in compiler
+- [x] Ternary operator (cond ? then : else) in compiler
+- [x] Buffered render mode (double-buffered full redraw, project.json selectable)
+- [x] Image header v3 (flags field: render_mode)
+- [x] Custom panic handler (LCD error display + USART output, replaces panic-halt)
 - [ ] SD card boot (SPI0 bus sharing issue needs to be resolved)

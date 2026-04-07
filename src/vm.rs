@@ -122,6 +122,16 @@ impl FunctionKind {
     }
 }
 
+/// Render mode — determines how the main loop renders widgets.
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum RenderMode {
+    /// Partial update: only dirty widgets redrawn (default).
+    Dirty = 0,
+    /// Double-buffered full redraw every frame (flicker-free).
+    Buffered = 1,
+}
+
 /// Function entry from the image header.
 #[derive(Clone, Copy)]
 pub struct FuncEntry {
@@ -131,8 +141,10 @@ pub struct FuncEntry {
     pub length: u32,
 }
 
-/// Image header size: version(1) + function_count(2) + reserved(2) = 5 bytes.
-const IMAGE_HEADER_SIZE: usize = 5;
+/// Image header size v1/v2: version(1) + function_count(2) + reserved(2) = 5 bytes.
+/// Image header size v3: + flags(2) = 7 bytes.
+const IMAGE_HEADER_SIZE_V2: usize = 5;
+const IMAGE_HEADER_SIZE_V3: usize = 7;
 /// Each function entry: func_id(2) + kind(1) + pad(1) + offset(4) + length(4) = 12 bytes.
 const FUNC_ENTRY_SIZE: usize = 12;
 
@@ -359,6 +371,8 @@ pub struct Vm {
     frame_base: u8,
     frame_size: u8,
     global_count: u8,
+    // Render mode from image header
+    pub render_mode: RenderMode,
 }
 
 impl Vm {
@@ -392,6 +406,7 @@ impl Vm {
             frame_base: 0,
             frame_size: 0,
             global_count: 0,
+            render_mode: RenderMode::Dirty,
         }
     }
 
@@ -430,13 +445,14 @@ impl Vm {
     /// Load a VM image from RAM bytes. Parses the image header and keeps
     /// opcodes in a Vec<u8>. Returns false if the header is invalid.
     pub fn load_ram(&mut self, image: &[u8]) -> bool {
-        if let Some((funcs, opcode_start, gc)) = parse_image_header(image) {
+        if let Some((funcs, opcode_start, gc, rm)) = parse_image_header(image) {
             let opcodes = image[opcode_start..].to_vec();
             self.code = VmCode::Ram(opcodes);
             self.functions = funcs;
             self.global_count = gc;
             self.frame_base = gc;
             self.frame_size = 0;
+            self.render_mode = rm;
             true
         } else {
             false
@@ -447,12 +463,12 @@ impl Vm {
     /// opcodes are read on demand from flash via SPI.
     pub fn load_flash(&mut self, flash: &Flash, base: u32, total_len: usize) -> bool {
         // Read header into a stack buffer
-        let hdr_max = IMAGE_HEADER_SIZE + FUNC_ENTRY_SIZE * 64; // max 64 functions
+        let hdr_max = IMAGE_HEADER_SIZE_V3 + FUNC_ENTRY_SIZE * 64; // max 64 functions
         let read_len = total_len.min(hdr_max);
-        let mut hdr_buf = [0u8; 5 + 12 * 64]; // 773 bytes on stack
+        let mut hdr_buf = [0u8; IMAGE_HEADER_SIZE_V3 + FUNC_ENTRY_SIZE * 64]; // 775 bytes on stack
         flash.read(base, &mut hdr_buf[..read_len]);
 
-        if let Some((funcs, opcode_start, gc)) = parse_image_header(&hdr_buf[..read_len]) {
+        if let Some((funcs, opcode_start, gc, rm)) = parse_image_header(&hdr_buf[..read_len]) {
             let opcode_base = base + opcode_start as u32;
             let opcode_len = total_len.saturating_sub(opcode_start);
             self.code = VmCode::Flash {
@@ -464,6 +480,7 @@ impl Vm {
             self.global_count = gc;
             self.frame_base = gc;
             self.frame_size = 0;
+            self.render_mode = rm;
             true
         } else {
             false
@@ -644,6 +661,7 @@ impl Vm {
         self.cb_head = 0;
         self.cb_tail = 0;
         self.critical = false;
+        self.render_mode = RenderMode::Dirty;
     }
 
     pub fn has_code(&self) -> bool {
@@ -792,7 +810,10 @@ impl Vm {
             OP_W_DIRTY => {
                 if self.target.is_some() { ctx.tree.mark_dirty(self.target); }
             }
-            OP_W_RENDER => render::render_dirty(ctx),
+            OP_W_RENDER => match self.render_mode {
+                RenderMode::Buffered => render::render_buffered(ctx),
+                RenderMode::Dirty => render::render_dirty(ctx),
+            },
             OP_ARR_LOAD => {
                 let idx = self.pop();
                 let arr_id = self.pop();
@@ -1176,8 +1197,17 @@ impl Vm {
                 let (cx, cy) = unpack_pair(self.pop());
                 ctx.lcd.draw_arc(cx as i16, cy as i16, radius, start, end, color);
             }
-            OP_BEGIN_FRAME => ctx.lcd.begin_frame(),
-            OP_END_FRAME => ctx.lcd.end_frame(),
+            OP_BEGIN_FRAME => {
+                // In buffered mode, render_buffered handles begin/end frame
+                if self.render_mode != RenderMode::Buffered {
+                    ctx.lcd.begin_frame();
+                }
+            }
+            OP_END_FRAME => {
+                if self.render_mode != RenderMode::Buffered {
+                    ctx.lcd.end_frame();
+                }
+            }
             OP_SEND_USART => {
                 let arr_id = self.pop() as u16;
                 if let Some(arr) = self.arrays.iter().find(|a| a.id == arr_id) {
@@ -1518,29 +1548,45 @@ impl Vm {
 
 /// Parse VM image header. Returns (function table, opcode start offset).
 ///
-/// Format:
-///   version(u8) + function_count(u16 LE) + reserved(u16)
+/// Format v1/v2:
+///   version(u8) + function_count(u16 LE) + global_count(u16 LE)
 ///   + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
-fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8)> {
-    if data.len() < IMAGE_HEADER_SIZE {
+/// Format v3 (adds flags):
+///   version(u8) + function_count(u16 LE) + global_count(u16 LE) + flags(u16 LE)
+///   + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
+///   flags bit 0: render_mode (0=dirty, 1=buffered)
+fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderMode)> {
+    if data.len() < IMAGE_HEADER_SIZE_V2 {
         return None;
     }
 
     let version = data[0];
-    if version != 1 && version != 2 {
+    if version < 1 || version > 3 {
         return None;
     }
 
     let func_count = u16::from_le_bytes([data[1], data[2]]) as usize;
-    // v1: reserved=0, v2: global_count
+    // v1: reserved=0, v2+: global_count
     let global_count = if version >= 2 {
         u16::from_le_bytes([data[3], data[4]]) as u8
     } else {
         0
     };
 
+    // v3: flags field after global_count
+    let (header_size, render_mode) = if version >= 3 {
+        if data.len() < IMAGE_HEADER_SIZE_V3 {
+            return None;
+        }
+        let flags = u16::from_le_bytes([data[5], data[6]]);
+        let rm = if flags & 0x01 != 0 { RenderMode::Buffered } else { RenderMode::Dirty };
+        (IMAGE_HEADER_SIZE_V3, rm)
+    } else {
+        (IMAGE_HEADER_SIZE_V2, RenderMode::Dirty)
+    };
+
     let table_size = func_count * FUNC_ENTRY_SIZE;
-    let opcode_start = IMAGE_HEADER_SIZE + table_size;
+    let opcode_start = header_size + table_size;
 
     if data.len() < opcode_start {
         return None;
@@ -1548,7 +1594,7 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8)> {
 
     let mut functions = Vec::with_capacity(func_count);
     for i in 0..func_count {
-        let base = IMAGE_HEADER_SIZE + i * FUNC_ENTRY_SIZE;
+        let base = header_size + i * FUNC_ENTRY_SIZE;
         let func_id = u16::from_le_bytes([data[base], data[base + 1]]);
         let kind_byte = data[base + 2];
         // data[base + 3] = pad
@@ -1569,7 +1615,7 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8)> {
         });
     }
 
-    Some((functions, opcode_start, global_count))
+    Some((functions, opcode_start, global_count, render_mode))
 }
 
 // --- Packed u32 helper ---

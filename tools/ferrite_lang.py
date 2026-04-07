@@ -214,7 +214,8 @@ def tokenize(source):
 
         # Two-char operators
         two = source[i:i + 2] if i + 1 < n else ''
-        if two in ('==', '!=', '<=', '>=', '&&', '||'):
+        if two in ('==', '!=', '<=', '>=', '&&', '||',
+                    '++', '--', '+=', '-=', '*=', '/=', '%='):
             tokens.append(Token(two, two, line))
             i += 2
             continue
@@ -225,6 +226,7 @@ def tokenize(source):
             '&': '&', '|': '|', '!': '!', '<': '<', '>': '>',
             '=': '=', '(': '(', ')': ')', '{': '{', '}': '}',
             '[': '[', ']': ']', ',': ',', ';': ';', '.': '.', ':': ':',
+            '?': '?',
         }
         if ch in single_map:
             tokens.append(Token(ch, ch, line))
@@ -320,6 +322,46 @@ class CallExpr:
 class ArrayLit:
     def __init__(self, elements, line):
         self.elements = elements
+        self.line = line
+
+
+class TernaryExpr:
+    """cond ? then_expr : else_expr"""
+    def __init__(self, cond, then_expr, else_expr, line):
+        self.cond = cond
+        self.then_expr = then_expr
+        self.else_expr = else_expr
+        self.line = line
+
+
+class IncDecExpr:
+    """Pre/post increment/decrement: ++i, i++, --i, i--
+    op is '+' or '-', pre is True for prefix."""
+    def __init__(self, name, op, pre, line):
+        self.name = name  # variable name
+        self.op = op      # '+' or '-'
+        self.pre = pre    # True = prefix (++i), False = postfix (i++)
+        self.line = line
+
+
+class CompoundAssign:
+    """x += expr, x -= expr, etc.
+    op is the arithmetic operator: +, -, *, /, %"""
+    def __init__(self, name, op, value, line, index=None):
+        self.name = name
+        self.op = op      # '+', '-', '*', '/', '%'
+        self.value = value
+        self.line = line
+        self.index = index  # for arr[i] += expr
+
+
+class DotCompoundAssign:
+    """widget.prop += expr"""
+    def __init__(self, obj, prop, op, value, line):
+        self.obj = obj
+        self.prop = prop
+        self.op = op
+        self.value = value
         self.line = line
 
 
@@ -605,6 +647,8 @@ class Parser:
     def _assign_or_expr_stmt(self):
         return self._parse_assign_or_expr(skip_semi=False)
 
+    _COMPOUND_OPS = {'+=': '+', '-=': '-', '*=': '*', '/=': '/', '%=': '%'}
+
     def _parse_assign_or_expr(self, skip_semi):
         expr = self._expression()
         # Check for assignment: ident = expr, ident[i] = expr, or widget.prop = expr
@@ -620,6 +664,21 @@ class Parser:
                 return DotAssign(expr.obj, expr.prop, value, expr.line)
             else:
                 raise CompileError("invalid assignment target", expr.line)
+        # Compound assignment: x += expr, arr[i] += expr, widget.prop += expr
+        if self._peek_type() in self._COMPOUND_OPS:
+            op_tok = self._advance()
+            arith_op = self._COMPOUND_OPS[op_tok.type]
+            value = self._expression()
+            if not skip_semi:
+                self._expect(';')
+            if isinstance(expr, VarRef):
+                return CompoundAssign(expr.name, arith_op, value, expr.line)
+            elif isinstance(expr, IndexExpr):
+                return CompoundAssign(expr.name, arith_op, value, expr.line, expr.index)
+            elif isinstance(expr, DotExpr):
+                return DotCompoundAssign(expr.obj, expr.prop, arith_op, value, expr.line)
+            else:
+                raise CompileError("invalid compound assignment target", expr.line)
         if not skip_semi:
             self._expect(';')
         return ExprStmt(expr, expr.line)
@@ -627,7 +686,14 @@ class Parser:
     # --- Expressions (precedence climbing) ---
 
     def _expression(self):
-        return self._or_expr()
+        expr = self._or_expr()
+        # Ternary: cond ? then_expr : else_expr
+        if self._match('?'):
+            then_expr = self._expression()
+            self._expect(':')
+            else_expr = self._expression()
+            return TernaryExpr(expr, then_expr, else_expr, expr.line)
+        return expr
 
     def _or_expr(self):
         left = self._and_expr()
@@ -692,6 +758,13 @@ class Parser:
         return left
 
     def _unary_expr(self):
+        # Prefix increment/decrement: ++i, --i
+        if self._check('++', '--'):
+            tok = self._advance()
+            operand = self._unary_expr()
+            if not isinstance(operand, VarRef):
+                raise CompileError("increment/decrement requires a variable", tok.line)
+            return IncDecExpr(operand.name, '+' if tok.type == '++' else '-', True, tok.line)
         if self._check('-', '!'):
             op = self._advance()
             operand = self._unary_expr()
@@ -723,6 +796,10 @@ class Parser:
         if isinstance(expr, VarRef) and self._match('.'):
             prop = self._expect('IDENT').value
             return DotExpr(expr.name, prop, expr.line)
+        # Postfix increment/decrement: i++, i--
+        if isinstance(expr, VarRef) and self._check('++', '--'):
+            tok = self._advance()
+            return IncDecExpr(expr.name, '+' if tok.type == '++' else '-', False, tok.line)
         return expr
 
     def _primary_expr(self):
@@ -1096,6 +1173,14 @@ class CodeGen:
             return self.T_INT
         if isinstance(node, ArrayLit):
             return self.T_INT
+        if isinstance(node, TernaryExpr):
+            tt = self._infer_type(node.then_expr)
+            et = self._infer_type(node.else_expr)
+            return self.T_FLOAT if (tt == self.T_FLOAT or et == self.T_FLOAT) else self.T_INT
+        if isinstance(node, IncDecExpr):
+            return self.var_types.get(node.name, self.T_INT)
+        if isinstance(node, CompoundAssign):
+            return self.var_types.get(node.name, self.T_INT)
         return self.T_INT
 
     # --- Functions ---
@@ -1178,6 +1263,10 @@ class CodeGen:
             self._gen_assign(node)
         elif isinstance(node, DotAssign):
             self._gen_dot_assign(node)
+        elif isinstance(node, CompoundAssign):
+            self._gen_compound_assign(node)
+        elif isinstance(node, DotCompoundAssign):
+            self._gen_dot_compound_assign(node)
         elif isinstance(node, IfStmt):
             self._gen_if(node)
         elif isinstance(node, WhileStmt):
@@ -1437,6 +1526,10 @@ class CodeGen:
             self._gen_unary(node)
         elif isinstance(node, CallExpr):
             self._gen_call(node)
+        elif isinstance(node, IncDecExpr):
+            self._gen_incdec_expr(node)
+        elif isinstance(node, TernaryExpr):
+            self._gen_ternary(node)
         else:
             raise CompileError(f"unknown expression: {type(node).__name__}")
 
@@ -1523,6 +1616,108 @@ class CodeGen:
             self.asm.not_()
         else:
             raise CompileError(f"unknown unary operator: {node.op}", node.line)
+
+    def _gen_incdec_expr(self, node):
+        """Compile ++i / i++ / --i / i--.
+        Prefix: new value on stack.  Postfix: old value on stack."""
+        slot = self._var_slot(node.name, node.line)
+        use_float = self.var_types.get(node.name, self.T_INT) == self.T_FLOAT
+        if node.pre:
+            # ++i: load, add 1, dup (keep new), store
+            self.asm.load(slot)
+            if use_float:
+                self.asm.push(float_bits(1.0))
+                self.asm.fadd() if node.op == '+' else self.asm.fsub()
+            else:
+                self.asm.push(1)
+                self.asm.add() if node.op == '+' else self.asm.sub()
+            self.asm.dup()
+            self.asm.store(slot)
+        else:
+            # i++: load, dup (keep old), add 1, store
+            self.asm.load(slot)
+            self.asm.dup()
+            if use_float:
+                self.asm.push(float_bits(1.0))
+                self.asm.fadd() if node.op == '+' else self.asm.fsub()
+            else:
+                self.asm.push(1)
+                self.asm.add() if node.op == '+' else self.asm.sub()
+            self.asm.store(slot)
+
+    def _emit_arith_op(self, op, use_float, line):
+        """Emit the arithmetic opcode for a compound assignment operator."""
+        if use_float:
+            fops = {'+': 'fadd', '-': 'fsub', '*': 'fmul', '/': 'fdiv'}
+            if op == '%':
+                raise CompileError("modulo (%) is not supported for float operands", line)
+            getattr(self.asm, fops[op])()
+        else:
+            iops = {'+': 'add', '-': 'sub', '*': 'mul', '/': 'div', '%': 'modulo'}
+            getattr(self.asm, iops[op])()
+
+    def _gen_compound_assign(self, node):
+        """Compile x += expr, arr[i] += expr."""
+        if node.index is not None:
+            # arr[i] += expr → load arr, idx, arr_load, gen_expr, op, arr_store
+            slot = self._var_slot(node.name, node.line)
+            self.asm.load(slot)           # arr_id
+            self._gen_expr(node.index)    # index
+            # We need arr_id and index again for store, but also the current value
+            # Strategy: arr_load, compute, then re-push arr_id+index for store
+            self.asm.load(slot)           # arr_id (again)
+            self._gen_expr(node.index)    # index (again)
+            self.asm.arr_load()           # current value
+            self._gen_expr(node.value)    # rhs
+            self._emit_arith_op(node.op, False, node.line)  # arrays are int
+            self.asm.arr_store()
+        else:
+            slot = self._var_slot(node.name, node.line)
+            use_float = self.var_types.get(node.name, self.T_INT) == self.T_FLOAT
+            val_type = self._infer_type(node.value)
+            self.asm.load(slot)
+            if use_float and val_type == self.T_INT:
+                # Promote: load is already float, but RHS needs itof
+                self._gen_expr(node.value)
+                self.asm.itof()
+            elif not use_float and val_type == self.T_FLOAT:
+                # Variable becomes float
+                self.asm.itof()
+                self.var_types[node.name] = self.T_FLOAT
+                use_float = True
+                self._gen_expr(node.value)
+            else:
+                self._gen_expr(node.value)
+            self._emit_arith_op(node.op, use_float, node.line)
+            self.asm.store(slot)
+
+    def _gen_dot_compound_assign(self, node):
+        """Compile widget.prop += expr → target, get, expr, op, set."""
+        self._emit_target(node.obj, node.line)
+        prop_id, is_compound = _resolve_prop(node.prop)
+        if is_compound:
+            raise CompileError(
+                f"compound assignment not supported for compound property '{node.prop}'",
+                node.line)
+        if prop_id == Prop.TEXT:
+            raise CompileError("compound assignment not supported for text property", node.line)
+        self.asm.w_get(prop_id)
+        self._gen_expr(node.value)
+        self._emit_arith_op(node.op, False, node.line)  # widget props are int
+        # Re-target (value expr may have changed target)
+        self._current_target = None
+        self._emit_target(node.obj, node.line)
+        self.asm.w_set(prop_id)
+
+    def _gen_ternary(self, node):
+        """Compile cond ? then_expr : else_expr."""
+        self._gen_expr(node.cond)
+        else_patch = self.asm.jz_fwd()
+        self._gen_expr(node.then_expr)
+        end_patch = self.asm.jmp_fwd()
+        self.asm.patch(else_patch)
+        self._gen_expr(node.else_expr)
+        self.asm.patch(end_patch)
 
     def _gen_call(self, node):
         name = node.name
@@ -2141,13 +2336,15 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
     return build_image(source, filename, include_dirs), None
 
 
-def build_image(source, filename="<input>", include_dirs=None):
-    """Compile source to VM image format (new unified header).
+def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty"):
+    """Compile source to VM image format (v3 header).
 
-    Image format (v2):
-      version(u8=2) + function_count(u16 LE) + global_count(u16 LE)
+    Image format (v3):
+      version(u8=3) + function_count(u16 LE) + global_count(u16 LE) + flags(u16 LE)
       + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
       + opcodes...
+
+    Flags bit 0: render_mode (0=dirty, 1=buffered)
 
     Requires fn setup() and fn loop() in the source.
     Global variables (top-level var) are supported.
@@ -2182,7 +2379,8 @@ def build_image(source, filename="<input>", include_dirs=None):
                 cc._funcs[fn_name] = (fid, kind, offset, length)
                 func_names[offset] = fn_name
 
-        header = cc.build_image_header(global_count=len(codegen.global_vars))
+        flags = 0x01 if render_mode == "buffered" else 0x00
+        header = cc.build_image_header(global_count=len(codegen.global_vars), flags=flags)
         image = header + bytecode
 
         # Stash function name map on the bytes object for CLI use
@@ -2225,10 +2423,12 @@ def _extract_labels(image):
     """Build {offset: "fn_name()"} labels dict from image header."""
     # Use real function names if available (from _ImageBytes)
     real_names = getattr(image, 'func_names', {})
+    version = image[0]
     func_count = struct.unpack_from('<H', image, 1)[0]
+    hdr_base = 7 if version >= 3 else 5
     labels = {}
     for i in range(func_count):
-        base = 5 + i * 12
+        base = hdr_base + i * 12
         kind = image[base + 2]
         offset = struct.unpack_from('<I', image, base + 4)[0]
         if offset in real_names:
@@ -2239,16 +2439,30 @@ def _extract_labels(image):
     return labels
 
 
+def _image_header_size(version, func_count):
+    """Return header size in bytes for the given version."""
+    base = 7 if version >= 3 else 5
+    return base + func_count * 12
+
+
 def _print_image_header(output):
     """Print image header summary to stdout."""
     real_names = getattr(output, 'func_names', {})
     version = output[0]
     func_count = struct.unpack_from('<H', output, 1)[0]
     global_count = struct.unpack_from('<H', output, 3)[0]
-    opcode_start = 5 + func_count * 12
-    print(f'; image v{version}: {func_count} functions, {global_count} globals, opcodes={len(output) - opcode_start}B')
+    hdr_base = 7 if version >= 3 else 5
+    opcode_start = hdr_base + func_count * 12
+
+    extra = ''
+    if version >= 3:
+        flags = struct.unpack_from('<H', output, 5)[0]
+        rm = 'buffered' if flags & 0x01 else 'dirty'
+        extra = f', render={rm}'
+
+    print(f'; image v{version}: {func_count} functions, {global_count} globals, opcodes={len(output) - opcode_start}B{extra}')
     for i in range(func_count):
-        base = 5 + i * 12
+        base = hdr_base + i * 12
         fid = struct.unpack_from('<H', output, base)[0]
         kind = output[base + 2]
         offset = struct.unpack_from('<I', output, base + 4)[0]
@@ -2274,6 +2488,8 @@ def main():
     parser.add_argument('--hexdump', action='store_true', help='Print hex dump')
     parser.add_argument('-I', '--include', action='append', default=[],
                         metavar='DIR', help='Add include search directory (repeatable)')
+    parser.add_argument('--render-mode', choices=['dirty', 'buffered'], default='dirty',
+                        help='Render mode: dirty (partial update) or buffered (full redraw)')
     args = parser.parse_args()
 
     try:
@@ -2297,11 +2513,12 @@ def main():
         use_image = args.image or (has_setup_loop and args.page is None)
 
         if use_image:
-            output = build_image(source, args.source)
-            # New image format: header(5 + 12*N) + opcodes
+            output = build_image(source, args.source, render_mode=args.render_mode)
+            # New image format: header + opcodes
             if len(output) >= 5:
+                version = output[0]
                 func_count = struct.unpack_from('<H', output, 1)[0]
-                opcode_start = 5 + func_count * 12
+                opcode_start = _image_header_size(version, func_count)
                 raw_code = output[opcode_start:]
             else:
                 raw_code = output
@@ -2326,8 +2543,9 @@ def main():
             f.write(output)
         msg = f"{args.source} -> {args.output} ({len(output)} bytes)"
         if use_image:
+            version = output[0]
             func_count = struct.unpack_from('<H', output, 1)[0]
-            opcode_start = 5 + func_count * 12
+            opcode_start = _image_header_size(version, func_count)
             msg += f" (header: {opcode_start}B, opcodes: {len(output) - opcode_start}B, {func_count} functions)"
         print(msg)
 

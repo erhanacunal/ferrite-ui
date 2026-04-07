@@ -9,6 +9,34 @@ use crate::widget::{
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
 
+// --- Buffered render (double-buffered full redraw) ---
+
+/// Draw the entire widget tree to the back buffer, then swap.
+/// Only fires when at least one widget is dirty — avoids unnecessary
+/// FPGA buffer swaps when nothing has changed.
+pub fn render_buffered(ctx: &mut Ctx) {
+    // Skip if nothing changed — prevent rapid begin/end frame cycling
+    let dfs = ctx.tree.dfs_order();
+    let mut has_dirty = false;
+    for i in 0..dfs.len() {
+        if ctx.tree.get(dfs[i]).is_dirty() {
+            has_dirty = true;
+            break;
+        }
+    }
+    if !has_dirty {
+        return;
+    }
+
+    ctx.lcd.begin_frame();
+    if ctx.tree.root.is_some() {
+        let root = ctx.tree.root;
+        render_subtree(ctx, root);
+    }
+    clear_all_dirty(ctx);
+    ctx.lcd.end_frame();
+}
+
 // --- Full screen render ---
 
 /// Draw the entire widget tree from scratch (initial draw or full redraw).

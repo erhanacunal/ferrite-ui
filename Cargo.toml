@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = { version = "0.7", features = ["device"] }
-panic-halt = "1.0"
 
 [profile.release]
 opt-level = "s"

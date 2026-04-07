@@ -5,7 +5,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use ctx::Ctx;
-use panic_halt as _;
+mod panic;
 mod backlight;
 mod clip;
 mod config;
@@ -44,7 +44,7 @@ use strpool::StringPool;
 use touch::Touch;
 use types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE, Size};
 use usart::Usart;
-use vm::{FunctionKind, Vm, VmState};
+use vm::{FunctionKind, RenderMode, Vm, VmState};
 
 use crate::systick::delay_ms;
 
@@ -941,7 +941,9 @@ fn main() -> ! {
                         }
 
                         ctx.tree.mark_dirty(hit);
-                        render::render_dirty(&mut ctx);
+                        if vm.render_mode == RenderMode::Dirty {
+                            render::render_dirty(&mut ctx);
+                        }
                     }
 
                     if vm.has_code() {
@@ -964,7 +966,9 @@ fn main() -> ! {
                                 ext.value = new_val;
                             }
                             ctx.tree.mark_dirty(dfs[i]);
-                            render::render_dirty(&mut ctx);
+                            if vm.render_mode == RenderMode::Dirty {
+                                render::render_dirty(&mut ctx);
+                            }
 
                             if vm.has_code() {
                                 let on_click = ctx.tree.on_click(dfs[i]);
@@ -1037,7 +1041,9 @@ fn main() -> ! {
                         ctx.tree.mark_dirty(clicked_id);
                     }
 
-                    render::render_dirty(&mut ctx);
+                    if vm.render_mode == RenderMode::Dirty {
+                        render::render_dirty(&mut ctx);
+                    }
 
                     // Enqueue on_click callback
                     if clicked_id.is_some() && clicked_func > 0 && vm.has_code() {
@@ -1085,7 +1091,10 @@ fn main() -> ! {
                 }
             }
 
-            render::render_dirty(&mut ctx);
+            match vm.render_mode {
+                RenderMode::Buffered => render::render_buffered(&mut ctx),
+                RenderMode::Dirty => render::render_dirty(&mut ctx),
+            }
 
             if vm.has_code() {
                 for i in 0..paint_count {
@@ -1103,7 +1112,10 @@ fn main() -> ! {
         // --- Drain callback queue (runs each to completion, FIFO order) ---
         if vm.has_pending_callbacks() {
             vm.drain_callbacks(&mut ctx);
-            render::render_dirty(&mut ctx);
+            match vm.render_mode {
+                RenderMode::Buffered => render::render_buffered(&mut ctx),
+                RenderMode::Dirty => render::render_dirty(&mut ctx),
+            }
 
             // Callbacks (e.g. switch_tab) may have made on_paint widgets
             // visible and already rendered them, clearing their dirty flag.

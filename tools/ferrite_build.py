@@ -366,7 +366,7 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
 
 # --- Program compilation ---
 
-def compile_program(source_path: str, include_dirs=None) -> bytes:
+def compile_program(source_path: str, include_dirs=None, render_mode="dirty") -> bytes:
     """Ferrite lang source → VM image (header + opcodes)."""
     try:
         from ferrite_lang import build_image, CompileError
@@ -377,7 +377,8 @@ def compile_program(source_path: str, include_dirs=None) -> bytes:
 
     source = Path(source_path).read_text(encoding="utf-8")
     try:
-        return build_image(source, filename=source_path, include_dirs=include_dirs)
+        return build_image(source, filename=source_path, include_dirs=include_dirs,
+                           render_mode=render_mode)
     except CompileError as e:
         raise CompileError(f"{source_path}: {e}") from e
 
@@ -557,10 +558,12 @@ def build(project_path: str, output_path: str) -> dict:
         resources.append((name, RES_PAGE, page_data, 0))
 
     # 4. Programs — .fl → VM image (header + opcodes, metadata embedded)
+    render_mode = project.get("render_mode", "dirty")
     for prog in project.get("programs", []):
         name = prog["name"]
         source = project_dir / prog["source"]
-        image_data = compile_program(str(source), include_dirs=include_dirs)
+        image_data = compile_program(str(source), include_dirs=include_dirs,
+                                     render_mode=render_mode)
         exec_mode = prog.get("exec_mode", "ram")
         prog_flags = RES_FLAG_FLASH_EXEC if exec_mode == "flash" else 0
         resources.append((name, RES_PROGRAM, image_data, prog_flags))

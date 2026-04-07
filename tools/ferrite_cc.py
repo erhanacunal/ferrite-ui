@@ -1400,20 +1400,24 @@ class Compiler:
         fid, kind, offset, _ = self._funcs[name]
         self._funcs[name] = (fid, kind, offset, length)
 
-    def build_image_header(self, global_count=0):
+    def build_image_header(self, global_count=0, flags=0):
         """Build VM image header binary.
 
-        Format:
-          version(u8) + function_count(u16 LE) + global_count(u16 LE)
+        Format (v3):
+          version(u8) + function_count(u16 LE) + global_count(u16 LE) + flags(u16 LE)
           + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
+
+        Flags:
+          bit 0: render_mode (0=dirty, 1=buffered)
 
         Each function entry is 12 bytes.
         """
         func_list = list(self._funcs.values())
         buf = bytearray()
-        buf.append(2)  # version 2: stack-based locals
+        buf.append(3)  # version 3: adds flags field
         buf.extend(struct.pack('<H', len(func_list)))
         buf.extend(struct.pack('<H', global_count))
+        buf.extend(struct.pack('<H', flags))
         for func_id, kind, offset, length in func_list:
             buf.extend(struct.pack('<HBBI', func_id, kind, 0, offset))
             buf.extend(struct.pack('<I', length))

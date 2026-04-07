@@ -342,6 +342,7 @@ class DesignerModel(QWidget):
         self._res_gen = 0   # bumped when fonts/images change, for cache invalidation
         self.include_dirs = []  # extra include dirs for compilation
         self.exec_mode = "flash"  # default exec_mode for the main program
+        self.render_mode = "dirty"  # "dirty" (partial update) or "buffered" (full redraw)
         self.main_fl = DEFAULT_MAIN_FL  # user code — embedded in .fui
 
     def add_widget(self, kind, parent=None):
@@ -460,6 +461,7 @@ class DesignerModel(QWidget):
         self.programs = []
         self.include_dirs = []
         self.exec_mode = "flash"
+        self.render_mode = "dirty"
         self.main_fl = DEFAULT_MAIN_FL
         self.tree_changed.emit()
         self.selection_changed.emit()
@@ -475,6 +477,7 @@ class DesignerModel(QWidget):
             "programs": self.programs[:],
             "include_dirs": self.include_dirs[:],
             "exec_mode": self.exec_mode,
+            "render_mode": self.render_mode,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -561,6 +564,7 @@ class DesignerModel(QWidget):
 
         self.include_dirs = data.get("include_dirs", [])
         self.exec_mode = data.get("exec_mode", "flash")
+        self.render_mode = data.get("render_mode", "dirty")
         self._path = path
         self._res_gen += 1
         self.selected = None
@@ -655,6 +659,7 @@ class DesignerModel(QWidget):
             "version": 2,
             "screen": [SCREEN_W, SCREEN_H],
             "include_dirs": dirs,
+            "render_mode": self.render_mode,
             "fonts": font_entries,
             "images": image_entries,
             "programs": [
@@ -1619,6 +1624,12 @@ class ResourcePanel(QWidget):
         self.exec_combo.addItems(["flash", "ram"])
         self.exec_combo.currentTextChanged.connect(lambda v: setattr(model, 'exec_mode', v))
         em_row.addWidget(self.exec_combo)
+        em_row.addSpacing(20)
+        em_row.addWidget(QLabel("Render mode:"))
+        self.render_combo = QComboBox()
+        self.render_combo.addItems(["dirty", "buffered"])
+        self.render_combo.currentTextChanged.connect(lambda v: setattr(model, 'render_mode', v))
+        em_row.addWidget(self.render_combo)
         em_row.addStretch()
         layout.addLayout(em_row)
 
@@ -1653,6 +1664,9 @@ class ResourcePanel(QWidget):
         idx = self.exec_combo.findText(self.model.exec_mode)
         if idx >= 0:
             self.exec_combo.setCurrentIndex(idx)
+        idx = self.render_combo.findText(self.model.render_mode)
+        if idx >= 0:
+            self.render_combo.setCurrentIndex(idx)
 
     def _add_font(self):
         path, _ = QFileDialog.getOpenFileName(
