@@ -136,6 +136,11 @@ Requires Rust nightly with the `thumbv7m-none-eabi` target:
 ```bash
 rustup target add thumbv7m-none-eabi
 cargo build --release --target thumbv7m-none-eabi
+cargo objcopy --release -- -O binary firmware.bin 
+
+# flash to device
+
+st-flash.exe write .\firmware.bin 0x08000000
 ```
 
 Binary output: `target/thumbv7m-none-eabi/release/ferrite-ui`
