@@ -42,7 +42,7 @@ fn setup() {
 
 // loop() runs repeatedly. The compiler wraps it in while(1){...yield;}
 fn loop() {
-    counter = counter + 1;
+    counter++;
     var s = itos(counter);
     target(label);
     setText(s);
@@ -206,6 +206,72 @@ if (temp < 10) { /* cold */ }     // 10 auto-promoted, uses FLT
 | `&` | Bitwise AND (int only) |
 | `\|` | Bitwise OR (int only) |
 
+### Compound Assignment
+
+| Operator | Equivalent |
+|----------|------------|
+| `x += y` | `x = x + y` |
+| `x -= y` | `x = x - y` |
+| `x *= y` | `x = x * y` |
+| `x /= y` | `x = x / y` |
+| `x %= y` | `x = x % y` |
+
+Works on variables, array elements, and widget properties (via dot syntax). Float-aware — uses float instructions when either side is float.
+
+```c
+var speed = 1.5;
+speed += 0.5;          // FADD (float compound)
+
+var colors[4] = [0, 0, 0, 0];
+colors[2] += 0x0100;   // array element compound
+
+btn.value += 10;       // widget property compound (target + get + add + set)
+```
+
+### Increment / Decrement
+
+| Operator | Description | Value of expression |
+|----------|-------------|---------------------|
+| `++x` | Pre-increment | value **after** increment |
+| `x++` | Post-increment | value **before** increment |
+| `--x` | Pre-decrement | value **after** decrement |
+| `x--` | Post-decrement | value **before** decrement |
+
+Works on variables and array elements. Float-aware — increments by `1.0` for float variables.
+
+```c
+var i = 0;
+var a = ++i;    // i=1, a=1 (pre: increment first, then use)
+var b = i++;    // b=1, i=2 (post: use first, then increment)
+
+var angle = 0.0;
+++angle;        // increments by 1.0 (float)
+
+for (var i = 0; i < 10; i++) {
+    // most common use case
+}
+```
+
+### Ternary Operator
+
+```c
+var x = (a > b) ? a : b;          // like if/else but as an expression
+var color = pressed ? 0xF800 : 0x07E0;
+```
+
+Right-associative and nestable:
+
+```c
+var level = (temp > 80) ? 2 : (temp > 50) ? 1 : 0;
+```
+
+Float-aware — if either branch is float, the result is float:
+
+```c
+var speed = 1.5;
+var v = (fast) ? speed : 0;  // 0 auto-promoted to 0.0, result is float
+```
+
 ## Control Flow
 
 ### if / else
@@ -225,14 +291,14 @@ if (x > 10) {
 ```c
 var i = 0;
 while (i < 10) {
-    i = i + 1;
+    i++;
 }
 ```
 
 ### for
 
 ```c
-for (var i = 0; i < 4; i = i + 1) {
+for (var i = 0; i < 4; i++) {
     target(btn);
     set(bg_color, colors[i]);
 }
@@ -243,8 +309,8 @@ for (var i = 0; i < 4; i = i + 1) {
 ```c
 while (true) {
     if (i >= 10) { break; }
-    if (i % 2 == 0) { i = i + 1; continue; }
-    i = i + 1;
+    if (i % 2 == 0) { i++; continue; }
+    i++;
 }
 ```
 
@@ -946,6 +1012,57 @@ set(on_paint, @my_painter);
 
 `@name` can be used anywhere an integer expression is expected — it evaluates to the function's numeric ID.
 
+### Lambda Expressions
+
+Lambdas are anonymous functions defined inline. They compile to a regular function and evaluate to the function's ID — syntactic sugar for defining a named function + using `@name`.
+
+```c
+// Instead of:
+fn handle_click(widget_id) {
+    btn.bg_color = 0xF800;
+    dirty();
+    render();
+}
+btn.on_click = @handle_click;
+
+// Write:
+btn.on_click = |widget_id| {
+    btn.bg_color = 0xF800;
+    dirty();
+    render();
+};
+```
+
+**Syntax:** `|params| { body }` — parameters use the same type annotations as regular functions:
+
+```c
+var f = |a, b| { return a + b; };
+var g = |x: float, y: float| { return x * y; };
+var h = || { counter++; };              // zero parameters
+```
+
+**No captures.** Lambdas can only access global variables and their own parameters/locals. Referencing a local variable from the enclosing function is a compile error:
+
+```c
+fn setup() {
+    var local_x = 42;
+    var f = |y| { return local_x + y; };  // ERROR: captures 'local_x'
+    return 0;
+}
+```
+
+Move the variable to a global to fix:
+
+```c
+var x;
+
+fn setup() {
+    x = 42;
+    var f = |y| { return x + y; };  // OK: 'x' is global
+    return 0;
+}
+```
+
 ### Callback Queue
 
 All callbacks are queued and executed in FIFO order between main loop iterations. This ensures callbacks never nest and the VM state remains predictable. The queue holds up to 8 pending callbacks.
@@ -1052,7 +1169,7 @@ fn loop() {
 }
 
 fn handle_click(widget_id) {
-    counter = counter + 1;
+    counter++;
     if (counter % 2 == 0) {
         btn.bg_color = 0xF800;
     } else {

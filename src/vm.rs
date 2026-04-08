@@ -22,18 +22,78 @@ use crate::widget::{WidgetId, FLAG_CHECKED, FLAG_CLICKABLE, FLAG_ENABLED, FLAG_V
 
 // === Code source — owned by VM ===
 
+/// Flash read-ahead cache size (1KB).
+const FLASH_CACHE_SIZE: usize = 1024;
+
+/// Cached flash reader — reads 1KB chunks to avoid per-byte SPI transactions.
+struct FlashReader {
+    flash: Flash,
+    base_addr: u32,
+    code_len: usize,
+    cache: [u8; FLASH_CACHE_SIZE],
+    cache_pos: usize,
+    cache_len: usize,
+}
+
+impl FlashReader {
+    fn new(flash: Flash, base_addr: u32, code_len: usize) -> Self {
+        Self {
+            flash,
+            base_addr,
+            code_len,
+            cache: [0u8; FLASH_CACHE_SIZE],
+            cache_pos: 0,
+            cache_len: 0,
+        }
+    }
+
+    fn fill_cache(&mut self, pos: usize) {
+        let avail = self.code_len.saturating_sub(pos);
+        let n = avail.min(FLASH_CACHE_SIZE);
+        if n > 0 {
+            self.flash.read(self.base_addr + pos as u32, &mut self.cache[..n]);
+        }
+        self.cache_pos = pos;
+        self.cache_len = n;
+    }
+
+    #[inline]
+    fn byte_at(&mut self, pos: usize) -> u8 {
+        if pos >= self.code_len { return 0; }
+        if pos >= self.cache_pos && pos < self.cache_pos + self.cache_len {
+            return self.cache[pos - self.cache_pos];
+        }
+        self.fill_cache(pos);
+        if self.cache_len > 0 { self.cache[0] } else { 0 }
+    }
+
+    #[inline]
+    fn read_bytes(&mut self, pos: usize, buf: &mut [u8]) -> usize {
+        if pos >= self.code_len { return 0; }
+        let avail = self.code_len - pos;
+        let n = buf.len().min(avail);
+        // Check if fully within cache
+        if pos >= self.cache_pos && pos + n <= self.cache_pos + self.cache_len {
+            let start = pos - self.cache_pos;
+            buf[..n].copy_from_slice(&self.cache[start..start + n]);
+            return n;
+        }
+        // Cache miss — refill from pos
+        self.fill_cache(pos);
+        let from_cache = n.min(self.cache_len);
+        buf[..from_cache].copy_from_slice(&self.cache[..from_cache]);
+        from_cache
+    }
+}
+
 /// Code source enum — VM owns its bytecode source.
 pub enum VmCode {
     /// No code loaded.
     None,
     /// RAM-backed: VM owns the bytecode buffer.
     Ram(Vec<u8>),
-    /// Flash-backed: reads bytecode from SPI flash on demand.
-    Flash {
-        flash: Flash,
-        base_addr: u32,
-        code_len: usize,
-    },
+    /// Flash-backed: cached reader, 1KB read-ahead.
+    Flash(Box<FlashReader>),
 }
 
 impl VmCode {
@@ -42,28 +102,23 @@ impl VmCode {
         match self {
             VmCode::None => 0,
             VmCode::Ram(data) => data.len(),
-            VmCode::Flash { code_len, .. } => *code_len,
+            VmCode::Flash(reader) => reader.code_len,
         }
     }
 
     #[inline]
-    pub fn byte_at(&self, pos: usize) -> u8 {
+    pub fn byte_at(&mut self, pos: usize) -> u8 {
         match self {
             VmCode::None => 0,
             VmCode::Ram(data) => {
                 if pos < data.len() { data[pos] } else { 0 }
             }
-            VmCode::Flash { flash, base_addr, code_len } => {
-                if pos >= *code_len { return 0; }
-                let mut b = [0u8; 1];
-                flash.read(base_addr + pos as u32, &mut b);
-                b[0]
-            }
+            VmCode::Flash(reader) => reader.byte_at(pos),
         }
     }
 
     #[inline]
-    pub fn read_bytes(&self, pos: usize, buf: &mut [u8]) -> usize {
+    pub fn read_bytes(&mut self, pos: usize, buf: &mut [u8]) -> usize {
         match self {
             VmCode::None => 0,
             VmCode::Ram(data) => {
@@ -73,15 +128,7 @@ impl VmCode {
                 buf[..n].copy_from_slice(&data[pos..pos + n]);
                 n
             }
-            VmCode::Flash { flash, base_addr, code_len } => {
-                if pos >= *code_len { return 0; }
-                let avail = *code_len - pos;
-                let n = buf.len().min(avail);
-                if n > 0 {
-                    flash.read(base_addr + pos as u32, &mut buf[..n]);
-                }
-                n
-            }
+            VmCode::Flash(reader) => reader.read_bytes(pos, buf),
         }
     }
 }
@@ -471,11 +518,9 @@ impl Vm {
         if let Some((funcs, opcode_start, gc, rm)) = parse_image_header(&hdr_buf[..read_len]) {
             let opcode_base = base + opcode_start as u32;
             let opcode_len = total_len.saturating_sub(opcode_start);
-            self.code = VmCode::Flash {
-                flash: Flash::new(),
-                base_addr: opcode_base,
-                code_len: opcode_len,
-            };
+            self.code = VmCode::Flash(Box::new(FlashReader::new(
+                Flash::new(), opcode_base, opcode_len,
+            )));
             self.functions = funcs;
             self.global_count = gc;
             self.frame_base = gc;

@@ -19,6 +19,7 @@ import sys
 import struct
 from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
                         FunctionKind as CcFunctionKind,
+                        SYSTEM_CALLBACK_KINDS,
                         disassemble, encode_svarint,
                         _resolve_prop, PROP_MAP, pack_pair, float_bits)
 
@@ -332,6 +333,17 @@ class TernaryExpr:
         self.then_expr = then_expr
         self.else_expr = else_expr
         self.line = line
+
+
+class LambdaExpr:
+    """Capture-less lambda: |params| { body }
+    Compiles to an anonymous function, evaluates to its func_id."""
+    def __init__(self, params, param_types, body, line):
+        self.params = params
+        self.param_types = param_types
+        self.body = body
+        self.line = line
+        self.func_name = None  # assigned during lambda collection phase
 
 
 class IncDecExpr:
@@ -836,7 +848,31 @@ class Parser:
                     elements.append(self._expression())
             tok = self._expect(']')
             return ArrayLit(elements, tok.line)
+        if self._check('|', '||'):
+            return self._lambda_expr()
         self._error(f"unexpected token: {self._cur().type}")
+
+    def _lambda_expr(self):
+        """Parse |params| { body } or || { body } — capture-less lambda."""
+        line = self._cur().line
+        params = []
+        param_types = []
+        if self._match('||'):
+            # || { body } — zero-param lambda (tokenizer merges || into one token)
+            pass
+        else:
+            self._expect('|')
+            if not self._check('|'):
+                pname = self._expect('IDENT').value
+                params.append(pname)
+                param_types.append(self._parse_type_annotation())
+                while self._match(','):
+                    pname = self._expect('IDENT').value
+                    params.append(pname)
+                    param_types.append(self._parse_type_annotation())
+            self._expect('|')
+        body = self._block()
+        return LambdaExpr(params, param_types, body, line)
 
 
 # ============================================================
@@ -987,6 +1023,15 @@ class CodeGen:
         # producing identical IDs while also tracking local reassignment.
         self.next_widget_id = 1  # 0 = pre-created root widget
 
+        # Phase 1.5: Collect lambdas from AST, detect captures, register as functions
+        global_names = {stmt.name for stmt in global_var_stmts}
+        self._next_lambda_id = 0
+        self._lambda_fns = []
+        for fn in program.functions:
+            self._collect_lambdas(fn.body, fn.params, global_names)
+        # Append lambda FnDefs so they're registered and emitted as regular functions
+        program.functions.extend(self._lambda_fns)
+
         # Phase 2: Register all functions and assign func_ids (1-based, source order)
         self.func_ids = {}
         next_fid = 1
@@ -1025,8 +1070,18 @@ class CodeGen:
             self.global_var_types[stmt.name] = vtype
 
         # Emit functions. Global var init code is injected at the start of setup().
+        # Order: setup first (runs once, evicted from cache), user functions
+        # in the middle, loop + event handlers + lambdas last (hot path, stays in cache).
+        def _fn_emit_order(fn):
+            if fn.name == 'setup':
+                return 0
+            if fn.name in SYSTEM_CALLBACK_KINDS or fn.name.startswith('__lambda_'):
+                return 2
+            return 1
+        emit_order = sorted(program.functions, key=_fn_emit_order)
+
         self._global_init_stmts = global_var_stmts
-        for fn in program.functions:
+        for fn in emit_order:
             self._gen_fn(fn)
         self._global_init_stmts = None
 
@@ -1037,6 +1092,204 @@ class CodeGen:
                     self.asm.patch(patch_pos, info['addr'])
 
         return self.asm.build()
+
+    # --- Lambda collection and capture detection ---
+
+    def _collect_lambdas(self, stmts, enclosing_params, global_names):
+        """Walk statements to find LambdaExpr nodes. For each lambda:
+        1. Check for captured variables (error if found)
+        2. Assign a unique name and create a FnDef
+        3. Store the name back in the LambdaExpr node for codegen
+        """
+        for stmt in stmts:
+            self._collect_lambdas_in_stmt(stmt, enclosing_params, global_names)
+
+    def _collect_lambdas_in_stmt(self, stmt, enclosing_params, global_names):
+        if isinstance(stmt, VarDecl):
+            if stmt.init is not None:
+                self._collect_lambdas_in_expr(
+                    stmt.init, enclosing_params, global_names)
+        elif isinstance(stmt, Assign):
+            self._collect_lambdas_in_expr(
+                stmt.value, enclosing_params, global_names)
+        elif isinstance(stmt, DotAssign):
+            self._collect_lambdas_in_expr(
+                stmt.value, enclosing_params, global_names)
+        elif isinstance(stmt, ExprStmt):
+            self._collect_lambdas_in_expr(
+                stmt.expr, enclosing_params, global_names)
+        elif isinstance(stmt, ReturnStmt):
+            if stmt.value is not None:
+                self._collect_lambdas_in_expr(
+                    stmt.value, enclosing_params, global_names)
+        elif isinstance(stmt, IfStmt):
+            self._collect_lambdas_in_expr(
+                stmt.cond, enclosing_params, global_names)
+            self._collect_lambdas(
+                stmt.then_body, enclosing_params, global_names)
+            if stmt.else_body:
+                self._collect_lambdas(
+                    stmt.else_body, enclosing_params, global_names)
+        elif isinstance(stmt, WhileStmt):
+            self._collect_lambdas_in_expr(
+                stmt.cond, enclosing_params, global_names)
+            self._collect_lambdas(
+                stmt.body, enclosing_params, global_names)
+        elif isinstance(stmt, ForStmt):
+            if stmt.init:
+                self._collect_lambdas_in_stmt(
+                    stmt.init, enclosing_params, global_names)
+            if stmt.cond:
+                self._collect_lambdas_in_expr(
+                    stmt.cond, enclosing_params, global_names)
+            if stmt.update:
+                self._collect_lambdas_in_stmt(
+                    stmt.update, enclosing_params, global_names)
+            self._collect_lambdas(
+                stmt.body, enclosing_params, global_names)
+
+    def _collect_lambdas_in_expr(self, expr, enclosing_params, global_names):
+        if isinstance(expr, LambdaExpr):
+            self._register_lambda(expr, enclosing_params, global_names)
+        elif isinstance(expr, BinOp):
+            self._collect_lambdas_in_expr(
+                expr.left, enclosing_params, global_names)
+            self._collect_lambdas_in_expr(
+                expr.right, enclosing_params, global_names)
+        elif isinstance(expr, UnaryOp):
+            self._collect_lambdas_in_expr(
+                expr.operand, enclosing_params, global_names)
+        elif isinstance(expr, CallExpr):
+            for arg in expr.args:
+                self._collect_lambdas_in_expr(
+                    arg, enclosing_params, global_names)
+        elif isinstance(expr, TernaryExpr):
+            self._collect_lambdas_in_expr(
+                expr.cond, enclosing_params, global_names)
+            self._collect_lambdas_in_expr(
+                expr.then_expr, enclosing_params, global_names)
+            self._collect_lambdas_in_expr(
+                expr.else_expr, enclosing_params, global_names)
+        elif isinstance(expr, IndexExpr):
+            self._collect_lambdas_in_expr(
+                expr.index, enclosing_params, global_names)
+        elif isinstance(expr, ArrayLit):
+            for elem in expr.elements:
+                self._collect_lambdas_in_expr(
+                    elem, enclosing_params, global_names)
+        elif isinstance(expr, CompoundAssign):
+            self._collect_lambdas_in_expr(
+                expr.value, enclosing_params, global_names)
+        elif isinstance(expr, DotCompoundAssign):
+            self._collect_lambdas_in_expr(
+                expr.value, enclosing_params, global_names)
+
+    def _register_lambda(self, expr, enclosing_params, global_names):
+        """Check captures and register a lambda as an anonymous function."""
+        # Collect all variable references in the lambda body
+        refs = set()
+        self._collect_var_refs(expr.body, refs)
+        # Collect variables declared inside the lambda body
+        declared = set(expr.params)
+        self._collect_declared_vars(expr.body, declared)
+        # Any ref that's not a param, not declared locally, and not global = capture
+        for name in refs:
+            if name not in declared and name not in global_names:
+                raise CompileError(
+                    f"lambda captures local variable '{name}' "
+                    f"(closures are not supported; use a global variable instead)",
+                    expr.line)
+        # Assign unique name and create FnDef
+        func_name = f'__lambda_{self._next_lambda_id}'
+        self._next_lambda_id += 1
+        expr.func_name = func_name
+        fn_def = FnDef(func_name, expr.params, expr.body, expr.line,
+                       expr.param_types)
+        self._lambda_fns.append(fn_def)
+
+    def _collect_var_refs(self, stmts, refs):
+        """Recursively collect all variable names referenced in statements."""
+        for stmt in stmts:
+            self._collect_var_refs_stmt(stmt, refs)
+
+    def _collect_var_refs_stmt(self, stmt, refs):
+        if isinstance(stmt, VarDecl):
+            if stmt.init is not None:
+                self._collect_var_refs_expr(stmt.init, refs)
+        elif isinstance(stmt, Assign):
+            refs.add(stmt.name)
+            self._collect_var_refs_expr(stmt.value, refs)
+        elif isinstance(stmt, ExprStmt):
+            self._collect_var_refs_expr(stmt.expr, refs)
+        elif isinstance(stmt, ReturnStmt):
+            if stmt.value is not None:
+                self._collect_var_refs_expr(stmt.value, refs)
+        elif isinstance(stmt, IfStmt):
+            self._collect_var_refs_expr(stmt.cond, refs)
+            self._collect_var_refs(stmt.then_body, refs)
+            if stmt.else_body:
+                self._collect_var_refs(stmt.else_body, refs)
+        elif isinstance(stmt, WhileStmt):
+            self._collect_var_refs_expr(stmt.cond, refs)
+            self._collect_var_refs(stmt.body, refs)
+        elif isinstance(stmt, ForStmt):
+            if stmt.init:
+                self._collect_var_refs_stmt(stmt.init, refs)
+            if stmt.cond:
+                self._collect_var_refs_expr(stmt.cond, refs)
+            if stmt.update:
+                self._collect_var_refs_stmt(stmt.update, refs)
+            self._collect_var_refs(stmt.body, refs)
+
+    def _collect_var_refs_expr(self, expr, refs):
+        if isinstance(expr, VarRef):
+            refs.add(expr.name)
+        elif isinstance(expr, IndexExpr):
+            refs.add(expr.name)
+            self._collect_var_refs_expr(expr.index, refs)
+        elif isinstance(expr, DotExpr):
+            refs.add(expr.obj)
+        elif isinstance(expr, BinOp):
+            self._collect_var_refs_expr(expr.left, refs)
+            self._collect_var_refs_expr(expr.right, refs)
+        elif isinstance(expr, UnaryOp):
+            self._collect_var_refs_expr(expr.operand, refs)
+        elif isinstance(expr, CallExpr):
+            # set(prop, ...) and get(prop): first arg is a property name, not a variable
+            start = 1 if expr.name in ('set', 'get') and expr.args else 0
+            for arg in expr.args[start:]:
+                self._collect_var_refs_expr(arg, refs)
+        elif isinstance(expr, TernaryExpr):
+            self._collect_var_refs_expr(expr.cond, refs)
+            self._collect_var_refs_expr(expr.then_expr, refs)
+            self._collect_var_refs_expr(expr.else_expr, refs)
+        elif isinstance(expr, IncDecExpr):
+            refs.add(expr.name)
+        elif isinstance(expr, CompoundAssign):
+            refs.add(expr.name)
+            self._collect_var_refs_expr(expr.value, refs)
+        elif isinstance(expr, DotCompoundAssign):
+            refs.add(expr.obj)
+            self._collect_var_refs_expr(expr.value, refs)
+        elif isinstance(expr, ArrayLit):
+            for elem in expr.elements:
+                self._collect_var_refs_expr(elem, refs)
+
+    def _collect_declared_vars(self, stmts, declared):
+        """Collect variable names declared (via var) in statements."""
+        for stmt in stmts:
+            if isinstance(stmt, VarDecl):
+                declared.add(stmt.name)
+            elif isinstance(stmt, IfStmt):
+                self._collect_declared_vars(stmt.then_body, declared)
+                if stmt.else_body:
+                    self._collect_declared_vars(stmt.else_body, declared)
+            elif isinstance(stmt, WhileStmt):
+                self._collect_declared_vars(stmt.body, declared)
+            elif isinstance(stmt, ForStmt):
+                if stmt.init and isinstance(stmt.init, VarDecl):
+                    declared.add(stmt.init.name)
+                self._collect_declared_vars(stmt.body, declared)
 
     def _count_var_slots(self, stmts):
         """Recursively count variable slots needed by statements."""
@@ -1530,6 +1783,9 @@ class CodeGen:
             self._gen_incdec_expr(node)
         elif isinstance(node, TernaryExpr):
             self._gen_ternary(node)
+        elif isinstance(node, LambdaExpr):
+            func_id = self._resolve_func_id(node.func_name, node.line)
+            self.asm.push(func_id)
         else:
             raise CompileError(f"unknown expression: {type(node).__name__}")
 
