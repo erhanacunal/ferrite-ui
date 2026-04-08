@@ -24,7 +24,7 @@ use crate::widget::{WidgetId, FLAG_CHECKED, FLAG_CLICKABLE, FLAG_ENABLED, FLAG_V
 
 /// Flash read-ahead cache size. Inline in VmCode enum (no heap allocation).
 /// 128B covers most loop bodies and avoids per-byte SPI transactions.
-const FLASH_CACHE_SIZE: usize = 128;
+const FLASH_CACHE_SIZE: usize = 1024;
 
 /// Code source enum — VM owns its bytecode source.
 pub enum VmCode {
