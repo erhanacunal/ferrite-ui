@@ -52,22 +52,24 @@ impl Gpio {
         }
     }
 
-    /// PA12: clock pulse — falling edge (BC) ile latch
+    /// PA12: clock pulse — FPGA latches on falling edge.
+    /// Resting state: PA12 HIGH. Matches original firmware timing.
     #[inline(always)]
     pub fn clock_pulse(&self) {
         unsafe {
-            let bop = (GPIOA_BASE + GPIO_BOP_OFFSET) as *mut u32;
-            core::ptr::write_volatile(bop, 1 << LCD_CLK_PIN);
-
-            cortex_m::asm::nop(); 
-            cortex_m::asm::nop(); 
-
+            // PA12 LOW — falling edge (FPGA latches data here)
             let bc = (GPIOA_BASE + GPIO_BC_OFFSET) as *mut u32;
             core::ptr::write_volatile(bc, 1 << LCD_CLK_PIN);
 
-           //spin(1);
-           cortex_m::asm::nop();
-           cortex_m::asm::nop();
+            cortex_m::asm::nop();
+            cortex_m::asm::nop();
+
+            // PA12 HIGH — restore resting state
+            let bop = (GPIOA_BASE + GPIO_BOP_OFFSET) as *mut u32;
+            core::ptr::write_volatile(bop, 1 << LCD_CLK_PIN);
+
+            cortex_m::asm::nop();
+            cortex_m::asm::nop();
         }
     }
 }

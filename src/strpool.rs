@@ -1,113 +1,210 @@
-/// Heap-allocated string pool for VM string operations.
+/// Static string pool for VM string operations.
 ///
-/// Each string is a separate heap allocation (Vec<u8>) with a unique auto-incrementing ID.
-/// No static memory — all strings live on the heap.
+/// Buffer lives in BSS (static RAM) — zero heap allocations, no fragmentation.
+/// Metadata (offsets, lengths) lives in StringPool struct inside Ctx (heap via Box<Ctx>).
+/// Compacting smart_clear preserves widget text while reclaiming temporaries.
+///
+/// RAM cost: 2048 bytes BSS (pool buffer) + ~132 bytes in Ctx (metadata)
 
-extern crate alloc;
+use crate::widget::{WidgetId, WidgetTree};
 
-use alloc::vec::Vec;
-use crate::widget::WidgetTree;
-
+const POOL_SIZE: usize = 2048;
+const MAX_STRINGS: usize = 64;
+const STR_NONE: u16 = 0xFFFF;
 const FMT_BUF_SIZE: usize = 32;
 
-/// Internal string representation — not exposed outside this module.
-struct FerriString {
-    id: u16,
-    buf: Vec<u8>,
+/// Pool buffer in BSS — static RAM, not heap. Single-threaded bare-metal.
+static mut POOL_BUF: [u8; POOL_SIZE] = [0u8; POOL_SIZE];
+
+#[inline]
+fn pool_buf() -> &'static mut [u8; POOL_SIZE] {
+    unsafe { &mut *core::ptr::addr_of_mut!(POOL_BUF) }
+}
+
+#[derive(Clone, Copy)]
+struct StrMeta {
+    offset: u16,
+    len: u16,
+}
+
+impl StrMeta {
+    const fn empty() -> Self {
+        Self { offset: 0, len: 0 }
+    }
 }
 
 pub struct StringPool {
-    strings: Vec<FerriString>,
-    next_id: u16,
+    meta: [StrMeta; MAX_STRINGS],
+    count: u8,
+    next: u16,
 }
 
 impl StringPool {
     pub fn new() -> Self {
         Self {
-            strings: Vec::new(),
-            next_id: 0,
+            meta: [StrMeta::empty(); MAX_STRINGS],
+            count: 0,
+            next: 0,
         }
     }
 
-    /// Allocate a string from a byte slice. Returns unique string ID.
+    /// Allocate a string from a byte slice. Returns string ID (u16) or None if full.
     pub fn alloc(&mut self, data: &[u8]) -> Option<u16> {
-        let id = self.next_id;
-        self.strings.push(FerriString {
-            id,
-            buf: Vec::from(data),
-        });
-        self.next_id = self.next_id.wrapping_add(1);
-        Some(id)
+        let len = data.len();
+        if self.count as usize >= MAX_STRINGS || self.next as usize + len > POOL_SIZE {
+            return None;
+        }
+        let buf = pool_buf();
+        let id = self.count;
+        let offset = self.next;
+        buf[offset as usize..offset as usize + len].copy_from_slice(data);
+        self.meta[id as usize] = StrMeta {
+            offset,
+            len: len as u16,
+        };
+        self.next += len as u16;
+        self.count += 1;
+        Some(id as u16)
     }
 
-    /// Remove a string by ID.
+    /// Mark a string as freed (zero-length). Reclaimed on next smart_clear().
     pub fn free(&mut self, id: u16) {
-        self.strings.retain(|s| s.id != id);
+        if (id as usize) < self.count as usize {
+            self.meta[id as usize].len = 0;
+        }
     }
 
     /// Get string bytes by ID.
     pub fn get(&self, id: u16) -> &[u8] {
-        match self.strings.iter().find(|s| s.id == id) {
-            Some(s) => &s.buf,
-            None => &[],
+        if id as usize >= self.count as usize {
+            return &[];
         }
+        let m = &self.meta[id as usize];
+        let buf = pool_buf();
+        &buf[m.offset as usize..m.offset as usize + m.len as usize]
     }
 
     /// Get string length by ID.
     pub fn len(&self, id: u16) -> u16 {
-        match self.strings.iter().find(|s| s.id == id) {
-            Some(s) => s.buf.len() as u16,
-            None => 0,
+        if id as usize >= self.count as usize {
+            return 0;
         }
+        self.meta[id as usize].len
     }
 
-    /// Concatenate two strings. Returns new string ID.
+    /// Concatenate two strings. Returns new string ID or None if full.
     pub fn concat(&mut self, a: u16, b: u16) -> Option<u16> {
-        let a_data = match self.strings.iter().find(|s| s.id == a) {
-            Some(s) => s.buf.clone(),
-            None => return None,
+        if a as usize >= self.count as usize || b as usize >= self.count as usize {
+            return None;
+        }
+        let a_meta = self.meta[a as usize];
+        let b_meta = self.meta[b as usize];
+        let total = a_meta.len as usize + b_meta.len as usize;
+        if self.count as usize >= MAX_STRINGS || self.next as usize + total > POOL_SIZE {
+            return None;
+        }
+        let buf = pool_buf();
+        let id = self.count;
+        let offset = self.next as usize;
+        // Copy a (byte-by-byte — src and dst in the same buffer)
+        let a_start = a_meta.offset as usize;
+        let a_len = a_meta.len as usize;
+        for i in 0..a_len {
+            buf[offset + i] = buf[a_start + i];
+        }
+        // Copy b
+        let b_start = b_meta.offset as usize;
+        let b_len = b_meta.len as usize;
+        for i in 0..b_len {
+            buf[offset + a_len + i] = buf[b_start + i];
+        }
+        self.meta[id as usize] = StrMeta {
+            offset: self.next,
+            len: total as u16,
         };
-        let b_data = match self.strings.iter().find(|s| s.id == b) {
-            Some(s) => &s.buf,
-            None => return None,
-        };
-
-        let mut combined = a_data;
-        combined.extend_from_slice(b_data);
-
-        let id = self.next_id;
-        self.strings.push(FerriString {
-            id,
-            buf: combined,
-        });
-        self.next_id = self.next_id.wrapping_add(1);
-        Some(id)
+        self.next += total as u16;
+        self.count += 1;
+        Some(id as u16)
     }
 
     /// Reset the entire pool. All string IDs become invalid.
     pub fn clear(&mut self) {
-        self.strings.clear();
+        self.count = 0;
+        self.next = 0;
     }
 
-    /// Smart clear: keep only strings referenced by widget text_id fields.
-    /// Unreferenced strings are freed. Widget IDs remain stable (no remapping needed).
+    /// Smart clear: keep strings referenced by widget text_id fields,
+    /// compact survivors to the front, remap widget references.
+    /// Zero heap allocations — uses u32 bitmask + iterates widget array directly.
     pub fn smart_clear(&mut self, tree: &mut WidgetTree) {
-        if self.strings.is_empty() {
+        if self.count == 0 {
             return;
         }
 
-        // Collect referenced string IDs from widget text_ids
-        let dfs = tree.dfs_order();
-        let mut keep: Vec<u16> = Vec::new();
-        for i in 0..dfs.len() {
-            let text_id = tree.text_id(dfs[i]);
-            if text_id != 0xFFFF && !keep.contains(&text_id) {
-                keep.push(text_id);
+        let wcount = tree.count();
+
+        // Phase 1: Build keep bitmask from widget text_ids
+        let mut keep: u64 = 0;
+        for i in 0..wcount {
+            let text_id = tree.text_id(WidgetId(i as u8));
+            if text_id != STR_NONE && (text_id as usize) < MAX_STRINGS {
+                keep |= 1u64 << text_id;
             }
         }
 
-        // Remove unreferenced strings
-        self.strings.retain(|s| keep.contains(&s.id));
+        // If nothing to keep, just clear
+        if keep == 0 {
+            self.clear();
+            return;
+        }
+
+        // Phase 2: Compact survivors to front with new sequential IDs
+        let buf = pool_buf();
+        let old_count = self.count as usize;
+        let mut remap = [STR_NONE; MAX_STRINGS];
+        let mut new_id: u8 = 0;
+        let mut write_pos: u16 = 0;
+
+        for old_id in 0..old_count {
+            if keep & (1u64 << old_id) == 0 {
+                continue;
+            }
+            let m = self.meta[old_id];
+            if m.len == 0 {
+                continue;
+            }
+            let src = m.offset as usize;
+            let len = m.len as usize;
+            let dst = write_pos as usize;
+            // Move bytes forward (src >= dst always since we compact left)
+            if dst != src {
+                for i in 0..len {
+                    buf[dst + i] = buf[src + i];
+                }
+            }
+            self.meta[new_id as usize] = StrMeta {
+                offset: write_pos,
+                len: m.len,
+            };
+            remap[old_id] = new_id as u16;
+            write_pos += m.len;
+            new_id += 1;
+        }
+
+        self.count = new_id;
+        self.next = write_pos;
+
+        // Phase 3: Remap widget text_id references
+        for i in 0..wcount {
+            let wid = WidgetId(i as u8);
+            let text_id = tree.text_id(wid);
+            if text_id != STR_NONE && (text_id as usize) < old_count {
+                let new = remap[text_id as usize];
+                if let Some(ext) = tree.ext_mut(wid) {
+                    ext.text_id = new;
+                }
+            }
+        }
     }
 }
 

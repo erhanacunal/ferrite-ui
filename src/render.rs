@@ -29,10 +29,7 @@ pub fn render_buffered(ctx: &mut Ctx) {
     }
 
     ctx.lcd.begin_frame();
-    if ctx.tree.root.is_some() {
-        let root = ctx.tree.root;
-        render_subtree(ctx, root);
-    }
+    render_all_iterative(ctx);
     clear_all_dirty(ctx);
     ctx.lcd.end_frame();
 }
@@ -40,34 +37,30 @@ pub fn render_buffered(ctx: &mut Ctx) {
 // --- Full screen render ---
 
 /// Draw the entire widget tree from scratch (initial draw or full redraw).
+/// Iterative DFS using cached order — no recursion, no stack growth.
 pub fn render_all(ctx: &mut Ctx) {
-    if ctx.tree.root.is_some() {
-        let root = ctx.tree.root;
-        render_subtree(ctx, root);
-    }
+    render_all_iterative(ctx);
     clear_all_dirty(ctx);
 }
 
-/// Draw subtree in DFS pre-order (z-order: parent first, child after).
-fn render_subtree(ctx: &Ctx, id: WidgetId) {
-    let widget = ctx.tree.get(id);
-    if !widget.is_visible() {
-        return;
-    }
-
-    let abs = ctx.tree.absolute_rect(id);
-    draw_widget(ctx, id, &abs);
-
-    let mut child = widget.first_child;
-    let max = ctx.tree.count();
-    let mut guard = 0usize;
-    while child.is_some() {
-        render_subtree(ctx, child);
-        child = ctx.tree.get(child).next_sibling;
-        guard += 1;
-        if guard > max {
-            break;
+/// Iterative full redraw: walk DFS order, skip invisible subtrees.
+fn render_all_iterative(ctx: &mut Ctx) {
+    let dfs = ctx.tree.dfs_order();
+    let mut i = 0;
+    while i < dfs.len() {
+        let id = dfs[i];
+        if !ctx.tree.is_tree_visible(id) {
+            // Skip entire subtree of this invisible widget
+            let mut end = i + 1;
+            while end < dfs.len() && ctx.tree.is_descendant(dfs[end], id) {
+                end += 1;
+            }
+            i = end;
+            continue;
         }
+        let abs = ctx.tree.absolute_rect(id);
+        draw_widget(ctx, id, &abs);
+        i += 1;
     }
 }
 
