@@ -24,14 +24,15 @@ For the some bricked Nextion Displays :)
 ## Features
 
 - **Widget system** -- HTML-like tree structure with CSS box model, split-struct design (18B base + 32B extension on demand)
-- **Widget types** -- Base (container), Label, Button, Progress, Slider, Checkbox, Radio
+- **Widget types** -- Base (container), Label, Button, Progress, Slider, Checkbox, Radio, Text Input, Gauge
 - **Dirty redraw** -- Two-pass clip-based painter's algorithm (erase hidden, then draw visible)
-- **Double buffering** -- FPGA back/front buffer swap for tear-free rendering
+- **Double buffering** -- FPGA back/front buffer swap, dual-buffer dirty tracking (only changed widgets redrawn per buffer)
 - **Bytecode VM** -- 57+ opcodes, stack-based locals (FRAME prologue), 128 globals + 128 locals per frame, 8-deep call stack
 - **Drawing primitives** -- fillRect, rect, line, circle, fillCircle, roundedRect, fillRoundedRect, arc, drawImage, drawText
 - **Float32 arithmetic** -- Software float (add/sub/mul/div/neg + comparisons + conversion)
 - **String pool** -- Heap-allocated strings with auto-incrementing IDs, smart GC preserving widget text
-- **Touch input** -- Debounced press/hold/release events, hit testing, on_click and on_tap callbacks
+- **Touch input** -- Debounced press/hold/release events, hit testing, on_click and on_tap callbacks, on-screen keyboard
+- **Scrollable containers** -- FLAG_CLIP_CHILDREN on any widget, scrollbar, virtual rendering (off-screen children skipped)
 - **Custom paint** -- on_paint callback for widget custom drawing
 - **Flash filesystem** -- TOC-based, named resources (fonts, images, programs, pages)
 - **Font rendering** -- Adafruit GFX compatible bitmap fonts (flash + embedded)
@@ -56,6 +57,12 @@ Hold the top-left corner for 3 seconds at boot. A red progress bar fills while h
 | Checkbox / Radio | Canvas (on_paint) |
 |------------------|-------------------|
 | ![Check Tab](docs/images/widgets_demo_3.jpeg) | ![Canvas Tab](docs/images/widgets_demo_4.jpeg) |
+
+### New Components
+
+| Gauge | Scroll List | Text Input + Keyboard |
+|-------|-------------|----------------------|
+| ![Gauge](docs/images/gauge.JPG) | ![Scroll List](docs/images/list.JPG) | ![Text Input](docs/images/text_input_keyboard.JPG) |
 
 ## Ferrite Language
 
