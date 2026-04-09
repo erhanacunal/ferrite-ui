@@ -3,23 +3,29 @@ use crate::ctx::Ctx;
 use crate::lcd::{self, Lcd};
 use crate::types::{Color, Edges, Rect};
 use crate::widget::{
-    ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_PRESSED, KIND_CHECKBOX, KIND_LABEL,
-    KIND_PROGRESS, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
+    ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_PRESSED,
+    KIND_CHECKBOX, KIND_GAUGE, KIND_INPUT, KIND_LABEL, KIND_PROGRESS, KIND_RADIO, KIND_SLIDER,
+    Widget, WidgetExt, WidgetId, WidgetTree,
 };
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
 
-// --- Buffered render (double-buffered full redraw) ---
+// --- Buffered render (double-buffered partial redraw) ---
 
-/// Draw the entire widget tree to the back buffer, then swap.
-/// Only fires when at least one widget is dirty — avoids unnecessary
-/// FPGA buffer swaps when nothing has changed.
+/// Draw only dirty widgets to the back buffer, then swap.
+///
+/// Uses dual-buffer dirty tracking: each widget has FLAG_DIRTY_A and
+/// FLAG_DIRTY_B. When a widget changes, both flags are set. Each buffer
+/// only redraws widgets dirty in its own flag, then clears that flag.
+/// This avoids full redraws — only changed widgets are redrawn per buffer.
 pub fn render_buffered(ctx: &mut Ctx) {
-    // Skip if nothing changed — prevent rapid begin/end frame cycling
+    let buf = ctx.lcd.back_buf();
+
+    // Skip if nothing is dirty for this buffer
     let dfs = ctx.tree.dfs_order();
     let mut has_dirty = false;
     for i in 0..dfs.len() {
-        if ctx.tree.get(dfs[i]).is_dirty() {
+        if ctx.tree.get(dfs[i]).is_dirty_buf(buf) {
             has_dirty = true;
             break;
         }
@@ -29,8 +35,49 @@ pub fn render_buffered(ctx: &mut Ctx) {
     }
 
     ctx.lcd.begin_frame();
-    render_all_iterative(ctx);
-    clear_all_dirty(ctx);
+
+    // Partial redraw: only widgets dirty in this buffer
+    for i in 0..dfs.len() {
+        let id = dfs[i];
+        if !ctx.tree.get(id).is_dirty_buf(buf) || !ctx.tree.is_tree_visible(id) {
+            continue;
+        }
+
+        let abs = ctx.tree.absolute_rect(id);
+
+        // Viewport clipping for children of scroll containers
+        let sp = ctx.tree.scroll_parent(id);
+        if sp.is_some() {
+            let viewport = ctx.tree.scroll_viewport(sp);
+            if abs.x < viewport.x
+                || abs.y < viewport.y
+                || abs.right() > viewport.right()
+                || abs.bottom() > viewport.bottom()
+            {
+                continue; // outside or partially visible
+            }
+        }
+
+        draw_widget(ctx, id, &abs);
+    }
+
+    // Draw scrollbars on top
+    for i in 0..dfs.len() {
+        let id = dfs[i];
+        if ctx.tree.get(id).flags & FLAG_CLIP_CHILDREN != 0
+            && ctx.tree.get(id).is_dirty_buf(buf)
+            && ctx.tree.is_tree_visible(id)
+        {
+            let abs = ctx.tree.absolute_rect(id);
+            draw_scrollbar(ctx, id, &abs);
+        }
+    }
+
+    // Clear only this buffer's dirty flags
+    for i in 0..dfs.len() {
+        ctx.tree.get_mut(dfs[i]).clear_dirty_buf(buf);
+    }
+
     ctx.lcd.end_frame();
 }
 
@@ -44,6 +91,7 @@ pub fn render_all(ctx: &mut Ctx) {
 }
 
 /// Iterative full redraw: walk DFS order, skip invisible subtrees.
+/// Children of scroll containers are clipped to the viewport.
 fn render_all_iterative(ctx: &mut Ctx) {
     let dfs = ctx.tree.dfs_order();
     let mut i = 0;
@@ -59,8 +107,40 @@ fn render_all_iterative(ctx: &mut Ctx) {
             continue;
         }
         let abs = ctx.tree.absolute_rect(id);
-        draw_widget(ctx, id, &abs);
+
+        // Viewport clipping for children of scroll containers
+        let sp = ctx.tree.scroll_parent(id);
+        if sp.is_some() {
+            let viewport = ctx.tree.scroll_viewport(sp);
+            // Only draw if FULLY inside viewport (text can't be partially clipped)
+            if abs.x >= viewport.x
+                && abs.y >= viewport.y
+                && abs.right() <= viewport.right()
+                && abs.bottom() <= viewport.bottom()
+            {
+                draw_widget(ctx, id, &abs);
+            } else {
+                // Outside or partially visible — skip entire subtree
+                let mut end = i + 1;
+                while end < dfs.len() && ctx.tree.is_descendant(dfs[end], id) {
+                    end += 1;
+                }
+                i = end;
+                continue;
+            }
+        } else {
+            draw_widget(ctx, id, &abs);
+        }
         i += 1;
+    }
+
+    // Draw scrollbars on top of all children
+    for i in 0..dfs.len() {
+        let id = dfs[i];
+        if ctx.tree.get(id).flags & FLAG_CLIP_CHILDREN != 0 && ctx.tree.is_tree_visible(id) {
+            let abs = ctx.tree.absolute_rect(id);
+            draw_scrollbar(ctx, id, &abs);
+        }
     }
 }
 
@@ -144,6 +224,20 @@ pub fn render_dirty(ctx: &mut Ctx) {
             let mut clip = ClipRegion::from_rect(sabs);
             clip.clip_to_bounds(&SCREEN);
 
+            // Viewport clipping for children of scroll containers
+            let sp = ctx.tree.scroll_parent(sid);
+            if sp.is_some() {
+                let viewport = ctx.tree.scroll_viewport(sp);
+                // Only draw if fully inside viewport (text can't be partially clipped)
+                if sabs.x < viewport.x
+                    || sabs.y < viewport.y
+                    || sabs.right() > viewport.right()
+                    || sabs.bottom() > viewport.bottom()
+                {
+                    continue;
+                }
+            }
+
             for oi in 0..occ_count {
                 clip.subtract(&occluders[oi]);
             }
@@ -151,6 +245,16 @@ pub fn render_dirty(ctx: &mut Ctx) {
             if !clip.is_empty() {
                 draw_widget_clipped(ctx, sid, &sabs, &clip);
             }
+        }
+    }
+
+    // Draw scrollbars on top of all children (only for dirty scroll containers)
+    for di in 0..dfs.len() {
+        let id = dfs[di];
+        let w = ctx.tree.get(id);
+        if w.flags & FLAG_CLIP_CHILDREN != 0 && w.is_dirty() && ctx.tree.is_tree_visible(id) {
+            let abs = ctx.tree.absolute_rect(id);
+            draw_scrollbar(ctx, id, &abs);
         }
     }
 
@@ -317,6 +421,17 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
         let inner = inner_rect(abs, &b);
         draw_check_indicator(&ctx.lcd, widget, &inner, ext);
     }
+
+    // Input text + cursor
+    if widget.kind == KIND_INPUT {
+        draw_input_text(ctx, widget, abs, ext);
+    }
+
+    // Gauge arc
+    if widget.kind == KIND_GAUGE {
+        let inner = inner_rect(abs, &ext.border);
+        draw_gauge(&ctx.lcd, widget, &inner, ext);
+    }
 }
 
 /// Draw widget with clip region (dirty render path).
@@ -411,6 +526,17 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
         let inner = inner_rect(abs, &b);
         draw_check_indicator(&ctx.lcd, widget, &inner, ext);
     }
+
+    // Input text + cursor
+    if widget.kind == KIND_INPUT {
+        draw_input_text(ctx, widget, abs, ext);
+    }
+
+    // Gauge arc
+    if widget.kind == KIND_GAUGE {
+        let inner = inner_rect(abs, &ext.border);
+        draw_gauge(&ctx.lcd, widget, &inner, ext);
+    }
 }
 
 /// Draw background image at the inner rect origin.
@@ -472,6 +598,183 @@ fn draw_label_text(ctx: &Ctx, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
         Some(bg_color)
     };
     font.draw_str(&ctx.lcd, &ctx.flash, text, tx, ty, ext.text_color, bg);
+}
+
+/// Draw input text with cursor in the content area.
+fn draw_input_text(ctx: &Ctx, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    let font = match ctx.fonts.resolve(ext.font_id) {
+        Some(f) => f,
+        None => return,
+    };
+
+    let b = ext.border;
+    let p = ext.padding;
+    let cx = abs.x + b.left as i16 + p.left as i16;
+    let cy = abs.y + b.top as i16 + p.top as i16;
+    let cw = abs
+        .w
+        .saturating_sub(b.left as u16 + b.right as u16 + p.left as u16 + p.right as u16);
+    let ch = abs
+        .h
+        .saturating_sub(b.top as u16 + b.bottom as u16 + p.top as u16 + p.bottom as u16);
+
+    if cw == 0 || ch == 0 {
+        return;
+    }
+
+    let lh = font.line_height() as i16;
+    let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
+
+    let bg_color = effective_bg(&ctx.tree, widget, ext);
+    let bg = if bg_color == 0 { None } else { Some(bg_color) };
+
+    // Draw text if present
+    let has_text = ext.text_id != 0xFFFF && ext.font_id != 0xFF;
+    if has_text {
+        let text = ctx.strpool.get(ext.text_id);
+        if !text.is_empty() {
+            font.draw_str(&ctx.lcd, &ctx.flash, text, cx, ty, ext.text_color, bg);
+        }
+    }
+
+    // Draw cursor when focused
+    if widget.flags & FLAG_FOCUSED != 0 && ctx.cursor_visible {
+        let cursor_pos = ext.value.max(0) as usize;
+        let mut cursor_x = cx;
+        if has_text {
+            let text = ctx.strpool.get(ext.text_id);
+            let end = cursor_pos.min(text.len());
+            for i in 0..end {
+                cursor_x += font.char_width(text[i] as char) as i16;
+            }
+        }
+        // Draw 2px wide cursor line
+        let cursor_y = cy + (ch as i16 - lh) / 2;
+        let cursor_h = lh as u16;
+        if cursor_x >= cx && cursor_x < cx + cw as i16 {
+            fill_rect_screen(&ctx.lcd, Rect::new(cursor_x, cursor_y, 2, cursor_h), ext.text_color);
+        }
+    }
+}
+
+/// Draw gauge arc/dial inside the inner rect.
+///
+/// 270° arc from 135° (bottom-left) to 45° (bottom-right), clockwise through top.
+/// - border_color: track arc color
+/// - press_color: filled arc color (value portion)
+/// - text_color: needle color
+/// - value: 0-100 gauge position
+fn draw_gauge(lcd: &Lcd, widget: &Widget, inner: &Rect, ext: &WidgetExt) {
+    if inner.is_empty() {
+        return;
+    }
+
+    // Gauge geometry
+    let cx = inner.x + inner.w as i16 / 2;
+    let cy = inner.y + inner.h as i16 / 2;
+    let r = (inner.w.min(inner.h) / 2).saturating_sub(2) as i16;
+    if r < 8 {
+        return;
+    }
+
+    // Arc angles: 135° (start) → 45° (end), 270° sweep
+    const ARC_START: i16 = 135;
+    const ARC_END: i16 = 45;
+    const ARC_SWEEP: i32 = 270;
+
+    let val = ext.value.clamp(0, 100) as i32;
+    let value_angle = (ARC_START as i32 + val * ARC_SWEEP / 100) % 360;
+
+    // Arc thickness: ~8% of radius, min 3px
+    let thickness = (r / 12).max(3) as i16;
+    let outer_r = r;
+    let inner_r = r - thickness;
+
+    // Draw track arc (full 270°)
+    let track_color = if widget.border_color != 0 {
+        widget.border_color
+    } else {
+        0x3186 // default dark gray
+    };
+    for dr in inner_r..=outer_r {
+        lcd.draw_arc(cx, cy, dr, ARC_START, ARC_END, track_color);
+    }
+
+    // Draw value arc (filled portion)
+    if val > 0 && ext.press_color != 0 {
+        let end = if val >= 100 { ARC_END } else { value_angle as i16 };
+        for dr in inner_r..=outer_r {
+            lcd.draw_arc(cx, cy, dr, ARC_START, end, ext.press_color);
+        }
+    }
+
+    // Draw needle
+    let needle_color = if ext.text_color != 0 && ext.text_color != 0xFFFF {
+        ext.text_color
+    } else {
+        0xFFFF // white default
+    };
+    let needle_r = inner_r - 4;
+    if needle_r > 4 {
+        let (sin_v, cos_v) = lcd::sin_cos_deg(value_angle as i16);
+        let nx = cx + ((needle_r as i32 * cos_v as i32) >> 8) as i16;
+        let ny = cy + ((needle_r as i32 * sin_v as i32) >> 8) as i16;
+        lcd.draw_line(cx, cy, nx, ny, needle_color);
+        // Draw thicker needle (2 extra lines offset by 1px)
+        lcd.draw_line(cx + 1, cy, nx + 1, ny, needle_color);
+        lcd.draw_line(cx, cy + 1, nx, ny + 1, needle_color);
+    }
+
+    // Center dot
+    lcd.fill_circle(cx, cy, 3, needle_color);
+
+    // Draw tick marks at 0%, 25%, 50%, 75%, 100%
+    let tick_color = track_color;
+    for i in 0..=4u32 {
+        let tick_angle = (ARC_START as i32 + i as i32 * ARC_SWEEP / 4) % 360;
+        let (sin_v, cos_v) = lcd::sin_cos_deg(tick_angle as i16);
+        let tx0 = cx + (((outer_r + 2) as i32 * cos_v as i32) >> 8) as i16;
+        let ty0 = cy + (((outer_r + 2) as i32 * sin_v as i32) >> 8) as i16;
+        let tx1 = cx + (((outer_r + 6) as i32 * cos_v as i32) >> 8) as i16;
+        let ty1 = cy + (((outer_r + 6) as i32 * sin_v as i32) >> 8) as i16;
+        lcd.draw_line(tx0, ty0, tx1, ty1, tick_color);
+    }
+}
+
+/// Scrollbar constants
+pub const SCROLLBAR_W: u16 = 10;
+const SCROLLBAR_TRACK: Color = 0x18C3;  // dark gray
+const SCROLLBAR_THUMB: Color = 0x6B4D;  // medium gray
+const SCROLLBAR_MIN_THUMB: u16 = 16;    // minimum thumb height
+
+/// Draw scrollbar on the right side of a scroll container.
+fn draw_scrollbar(ctx: &Ctx, id: WidgetId, abs: &Rect) {
+    let content_h = ctx.tree.content_height(id);
+    let cr = ctx.tree.content_rect(id);
+    if cr.h == 0 || content_h <= cr.h {
+        return; // no scrollbar needed — all content fits
+    }
+
+    let scroll_y = ctx.tree.value(id).max(0) as u32;
+    let ch = content_h as u32;
+    let vh = cr.h as u32;
+
+    // Track: right edge of content area
+    let track_x = cr.x + cr.w as i16 - SCROLLBAR_W as i16;
+    let track_y = cr.y;
+    let track_h = cr.h;
+    fill_rect_screen(&ctx.lcd, Rect::new(track_x, track_y, SCROLLBAR_W, track_h), SCROLLBAR_TRACK);
+
+    // Thumb: proportional size and position
+    let thumb_h = ((vh * track_h as u32) / ch).max(SCROLLBAR_MIN_THUMB as u32).min(track_h as u32) as u16;
+    let max_scroll = ch - vh;
+    let scroll_range = track_h.saturating_sub(thumb_h) as u32;
+    let thumb_y = if max_scroll > 0 {
+        track_y + ((scroll_y * scroll_range) / max_scroll) as i16
+    } else {
+        track_y
+    };
+    fill_rect_screen(&ctx.lcd, Rect::new(track_x, thumb_y, SCROLLBAR_W, thumb_h), SCROLLBAR_THUMB);
 }
 
 /// Draw rect clipped against clip region.

@@ -35,6 +35,11 @@ impl Lcd {
         }
     }
 
+    /// Current back buffer index (0 or 1). Used for dual-buffer dirty tracking.
+    pub fn back_buf(&self) -> u8 {
+        self.lcd5
+    }
+
     /// End frame: swap front buffer to show what was just drawn.
     /// FPGA atomically swaps — no tearing.
     pub fn end_frame(&mut self) {
@@ -424,7 +429,7 @@ static SIN_TABLE: [u16; 91] = [
 
 /// Return (sin, cos) in Q8 fixed-point for angle in degrees (0..359).
 /// Positive sin = downward, positive cos = rightward (screen coordinates).
-fn sin_cos_deg(deg: i16) -> (i16, i16) {
+pub fn sin_cos_deg(deg: i16) -> (i16, i16) {
     let d = ((deg % 360) + 360) % 360;
 
     let sin_val = match d {

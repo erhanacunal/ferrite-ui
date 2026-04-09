@@ -12,13 +12,14 @@ use crate::proto::{
     PROP_CLICKABLE, PROP_ENABLED, PROP_FONT_ID, PROP_KIND, PROP_LOCATION, PROP_LOC_X, PROP_LOC_Y,
     PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L, PROP_MARGIN_R, PROP_MARGIN_T, PROP_PADDING,
     PROP_IMAGE_ID, PROP_ON_CLICK, PROP_ON_PAINT, PROP_ON_TAP, PROP_BORDER_RADIUS, PROP_VALUE, PROP_CHECKED,
+    PROP_MAX_LENGTH, PROP_CURSOR_POS, PROP_ON_CHANGE, PROP_SCROLL_Y, PROP_CLIP_CHILDREN,
     PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
     PROP_PRESS_COLOR, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W,
     PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VISIBLE,
 };
 use crate::render;
 use crate::types::{Edges, Offset, Size};
-use crate::widget::{WidgetId, FLAG_CHECKED, FLAG_CLICKABLE, FLAG_ENABLED, FLAG_VISIBLE};
+use crate::widget::{WidgetId, FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_VISIBLE, FLAG_DIRTY_AB};
 
 // === Code source — owned by VM ===
 
@@ -1393,6 +1394,7 @@ impl Vm {
             PROP_ENABLED => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_ENABLED, val != 0); return; }
             PROP_CLICKABLE => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_CLICKABLE, val != 0); return; }
             PROP_CHECKED => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_CHECKED, val != 0); return; }
+            PROP_CLIP_CHILDREN => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_CLIP_CHILDREN, val != 0); return; }
             PROP_BG_COLOR => { ctx.tree.get_mut(self.target).background_color = val as u16; return; }
             PROP_BORDER_COLOR => { ctx.tree.get_mut(self.target).border_color = val as u16; return; }
             PROP_KIND => { ctx.tree.get_mut(self.target).kind = val as u8; return; }
@@ -1424,6 +1426,10 @@ impl Vm {
                 PROP_ON_CLICK => ext.on_click = val as u16,
                 PROP_ON_PAINT => ext.on_paint = val as u16,
                 PROP_ON_TAP => ext.on_tap = val as u16,
+                PROP_MAX_LENGTH => ext.max_length = val as u8,
+                PROP_CURSOR_POS => ext.value = val as i16,
+                PROP_ON_CHANGE => ext.on_tap = val as u16,
+                PROP_SCROLL_Y => ext.value = val as i16,
                 _ => {}
             }
         }
@@ -1441,6 +1447,7 @@ impl Vm {
             PROP_ENABLED => if w.flags & FLAG_ENABLED != 0 { 1 } else { 0 },
             PROP_CLICKABLE => if w.flags & FLAG_CLICKABLE != 0 { 1 } else { 0 },
             PROP_CHECKED => if w.flags & FLAG_CHECKED != 0 { 1 } else { 0 },
+            PROP_CLIP_CHILDREN => if w.flags & FLAG_CLIP_CHILDREN != 0 { 1 } else { 0 },
             PROP_BG_COLOR => w.background_color as i32,
             PROP_BORDER_COLOR => w.border_color as i32,
             PROP_KIND => w.kind as i32,
@@ -1467,6 +1474,10 @@ impl Vm {
             PROP_ON_CLICK => ctx.tree.on_click(self.target) as i32,
             PROP_ON_PAINT => ctx.tree.on_paint(self.target) as i32,
             PROP_ON_TAP => ctx.tree.on_tap(self.target) as i32,
+            PROP_MAX_LENGTH => ctx.tree.max_length(self.target) as i32,
+            PROP_CURSOR_POS => ctx.tree.value(self.target) as i32,
+            PROP_ON_CHANGE => ctx.tree.on_tap(self.target) as i32,
+            PROP_SCROLL_Y => ctx.tree.value(self.target) as i32,
             _ => 0,
         }
     }
@@ -1663,7 +1674,7 @@ fn unpack_pair(packed: i32) -> (u16, u16) {
 // --- Flag helper ---
 
 #[inline]
-fn set_flag(flags: &mut u8, mask: u8, val: bool) {
+fn set_flag(flags: &mut u16, mask: u16, val: bool) {
     if val {
         *flags |= mask;
     } else {

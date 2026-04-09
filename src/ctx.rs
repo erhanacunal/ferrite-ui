@@ -21,4 +21,5 @@ pub struct Ctx {
     pub strpool: StringPool,
     pub fs: Option<Fs>,
     pub backlight: Backlight,
+    pub cursor_visible: bool,
 }

@@ -221,6 +221,11 @@ class Prop:
     BORDER_RADIUS = 0x23
     VALUE = 0x24
     CHECKED = 0x25
+    MAX_LENGTH = 0x26
+    CURSOR_POS = 0x27
+    ON_CHANGE = 0x28
+    SCROLL_Y = 0x29
+    CLIP_CHILDREN = 0x2A
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -918,6 +923,8 @@ PROP_NAMES = {
     0x18: 'PADDING_T', 0x19: 'PADDING_R', 0x1A: 'PADDING_B', 0x1B: 'PADDING_L',
     0x1F: 'IMAGE_ID',
     0x20: 'ON_CLICK', 0x21: 'ON_PAINT', 0x22: 'ON_TAP', 0x23: 'BORDER_RADIUS', 0x24: 'VALUE', 0x25: 'CHECKED',
+    0x26: 'MAX_LENGTH', 0x27: 'CURSOR_POS', 0x28: 'ON_CHANGE',
+    0x29: 'SCROLL_Y', 0x2A: 'CLIP_CHILDREN',
     0x40: 'LOCATION', 0x41: 'SIZE', 0x42: 'MARGIN',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -1134,6 +1141,11 @@ PROP_MAP = {
     'radius': (Prop.BORDER_RADIUS, False),
     'value': (Prop.VALUE, False),
     'checked': (Prop.CHECKED, False),
+    'max_length': (Prop.MAX_LENGTH, False),
+    'cursor_pos': (Prop.CURSOR_POS, False),
+    'on_change': (Prop.ON_CHANGE, False),
+    'scroll_y': (Prop.SCROLL_Y, False),
+    'clip_children': (Prop.CLIP_CHILDREN, False),
     'text': (Prop.TEXT, True),
     'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }

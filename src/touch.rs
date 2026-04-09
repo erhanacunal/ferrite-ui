@@ -293,7 +293,15 @@ pub fn hit_test(tree: &mut WidgetTree, x: u16, y: u16) -> WidgetId {
             && (y as i16) >= abs.y
             && (y as i16) < abs.bottom()
         {
-            result = id; // Son eşleşen = en üstteki
+            // Skip if outside scroll viewport
+            let sp = tree.scroll_parent(id);
+            if sp.is_some() {
+                let viewport = tree.scroll_viewport(sp);
+                if !abs.intersects(&viewport) {
+                    continue;
+                }
+            }
+            result = id;
         }
     }
 

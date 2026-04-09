@@ -1,0 +1,210 @@
+// main.fl — Gauge Widget Demo (800x480)
+//
+// Three gauges: speed, temperature, fuel level.
+// Animated values that sweep back and forth.
+
+var title_lbl;
+var g_speed;
+var g_temp;
+var g_fuel;
+var lbl_speed;
+var lbl_temp;
+var lbl_fuel;
+var val_speed;
+var val_temp;
+var val_fuel;
+var speed;
+var temp;
+var fuel;
+var dir_speed;
+var dir_temp;
+var dir_fuel;
+
+fn rgb565(r, g, b) {
+    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
+}
+
+fn setup() {
+    speed = 0;
+    temp = 30;
+    fuel = 80;
+    dir_speed = 1;
+    dir_temp = 1;
+    dir_fuel = -1;
+
+    // ── Title ──
+    title_lbl = alloc();
+    target(title_lbl);
+    set(kind, 1);
+    set(location, 0, 5);
+    set(size, 800, 30);
+    set(text, "Gauge Widget Demo");
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(font_id, 0);
+    parent(0);
+
+    // ── Speed gauge (left) ──
+    g_speed = alloc();
+    target(g_speed);
+    set(kind, 8);
+    set(location, 20, 50);
+    set(size, 240, 240);
+    set(bg_color, rgb565(15, 15, 25));
+    set(border, 2, 2, 2, 2);
+    set(border_color, rgb565(50, 50, 80));
+    set(press_color, rgb565(0, 180, 255));
+    set(text_color, 0xFFFF);
+    set(border_radius, 8);
+    set(value, 0);
+    parent(0);
+
+    lbl_speed = alloc();
+    target(lbl_speed);
+    set(kind, 1);
+    set(location, 20, 295);
+    set(size, 240, 24);
+    set(text, "SPEED");
+    set(text_color, rgb565(0, 180, 255));
+    set(text_align, 1);
+    set(font_id, 0);
+    parent(0);
+
+    val_speed = alloc();
+    target(val_speed);
+    set(kind, 1);
+    set(location, 20, 320);
+    set(size, 240, 24);
+    set(text, "0 km/h");
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(font_id, 0);
+    parent(0);
+
+    // ── Temperature gauge (center) ──
+    g_temp = alloc();
+    target(g_temp);
+    set(kind, 8);
+    set(location, 280, 50);
+    set(size, 240, 240);
+    set(bg_color, rgb565(15, 15, 25));
+    set(border, 2, 2, 2, 2);
+    set(border_color, rgb565(50, 50, 80));
+    set(press_color, rgb565(255, 100, 0));
+    set(text_color, rgb565(255, 200, 50));
+    set(border_radius, 8);
+    set(value, 30);
+    parent(0);
+
+    lbl_temp = alloc();
+    target(lbl_temp);
+    set(kind, 1);
+    set(location, 280, 295);
+    set(size, 240, 24);
+    set(text, "TEMPERATURE");
+    set(text_color, rgb565(255, 100, 0));
+    set(text_align, 1);
+    set(font_id, 0);
+    parent(0);
+
+    val_temp = alloc();
+    target(val_temp);
+    set(kind, 1);
+    set(location, 280, 320);
+    set(size, 240, 24);
+    set(text, "30 C");
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(font_id, 0);
+    parent(0);
+
+    // ── Fuel gauge (right) ──
+    g_fuel = alloc();
+    target(g_fuel);
+    set(kind, 8);
+    set(location, 540, 50);
+    set(size, 240, 240);
+    set(bg_color, rgb565(15, 15, 25));
+    set(border, 2, 2, 2, 2);
+    set(border_color, rgb565(50, 50, 80));
+    set(press_color, rgb565(0, 200, 80));
+    set(text_color, rgb565(100, 255, 150));
+    set(border_radius, 8);
+    set(value, 80);
+    parent(0);
+
+    lbl_fuel = alloc();
+    target(lbl_fuel);
+    set(kind, 1);
+    set(location, 540, 295);
+    set(size, 240, 24);
+    set(text, "FUEL");
+    set(text_color, rgb565(0, 200, 80));
+    set(text_align, 1);
+    set(font_id, 0);
+    parent(0);
+
+    val_fuel = alloc();
+    target(val_fuel);
+    set(kind, 1);
+    set(location, 540, 320);
+    set(size, 240, 24);
+    set(text, "80%");
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(font_id, 0);
+    parent(0);
+
+    render();
+    return 0;
+}
+
+fn loop() {
+    // Animate speed
+    speed += dir_speed;
+    if (speed >= 100) { dir_speed = -1; }
+    if (speed <= 0) { dir_speed = 1; }
+    target(g_speed);
+    set(value, speed);
+    dirty();
+
+    strClear();
+    var s1 = itos(speed);
+    var s2 = str(" km/h");
+    var s3 = concat(s1, s2);
+    target(val_speed);
+    set(text, s3);
+    dirty();
+
+    // Animate temperature
+    temp += dir_temp;
+    if (temp >= 90) { dir_temp = -1; }
+    if (temp <= 10) { dir_temp = 1; }
+    target(g_temp);
+    set(value, temp);
+    dirty();
+
+    strClear();
+    var t1 = itos(temp);
+    var t2 = str(" C");
+    var t3 = concat(t1, t2);
+    target(val_temp);
+    set(text, t3);
+    dirty();
+
+    // Animate fuel (slow)
+    fuel += dir_fuel;
+    if (fuel >= 100) { dir_fuel = -1; }
+    if (fuel <= 5) { dir_fuel = 1; }
+    target(g_fuel);
+    set(value, fuel);
+    dirty();
+
+    strClear();
+    var f1 = itos(fuel);
+    var f2 = str("%");
+    var f3 = concat(f1, f2);
+    target(val_fuel);
+    set(text, f3);
+    dirty();
+}

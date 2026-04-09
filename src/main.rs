@@ -19,6 +19,7 @@ mod gpio;
 mod heap;
 mod image;
 mod irq;
+mod keyboard;
 mod lcd;
 mod proto;
 mod protocol;
@@ -543,6 +544,186 @@ fn touch_to_slider_value(abs: &types::Rect, touch_x: u16) -> i16 {
     }
 }
 
+/// Focus a KIND_INPUT widget: unfocus previous, set FLAG_FOCUSED, show keyboard.
+fn focus_input(kb: &mut keyboard::Keyboard, ctx: &mut Ctx, id: widget::WidgetId) {
+    // Unfocus previous
+    if kb.focused.is_some() && kb.focused != id {
+        ctx.tree.get_mut(kb.focused).flags &= !widget::FLAG_FOCUSED;
+        ctx.tree.mark_dirty(kb.focused);
+    }
+    // Focus new
+    kb.focused = id;
+    ctx.tree.get_mut(id).flags |= widget::FLAG_FOCUSED;
+    ctx.tree.mark_dirty(id);
+    kb.visible = true;
+    kb.dirty = true;
+    kb.reset_blink(systick::millis());
+    ctx.cursor_visible = true;
+}
+
+/// Dismiss the on-screen keyboard and unfocus the current input.
+fn dismiss_keyboard(kb: &mut keyboard::Keyboard, ctx: &mut Ctx) {
+    if kb.focused.is_some() {
+        ctx.tree.get_mut(kb.focused).flags &= !widget::FLAG_FOCUSED;
+        ctx.tree.mark_dirty(kb.focused);
+    }
+    kb.focused = widget::WidgetId::NONE;
+    kb.visible = false;
+    ctx.cursor_visible = false;
+
+    // Mark widgets in keyboard area dirty for repaint
+    let dfs = ctx.tree.dfs_order();
+    for i in 0..dfs.len() {
+        let abs = ctx.tree.absolute_rect(dfs[i]);
+        if abs.y + abs.h as i16 > keyboard::KB_Y as i16 {
+            ctx.tree.mark_dirty(dfs[i]);
+        }
+    }
+}
+
+/// Position cursor in a KIND_INPUT widget based on touch X coordinate.
+fn position_cursor(ctx: &mut Ctx, id: widget::WidgetId, touch_x: u16) {
+    let ext = ctx.tree.ext(id).unwrap_or(&widget::WidgetExt::DEFAULT);
+    let text_id = ext.text_id;
+    let font_id = ext.font_id;
+
+    let font = match ctx.fonts.resolve(font_id) {
+        Some(f) => f,
+        None => return,
+    };
+
+    let abs = ctx.tree.absolute_rect(id);
+    let b = ctx.tree.border(id);
+    let p = ctx.tree.padding(id);
+    let cx = abs.x + b.left as i16 + p.left as i16;
+
+    let mut cursor_pos: i16 = 0;
+    if text_id != 0xFFFF {
+        let text = ctx.strpool.get(text_id);
+        let tx = touch_x as i16;
+        let mut acc = cx;
+        for (i, &ch) in text.iter().enumerate() {
+            let cw = font.char_width(ch as char) as i16;
+            if tx < acc + cw / 2 {
+                cursor_pos = i as i16;
+                break;
+            }
+            acc += cw;
+            cursor_pos = (i + 1) as i16;
+        }
+    }
+
+    if let Some(ext) = ctx.tree.ensure_ext(id) {
+        ext.value = cursor_pos;
+    }
+}
+
+/// Handle a keyboard key action on the focused input widget.
+fn handle_key_action(
+    kb: &mut keyboard::Keyboard,
+    ctx: &mut Ctx,
+    vm: &mut Box<Vm>,
+    action: keyboard::KeyAction,
+) {
+    let id = kb.focused;
+    if id.is_none() {
+        return;
+    }
+
+    match action {
+        keyboard::KeyAction::Char(ch) => {
+            let text_id = ctx.tree.text_id(id);
+            let max_len = ctx.tree.max_length(id);
+            let cursor = ctx.tree.value(id).max(0) as usize;
+
+            if text_id != 0xFFFF {
+                if ctx.strpool.insert_byte(text_id, cursor, ch, max_len) {
+                    if let Some(ext) = ctx.tree.ensure_ext(id) {
+                        ext.value = (cursor + 1) as i16;
+                    }
+                    ctx.tree.mark_dirty(id);
+                    fire_on_change(ctx, vm, id);
+                }
+            } else {
+                // No text yet — allocate a new string
+                let data = [ch];
+                if let Some(new_id) = ctx.strpool.alloc(&data) {
+                    if let Some(ext) = ctx.tree.ensure_ext(id) {
+                        ext.text_id = new_id;
+                        ext.value = 1;
+                    }
+                    ctx.tree.mark_dirty(id);
+                    fire_on_change(ctx, vm, id);
+                }
+            }
+            kb.reset_blink(systick::millis());
+            ctx.cursor_visible = true;
+        }
+        keyboard::KeyAction::Backspace => {
+            let text_id = ctx.tree.text_id(id);
+            let cursor = ctx.tree.value(id).max(0) as usize;
+            if text_id != 0xFFFF && cursor > 0 {
+                if ctx.strpool.delete_byte(text_id, cursor - 1) {
+                    if let Some(ext) = ctx.tree.ensure_ext(id) {
+                        ext.value = (cursor - 1) as i16;
+                    }
+                    ctx.tree.mark_dirty(id);
+                    fire_on_change(ctx, vm, id);
+                }
+            }
+            kb.reset_blink(systick::millis());
+            ctx.cursor_visible = true;
+        }
+        keyboard::KeyAction::Enter => {
+            fire_on_change(ctx, vm, id);
+            dismiss_keyboard(kb, ctx);
+        }
+        keyboard::KeyAction::Shift | keyboard::KeyAction::Symbols | keyboard::KeyAction::Abc => {
+            // Layer change handled inside kb.handle_release — just redraw
+        }
+    }
+}
+
+/// Fire on_change callback (uses on_tap slot) for a KIND_INPUT widget.
+fn fire_on_change(ctx: &Ctx, vm: &mut Box<Vm>, id: widget::WidgetId) {
+    if !vm.has_code() {
+        return;
+    }
+    let on_change = ctx.tree.on_tap(id);
+    if on_change > 0 {
+        if let Some(entry) = vm.find_func(on_change) {
+            vm.enqueue_callback(entry.offset as u16, &[id.0 as i32]);
+        }
+    }
+}
+
+/// Set scroll position from a touch Y coordinate on the scrollbar track.
+fn scrollbar_set_position(ctx: &mut Ctx, scroll_id: widget::WidgetId, touch_y: u16) {
+    let cr = ctx.tree.content_rect(scroll_id);
+    let ch = ctx.tree.content_height(scroll_id) as i32;
+    let vh = cr.h as i32;
+    if ch <= vh {
+        return;
+    }
+    let max_scroll = ch - vh;
+
+    // Map touch Y within the track to scroll offset
+    let ty = touch_y as i32;
+    let track_top = cr.y as i32;
+    let track_h = cr.h as i32;
+    if track_h <= 0 {
+        return;
+    }
+
+    let ratio = ((ty - track_top).clamp(0, track_h) * 1000) / track_h;
+    let new_scroll = ((ratio * max_scroll) / 1000).clamp(0, max_scroll) as i16;
+
+    if let Some(ext) = ctx.tree.ensure_ext(scroll_id) {
+        ext.value = new_scroll;
+    }
+    ctx.tree.mark_dirty(scroll_id);
+}
+
 // === Entry Point ===
 
 #[entry]
@@ -572,6 +753,7 @@ fn main() -> ! {
         strpool: StringPool::new(),
         fs: None,
         backlight: backlight::Backlight::init(),
+        cursor_visible: false,
     });
     ctx.fonts.add(Font::from_embedded(
         &embedded_font::GLYPHS,
@@ -746,6 +928,9 @@ fn main() -> ! {
 
     // === MAIN LOOP ===
 
+    let mut kb = keyboard::Keyboard::new();
+    let mut scroll_id = widget::WidgetId::NONE;
+    let mut scroll_active = false; // true when dragging scrollbar
     let mut protocol = Protocol::new();
 
     loop {
@@ -822,6 +1007,11 @@ fn main() -> ! {
                     ctx.tree.clear();
                     ctx.strpool.clear();
                     vm.reset();
+                    kb.visible = false;
+                    kb.focused = widget::WidgetId::NONE;
+                    ctx.cursor_visible = false;
+                    scroll_id = widget::WidgetId::NONE;
+                    scroll_active = false;
 
                     // Re-create root widget (widget 0)
                     let root = ctx.tree.alloc().unwrap();
@@ -916,162 +1106,265 @@ fn main() -> ! {
         if error_code == 0 {
             if let Some(event) = touch.poll() {
                 if event.kind == touch::TouchEventKind::Press {
-                    let hit = touch::hit_test(&mut ctx.tree, event.x, event.y);
-                    if hit.is_some() {
-                        ctx.tree.get_mut(hit).flags |= widget::FLAG_PRESSED;
+                    // Keyboard intercept: press on keyboard area
+                    if kb.visible && event.y >= keyboard::KB_Y {
+                        kb.handle_press(event.x, event.y);
+                        // Draw only the pressed key highlighted
+                        kb.draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, kb.pressed_key, true);
+                    } else {
+                        let hit = touch::hit_test(&mut ctx.tree, event.x, event.y);
 
-                        // Slider: update value from touch position
-                        if ctx.tree.get(hit).kind == widget::KIND_SLIDER {
-                            let abs = ctx.tree.absolute_rect(hit);
-                            let new_val = touch_to_slider_value(&abs, event.x);
-                            if let Some(ext) = ctx.tree.ensure_ext(hit) {
-                                ext.value = new_val;
-                            }
-                            if vm.has_code() {
-                                let on_click = ctx.tree.on_click(hit);
-                                if on_click > 0 {
-                                    if let Some(entry) = vm.find_func(on_click) {
-                                        vm.enqueue_callback(
-                                            entry.offset as u16,
-                                            &[hit.0 as i32, new_val as i32],
-                                        );
-                                    }
+                        // Dismiss keyboard if tapping outside an input
+                        if kb.visible && (!hit.is_some() || ctx.tree.get(hit).kind != widget::KIND_INPUT) {
+                            dismiss_keyboard(&mut kb, &mut ctx);
+                        }
+
+                        // Scrollbar detection: check if press is on a scrollbar
+                        scroll_id = widget::WidgetId::NONE;
+                        scroll_active = false;
+                        {
+                            // Find scroll container: either the hit widget or an ancestor
+                            let scroll_target = if hit.is_some() {
+                                let w = ctx.tree.get(hit);
+                                if w.flags & widget::FLAG_CLIP_CHILDREN != 0 {
+                                    hit
+                                } else {
+                                    ctx.tree.scroll_parent(hit)
+                                }
+                            } else {
+                                // No hit — check if press is inside any scroll container
+                                widget::WidgetId::NONE
+                            };
+                            if scroll_target.is_some() {
+                                let cr = ctx.tree.content_rect(scroll_target);
+                                let ch = ctx.tree.content_height(scroll_target);
+                                // Check if touch is on the scrollbar (right 10px of content area)
+                                if ch > cr.h
+                                    && (event.x as i16) >= cr.x + cr.w as i16 - 10
+                                    && (event.x as i16) < cr.right()
+                                    && (event.y as i16) >= cr.y
+                                    && (event.y as i16) < cr.bottom()
+                                {
+                                    scroll_id = scroll_target;
+                                    scroll_active = true;
+                                    // Set scroll position from touch Y
+                                    scrollbar_set_position(&mut ctx, scroll_target, event.y);
                                 }
                             }
                         }
 
-                        ctx.tree.mark_dirty(hit);
-                        if vm.render_mode == RenderMode::Dirty {
-                            render::render_dirty(&mut ctx);
-                        }
-                    }
+                        if hit.is_some() {
+                            ctx.tree.get_mut(hit).flags |= widget::FLAG_PRESSED;
 
-                    if vm.has_code() {
-                        if let Some(entry) = vm.find_by_kind(FunctionKind::OnTouchDown) {
-                            vm.enqueue_callback(
-                                entry.offset as u16,
-                                &[event.x as i32, event.y as i32],
-                            );
-                        }
-                    }
-                } else if event.kind == touch::TouchEventKind::Hold {
-                    // Slider drag: update pressed slider value
-                    let dfs = ctx.tree.dfs_order();
-                    for i in 0..dfs.len() {
-                        let w = ctx.tree.get(dfs[i]);
-                        if w.flags & widget::FLAG_PRESSED != 0 && w.kind == widget::KIND_SLIDER {
-                            let abs = ctx.tree.absolute_rect(dfs[i]);
-                            let new_val = touch_to_slider_value(&abs, event.x);
-                            if let Some(ext) = ctx.tree.ensure_ext(dfs[i]) {
-                                ext.value = new_val;
+                            // Input: focus and position cursor
+                            if ctx.tree.get(hit).kind == widget::KIND_INPUT {
+                                focus_input(&mut kb, &mut ctx, hit);
+                                position_cursor(&mut ctx, hit, event.x);
                             }
-                            ctx.tree.mark_dirty(dfs[i]);
+
+                            // Slider: update value from touch position
+                            if ctx.tree.get(hit).kind == widget::KIND_SLIDER {
+                                let abs = ctx.tree.absolute_rect(hit);
+                                let new_val = touch_to_slider_value(&abs, event.x);
+                                if let Some(ext) = ctx.tree.ensure_ext(hit) {
+                                    ext.value = new_val;
+                                }
+                                if vm.has_code() {
+                                    let on_click = ctx.tree.on_click(hit);
+                                    if on_click > 0 {
+                                        if let Some(entry) = vm.find_func(on_click) {
+                                            vm.enqueue_callback(
+                                                entry.offset as u16,
+                                                &[hit.0 as i32, new_val as i32],
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            ctx.tree.mark_dirty(hit);
                             if vm.render_mode == RenderMode::Dirty {
                                 render::render_dirty(&mut ctx);
                             }
-
-                            if vm.has_code() {
-                                let on_click = ctx.tree.on_click(dfs[i]);
-                                if on_click > 0 {
-                                    if let Some(entry) = vm.find_func(on_click) {
-                                        vm.enqueue_callback(
-                                            entry.offset as u16,
-                                            &[dfs[i].0 as i32, new_val as i32],
-                                        );
-                                    }
-                                }
-                            }
-                            break;
                         }
-                    }
 
-                    if vm.has_code() {
-                        if let Some(entry) = vm.find_by_kind(FunctionKind::OnTouchMove) {
-                            vm.enqueue_callback(
-                                entry.offset as u16,
-                                &[event.x as i32, event.y as i32],
-                            );
-                        }
-                    }
-                } else if event.kind == touch::TouchEventKind::Release {
-                    let mut clicked_id = widget::WidgetId::NONE;
-                    let mut clicked_func: u16 = 0;
-
-                    let dfs = ctx.tree.dfs_order();
-                    for i in 0..dfs.len() {
-                        let w = ctx.tree.get_mut(dfs[i]);
-                        if w.flags & widget::FLAG_PRESSED != 0 {
-                            w.flags &= !widget::FLAG_PRESSED;
-                            let abs = ctx.tree.absolute_rect(dfs[i]);
-                            if abs.contains(event.x, event.y) {
-                                clicked_id = dfs[i];
-                                clicked_func = ctx.tree.on_click(dfs[i]);
-                            }
-                            ctx.tree.mark_dirty(dfs[i]);
-                        }
-                    }
-
-                    // Checkbox: toggle checked state on click
-                    if clicked_id.is_some()
-                        && ctx.tree.get(clicked_id).kind == widget::KIND_CHECKBOX
-                    {
-                        let w = ctx.tree.get_mut(clicked_id);
-                        w.flags ^= widget::FLAG_CHECKED;
-                        ctx.tree.mark_dirty(clicked_id);
-                    }
-
-                    // Radio: uncheck siblings, check self
-                    if clicked_id.is_some() && ctx.tree.get(clicked_id).kind == widget::KIND_RADIO {
-                        let parent = ctx.tree.get(clicked_id).parent;
-                        if parent.is_some() {
-                            let mut sib = ctx.tree.get(parent).first_child;
-                            while sib.is_some() {
-                                if sib != clicked_id
-                                    && ctx.tree.get(sib).kind == widget::KIND_RADIO
-                                    && ctx.tree.get(sib).flags & widget::FLAG_CHECKED != 0
-                                {
-                                    ctx.tree.get_mut(sib).flags &= !widget::FLAG_CHECKED;
-                                    ctx.tree.mark_dirty(sib);
-                                }
-                                sib = ctx.tree.get(sib).next_sibling;
-                            }
-                        }
-                        let w = ctx.tree.get_mut(clicked_id);
-                        w.flags |= widget::FLAG_CHECKED;
-                        ctx.tree.mark_dirty(clicked_id);
-                    }
-
-                    if vm.render_mode == RenderMode::Dirty {
-                        render::render_dirty(&mut ctx);
-                    }
-
-                    // Enqueue on_click callback
-                    if clicked_id.is_some() && clicked_func > 0 && vm.has_code() {
-                        if let Some(entry) = vm.find_func(clicked_func) {
-                            vm.enqueue_callback(entry.offset as u16, &[clicked_id.0 as i32]);
-                        }
-                    }
-
-                    // Enqueue on_tap callback (widget_id, packed x|y)
-                    if clicked_id.is_some() && vm.has_code() {
-                        let tap_func = ctx.tree.on_tap(clicked_id);
-                        if tap_func > 0 {
-                            if let Some(entry) = vm.find_func(tap_func) {
-                                let packed_xy = ((event.x as u32) << 16 | event.y as u32) as i32;
+                        if vm.has_code() {
+                            if let Some(entry) = vm.find_by_kind(FunctionKind::OnTouchDown) {
                                 vm.enqueue_callback(
                                     entry.offset as u16,
-                                    &[clicked_id.0 as i32, packed_xy],
+                                    &[event.x as i32, event.y as i32],
                                 );
                             }
                         }
                     }
+                } else if event.kind == touch::TouchEventKind::Hold {
+                    // Skip hold if press was on keyboard
+                    if kb.pressed_key == keyboard::KEY_NONE {
+                        // Scrollbar drag: update scroll position from touch Y
+                        if scroll_active && scroll_id.is_some() {
+                            scrollbar_set_position(&mut ctx, scroll_id, event.y);
+                            if vm.render_mode == RenderMode::Dirty {
+                                render::render_dirty(&mut ctx);
+                            }
+                        }
 
-                    if vm.has_code() {
-                        if let Some(entry) = vm.find_by_kind(FunctionKind::OnTouchUp) {
-                            vm.enqueue_callback(entry.offset as u16, &[]);
+                        // Slider drag: update pressed slider value
+                        let dfs = ctx.tree.dfs_order();
+                        for i in 0..dfs.len() {
+                            let w = ctx.tree.get(dfs[i]);
+                            if w.flags & widget::FLAG_PRESSED != 0 && w.kind == widget::KIND_SLIDER {
+                                let abs = ctx.tree.absolute_rect(dfs[i]);
+                                let new_val = touch_to_slider_value(&abs, event.x);
+                                if let Some(ext) = ctx.tree.ensure_ext(dfs[i]) {
+                                    ext.value = new_val;
+                                }
+                                ctx.tree.mark_dirty(dfs[i]);
+                                if vm.render_mode == RenderMode::Dirty {
+                                    render::render_dirty(&mut ctx);
+                                }
+
+                                if vm.has_code() {
+                                    let on_click = ctx.tree.on_click(dfs[i]);
+                                    if on_click > 0 {
+                                        if let Some(entry) = vm.find_func(on_click) {
+                                            vm.enqueue_callback(
+                                                entry.offset as u16,
+                                                &[dfs[i].0 as i32, new_val as i32],
+                                            );
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+
+                        if vm.has_code() {
+                            if let Some(entry) = vm.find_by_kind(FunctionKind::OnTouchMove) {
+                                vm.enqueue_callback(
+                                    entry.offset as u16,
+                                    &[event.x as i32, event.y as i32],
+                                );
+                            }
+                        }
+                    }
+                } else if event.kind == touch::TouchEventKind::Release {
+                    // Keyboard key release
+                    if kb.pressed_key != keyboard::KEY_NONE {
+                        let prev_key = kb.pressed_key;
+                        if let Some(action) = kb.handle_release(event.x, event.y) {
+                            handle_key_action(&mut kb, &mut ctx, &mut vm, action);
+                        }
+                        // Redraw just the released key (normal state), unless
+                        // a layer change already scheduled a full redraw
+                        if !kb.dirty && kb.visible {
+                            kb.draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, prev_key, false);
+                        }
+                    } else {
+                        // If scroll drag was active, suppress click
+                        let was_scrolling = scroll_active;
+                        scroll_id = widget::WidgetId::NONE;
+                        scroll_active = false;
+
+                        // Normal widget release
+                        let mut clicked_id = widget::WidgetId::NONE;
+                        let mut clicked_func: u16 = 0;
+
+                        let dfs = ctx.tree.dfs_order();
+                        for i in 0..dfs.len() {
+                            let w = ctx.tree.get_mut(dfs[i]);
+                            if w.flags & widget::FLAG_PRESSED != 0 {
+                                w.flags &= !widget::FLAG_PRESSED;
+                                if !was_scrolling {
+                                    let abs = ctx.tree.absolute_rect(dfs[i]);
+                                    if abs.contains(event.x, event.y) {
+                                        clicked_id = dfs[i];
+                                        clicked_func = ctx.tree.on_click(dfs[i]);
+                                    }
+                                }
+                                ctx.tree.mark_dirty(dfs[i]);
+                            }
+                        }
+
+                        // Checkbox: toggle checked state on click
+                        if clicked_id.is_some()
+                            && ctx.tree.get(clicked_id).kind == widget::KIND_CHECKBOX
+                        {
+                            let w = ctx.tree.get_mut(clicked_id);
+                            w.flags ^= widget::FLAG_CHECKED;
+                            ctx.tree.mark_dirty(clicked_id);
+                        }
+
+                        // Radio: uncheck siblings, check self
+                        if clicked_id.is_some() && ctx.tree.get(clicked_id).kind == widget::KIND_RADIO {
+                            let parent = ctx.tree.get(clicked_id).parent;
+                            if parent.is_some() {
+                                let mut sib = ctx.tree.get(parent).first_child;
+                                while sib.is_some() {
+                                    if sib != clicked_id
+                                        && ctx.tree.get(sib).kind == widget::KIND_RADIO
+                                        && ctx.tree.get(sib).flags & widget::FLAG_CHECKED != 0
+                                    {
+                                        ctx.tree.get_mut(sib).flags &= !widget::FLAG_CHECKED;
+                                        ctx.tree.mark_dirty(sib);
+                                    }
+                                    sib = ctx.tree.get(sib).next_sibling;
+                                }
+                            }
+                            let w = ctx.tree.get_mut(clicked_id);
+                            w.flags |= widget::FLAG_CHECKED;
+                            ctx.tree.mark_dirty(clicked_id);
+                        }
+
+                        // Input: reposition cursor on tap
+                        if clicked_id.is_some()
+                            && ctx.tree.get(clicked_id).kind == widget::KIND_INPUT
+                        {
+                            position_cursor(&mut ctx, clicked_id, event.x);
+                            ctx.tree.mark_dirty(clicked_id);
+                        }
+
+                        if vm.render_mode == RenderMode::Dirty {
+                            render::render_dirty(&mut ctx);
+                        }
+
+                        // Enqueue on_click callback
+                        if clicked_id.is_some() && clicked_func > 0 && vm.has_code() {
+                            if let Some(entry) = vm.find_func(clicked_func) {
+                                vm.enqueue_callback(entry.offset as u16, &[clicked_id.0 as i32]);
+                            }
+                        }
+
+                        // Enqueue on_tap callback (widget_id, packed x|y) — skip for KIND_INPUT
+                        if clicked_id.is_some() && vm.has_code()
+                            && ctx.tree.get(clicked_id).kind != widget::KIND_INPUT
+                        {
+                            let tap_func = ctx.tree.on_tap(clicked_id);
+                            if tap_func > 0 {
+                                if let Some(entry) = vm.find_func(tap_func) {
+                                    let packed_xy = ((event.x as u32) << 16 | event.y as u32) as i32;
+                                    vm.enqueue_callback(
+                                        entry.offset as u16,
+                                        &[clicked_id.0 as i32, packed_xy],
+                                    );
+                                }
+                            }
+                        }
+
+                        if vm.has_code() {
+                            if let Some(entry) = vm.find_by_kind(FunctionKind::OnTouchUp) {
+                                vm.enqueue_callback(entry.offset as u16, &[]);
+                            }
                         }
                     }
                 }
+            }
+        }
+
+        // --- Cursor blink (toggle every 500ms when keyboard visible) ---
+        if kb.visible && kb.focused.is_some() {
+            if kb.update_blink(systick::millis()) {
+                ctx.cursor_visible = kb.cursor_visible;
+                ctx.tree.mark_dirty(kb.focused);
             }
         }
 
@@ -1096,6 +1389,12 @@ fn main() -> ! {
                 RenderMode::Dirty => render::render_dirty(&mut ctx),
             }
 
+            // Draw keyboard overlay on top of all widgets (only when dirty)
+            if kb.visible && kb.dirty {
+                kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
+                kb.dirty = false;
+            }
+
             if vm.has_code() {
                 for i in 0..paint_count {
                     let id = paint_ids[i];
@@ -1115,6 +1414,10 @@ fn main() -> ! {
             match vm.render_mode {
                 RenderMode::Buffered => render::render_buffered(&mut ctx),
                 RenderMode::Dirty => render::render_dirty(&mut ctx),
+            }
+            if kb.visible && kb.dirty {
+                kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
+                kb.dirty = false;
             }
 
             // Callbacks (e.g. switch_tab) may have made on_paint widgets

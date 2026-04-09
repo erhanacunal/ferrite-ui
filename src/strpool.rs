@@ -133,6 +133,82 @@ impl StringPool {
         self.next = 0;
     }
 
+    /// Insert a byte at `pos` in string `id`. Copies to end of pool.
+    /// Old space becomes a gap, reclaimed by smart_clear().
+    pub fn insert_byte(&mut self, id: u16, pos: usize, byte: u8, max_len: u8) -> bool {
+        if id as usize >= self.count as usize {
+            return false;
+        }
+        let m = self.meta[id as usize];
+        let old_len = m.len as usize;
+        // Enforce max_length (0 = no limit)
+        if max_len > 0 && old_len >= max_len as usize {
+            return false;
+        }
+        let pos = pos.min(old_len);
+        let new_len = old_len + 1;
+        if self.next as usize + new_len > POOL_SIZE {
+            return false;
+        }
+        let buf = pool_buf();
+        let src = m.offset as usize;
+        let dst = self.next as usize;
+        // Copy bytes before pos
+        for i in 0..pos {
+            buf[dst + i] = buf[src + i];
+        }
+        // Insert new byte
+        buf[dst + pos] = byte;
+        // Copy bytes after pos
+        for i in pos..old_len {
+            buf[dst + 1 + i] = buf[src + i];
+        }
+        self.meta[id as usize] = StrMeta {
+            offset: self.next,
+            len: new_len as u16,
+        };
+        self.next += new_len as u16;
+        true
+    }
+
+    /// Delete byte at `pos` in string `id`. Copies to end of pool.
+    /// Old space becomes a gap, reclaimed by smart_clear().
+    pub fn delete_byte(&mut self, id: u16, pos: usize) -> bool {
+        if id as usize >= self.count as usize {
+            return false;
+        }
+        let m = self.meta[id as usize];
+        let old_len = m.len as usize;
+        if pos >= old_len || old_len == 0 {
+            return false;
+        }
+        let new_len = old_len - 1;
+        if new_len == 0 {
+            self.meta[id as usize].len = 0;
+            return true;
+        }
+        if self.next as usize + new_len > POOL_SIZE {
+            return false;
+        }
+        let buf = pool_buf();
+        let src = m.offset as usize;
+        let dst = self.next as usize;
+        // Copy bytes before pos
+        for i in 0..pos {
+            buf[dst + i] = buf[src + i];
+        }
+        // Copy bytes after pos (skip deleted byte)
+        for i in (pos + 1)..old_len {
+            buf[dst + i - 1] = buf[src + i];
+        }
+        self.meta[id as usize] = StrMeta {
+            offset: self.next,
+            len: new_len as u16,
+        };
+        self.next += new_len as u16;
+        true
+    }
+
     /// Smart clear: keep strings referenced by widget text_id fields,
     /// compact survivors to the front, remap widget references.
     /// Zero heap allocations — uses u32 bitmask + iterates widget array directly.

@@ -52,6 +52,11 @@ pub const PROP_ON_TAP: u8 = 0x22;
 pub const PROP_BORDER_RADIUS: u8 = 0x23;
 pub const PROP_VALUE: u8 = 0x24;
 pub const PROP_CHECKED: u8 = 0x25;
+pub const PROP_MAX_LENGTH: u8 = 0x26;
+pub const PROP_CURSOR_POS: u8 = 0x27;
+pub const PROP_ON_CHANGE: u8 = 0x28;
+pub const PROP_SCROLL_Y: u8 = 0x29;
+pub const PROP_CLIP_CHILDREN: u8 = 0x2A;
 
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;

@@ -1,0 +1,108 @@
+// main.fl — Scroll List Demo (800x480)
+//
+// Demonstrates scrollable container with clipped children.
+// 15 items in a 300px viewport — drag to scroll, tap to select.
+
+var title_lbl;
+var list;
+var selected_lbl;
+var selected_idx;
+
+fn rgb565(r, g, b) {
+    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
+}
+
+fn setup() {
+    selected_idx = -1;
+
+    // ── Title ──
+    title_lbl = alloc();
+    target(title_lbl);
+    set(kind, 1);
+    set(location, 0, 10);
+    set(size, 800, 30);
+    set(text, "Scroll List Demo — drag to scroll, tap to select");
+    set(text_color, 0xFFFF);
+    set(text_align, 1);
+    set(font_id, 0);
+    parent(0);
+
+    // ── Scrollable list container ──
+    list = alloc();
+    target(list);
+    set(location, 200, 60);
+    set(size, 400, 300);
+    set(bg_color, rgb565(20, 20, 30));
+    set(border, 2, 2, 2, 2);
+    set(border_color, rgb565(60, 60, 100));
+    set(border_radius, 6);
+    set(padding, 4, 4, 4, 4);
+    set(clip_children, 1);
+    set(clickable, 1);
+    parent(0);
+
+    // ── List items (15 items, each 44px tall, 4px gap) ──
+    var i = 0;
+    while (i < 15) {
+        var item = alloc();
+        target(item);
+        set(kind, 1);
+        set(location, 4, i * 48);
+        set(size, 374, 44);
+        set(bg_color, rgb565(35, 35, 50));
+        set(press_color, rgb565(50, 80, 130));
+        set(border_radius, 4);
+        set(padding, 10, 8, 10, 8);
+        set(text_color, 0xFFFF);
+        set(font_id, 0);
+        set(clickable, 1);
+        set(on_click, @on_item_click);
+
+        // Set item text
+        strClear();
+        var s1 = str("Item ");
+        var s2 = itos(i + 1);
+        var s3 = concat(s1, s2);
+        var s4 = str(" — Scroll to see more");
+        var label = concat(s3, s4);
+        set(text, label);
+
+        parent(list);
+        i++;
+    }
+
+    // ── Selected item label ──
+    selected_lbl = alloc();
+    target(selected_lbl);
+    set(kind, 1);
+    set(location, 200, 380);
+    set(size, 400, 30);
+    set(text, "Tap an item to select it");
+    set(text_color, rgb565(150, 200, 150));
+    set(text_align, 1);
+    set(font_id, 0);
+    parent(0);
+
+    render();
+    return 0;
+}
+
+fn loop() {
+    // Touch events handled by framework
+}
+
+fn on_item_click(wid) {
+    // Find which item was clicked (widget IDs start after list container)
+    var base = list + 1;
+    var idx = wid - base;
+
+    // Update selected label
+    target(selected_lbl);
+    strClear();
+    var s1 = str("Selected: Item ");
+    var s2 = itos(idx + 1);
+    var out = concat(s1, s2);
+    set(text, out);
+    dirty();
+    selected_idx = idx;
+}

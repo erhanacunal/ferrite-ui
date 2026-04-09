@@ -1,16 +1,23 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use crate::render::SCROLLBAR_W;
 use crate::types::{Color, Edges, Offset, Rect, Size};
 
-// --- Flags ---
+// --- Flags (u16) ---
 
-pub const FLAG_VISIBLE: u8 = 1 << 0;
-pub const FLAG_ENABLED: u8 = 1 << 1;
-pub const FLAG_CLICKABLE: u8 = 1 << 2;
-pub const FLAG_DIRTY: u8 = 1 << 3;
-pub const FLAG_PRESSED: u8 = 1 << 4;
-pub const FLAG_CHECKED: u8 = 1 << 5;
+pub const FLAG_VISIBLE: u16 = 1 << 0;
+pub const FLAG_ENABLED: u16 = 1 << 1;
+pub const FLAG_CLICKABLE: u16 = 1 << 2;
+pub const FLAG_DIRTY_A: u16 = 1 << 3;
+pub const FLAG_PRESSED: u16 = 1 << 4;
+pub const FLAG_CHECKED: u16 = 1 << 5;
+pub const FLAG_FOCUSED: u16 = 1 << 6;
+pub const FLAG_CLIP_CHILDREN: u16 = 1 << 7;
+pub const FLAG_DIRTY_B: u16 = 1 << 8;
+
+/// Combined mask: dirty in both buffers. Used by mark_dirty().
+pub const FLAG_DIRTY_AB: u16 = FLAG_DIRTY_A | FLAG_DIRTY_B;
 
 // --- Widget Kind ---
 
@@ -21,6 +28,8 @@ pub const KIND_PROGRESS: u8 = 3;
 pub const KIND_SLIDER: u8 = 4;
 pub const KIND_CHECKBOX: u8 = 5;
 pub const KIND_RADIO: u8 = 6;
+pub const KIND_INPUT: u8 = 7;
+pub const KIND_GAUGE: u8 = 8;
 
 // --- Text Alignment ---
 
@@ -54,25 +63,25 @@ impl WidgetId {
 
 const EXT_NONE: u8 = 0xFF;
 
-// --- Widget (base: 18 bytes) ---
+// --- Widget (base: 20 bytes) ---
 
 /// Base widget node -- tree links, layout, and appearance.
 ///
 /// Optional fields (edges, text, callbacks, etc.) live in WidgetExt,
 /// allocated on demand via WidgetTree::ensure_ext(). Widgets that only
-/// need position, size, and color pay 18 bytes instead of 48.
+/// need position, size, and color pay 20 bytes instead of 50.
 pub struct Widget {
     // Tree links (3 bytes)
     pub parent: WidgetId,
     pub first_child: WidgetId,
     pub next_sibling: WidgetId,
 
-    // State + type (2 bytes)
-    pub flags: u8,
+    // Type + extension (2 bytes)
     pub kind: u8,
-
-    // Extension index (1 byte) -- 0xFF = no extension
     ext: u8,
+
+    // State (2 bytes) -- u16 for dual-buffer dirty tracking
+    pub flags: u16,
 
     // Position and size (8 bytes)
     pub location: Offset,
@@ -89,9 +98,9 @@ impl Widget {
             parent: WidgetId::NONE,
             first_child: WidgetId::NONE,
             next_sibling: WidgetId::NONE,
-            flags: FLAG_VISIBLE | FLAG_ENABLED,
             kind: KIND_BASE,
             ext: EXT_NONE,
+            flags: FLAG_VISIBLE | FLAG_ENABLED,
             location: Offset { x: 0, y: 0 },
             size: Size { w: 0, h: 0 },
             background_color: 0x0000,
@@ -107,16 +116,31 @@ impl Widget {
         self.flags & FLAG_VISIBLE != 0
     }
 
+    /// Check if dirty in buffer A (used by dirty render mode).
     pub fn is_dirty(&self) -> bool {
-        self.flags & FLAG_DIRTY != 0
+        self.flags & FLAG_DIRTY_A != 0
     }
 
+    /// Check if dirty in a specific buffer (0=A, 1=B).
+    pub fn is_dirty_buf(&self, buf: u8) -> bool {
+        let mask = if buf == 0 { FLAG_DIRTY_A } else { FLAG_DIRTY_B };
+        self.flags & mask != 0
+    }
+
+    /// Mark dirty in both buffers (used when widget content changes).
     pub fn mark_dirty(&mut self) {
-        self.flags |= FLAG_DIRTY;
+        self.flags |= FLAG_DIRTY_AB;
     }
 
+    /// Clear dirty flag for buffer A only (dirty render mode).
     pub fn clear_dirty(&mut self) {
-        self.flags &= !FLAG_DIRTY;
+        self.flags &= !FLAG_DIRTY_A;
+    }
+
+    /// Clear dirty flag for a specific buffer (0=A, 1=B).
+    pub fn clear_dirty_buf(&mut self, buf: u8) {
+        let mask = if buf == 0 { FLAG_DIRTY_A } else { FLAG_DIRTY_B };
+        self.flags &= !mask;
     }
 }
 
@@ -140,9 +164,9 @@ pub struct WidgetExt {
     pub border_radius: u16,
     pub press_color: Color,
 
-    // Image + padding (2 bytes)
+    // Image + max input length (2 bytes)
     pub image_id: u8,
-    _pad: u8,
+    pub max_length: u8,
 
     // Callbacks (6 bytes)
     pub on_click: u16,
@@ -167,7 +191,7 @@ impl WidgetExt {
         border_radius: 0,
         press_color: 0,
         image_id: 0,
-        _pad: 0,
+        max_length: 0,
         on_click: 0,
         on_paint: 0,
         on_tap: 0,
@@ -223,7 +247,7 @@ impl WidgetTree {
         }
         let id = WidgetId(self.widgets.len() as u8);
         let mut w = Widget::new();
-        w.flags |= FLAG_DIRTY;
+        w.flags |= FLAG_DIRTY_AB;
         self.widgets.push(w);
         self.dfs_valid = false;
         Some(id)
@@ -318,6 +342,10 @@ impl WidgetTree {
         self.ext(id).map_or(0, |e| e.image_id)
     }
 
+    pub fn max_length(&self, id: WidgetId) -> u8 {
+        self.ext(id).map_or(0, |e| e.max_length)
+    }
+
     pub fn on_click(&self, id: WidgetId) -> u16 {
         self.ext(id).map_or(0, |e| e.on_click)
     }
@@ -368,6 +396,8 @@ impl WidgetTree {
     }
 
     /// Compute widget's absolute border-box rect in screen coordinates.
+    /// If an ancestor has FLAG_CLIP_CHILDREN, children are offset by
+    /// that ancestor's scroll_y (stored in ext.value).
     pub fn absolute_rect(&self, id: WidgetId) -> Rect {
         let w = &self.widgets[id.index()];
         let m = self.margin(id);
@@ -394,6 +424,11 @@ impl WidgetTree {
                 + pm.top as i16
                 + pb.top as i16
                 + pp.top as i16;
+            // Scroll offset: shift children by -scroll_y
+            if p.flags & FLAG_CLIP_CHILDREN != 0 {
+                let scroll_y = self.value(pid);
+                y -= scroll_y;
+            }
             pid = p.parent;
         }
 
@@ -416,6 +451,60 @@ impl WidgetTree {
             abs.w.saturating_sub(inset_l as u16 + inset_r),
             abs.h.saturating_sub(inset_t as u16 + inset_b),
         )
+    }
+
+    /// Scroll viewport: content_rect minus scrollbar width when scrollbar is needed.
+    /// Used for viewport checks (render, hit_test). If no scrollbar needed, returns content_rect.
+    pub fn scroll_viewport(&self, id: WidgetId) -> Rect {
+        let cr = self.content_rect(id);
+        let ch = self.content_height(id);
+        if ch > cr.h {
+            // Scrollbar present — narrow the viewport
+            Rect::new(cr.x, cr.y, cr.w.saturating_sub(SCROLLBAR_W), cr.h)
+        } else {
+            cr
+        }
+    }
+
+    /// Find nearest ancestor with FLAG_CLIP_CHILDREN. Returns NONE if none found.
+    pub fn scroll_parent(&self, id: WidgetId) -> WidgetId {
+        let max = self.widgets.len();
+        let mut depth = 0usize;
+        let mut pid = self.widgets[id.index()].parent;
+        while pid.is_some() {
+            if self.widgets[pid.index()].flags & FLAG_CLIP_CHILDREN != 0 {
+                return pid;
+            }
+            depth += 1;
+            if depth > max {
+                break;
+            }
+            pid = self.widgets[pid.index()].parent;
+        }
+        WidgetId::NONE
+    }
+
+    /// Compute total content height from direct children of a widget.
+    /// Used to clamp scroll range: max_scroll = content_height - viewport_height.
+    pub fn content_height(&self, id: WidgetId) -> u16 {
+        let mut max_bottom: i16 = 0;
+        let mut child = self.widgets[id.index()].first_child;
+        let guard_max = self.widgets.len();
+        let mut guard = 0usize;
+        while child.is_some() {
+            let c = &self.widgets[child.index()];
+            let cm = self.margin(child);
+            let bottom = c.location.y + cm.top as i16 + c.size.h as i16 + cm.bottom as i16;
+            if bottom > max_bottom {
+                max_bottom = bottom;
+            }
+            child = c.next_sibling;
+            guard += 1;
+            if guard > guard_max {
+                break;
+            }
+        }
+        if max_bottom > 0 { max_bottom as u16 } else { 0 }
     }
 
     /// Is child a descendant of ancestor?
@@ -454,9 +543,9 @@ impl WidgetTree {
         true
     }
 
-    /// Mark widget and all descendants as dirty.
+    /// Mark widget and all descendants as dirty in both buffers.
     pub fn mark_dirty(&mut self, id: WidgetId) {
-        self.widgets[id.index()].flags |= FLAG_DIRTY;
+        self.widgets[id.index()].flags |= FLAG_DIRTY_AB;
         let mut child = self.widgets[id.index()].first_child;
         while child.is_some() {
             self.mark_dirty(child);
