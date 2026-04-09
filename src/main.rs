@@ -1390,7 +1390,7 @@ fn main() -> ! {
             match vm.render_mode {
                 RenderMode::Buffered => {
                     // Keyboard visible = always needs a frame (keyboard must be in both buffers)
-                    if render::buffered_has_dirty(&mut ctx) || kb.visible {
+                    if render::buffered_has_dirty(&mut ctx) {
                         ctx.lcd.begin_frame();
                         render::render_buffered_content(&mut ctx);
                         if kb.visible {
@@ -1426,7 +1426,7 @@ fn main() -> ! {
             vm.drain_callbacks(&mut ctx);
             match vm.render_mode {
                 RenderMode::Buffered => {
-                    if render::buffered_has_dirty(&mut ctx) || kb.visible {
+                    if render::buffered_has_dirty(&mut ctx) {
                         ctx.lcd.begin_frame();
                         render::render_buffered_content(&mut ctx);
                         if kb.visible {
