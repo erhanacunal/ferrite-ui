@@ -12,29 +12,24 @@ const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
 
 // --- Buffered render (double-buffered partial redraw) ---
 
-/// Draw only dirty widgets to the back buffer, then swap.
-///
-/// Uses dual-buffer dirty tracking: each widget has FLAG_DIRTY_A and
-/// FLAG_DIRTY_B. When a widget changes, both flags are set. Each buffer
-/// only redraws widgets dirty in its own flag, then clears that flag.
-/// This avoids full redraws — only changed widgets are redrawn per buffer.
-pub fn render_buffered(ctx: &mut Ctx) {
+/// Check if the back buffer has any dirty widgets.
+pub fn buffered_has_dirty(ctx: &mut Ctx) -> bool {
     let buf = ctx.lcd.back_buf();
-
-    // Skip if nothing is dirty for this buffer
     let dfs = ctx.tree.dfs_order();
-    let mut has_dirty = false;
     for i in 0..dfs.len() {
         if ctx.tree.get(dfs[i]).is_dirty_buf(buf) {
-            has_dirty = true;
-            break;
+            return true;
         }
     }
-    if !has_dirty {
-        return;
-    }
+    false
+}
 
-    ctx.lcd.begin_frame();
+/// Draw only dirty widgets to the current back buffer.
+/// Caller must call lcd.begin_frame() before and lcd.end_frame() after.
+/// This allows the caller to draw overlays (keyboard) between widgets and swap.
+pub fn render_buffered_content(ctx: &mut Ctx) {
+    let buf = ctx.lcd.back_buf();
+    let dfs = ctx.tree.dfs_order();
 
     // Partial redraw: only widgets dirty in this buffer
     for i in 0..dfs.len() {
@@ -77,8 +72,6 @@ pub fn render_buffered(ctx: &mut Ctx) {
     for i in 0..dfs.len() {
         ctx.tree.get_mut(dfs[i]).clear_dirty_buf(buf);
     }
-
-    ctx.lcd.end_frame();
 }
 
 // --- Full screen render ---

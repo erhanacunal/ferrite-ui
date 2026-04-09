@@ -1109,8 +1109,11 @@ fn main() -> ! {
                     // Keyboard intercept: press on keyboard area
                     if kb.visible && event.y >= keyboard::KB_Y {
                         kb.handle_press(event.x, event.y);
-                        // Draw only the pressed key highlighted
-                        kb.draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, kb.pressed_key, true);
+                        // In dirty mode, draw only the pressed key immediately.
+                        // In buffered mode, keyboard is redrawn fully in next frame.
+                        if vm.render_mode == RenderMode::Dirty {
+                            kb.draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, kb.pressed_key, true);
+                        }
                     } else {
                         let hit = touch::hit_test(&mut ctx.tree, event.x, event.y);
 
@@ -1254,9 +1257,9 @@ fn main() -> ! {
                         if let Some(action) = kb.handle_release(event.x, event.y) {
                             handle_key_action(&mut kb, &mut ctx, &mut vm, action);
                         }
-                        // Redraw just the released key (normal state), unless
-                        // a layer change already scheduled a full redraw
-                        if !kb.dirty && kb.visible {
+                        // In dirty mode: redraw just the released key (normal state)
+                        // In buffered mode: keyboard is redrawn fully in next frame
+                        if vm.render_mode == RenderMode::Dirty && !kb.dirty && kb.visible {
                             kb.draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, prev_key, false);
                         }
                     } else {
@@ -1385,14 +1388,24 @@ fn main() -> ! {
             }
 
             match vm.render_mode {
-                RenderMode::Buffered => render::render_buffered(&mut ctx),
-                RenderMode::Dirty => render::render_dirty(&mut ctx),
-            }
-
-            // Draw keyboard overlay on top of all widgets (only when dirty)
-            if kb.visible && kb.dirty {
-                kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
-                kb.dirty = false;
+                RenderMode::Buffered => {
+                    // Keyboard visible = always needs a frame (keyboard must be in both buffers)
+                    if render::buffered_has_dirty(&mut ctx) || kb.visible {
+                        ctx.lcd.begin_frame();
+                        render::render_buffered_content(&mut ctx);
+                        if kb.visible {
+                            kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
+                        }
+                        ctx.lcd.end_frame();
+                    }
+                }
+                RenderMode::Dirty => {
+                    render::render_dirty(&mut ctx);
+                    if kb.visible && kb.dirty {
+                        kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
+                        kb.dirty = false;
+                    }
+                }
             }
 
             if vm.has_code() {
@@ -1412,12 +1425,23 @@ fn main() -> ! {
         if vm.has_pending_callbacks() {
             vm.drain_callbacks(&mut ctx);
             match vm.render_mode {
-                RenderMode::Buffered => render::render_buffered(&mut ctx),
-                RenderMode::Dirty => render::render_dirty(&mut ctx),
-            }
-            if kb.visible && kb.dirty {
-                kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
-                kb.dirty = false;
+                RenderMode::Buffered => {
+                    if render::buffered_has_dirty(&mut ctx) || kb.visible {
+                        ctx.lcd.begin_frame();
+                        render::render_buffered_content(&mut ctx);
+                        if kb.visible {
+                            kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
+                        }
+                        ctx.lcd.end_frame();
+                    }
+                }
+                RenderMode::Dirty => {
+                    render::render_dirty(&mut ctx);
+                    if kb.visible && kb.dirty {
+                        kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
+                        kb.dirty = false;
+                    }
+                }
             }
 
             // Callbacks (e.g. switch_tab) may have made on_paint widgets

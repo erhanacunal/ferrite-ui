@@ -846,7 +846,13 @@ impl Vm {
                 if self.target.is_some() { ctx.tree.mark_dirty(self.target); }
             }
             OP_W_RENDER => match self.render_mode {
-                RenderMode::Buffered => render::render_buffered(ctx),
+                RenderMode::Buffered => {
+                    if render::buffered_has_dirty(ctx) {
+                        ctx.lcd.begin_frame();
+                        render::render_buffered_content(ctx);
+                        ctx.lcd.end_frame();
+                    }
+                }
                 RenderMode::Dirty => render::render_dirty(ctx),
             },
             OP_ARR_LOAD => {
