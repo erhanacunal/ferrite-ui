@@ -1,6 +1,9 @@
 // test_touch.fl — Minimal touch test with widget ID offset
 // Tests: alloc, target, parent(0), clickable, on_click, on_touch_down
 
+#include "core.fl"
+#include "color.fl"
+
 var btn;
 var counter = 0;
 
@@ -15,13 +18,13 @@ fn on_btn_click(widget_id) {
 }
 
 fn on_touch_down(x, y) {
-    fillRect(x - 3, y - 3, 6, 6, 0xF800);
+    fillRect(x - 3, y - 3, 6, 6, RED);
 }
 
 fn setup() {
     btn = alloc();
     target(btn);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 200, 150);
     set(size, 400, 180);
     set(bg_color, 0x3186);
@@ -29,10 +32,10 @@ fn setup() {
     set(border, 2, 2, 2, 2);
     set(border_color, 0x5ACB);
     set(border_radius, 16);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "TAP ME: 0");
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 1);
     parent(0);
     render();

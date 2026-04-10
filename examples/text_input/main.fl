@@ -4,6 +4,9 @@
 // Two input fields (name + message) and a submit button.
 // Typed text is echoed in a label below.
 
+#include "core.fl"
+#include "color.fl"
+
 var title_lbl;
 var name_lbl;
 var name_input;
@@ -22,12 +25,12 @@ fn setup() {
     // ── Title ──
     title_lbl = alloc();
     target(title_lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 0, 10);
     set(size, 800, 40);
     set(text, "Text Input Demo");
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
     parent(0);
 
@@ -36,13 +39,13 @@ fn setup() {
     target(divider);
     set(location, 50, 55);
     set(size, 700, 2);
-    set(bg_color, 0x4208);
+    set(bg_color, DARK_GRAY);
     parent(0);
 
     // ── Name field ──
     name_lbl = alloc();
     target(name_lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 50, 70);
     set(size, 100, 30);
     set(text, "Name:");
@@ -52,7 +55,7 @@ fn setup() {
 
     name_input = alloc();
     target(name_input);
-    set(kind, 7);
+    set(kind, KIND_INPUT);
     set(location, 160, 65);
     set(size, 540, 36);
     set(bg_color, rgb565(30, 30, 40));
@@ -60,17 +63,17 @@ fn setup() {
     set(border_color, rgb565(80, 80, 120));
     set(border_radius, 4);
     set(padding, 6, 6, 6, 6);
-    set(text_color, 0xFFFF);
+    set(text_color, WHITE);
     set(font_id, 0);
     set(max_length, 32);
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_change, @on_name_changed);
     parent(0);
 
     // ── Message field ──
     msg_lbl = alloc();
     target(msg_lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 50, 120);
     set(size, 100, 30);
     set(text, "Message:");
@@ -80,7 +83,7 @@ fn setup() {
 
     msg_input = alloc();
     target(msg_input);
-    set(kind, 7);
+    set(kind, KIND_INPUT);
     set(location, 160, 115);
     set(size, 540, 36);
     set(bg_color, rgb565(30, 30, 40));
@@ -88,10 +91,10 @@ fn setup() {
     set(border_color, rgb565(80, 80, 120));
     set(border_radius, 4);
     set(padding, 6, 6, 6, 6);
-    set(text_color, 0xFFFF);
+    set(text_color, WHITE);
     set(font_id, 0);
     set(max_length, 64);
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_change, @on_msg_changed);
     parent(0);
 
@@ -103,29 +106,30 @@ fn setup() {
     set(bg_color, rgb565(0, 100, 200));
     set(press_color, rgb565(0, 70, 150));
     set(border_radius, 6);
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, @on_submit);
     parent(0);
 
     submit_txt = alloc();
     target(submit_txt);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 0, 0);
     set(size, 160, 40);
     set(text, "Submit");
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
     parent(submit_btn);
 
     // ── Output area ──
     output_lbl = alloc();
     target(output_lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 50, 230);
     set(size, 700, 30);
     set(text, "Tap an input field to start typing...");
     set(text_color, rgb565(120, 200, 120));
+    set(bg_color, 1);
     set(font_id, 0);
     parent(0);
 

@@ -1,0 +1,22 @@
+// core.fl — Widget system constants
+// Usage: #include "core.fl"
+
+// Widget kinds
+const KIND_BASE     = 0;
+const KIND_LABEL    = 1;
+const KIND_BUTTON   = 2;
+const KIND_PROGRESS = 3;
+const KIND_SLIDER   = 4;
+const KIND_CHECKBOX = 5;
+const KIND_RADIO    = 6;
+const KIND_INPUT    = 7;
+const KIND_GAUGE    = 8;
+
+// Text alignment
+const ALIGN_LEFT   = 0;
+const ALIGN_CENTER = 1;
+const ALIGN_RIGHT  = 2;
+
+// Boolean values for set() calls
+const ON  = 1;
+const OFF = 0;

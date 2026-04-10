@@ -1,9 +1,12 @@
 // test_7btn.fl — 7 buttons with labels, no sub-panel
 
-var C_BG = 0x1082;
-var C_BTN = 0x3186;
-var C_PRESS = 0x4A69;
-var C_BRD = 0x5ACB;
+#include "core.fl"
+#include "color.fl"
+
+const C_BG = 0x1082;
+const C_BTN = 0x3186;
+const C_PRESS = 0x4A69;
+const C_BRD = 0x5ACB;
 var panel;
 var btn_a;
 var btn_b;
@@ -34,15 +37,15 @@ fn setup() {
     set(border, 2, 2, 2, 2);
     set(border_color, C_BRD);
     set(border_radius, 16);
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 1);
     parent(panel);
     var lbl = alloc();
     target(lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(size, 230, 120);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "PRINT");
     parent(btn_a);
 
@@ -55,15 +58,15 @@ fn setup() {
     set(border, 2, 2, 2, 2);
     set(border_color, C_BRD);
     set(border_radius, 16);
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 1);
     parent(panel);
     lbl = alloc();
     target(lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(size, 230, 120);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "AUTO HOME");
     parent(btn_b);
 
@@ -76,15 +79,15 @@ fn setup() {
     set(border, 2, 2, 2, 2);
     set(border_color, C_BRD);
     set(border_radius, 16);
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 1);
     parent(panel);
     lbl = alloc();
     target(lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(size, 230, 120);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "AUTO LEVEL");
     parent(btn_c);
 
@@ -98,15 +101,15 @@ fn setup() {
     set(border, 2, 2, 2, 2);
     set(border_color, C_BRD);
     set(border_radius, 16);
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 1);
     parent(panel);
     lbl = alloc();
     target(lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(size, 230, 120);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "PREHEAT");
     parent(btn_d);
 
@@ -119,15 +122,15 @@ fn setup() {
     set(border, 2, 2, 2, 2);
     set(border_color, C_BRD);
     set(border_radius, 16);
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 1);
     parent(panel);
     lbl = alloc();
     target(lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(size, 230, 120);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "CONTROL");
     parent(btn_e);
 
@@ -140,15 +143,15 @@ fn setup() {
     set(border, 2, 2, 2, 2);
     set(border_color, C_BRD);
     set(border_radius, 16);
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 1);
     parent(panel);
     lbl = alloc();
     target(lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(size, 230, 120);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "SETTINGS");
     parent(btn_f);
 
@@ -162,15 +165,15 @@ fn setup() {
     set(border, 2, 2, 2, 2);
     set(border_color, C_BRD);
     set(border_radius, 16);
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 1);
     parent(panel);
     lbl = alloc();
     target(lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(size, 230, 120);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "INFO");
     parent(btn_g);
 

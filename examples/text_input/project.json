@@ -1,7 +1,8 @@
 {
     "screen_width": 800,
     "screen_height": 480,
-    "render_mode": "buffered",
+    "include_dirs": ["../../lib"],
+    "render_mode": "dirty",
     "programs": [
         {
             "name": "main",

@@ -3,6 +3,9 @@
 // Three gauges: speed, temperature, fuel level.
 // Animated values that sweep back and forth.
 
+#include "core.fl"
+#include "color.fl"
+
 var title_lbl;
 var g_speed;
 var g_temp;
@@ -35,56 +38,57 @@ fn setup() {
     // ── Title ──
     title_lbl = alloc();
     target(title_lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 0, 5);
     set(size, 800, 30);
     set(text, "Gauge Widget Demo");
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
     parent(0);
 
     // ── Speed gauge (left) ──
     g_speed = alloc();
     target(g_speed);
-    set(kind, 8);
+    set(kind, KIND_GAUGE);
     set(location, 20, 50);
     set(size, 240, 240);
     set(bg_color, rgb565(15, 15, 25));
     set(border, 2, 2, 2, 2);
     set(border_color, rgb565(50, 50, 80));
     set(press_color, rgb565(0, 180, 255));
-    set(text_color, 0xFFFF);
+    set(text_color, WHITE);
     set(border_radius, 8);
     set(value, 0);
     parent(0);
 
     lbl_speed = alloc();
     target(lbl_speed);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 20, 295);
     set(size, 240, 24);
     set(text, "SPEED");
     set(text_color, rgb565(0, 180, 255));
-    set(text_align, 1);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
     parent(0);
 
     val_speed = alloc();
     target(val_speed);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 20, 320);
     set(size, 240, 24);
     set(text, "0 km/h");
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
+    set(bg_color, 1);
     parent(0);
 
     // ── Temperature gauge (center) ──
     g_temp = alloc();
     target(g_temp);
-    set(kind, 8);
+    set(kind, KIND_GAUGE);
     set(location, 280, 50);
     set(size, 240, 240);
     set(bg_color, rgb565(15, 15, 25));
@@ -98,30 +102,31 @@ fn setup() {
 
     lbl_temp = alloc();
     target(lbl_temp);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 280, 295);
     set(size, 240, 24);
     set(text, "TEMPERATURE");
     set(text_color, rgb565(255, 100, 0));
-    set(text_align, 1);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
     parent(0);
 
     val_temp = alloc();
     target(val_temp);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 280, 320);
     set(size, 240, 24);
     set(text, "30 C");
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
+    set(bg_color, 1);
     parent(0);
 
     // ── Fuel gauge (right) ──
     g_fuel = alloc();
     target(g_fuel);
-    set(kind, 8);
+    set(kind, KIND_GAUGE);
     set(location, 540, 50);
     set(size, 240, 240);
     set(bg_color, rgb565(15, 15, 25));
@@ -135,24 +140,25 @@ fn setup() {
 
     lbl_fuel = alloc();
     target(lbl_fuel);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 540, 295);
     set(size, 240, 24);
     set(text, "FUEL");
     set(text_color, rgb565(0, 200, 80));
-    set(text_align, 1);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
     parent(0);
 
     val_fuel = alloc();
     target(val_fuel);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 540, 320);
     set(size, 240, 24);
     set(text, "80%");
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
+    set(bg_color, 1);
     parent(0);
 
     render();

@@ -86,7 +86,7 @@ def preprocess(source, filename="<input>", include_dirs=None, _included=None):
 # ============================================================
 
 KEYWORDS = {
-    'var', 'fn', 'if', 'else', 'while', 'for',
+    'var', 'const', 'fn', 'if', 'else', 'while', 'for',
     'return', 'true', 'false', 'break', 'continue',
     'not',
 }
@@ -380,11 +380,12 @@ class DotCompoundAssign:
 # -- Statements --
 
 class VarDecl:
-    def __init__(self, name, init, line, array_size=None):
+    def __init__(self, name, init, line, array_size=None, is_const=False):
         self.name = name
         self.init = init
         self.line = line
         self.array_size = array_size
+        self.is_const = is_const
 
 
 class Assign:
@@ -564,6 +565,8 @@ class Parser:
     def _statement(self):
         if self._check('VAR'):
             return self._var_decl()
+        if self._check('CONST'):
+            return self._const_decl()
         if self._check('IF'):
             return self._if_stmt()
         if self._check('WHILE'):
@@ -595,6 +598,15 @@ class Parser:
             init = self._expression()
         self._expect(';')
         return VarDecl(name, init, line, array_size)
+
+    def _const_decl(self):
+        line = self._cur().line
+        self._expect('CONST')
+        name = self._expect('IDENT').value
+        self._expect('=')
+        init = self._expression()
+        self._expect(';')
+        return VarDecl(name, init, line, is_const=True)
 
     def _if_stmt(self):
         line = self._cur().line
@@ -924,6 +936,8 @@ class CodeGen:
         self._last_alltar_var = None  # peephole: skip target() after alloc+target+store
         self._current_target = None  # track targeted widget for dot-access optimization
         self.array_vars = set() # names that hold array_ids
+        self.const_vars = set() # names declared with const (immutable)
+        self.const_values = {}  # name -> (value, type) for inlineable consts (no slot needed)
         self._global_init_stmts = None  # set during generate_image()
         self._in_function = False  # True when emitting function body
 
@@ -999,12 +1013,15 @@ class CodeGen:
                 global_var_stmts.append(stmt)
             else:
                 raise CompileError(
-                    "only global variable declarations are allowed at top level "
+                    "only var/const declarations are allowed at top level "
                     "(use fn setup() for initialization code)",
                     getattr(stmt, 'line', 0))
 
-        # Count global var slots
-        global_slots = len(global_var_stmts)
+        # Count global var slots (inlineable consts don't need slots)
+        global_slots = sum(
+            1 for s in global_var_stmts
+            if not (s.is_const and self._const_literal_value(s.init) is not None)
+        )
         self._fn_base = global_slots
 
         # Pre-scan for alloc() in global var inits
@@ -1057,6 +1074,16 @@ class CodeGen:
         self.var_types = {}
         self.next_slot = 0
         for stmt in global_var_stmts:
+            if stmt.is_const:
+                self.const_vars.add(stmt.name)
+                # Inline literal consts — no slot, no runtime code
+                lit = self._const_literal_value(stmt.init)
+                if lit is not None:
+                    val, vtype = lit
+                    self.const_values[stmt.name] = (val, vtype)
+                    self.var_types[stmt.name] = vtype
+                    self.global_var_types[stmt.name] = vtype
+                    continue
             slot = self._alloc_var(stmt.name, getattr(stmt, 'line', 0))
             self.global_vars[stmt.name] = slot
             if stmt.array_size is not None:
@@ -1296,6 +1323,9 @@ class CodeGen:
         count = 0
         for stmt in stmts:
             if isinstance(stmt, VarDecl):
+                # Inlineable consts don't need a slot
+                if stmt.is_const and self._const_literal_value(stmt.init) is not None:
+                    continue
                 count += 1  # arrays use 1 slot (arr_id), not N
             elif isinstance(stmt, IfStmt):
                 count += self._count_var_slots(stmt.then_body)
@@ -1538,6 +1568,15 @@ class CodeGen:
             raise CompileError(f"unknown statement: {type(node).__name__}")
 
     def _gen_var_decl(self, node):
+        if node.is_const:
+            self.const_vars.add(node.name)
+            # Inline literal consts — no slot, no runtime code
+            lit = self._const_literal_value(node.init)
+            if lit is not None:
+                val, vtype = lit
+                self.const_values[node.name] = (val, vtype)
+                self.var_types[node.name] = vtype
+                return
         slot = self._alloc_var(node.name, node.line)
         if node.array_size is not None:
             # Array: VM pool'da oluştur, arr_id'yi var slot'a sakla
@@ -1584,6 +1623,9 @@ class CodeGen:
 
     def _gen_global_init(self, node):
         """Emit init code for a global variable whose slot is already allocated."""
+        # Inlineable consts have no slot — skip
+        if node.name in self.const_values:
+            return
         slot = self.global_vars[node.name]
         if node.array_size is not None:
             if node.init is not None:
@@ -1617,7 +1659,23 @@ class CodeGen:
                 self.asm.push(0)
         self.asm.store(slot)
 
+    def _check_const(self, name, line):
+        if name in self.const_vars:
+            raise CompileError(f"cannot assign to const variable: {name}", line)
+
+    @staticmethod
+    def _const_literal_value(init):
+        """Return (value, type) if init is a compile-time literal, else None."""
+        if isinstance(init, NumLit):
+            return (init.value, CodeGen.T_INT)
+        if isinstance(init, FloatLit):
+            return (init.value, CodeGen.T_FLOAT)
+        if isinstance(init, BoolLit):
+            return (1 if init.value else 0, CodeGen.T_INT)
+        return None
+
     def _gen_assign(self, node):
+        self._check_const(node.name, node.line)
         if node.index is not None:
             # arr[idx] = value → arr_id, idx, value, ARR_STORE
             slot = self._var_slot(node.name, node.line)
@@ -1762,8 +1820,16 @@ class CodeGen:
         elif isinstance(node, VarRef):
             if node.name in self.array_vars:
                 raise CompileError(f"'{node.name}' is an array, use {node.name}[index]", node.line)
-            slot = self._var_slot(node.name, node.line)
-            self.asm.load(slot)
+            # Inline const: emit PUSH instead of LOAD
+            if node.name in self.const_values:
+                val, vtype = self.const_values[node.name]
+                if vtype == self.T_FLOAT:
+                    self.asm.push(float_bits(val))
+                else:
+                    self.asm.push(val)
+            else:
+                slot = self._var_slot(node.name, node.line)
+                self.asm.load(slot)
         elif isinstance(node, IndexExpr):
             if node.name not in self.array_vars:
                 raise CompileError(f"'{node.name}' is not an array", node.line)
@@ -1876,6 +1942,7 @@ class CodeGen:
     def _gen_incdec_expr(self, node):
         """Compile ++i / i++ / --i / i--.
         Prefix: new value on stack.  Postfix: old value on stack."""
+        self._check_const(node.name, node.line)
         slot = self._var_slot(node.name, node.line)
         use_float = self.var_types.get(node.name, self.T_INT) == self.T_FLOAT
         if node.pre:
@@ -1914,6 +1981,7 @@ class CodeGen:
 
     def _gen_compound_assign(self, node):
         """Compile x += expr, arr[i] += expr."""
+        self._check_const(node.name, node.line)
         if node.index is not None:
             # arr[i] += expr → load arr, idx, arr_load, gen_expr, op, arr_store
             slot = self._var_slot(node.name, node.line)

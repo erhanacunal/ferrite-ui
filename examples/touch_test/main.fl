@@ -1,3 +1,6 @@
+#include "core.fl"
+#include "color.fl"
+
 var panel;
 var btn1;
 var btn2;
@@ -7,18 +10,18 @@ fn setup() {
     target(panel);
     set(location, 150, 100);
     set(size, 500, 280);
-    set(bg_color, 0x001F);
+    set(bg_color, BLUE);
     set(border, 3, 3, 3, 3);
-    set(border_color, 0xFFFF);
+    set(border_color, WHITE);
     parent(0);
 
     btn1 = alloc();
     target(btn1);
     set(location, 20, 20);
     set(size, 100, 60);
-    set(bg_color, 0xF800);
+    set(bg_color, RED);
     set(press_color, rgb565(0, 0, 255));
-    set(clickable, 1);
+    set(clickable, ON);
     parent(panel);
 
     btn2 = alloc();
@@ -27,7 +30,7 @@ fn setup() {
     set(size, 100, 60);
     set(bg_color, rgb565(0, 255, 0));
     set(press_color, rgb565(0, 0, 255));
-    set(clickable, 1);
+    set(clickable, ON);
     parent(panel);
 
     render();

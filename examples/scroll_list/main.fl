@@ -3,6 +3,9 @@
 // Demonstrates scrollable container with clipped children.
 // 15 items in a 300px viewport — drag to scroll, tap to select.
 
+#include "core.fl"
+#include "color.fl"
+
 var title_lbl;
 var list;
 var selected_lbl;
@@ -18,12 +21,12 @@ fn setup() {
     // ── Title ──
     title_lbl = alloc();
     target(title_lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 0, 10);
     set(size, 800, 30);
     set(text, "Scroll List Demo — drag to scroll, tap to select");
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
     parent(0);
 
@@ -37,8 +40,8 @@ fn setup() {
     set(border_color, rgb565(60, 60, 100));
     set(border_radius, 6);
     set(padding, 4, 4, 4, 4);
-    set(clip_children, 1);
-    set(clickable, 1);
+    set(clip_children, ON);
+    set(clickable, ON);
     parent(0);
 
     // ── List items (15 items, each 44px tall, 4px gap) ──
@@ -46,16 +49,16 @@ fn setup() {
     while (i < 15) {
         var item = alloc();
         target(item);
-        set(kind, 1);
+        set(kind, KIND_LABEL);
         set(location, 4, i * 48);
         set(size, 374, 44);
         set(bg_color, rgb565(35, 35, 50));
         set(press_color, rgb565(50, 80, 130));
         set(border_radius, 4);
         set(padding, 10, 8, 10, 8);
-        set(text_color, 0xFFFF);
+        set(text_color, WHITE);
         set(font_id, 0);
-        set(clickable, 1);
+        set(clickable, ON);
         set(on_click, @on_item_click);
 
         // Set item text
@@ -74,12 +77,12 @@ fn setup() {
     // ── Selected item label ──
     selected_lbl = alloc();
     target(selected_lbl);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 200, 380);
     set(size, 400, 30);
     set(text, "Tap an item to select it");
     set(text_color, rgb565(150, 200, 150));
-    set(text_align, 1);
+    set(text_align, ALIGN_CENTER);
     set(font_id, 0);
     parent(0);
 

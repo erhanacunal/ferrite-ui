@@ -1,6 +1,9 @@
 // test_menu.fl — Minimal menu test (3 buttons + sub-panel)
 
-var C_BG = 0x1082;
+#include "core.fl"
+#include "color.fl"
+
+const C_BG = 0x1082;
 var main_panel;
 var sub_panel;
 var btn_a;
@@ -11,10 +14,10 @@ fn on_main(widget_id) {
     if (widget_id == btn_a) {
         critical();
         target(main_panel);
-        set(visible, 0);
+        set(visible, OFF);
         dirty();
         target(sub_panel);
-        set(visible, 1);
+        set(visible, ON);
         dirty();
         render();
     }
@@ -24,10 +27,10 @@ fn on_sub(widget_id) {
     if (widget_id == btn_back) {
         critical();
         target(sub_panel);
-        set(visible, 0);
+        set(visible, OFF);
         dirty();
         target(main_panel);
-        set(visible, 1);
+        set(visible, ON);
         dirty();
         render();
     }
@@ -43,7 +46,7 @@ fn setup() {
 
     btn_a = alloc();
     target(btn_a);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 100, 100);
     set(size, 250, 100);
     set(bg_color, 0x3186);
@@ -51,16 +54,16 @@ fn setup() {
     set(border, 2, 2, 2, 2);
     set(border_color, 0x5ACB);
     set(border_radius, 12);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "GO TO SUB");
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 1);
     parent(main_panel);
 
     btn_b = alloc();
     target(btn_b);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 450, 100);
     set(size, 250, 100);
     set(bg_color, 0x3186);
@@ -68,10 +71,10 @@ fn setup() {
     set(border, 2, 2, 2, 2);
     set(border_color, 0x5ACB);
     set(border_radius, 12);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "BUTTON B");
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 1);
     parent(main_panel);
 
@@ -79,24 +82,24 @@ fn setup() {
     sub_panel = alloc();
     target(sub_panel);
     set(size, 800, 480);
-    set(bg_color, 0x0010);
-    set(visible, 0);
+    set(bg_color, NAVY);
+    set(visible, OFF);
     parent(0);
 
     btn_back = alloc();
     target(btn_back);
-    set(kind, 1);
+    set(kind, KIND_LABEL);
     set(location, 250, 200);
     set(size, 300, 80);
-    set(bg_color, 0xF800);
-    set(press_color, 0x8000);
+    set(bg_color, RED);
+    set(press_color, DARK_RED);
     set(border, 2, 2, 2, 2);
-    set(border_color, 0xFFFF);
+    set(border_color, WHITE);
     set(border_radius, 12);
-    set(text_color, 0xFFFF);
-    set(text_align, 1);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
     set(text, "< BACK");
-    set(clickable, 1);
+    set(clickable, ON);
     set(on_click, 2);
     parent(sub_panel);
 

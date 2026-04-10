@@ -3,6 +3,9 @@
 // 4-tab demo: Buttons, Sliders, Checkbox/Radio, Canvas
 // Demonstrates all widget types and drawing primitives.
 
+#include "core.fl"
+#include "color.fl"
+
 // ── Globals (24 of 32 slots) ──
 var panel1;         // tab panels
 var panel2;
@@ -48,7 +51,7 @@ fn hide_show(idx, on) {
 
 fn switch_tab(idx) {
     critical();
-    hide_show(active_tab, 0);
+    hide_show(active_tab, OFF);
 
     target(tab1); set(bg_color, 0x2945); dirty();
     target(tab2); set(bg_color, 0x2945); dirty();
@@ -61,7 +64,7 @@ fn switch_tab(idx) {
     if (idx == 3) { target(tab4); }
     set(bg_color, 0x2C9F); dirty();
     active_tab = idx;
-    hide_show(idx, 1);
+    hide_show(idx, ON);
     render();
 }
 
@@ -92,7 +95,7 @@ fn on_reset(wid) {
     dirty();
     target(status_lbl);
     set(text, "Counter reset!");
-    set(text_color, 0xFD20);
+    set(text_color, ORANGE);
     dirty();
     render();
 }
@@ -100,9 +103,9 @@ fn on_reset(wid) {
 fn on_color(wid) {
     target(color_btn);
     var c = get(bg_color);
-    if (c == 0xF800) { set(bg_color, 0x07E0); }
-    else if (c == 0x07E0) { set(bg_color, 0x2C9F); }
-    else { set(bg_color, 0xF800); }
+    if (c == RED) { set(bg_color, GREEN); }
+    else if (c == GREEN) { set(bg_color, 0x2C9F); }
+    else { set(bg_color, RED); }
     dirty();
     render();
 }
@@ -158,58 +161,58 @@ fn on_paint(wid) {
     var y = 90;
 
     // Filled rects
-    fillRect(30, y, 70, 50, 0xF800);
-    fillRect(110, y, 70, 50, 0x07E0);
-    fillRect(190, y, 70, 50, 0x001F);
-    fillRect(270, y, 70, 50, 0xFFE0);
+    fillRect(30, y, 70, 50, RED);
+    fillRect(110, y, 70, 50, GREEN);
+    fillRect(190, y, 70, 50, BLUE);
+    fillRect(270, y, 70, 50, YELLOW);
 
     // Outlined rects
-    rect(30, y + 65, 70, 50, 0xFFFF);
-    rect(110, y + 65, 70, 50, 0x07FF);
-    rect(190, y + 65, 70, 50, 0xF81F);
-    rect(270, y + 65, 70, 50, 0xFD20);
+    rect(30, y + 65, 70, 50, WHITE);
+    rect(110, y + 65, 70, 50, CYAN);
+    rect(190, y + 65, 70, 50, MAGENTA);
+    rect(270, y + 65, 70, 50, ORANGE);
 
     // Circles
-    fillCircle(400, y + 25, 22, 0xFD20);
-    circle(400, y + 25, 25, 0xFFFF);
-    fillCircle(460, y + 25, 22, 0xFC18);
-    circle(460, y + 25, 25, 0xFFFF);
-    fillCircle(520, y + 25, 22, 0x867D);
-    circle(520, y + 25, 25, 0xFFFF);
+    fillCircle(400, y + 25, 22, ORANGE);
+    circle(400, y + 25, 25, WHITE);
+    fillCircle(460, y + 25, 22, PINK);
+    circle(460, y + 25, 25, WHITE);
+    fillCircle(520, y + 25, 22, SKY_BLUE);
+    circle(520, y + 25, 25, WHITE);
 
     // Star pattern with lines
     var cx = 460;
     var cy = y + 95;
-    line(cx - 35, cy, cx + 35, cy, 0xFFE0);
-    line(cx, cy - 35, cx, cy + 35, 0xFFE0);
-    line(cx - 25, cy - 25, cx + 25, cy + 25, 0xFEA0);
-    line(cx - 25, cy + 25, cx + 25, cy - 25, 0xFEA0);
+    line(cx - 35, cy, cx + 35, cy, YELLOW);
+    line(cx, cy - 35, cx, cy + 35, YELLOW);
+    line(cx - 25, cy - 25, cx + 25, cy + 25, GOLD);
+    line(cx - 25, cy + 25, cx + 25, cy - 25, GOLD);
 
     // Rounded rects
     fillRoundedRect(580, y, 190, 50, 10, 0x2945);
-    drawText(600, y + 28, 0, 0xFFFF, 0x2945, "Rounded Fill");
-    roundedRect(580, y + 65, 190, 50, 10, 0xB7E0);
-    drawText(600, y + 95, 0, 0xB7E0, 0, "Rounded Line");
+    drawText(600, y + 28, 0, WHITE, 0x2945, "Rounded Fill");
+    roundedRect(580, y + 65, 190, 50, 10, LIME);
+    drawText(600, y + 95, 0, LIME, 0, "Rounded Line");
 
     // Color gradient
     var gx = 580;
     var gy = y + 140;
-    fillRect(gx, gy, 38, 18, 0xF800);
+    fillRect(gx, gy, 38, 18, RED);
     fillRect(gx + 38, gy, 38, 18, 0xFBE0);
-    fillRect(gx + 76, gy, 38, 18, 0xFFE0);
-    fillRect(gx + 114, gy, 38, 18, 0x07E0);
-    fillRect(gx + 152, gy, 38, 18, 0x001F);
+    fillRect(gx + 76, gy, 38, 18, YELLOW);
+    fillRect(gx + 114, gy, 38, 18, GREEN);
+    fillRect(gx + 152, gy, 38, 18, BLUE);
 
     // Arcs
-    arc(120, y + 200, 40, 0, 90, 0xF800);
-    arc(120, y + 200, 40, 90, 180, 0x07E0);
-    arc(120, y + 200, 40, 180, 270, 0x001F);
-    arc(120, y + 200, 40, 270, 360, 0xFFE0);
-    arc(120, y + 200, 35, 0, 360, 0xFFFF);
+    arc(120, y + 200, 40, 0, 90, RED);
+    arc(120, y + 200, 40, 90, 180, GREEN);
+    arc(120, y + 200, 40, 180, 270, BLUE);
+    arc(120, y + 200, 40, 270, 360, YELLOW);
+    arc(120, y + 200, 35, 0, 360, WHITE);
 
     // Labels
-    drawText(30, y + 270, 0, 0xFFFF, 0, "108MHz bare-metal rendering");
-    drawText(30, y + 290, 0, 0x4208, 0, "rect, circle, line, arc, roundedRect, text");
+    drawText(30, y + 270, 0, WHITE, 0, "108MHz bare-metal rendering");
+    drawText(30, y + 290, 0, DARK_GRAY, 0, "rect, circle, line, arc, roundedRect, text");
 }
 
 // ════════════════════════════════
@@ -233,48 +236,48 @@ fn setup() {
     tab1 = alloc(); target(tab1);
     set(size, 200, 50);
     set(bg_color, 0x2C9F); set(press_color, 0x2C9F);
-    set(border, 0, 1, 0, 0); set(border_color, 0x4208);
-    set(clickable, 1); set(on_click, @on_tab);
+    set(border, 0, 1, 0, 0); set(border_color, DARK_GRAY);
+    set(clickable, ON); set(on_click, @on_tab);
     parent(bar);
     var l = alloc(); target(l);
-    set(kind, 1); set(size, 200, 50);
-    set(text_color, 0xFFFF); set(text_align, 1); set(text, "BUTTONS");
+    set(kind, KIND_LABEL); set(size, 200, 50);
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER); set(text, "BUTTONS");
     parent(tab1);
 
     tab2 = alloc(); target(tab2);
     set(location, 200, 0);
     set(size, 200, 50);
     set(bg_color, 0x2945); set(press_color, 0x2C9F);
-    set(border, 0, 1, 0, 0); set(border_color, 0x4208);
-    set(clickable, 1); set(on_click, @on_tab);
+    set(border, 0, 1, 0, 0); set(border_color, DARK_GRAY);
+    set(clickable, ON); set(on_click, @on_tab);
     parent(bar);
     l = alloc(); target(l);
-    set(kind, 1); set(size, 200, 50);
-    set(text_color, 0xFFFF); set(text_align, 1); set(text, "SLIDERS");
+    set(kind, KIND_LABEL); set(size, 200, 50);
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER); set(text, "SLIDERS");
     parent(tab2);
 
     tab3 = alloc(); target(tab3);
     set(location, 400, 0);
     set(size, 200, 50);
     set(bg_color, 0x2945); set(press_color, 0x2C9F);
-    set(border, 0, 1, 0, 0); set(border_color, 0x4208);
-    set(clickable, 1); set(on_click, @on_tab);
+    set(border, 0, 1, 0, 0); set(border_color, DARK_GRAY);
+    set(clickable, ON); set(on_click, @on_tab);
     parent(bar);
     l = alloc(); target(l);
-    set(kind, 1); set(size, 200, 50);
-    set(text_color, 0xFFFF); set(text_align, 1); set(text, "CHECK");
+    set(kind, KIND_LABEL); set(size, 200, 50);
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER); set(text, "CHECK");
     parent(tab3);
 
     tab4 = alloc(); target(tab4);
     set(location, 600, 0);
     set(size, 200, 50);
     set(bg_color, 0x2945); set(press_color, 0x2C9F);
-    set(border, 0, 1, 0, 0); set(border_color, 0x4208);
-    set(clickable, 1); set(on_click, @on_tab);
+    set(border, 0, 1, 0, 0); set(border_color, DARK_GRAY);
+    set(clickable, ON); set(on_click, @on_tab);
     parent(bar);
     l = alloc(); target(l);
-    set(kind, 1); set(size, 200, 50);
-    set(text_color, 0xFFFF); set(text_align, 1); set(text, "CANVAS");
+    set(kind, KIND_LABEL); set(size, 200, 50);
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER); set(text, "CANVAS");
     parent(tab4);
 
     // ════════════════════════════════
@@ -286,9 +289,9 @@ fn setup() {
     parent(0);
 
     // Section title
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 30, 10); set(size, 300, 25);
-    set(text_color, 0xC618); set(text, "Buttons");
+    set(text_color, LIGHT_GRAY); set(text, "Buttons");
     parent(panel1);
 
     // Counter button
@@ -296,86 +299,86 @@ fn setup() {
     set(location, 30, 45); set(size, 220, 65);
     set(bg_color, 0x2C9F); set(press_color, 0x1A5F);
     set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
-    set(border_radius, 12); set(clickable, 1); set(on_click, @on_count);
+    set(border_radius, 12); set(clickable, ON); set(on_click, @on_count);
     parent(panel1);
-    l = alloc(); target(l); set(kind, 1);
-    set(size, 220, 65); set(text_color, 0xFFFF);
-    set(text_align, 1); set(text, "TAP ME");
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(size, 220, 65); set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER); set(text, "TAP ME");
     parent(b);
 
     // Counter label
-    counter_lbl = alloc(); target(counter_lbl); set(kind, 1);
+    counter_lbl = alloc(); target(counter_lbl); set(kind, KIND_LABEL);
     set(location, 270, 55); set(size, 200, 40);
-    set(text_color, 0xFFFF); set(text, "Tapped: 0");
+    set(text_color, WHITE); set(text, "Tapped: 0");
     set(bg_color, 0x1082);
     parent(panel1);
 
     // Reset button
     b = alloc(); target(b);
     set(location, 30, 130); set(size, 150, 45);
-    set(bg_color, 0x4208); set(press_color, 0x6B4D);
+    set(bg_color, DARK_GRAY); set(press_color, 0x6B4D);
     set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
-    set(border_radius, 8); set(clickable, 1); set(on_click, @on_reset);
+    set(border_radius, 8); set(clickable, ON); set(on_click, @on_reset);
     parent(panel1);
-    l = alloc(); target(l); set(kind, 1);
-    set(size, 150, 45); set(text_color, 0xFFFF);
-    set(text_align, 1); set(text, "RESET");
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(size, 150, 45); set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER); set(text, "RESET");
     parent(b);
 
     // Color cycle button
     color_btn = alloc(); target(color_btn);
     set(location, 200, 130); set(size, 170, 45);
-    set(bg_color, 0xF800); set(press_color, 0x8000);
+    set(bg_color, RED); set(press_color, DARK_RED);
     set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
-    set(border_radius, 8); set(clickable, 1); set(on_click, @on_color);
+    set(border_radius, 8); set(clickable, ON); set(on_click, @on_color);
     parent(panel1);
-    l = alloc(); target(l); set(kind, 1);
-    set(size, 170, 45); set(text_color, 0xFFFF);
-    set(text_align, 1); set(text, "CYCLE COLOR");
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(size, 170, 45); set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER); set(text, "CYCLE COLOR");
     parent(color_btn);
 
     // Status label
-    status_lbl = alloc(); target(status_lbl); set(kind, 1);
+    status_lbl = alloc(); target(status_lbl); set(kind, KIND_LABEL);
     set(location, 30, 195); set(size, 400, 25);
-    set(text_color, 0x4208); set(text, "Tap buttons to interact");
+    set(text_color, DARK_GRAY); set(text, "Tap buttons to interact");
     parent(panel1);
 
     // Button styles section
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 30, 240); set(size, 300, 25);
-    set(text_color, 0xC618); set(text, "Button Styles");
+    set(text_color, LIGHT_GRAY); set(text, "Button Styles");
     parent(panel1);
 
     // Pill
     b = alloc(); target(b);
     set(location, 30, 275); set(size, 140, 38);
-    set(bg_color, 0x07E0); set(press_color, 0x0320);
+    set(bg_color, GREEN); set(press_color, DARK_GREEN);
     set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
-    set(border_radius, 19); set(clickable, 1);
+    set(border_radius, 19); set(clickable, ON);
     parent(panel1);
-    l = alloc(); target(l); set(kind, 1);
-    set(size, 140, 38); set(text_color, 0xFFFF); set(text_align, 1); set(text, "Pill");
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(size, 140, 38); set(text_color, WHITE); set(text_align, ALIGN_CENTER); set(text, "Pill");
     parent(b);
 
     // Square
     b = alloc(); target(b);
     set(location, 190, 275); set(size, 100, 38);
-    set(bg_color, 0xFD20); set(press_color, 0x8200);
+    set(bg_color, ORANGE); set(press_color, BROWN);
     set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
-    set(clickable, 1);
+    set(clickable, ON);
     parent(panel1);
-    l = alloc(); target(l); set(kind, 1);
-    set(size, 100, 38); set(text_color, 0xFFFF); set(text_align, 1); set(text, "Square");
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(size, 100, 38); set(text_color, WHITE); set(text_align, ALIGN_CENTER); set(text, "Square");
     parent(b);
 
     // Ghost (border only)
     b = alloc(); target(b);
     set(location, 310, 275); set(size, 130, 38);
     set(border, 2, 2, 2, 2); set(border_color, 0x2C9F);
-    set(border_radius, 8); set(clickable, 1); set(press_color, 0x2C9F);
+    set(border_radius, 8); set(clickable, ON); set(press_color, 0x2C9F);
     parent(panel1);
-    l = alloc(); target(l); set(kind, 1);
-    set(size, 130, 38); set(text_color, 0x2C9F); set(text_align, 1); set(text, "Ghost");
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(size, 130, 38); set(text_color, 0x2C9F); set(text_align, ALIGN_CENTER); set(text, "Ghost");
     parent(b);
 
     // Big button with subtitle
@@ -383,29 +386,29 @@ fn setup() {
     set(location, 500, 45); set(size, 260, 110);
     set(bg_color, 0x18C3); set(press_color, 0x2945);
     set(border, 3, 3, 3, 3); set(border_color, 0x2C9F);
-    set(border_radius, 16); set(clickable, 1);
+    set(border_radius, 16); set(clickable, ON);
     parent(panel1);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 0, 15); set(size, 260, 40);
-    set(text_color, 0xFFFF); set(text_align, 1); set(text, "BIG BUTTON");
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER); set(text, "BIG BUTTON");
     parent(b);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 0, 55); set(size, 260, 25);
-    set(text_color, 0x4208); set(text_align, 1); set(text, "with subtitle");
+    set(text_color, DARK_GRAY); set(text_align, ALIGN_CENTER); set(text, "with subtitle");
     parent(b);
 
     // Alignment demo
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 500, 185); set(size, 260, 22);
-    set(text_color, 0xC618); set(text, "Left Aligned");
+    set(text_color, LIGHT_GRAY); set(text, "Left Aligned");
     parent(panel1);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 500, 212); set(size, 260, 22);
-    set(text_color, 0xC618); set(text_align, 1); set(text, "Center Aligned");
+    set(text_color, LIGHT_GRAY); set(text_align, ALIGN_CENTER); set(text, "Center Aligned");
     parent(panel1);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 500, 239); set(size, 260, 22);
-    set(text_color, 0xC618); set(text_align, 2); set(text, "Right Aligned");
+    set(text_color, LIGHT_GRAY); set(text_align, ALIGN_RIGHT); set(text, "Right Aligned");
     parent(panel1);
 
     // ════════════════════════════════
@@ -414,114 +417,114 @@ fn setup() {
 
     panel2 = alloc(); target(panel2);
     set(location, 0, 50); set(size, 800, 430); set(bg_color, 0x1082);
-    set(visible, 0);
+    set(visible, OFF);
     parent(0);
 
     // Progress bars
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 30, 15); set(size, 300, 25);
-    set(text_color, 0xC618); set(text, "Progress Bars");
+    set(text_color, LIGHT_GRAY); set(text, "Progress Bars");
     parent(panel2);
 
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 30, 50); set(size, 150, 20);
-    set(text_color, 0xFFFF); set(text, "Download");
+    set(text_color, WHITE); set(text, "Download");
     parent(panel2);
     prog1 = alloc(); target(prog1);
-    set(kind, 3); set(location, 30, 75); set(size, 350, 20);
-    set(bg_color, 0x2104); set(press_color, 0x07E0);
+    set(kind, KIND_PROGRESS); set(location, 30, 75); set(size, 350, 20);
+    set(bg_color, 0x2104); set(press_color, GREEN);
     set(border_radius, 5); set(value, 75);
     parent(panel2);
 
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 30, 105); set(size, 150, 20);
-    set(text_color, 0xFFFF); set(text, "Upload");
+    set(text_color, WHITE); set(text, "Upload");
     parent(panel2);
     prog2 = alloc(); target(prog2);
-    set(kind, 3); set(location, 30, 130); set(size, 350, 20);
-    set(bg_color, 0x2104); set(press_color, 0xFD20);
+    set(kind, KIND_PROGRESS); set(location, 30, 130); set(size, 350, 20);
+    set(bg_color, 0x2104); set(press_color, ORANGE);
     set(border_radius, 5); set(value, 45);
     parent(panel2);
 
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 30, 160); set(size, 150, 20);
-    set(text_color, 0xFFFF); set(text, "Battery");
+    set(text_color, WHITE); set(text, "Battery");
     parent(panel2);
     prog3 = alloc(); target(prog3);
-    set(kind, 3); set(location, 30, 185); set(size, 350, 20);
-    set(bg_color, 0x2104); set(press_color, 0xF800);
+    set(kind, KIND_PROGRESS); set(location, 30, 185); set(size, 350, 20);
+    set(bg_color, 0x2104); set(press_color, RED);
     set(border_radius, 5); set(value, 15);
     parent(panel2);
 
     // Percentage labels
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 390, 75); set(size, 50, 20);
-    set(text_color, 0x07E0); set(text, "75%");
+    set(text_color, GREEN); set(text, "75%");
     parent(panel2);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 390, 130); set(size, 50, 20);
-    set(text_color, 0xFD20); set(text, "45%");
+    set(text_color, ORANGE); set(text, "45%");
     parent(panel2);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 390, 185); set(size, 50, 20);
-    set(text_color, 0xF800); set(text, "15%");
+    set(text_color, RED); set(text, "15%");
     parent(panel2);
 
     // Sliders
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 30, 230); set(size, 300, 25);
-    set(text_color, 0xC618); set(text, "Sliders (drag to adjust)");
+    set(text_color, LIGHT_GRAY); set(text, "Sliders (drag to adjust)");
     parent(panel2);
 
-    s1_lbl = alloc(); target(s1_lbl); set(kind, 1);
+    s1_lbl = alloc(); target(s1_lbl); set(kind, KIND_LABEL);
     set(location, 30, 265); set(size, 250, 22);
-    set(text_color, 0xFFFF); set(text, "Brightness: 100%");
+    set(text_color, WHITE); set(text, "Brightness: 100%");
     parent(panel2);
     var s = alloc(); target(s);
-    set(kind, 4); set(location, 30, 295); set(size, 350, 28);
+    set(kind, KIND_SLIDER); set(location, 30, 295); set(size, 350, 28);
     set(bg_color, 0x2104); set(press_color, 0x2C9F);
-    set(border_color, 0xFFFF); set(border_radius, 8);
-    set(clickable, 1); set(value, 100); set(on_click, @on_s1);
+    set(border_color, WHITE); set(border_radius, 8);
+    set(clickable, ON); set(value, 100); set(on_click, @on_s1);
     parent(panel2);
 
-    s2_lbl = alloc(); target(s2_lbl); set(kind, 1);
+    s2_lbl = alloc(); target(s2_lbl); set(kind, KIND_LABEL);
     set(location, 30, 340); set(size, 250, 22);
-    set(text_color, 0xFFFF); set(text, "Volume: 50%");
+    set(text_color, WHITE); set(text, "Volume: 50%");
     parent(panel2);
     s = alloc(); target(s);
-    set(kind, 4); set(location, 30, 370); set(size, 350, 28);
-    set(bg_color, 0x2104); set(press_color, 0x07E0);
-    set(border_color, 0xFFFF); set(border_radius, 8);
-    set(clickable, 1); set(value, 50); set(on_click, @on_s2);
+    set(kind, KIND_SLIDER); set(location, 30, 370); set(size, 350, 28);
+    set(bg_color, 0x2104); set(press_color, GREEN);
+    set(border_color, WHITE); set(border_radius, 8);
+    set(clickable, ON); set(value, 50); set(on_click, @on_s2);
     parent(panel2);
 
     // Right: thin bars + big slider
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 470, 50); set(size, 300, 25);
-    set(text_color, 0xC618); set(text, "Thin Bars");
+    set(text_color, LIGHT_GRAY); set(text, "Thin Bars");
     parent(panel2);
     l = alloc(); target(l);
-    set(kind, 3); set(location, 470, 85); set(size, 300, 8);
-    set(bg_color, 0x2104); set(press_color, 0x07FF); set(value, 80);
+    set(kind, KIND_PROGRESS); set(location, 470, 85); set(size, 300, 8);
+    set(bg_color, 0x2104); set(press_color, CYAN); set(value, 80);
     parent(panel2);
     l = alloc(); target(l);
-    set(kind, 3); set(location, 470, 100); set(size, 300, 8);
-    set(bg_color, 0x2104); set(press_color, 0xFC18); set(value, 55);
+    set(kind, KIND_PROGRESS); set(location, 470, 100); set(size, 300, 8);
+    set(bg_color, 0x2104); set(press_color, PINK); set(value, 55);
     parent(panel2);
     l = alloc(); target(l);
-    set(kind, 3); set(location, 470, 115); set(size, 300, 8);
-    set(bg_color, 0x2104); set(press_color, 0xFEA0); set(value, 30);
+    set(kind, KIND_PROGRESS); set(location, 470, 115); set(size, 300, 8);
+    set(bg_color, 0x2104); set(press_color, GOLD); set(value, 30);
     parent(panel2);
 
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 470, 150); set(size, 300, 25);
-    set(text_color, 0xC618); set(text, "Large Slider");
+    set(text_color, LIGHT_GRAY); set(text, "Large Slider");
     parent(panel2);
     s = alloc(); target(s);
-    set(kind, 4); set(location, 470, 185); set(size, 300, 45);
-    set(bg_color, 0x2104); set(press_color, 0x8010);
-    set(border_color, 0xF81F); set(border, 2, 2, 2, 2);
-    set(border_radius, 12); set(clickable, 1); set(value, 65);
+    set(kind, KIND_SLIDER); set(location, 470, 185); set(size, 300, 45);
+    set(bg_color, 0x2104); set(press_color, PURPLE);
+    set(border_color, MAGENTA); set(border, 2, 2, 2, 2);
+    set(border_radius, 12); set(clickable, ON); set(value, 65);
     parent(panel2);
 
     // ════════════════════════════════
@@ -530,13 +533,13 @@ fn setup() {
 
     panel3 = alloc(); target(panel3);
     set(location, 0, 50); set(size, 800, 430); set(bg_color, 0x1082);
-    set(visible, 0);
+    set(visible, OFF);
     parent(0);
 
     // Checkboxes section
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 30, 15); set(size, 350, 25);
-    set(text_color, 0xC618); set(text, "Checkboxes (toggle on tap)");
+    set(text_color, LIGHT_GRAY); set(text, "Checkboxes (toggle on tap)");
     parent(panel3);
 
     // WiFi checkbox row
@@ -544,14 +547,14 @@ fn setup() {
     set(location, 30, 50); set(size, 300, 35);
     parent(panel3);
     cb1 = alloc(); target(cb1);
-    set(kind, 5); set(location, 0, 2); set(size, 28, 28);
-    set(bg_color, 0x2104); set(text_color, 0xFFFF);
-    set(press_color, 0x07E0); set(border_radius, 4);
-    set(clickable, 1); set(checked, 1); set(on_click, @on_check);
+    set(kind, KIND_CHECKBOX); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, WHITE);
+    set(press_color, GREEN); set(border_radius, 4);
+    set(clickable, ON); set(checked, ON); set(on_click, @on_check);
     parent(b);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 40, 0); set(size, 200, 35);
-    set(text_color, 0xFFFF); set(text, "WiFi");
+    set(text_color, WHITE); set(text, "WiFi");
     parent(b);
 
     // Bluetooth checkbox row
@@ -559,14 +562,14 @@ fn setup() {
     set(location, 30, 95); set(size, 300, 35);
     parent(panel3);
     cb2 = alloc(); target(cb2);
-    set(kind, 5); set(location, 0, 2); set(size, 28, 28);
-    set(bg_color, 0x2104); set(text_color, 0xFFFF);
+    set(kind, KIND_CHECKBOX); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, WHITE);
     set(press_color, 0x2C9F); set(border_radius, 4);
-    set(clickable, 1); set(on_click, @on_check);
+    set(clickable, ON); set(on_click, @on_check);
     parent(b);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 40, 0); set(size, 200, 35);
-    set(text_color, 0xFFFF); set(text, "Bluetooth");
+    set(text_color, WHITE); set(text, "Bluetooth");
     parent(b);
 
     // Sound checkbox row
@@ -574,20 +577,20 @@ fn setup() {
     set(location, 30, 140); set(size, 300, 35);
     parent(panel3);
     cb3 = alloc(); target(cb3);
-    set(kind, 5); set(location, 0, 2); set(size, 28, 28);
-    set(bg_color, 0x2104); set(text_color, 0xFFFF);
-    set(press_color, 0xFD20);
-    set(clickable, 1); set(checked, 1); set(on_click, @on_check);
+    set(kind, KIND_CHECKBOX); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, WHITE);
+    set(press_color, ORANGE);
+    set(clickable, ON); set(checked, ON); set(on_click, @on_check);
     parent(b);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 40, 0); set(size, 200, 35);
-    set(text_color, 0xFFFF); set(text, "Sound");
+    set(text_color, WHITE); set(text, "Sound");
     parent(b);
 
     // Radio section
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 30, 200); set(size, 300, 25);
-    set(text_color, 0xC618); set(text, "Radio Group (select one)");
+    set(text_color, LIGHT_GRAY); set(text, "Radio Group (select one)");
     parent(panel3);
 
     b = alloc(); target(b);
@@ -599,14 +602,14 @@ fn setup() {
     set(location, 0, 0); set(size, 300, 35);
     parent(b);
     r1 = alloc(); target(r1);
-    set(kind, 6); set(location, 0, 2); set(size, 28, 28);
-    set(bg_color, 0x2104); set(text_color, 0xFFFF);
+    set(kind, KIND_RADIO); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, WHITE);
     set(press_color, 0x2C9F);
-    set(clickable, 1); set(checked, 1); set(on_click, @on_radio);
+    set(clickable, ON); set(checked, ON); set(on_click, @on_radio);
     parent(b);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 40, 0); set(size, 200, 35);
-    set(text_color, 0xFFFF); set(text, "Light Theme");
+    set(text_color, WHITE); set(text, "Light Theme");
     parent(b);
 
     // Dark
@@ -614,14 +617,14 @@ fn setup() {
     set(location, 0, 45); set(size, 300, 35);
     parent(b);
     r2 = alloc(); target(r2);
-    set(kind, 6); set(location, 0, 2); set(size, 28, 28);
-    set(bg_color, 0x2104); set(text_color, 0xFFFF);
+    set(kind, KIND_RADIO); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, WHITE);
     set(press_color, 0x2C9F);
-    set(clickable, 1); set(on_click, @on_radio);
+    set(clickable, ON); set(on_click, @on_radio);
     parent(b);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 40, 0); set(size, 200, 35);
-    set(text_color, 0xFFFF); set(text, "Dark Theme");
+    set(text_color, WHITE); set(text, "Dark Theme");
     parent(b);
 
     // Auto
@@ -629,74 +632,74 @@ fn setup() {
     set(location, 0, 90); set(size, 300, 35);
     parent(b);
     l = alloc(); target(l);
-    set(kind, 6); set(location, 0, 2); set(size, 28, 28);
-    set(bg_color, 0x2104); set(text_color, 0xFFFF);
+    set(kind, KIND_RADIO); set(location, 0, 2); set(size, 28, 28);
+    set(bg_color, 0x2104); set(text_color, WHITE);
     set(press_color, 0x2C9F);
-    set(clickable, 1); set(on_click, @on_radio);
+    set(clickable, ON); set(on_click, @on_radio);
     parent(b);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 40, 0); set(size, 200, 35);
-    set(text_color, 0xFFFF); set(text, "Auto");
+    set(text_color, WHITE); set(text, "Auto");
     parent(b);
 
     // Status label
-    chk_lbl = alloc(); target(chk_lbl); set(kind, 1);
+    chk_lbl = alloc(); target(chk_lbl); set(kind, KIND_LABEL);
     set(location, 450, 50); set(size, 320, 28);
     set(text_color, 0x2C9F); set(text, "WiFi Sound");
     set(bg_color, 0x1082);
     parent(panel3);
 
     // Right: large checkboxes
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 450, 100); set(size, 300, 25);
-    set(text_color, 0xC618); set(text, "Large Checkboxes");
+    set(text_color, LIGHT_GRAY); set(text, "Large Checkboxes");
     parent(panel3);
 
     b = alloc(); target(b);
-    set(kind, 5); set(location, 450, 140); set(size, 45, 45);
-    set(bg_color, 0x2104); set(text_color, 0x07E0);
-    set(press_color, 0x07E0); set(border_radius, 6);
-    set(clickable, 1); set(checked, 1);
+    set(kind, KIND_CHECKBOX); set(location, 450, 140); set(size, 45, 45);
+    set(bg_color, 0x2104); set(text_color, GREEN);
+    set(press_color, GREEN); set(border_radius, 6);
+    set(clickable, ON); set(checked, ON);
     parent(panel3);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 505, 148); set(size, 150, 30);
-    set(text_color, 0x07E0); set(text, "Accepted");
+    set(text_color, GREEN); set(text, "Accepted");
     parent(panel3);
 
     b = alloc(); target(b);
-    set(kind, 5); set(location, 450, 200); set(size, 45, 45);
-    set(bg_color, 0x2104); set(text_color, 0xF800);
-    set(press_color, 0xF800); set(border_radius, 6);
-    set(clickable, 1);
+    set(kind, KIND_CHECKBOX); set(location, 450, 200); set(size, 45, 45);
+    set(bg_color, 0x2104); set(text_color, RED);
+    set(press_color, RED); set(border_radius, 6);
+    set(clickable, ON);
     parent(panel3);
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 505, 208); set(size, 150, 30);
-    set(text_color, 0xF800); set(text, "Rejected");
+    set(text_color, RED); set(text, "Rejected");
     parent(panel3);
 
     // Large radios
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 450, 275); set(size, 300, 25);
-    set(text_color, 0xC618); set(text, "Large Radio");
+    set(text_color, LIGHT_GRAY); set(text, "Large Radio");
     parent(panel3);
 
     b = alloc(); target(b);
     set(location, 450, 310); set(size, 250, 40);
     parent(panel3);
     l = alloc(); target(l);
-    set(kind, 6); set(size, 36, 36);
-    set(bg_color, 0x2104); set(text_color, 0xF81F);
-    set(press_color, 0xF81F); set(clickable, 1); set(checked, 1);
+    set(kind, KIND_RADIO); set(size, 36, 36);
+    set(bg_color, 0x2104); set(text_color, MAGENTA);
+    set(press_color, MAGENTA); set(clickable, ON); set(checked, ON);
     parent(b);
     l = alloc(); target(l);
-    set(kind, 6); set(location, 70, 0); set(size, 36, 36);
-    set(bg_color, 0x2104); set(text_color, 0x07FF);
-    set(press_color, 0x07FF); set(clickable, 1);
+    set(kind, KIND_RADIO); set(location, 70, 0); set(size, 36, 36);
+    set(bg_color, 0x2104); set(text_color, CYAN);
+    set(press_color, CYAN); set(clickable, ON);
     parent(b);
     l = alloc(); target(l);
-    set(kind, 6); set(location, 140, 0); set(size, 36, 36);
-    set(bg_color, 0x2104); set(text_color, 0xFEA0);
-    set(press_color, 0xFEA0); set(clickable, 1);
+    set(kind, KIND_RADIO); set(location, 140, 0); set(size, 36, 36);
+    set(bg_color, 0x2104); set(text_color, GOLD);
+    set(press_color, GOLD); set(clickable, ON);
     parent(b);
 
     // ════════════════════════════════
@@ -705,12 +708,12 @@ fn setup() {
 
     panel4 = alloc(); target(panel4);
     set(location, 0, 50); set(size, 800, 430); set(bg_color, 0x1082);
-    set(visible, 0); set(on_paint, @on_paint);
+    set(visible, OFF); set(on_paint, @on_paint);
     parent(0);
 
-    l = alloc(); target(l); set(kind, 1);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
     set(location, 20, 10); set(size, 760, 25);
-    set(text_color, 0xC618);
+    set(text_color, LIGHT_GRAY);
     set(text, "Drawing Primitives (on_paint callback)");
     parent(panel4);
 
