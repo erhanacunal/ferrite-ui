@@ -285,6 +285,10 @@ const OP_FPGA_DAT: u8 = 0x9E; // pop data → send_data(data)
 const OP_CRITICAL: u8 = 0x9F; // enter critical section — run until next yield
 const OP_SET_BRIGHTNESS: u8 = 0xA0; // pop percent → set backlight
 const OP_BRIGHTNESS: u8 = 0xA1; // push current backlight percent
+const OP_FILE_OPEN: u8 = 0xA2;  // pop str_id (name) → push handle (1|2|0xFF)
+const OP_FILE_READ: u8 = 0xA3;  // pop handle → push byte (0..255) or -1 on EOF
+const OP_FILE_SIZE: u8 = 0xA4;  // pop handle → push size
+const OP_FILE_CLOSE: u8 = 0xA5; // pop handle, release slot
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -373,6 +377,20 @@ struct CbRequest {
     args: [i32; CB_MAX_ARGS],
 }
 
+/// Open file slot — absolute flash offset, total size, current read position.
+/// Max 2 files open concurrently (handles 1 and 2; 0xFF means error).
+#[derive(Clone, Copy)]
+struct OpenFile {
+    offset: u32,
+    size: u32,
+    pos: u32,
+}
+
+/// Returned by fileOpen on error. fileRead/Size/Close with this handle → VM Error.
+const FILE_HANDLE_ERR: i32 = 0xFF;
+/// EOF marker returned by fileRead when past end-of-file.
+const FILE_EOF: i32 = -1;
+
 pub struct Vm {
     pc: u16,
     stack: [i32; STACK_SIZE],
@@ -405,6 +423,8 @@ pub struct Vm {
     global_count: u8,
     // Render mode from image header
     pub render_mode: RenderMode,
+    // Open file slots — index 0 = handle 1, index 1 = handle 2.
+    open_files: [Option<OpenFile>; 2],
 }
 
 impl Vm {
@@ -439,6 +459,7 @@ impl Vm {
             frame_size: 0,
             global_count: 0,
             render_mode: RenderMode::Dirty,
+            open_files: [None, None],
         }
     }
 
@@ -697,6 +718,7 @@ impl Vm {
         self.cb_tail = 0;
         self.critical = false;
         self.render_mode = RenderMode::Dirty;
+        self.open_files = [None, None];
     }
 
     pub fn has_code(&self) -> bool {
@@ -1329,6 +1351,45 @@ impl Vm {
                 self.push(ctx.backlight.brightness() as i32);
             }
 
+            // --- File ops (flash filesystem, read-only) ---
+            OP_FILE_OPEN => {
+                let str_id = self.pop() as u16;
+                let name = ctx.strpool.get(str_id);
+                let result = self.file_open(ctx, name);
+                self.push(result);
+            }
+            OP_FILE_READ => {
+                let handle = self.pop();
+                match self.file_slot_mut(handle) {
+                    Some(f) => {
+                        if f.pos >= f.size {
+                            self.push(FILE_EOF);
+                        } else {
+                            let addr = f.offset + f.pos;
+                            let mut buf = [0u8; 1];
+                            ctx.flash.read(addr, &mut buf);
+                            f.pos += 1;
+                            self.push(buf[0] as i32);
+                        }
+                    }
+                    None => self.state = VmState::Error,
+                }
+            }
+            OP_FILE_SIZE => {
+                let handle = self.pop();
+                match self.file_slot(handle) {
+                    Some(f) => self.push(f.size as i32),
+                    None => self.state = VmState::Error,
+                }
+            }
+            OP_FILE_CLOSE => {
+                let handle = self.pop();
+                match self.file_slot_index(handle) {
+                    Some(idx) => self.open_files[idx] = None,
+                    None => self.state = VmState::Error,
+                }
+            }
+
             // --- Float32 (soft-float) ---
             OP_ITOF => {
                 let i = self.pop();
@@ -1592,6 +1653,57 @@ impl Vm {
             Some(pos) => self.push(self.arrays[pos].data.len() as i32),
             None => self.state = VmState::Error,
         }
+    }
+
+    // --- File ops ---
+
+    /// Map a handle (1 or 2) to the open_files index (0 or 1).
+    /// Returns None if handle is out of range or slot is empty.
+    fn file_slot_index(&self, handle: i32) -> Option<usize> {
+        let idx = match handle {
+            1 => 0,
+            2 => 1,
+            _ => return None,
+        };
+        if self.open_files[idx].is_some() { Some(idx) } else { None }
+    }
+
+    fn file_slot(&self, handle: i32) -> Option<&OpenFile> {
+        self.file_slot_index(handle).map(|i| self.open_files[i].as_ref().unwrap())
+    }
+
+    fn file_slot_mut(&mut self, handle: i32) -> Option<&mut OpenFile> {
+        let idx = self.file_slot_index(handle)?;
+        self.open_files[idx].as_mut()
+    }
+
+    /// Open a file by name. Returns handle 1 or 2, or 0xFF on error:
+    ///   - fs not mounted
+    ///   - name not found
+    ///   - resource is not a file (wrong kind)
+    ///   - both slots in use
+    fn file_open(&mut self, ctx: &Ctx, name: &[u8]) -> i32 {
+        let fs = match ctx.fs.as_ref() {
+            Some(f) => f,
+            None => return FILE_HANDLE_ERR,
+        };
+        let entry = match fs.find(&ctx.flash, name) {
+            Some(e) if e.kind == crate::fs::RES_FILE => e,
+            _ => return FILE_HANDLE_ERR,
+        };
+        let slot = if self.open_files[0].is_none() {
+            0
+        } else if self.open_files[1].is_none() {
+            1
+        } else {
+            return FILE_HANDLE_ERR;
+        };
+        self.open_files[slot] = Some(OpenFile {
+            offset: entry.offset,
+            size: entry.size,
+            pos: 0,
+        });
+        (slot + 1) as i32
     }
 }
 

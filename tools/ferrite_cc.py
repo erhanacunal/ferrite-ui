@@ -179,6 +179,10 @@ class Builtin:
     CRITICAL = 31
     SET_BRIGHTNESS = 32
     BRIGHTNESS = 33
+    FILE_OPEN = 34  # (name_str_id) → handle(1|2) or 0xFF on error
+    FILE_READ = 35  # (handle) → byte(0..255) or -1 on EOF
+    FILE_SIZE = 36  # (handle) → size in bytes
+    FILE_CLOSE = 37 # (handle) — release slot
 
 
 class Prop:

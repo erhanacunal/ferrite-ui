@@ -7,7 +7,7 @@
 ///   immediately after     : Resource data (packed)
 ///
 /// Resources are accessed by name (null-terminated ASCII, max 15 chars).
-/// Kind: Font=0, Image=1, Program=2, Page=3
+/// Kind: Font=0, Image=1, Program=2, Page=3, File=4
 
 use crate::flash::Flash;
 
@@ -46,6 +46,7 @@ pub const RES_FONT: u8 = 0;
 pub const RES_IMAGE: u8 = 1;
 pub const RES_PROGRAM: u8 = 2;
 pub const RES_PAGE: u8 = 3;
+pub const RES_FILE: u8 = 4;
 
 // --- Header (flash'tan okunan, RAM'de cache) ---
 

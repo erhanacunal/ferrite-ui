@@ -912,6 +912,7 @@ NO_VALUE_BUILTINS = {
     'beginFrame', 'endFrame',
     'sendUsart',
     'rtcWrite',
+    'fileClose',
 }
 
 
@@ -2452,6 +2453,42 @@ class CodeGen:
                 raise CompileError("rtcWrite() takes 1 argument: array", node.line)
             self._gen_expr(node.args[0])
             self.asm.builtin(Builtin.RTC_WRITE)
+            return
+
+        if name == 'fileOpen':
+            # fileOpen(name) → handle (1 or 2), or 0xFF on error.
+            # Caller MUST check handle != 0xFF before use.
+            if len(node.args) != 1:
+                raise CompileError("fileOpen() takes 1 argument: name", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.FILE_OPEN)
+            return
+
+        if name == 'fileRead':
+            # fileRead(handle) → byte (0..255) or -1 on EOF.
+            # Passing 0xFF or an unopened handle → VM error.
+            if len(node.args) != 1:
+                raise CompileError("fileRead() takes 1 argument: handle", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.FILE_READ)
+            return
+
+        if name == 'fileSize':
+            # fileSize(handle) → total byte count.
+            # Passing 0xFF or an unopened handle → VM error.
+            if len(node.args) != 1:
+                raise CompileError("fileSize() takes 1 argument: handle", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.FILE_SIZE)
+            return
+
+        if name == 'fileClose':
+            # fileClose(handle) — release one of the two slots.
+            # Passing 0xFF or an unopened handle → VM error.
+            if len(node.args) != 1:
+                raise CompileError("fileClose() takes 1 argument: handle", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.FILE_CLOSE)
             return
 
         # --- User-defined function ---

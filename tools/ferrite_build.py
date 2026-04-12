@@ -52,6 +52,9 @@ JSON format:
     ],
     "programs": [
       {"name": "init", "source": "scripts/init.fl", "exec_mode": "ram|flash"}
+    ],
+    "files": [
+      {"name": "config", "source": "data/config.bin"}
     ]
   }
 """
@@ -79,6 +82,7 @@ RES_FONT = 0
 RES_IMAGE = 1
 RES_PROGRAM = 2
 RES_PAGE = 3
+RES_FILE = 4
 
 # Resource flags (stored in entry reserved[0], byte 28)
 RES_FLAG_FLASH_EXEC = 0x01
@@ -568,7 +572,18 @@ def build(project_path: str, output_path: str) -> dict:
         prog_flags = RES_FLAG_FLASH_EXEC if exec_mode == "flash" else 0
         resources.append((name, RES_PROGRAM, image_data, prog_flags))
 
-    # 5. Build flash binary
+    # 5. Files — raw user data accessible from ferrite programs via fileOpen/Read.
+    #    Max 15-char names; no processing — bytes stored verbatim.
+    for f in project.get("files", []):
+        name = f["name"]
+        if len(name.encode("ascii")) > 15:
+            print(f"Error: file name '{name}' exceeds 15 chars", file=sys.stderr)
+            sys.exit(1)
+        source = project_dir / f["source"]
+        data = source.read_bytes()
+        resources.append((name, RES_FILE, data, 0))
+
+    # 6. Build flash binary
     fs_binary = build_fs(project, resources)
     Path(output_path).write_bytes(fs_binary)
 
@@ -592,8 +607,9 @@ def show_info(project_path: str):
     images = project.get("images", [])
     pages = project.get("pages", [])
     programs = project.get("programs", [])
+    files = project.get("files", [])
 
-    total_res = len(fonts) + len(images) + len(pages) + len(programs)
+    total_res = len(fonts) + len(images) + len(pages) + len(programs) + len(files)
 
     print(f"Project: {project_path}")
     print(f"Screen:  {screen[0]}×{screen[1]}")
@@ -601,6 +617,7 @@ def show_info(project_path: str):
     print(f"Images:  {len(images)}")
     print(f"Pages:   {len(pages)}")
     print(f"Programs:{len(programs)}")
+    print(f"Files:   {len(files)}")
     print(f"Total:   {total_res} resources")
 
     if total_res > MAX_RESOURCES:
@@ -658,7 +675,7 @@ def main():
     print(f"  Widgets:   {stats['next_widget_id']} IDs allocated")
     print()
 
-    KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE"}
+    KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE", RES_FILE: "FILE"}
     for name, kind, size in stats["details"]:
         print(f"  {KIND_NAMES.get(kind, '?'):>7s}  {name:<16s}  {size:>6d} bytes")
 

@@ -132,9 +132,31 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - `0x001010 - 0x001FFF`: Resource Table (max 127 entries × 32B)
   - `0x002000+`: Resource data (packed)
 - **Entry format (32B):** name[16] + kind(1) + pad(3) + offset(4) + size(4) + reserved(4)
-- **Resource types:** Font=0, Image=1, Program=2, Page=3
+- **Resource types:** Font=0, Image=1, Program=2, Page=3, File=4
 - **API:** `mount()`, `find(name)`, `read_resource()`, `count_by_kind()`, `find_nth_by_kind()`, `verify_checksum()`
 - **RAM cost:** 12 bytes (header cache only — table stays in flash)
+
+### User Files (RES_FILE)
+- **Purpose:** Arbitrary user data accessible from ferrite programs — config, level data, raw tables.
+- **Embedding:** `project.json` → `"files": [{"name": "cfg", "source": "data/cfg.bin"}]`
+- **VM state:** 2 open-file slots in Vm (~24B). Only 2 files can be open at once.
+- **VM builtins:**
+  - `fileOpen(name)` → handle `1` or `2`, or `0xFF` on error. **Caller MUST check.**
+  - `fileRead(handle)` → byte `0..255`, or `-1` on EOF.
+  - `fileSize(handle)` → total size in bytes.
+  - `fileClose(handle)` — release slot.
+- **Error handling:** passing `0xFF` (or any unopened handle) to `fileRead`/`fileSize`/`fileClose` → VM enters `Error` state. Programs must guard calls.
+- **Typical loop:**
+  ```
+  var h = fileOpen("cfg");
+  if (h != 0xFF) {
+      var b;
+      while ((b = fileRead(h)) >= 0) {
+          // process b
+      }
+      fileClose(h);
+  }
+  ```
 
 ### Recovery Mode
 - **Hold top-left corner for 3 seconds at boot** → recovery mode

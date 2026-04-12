@@ -921,6 +921,122 @@ fn loop() {
 }
 ```
 
+## Files (Flash Filesystem)
+
+Read user data bundled into the flash image at build time. Files are declared in `project.json` under `"files": [...]` and stored in flash as `RES_FILE` resources. The VM exposes a minimal handle-based API for sequential byte-by-byte reading.
+
+### Embedding Files
+
+In `project.json`:
+
+```json
+{
+  "files": [
+    { "name": "config",  "source": "data/config.bin" },
+    { "name": "palette", "source": "data/palette.raw" }
+  ]
+}
+```
+
+Names are limited to **15 ASCII characters**. Source paths are relative to the project directory. Files are stored verbatim — no compression, no transformation. There is no directory listing at runtime: the program must know the file name it wants to open.
+
+### Constraints
+
+- Files are **read-only** (flash-backed).
+- At most **2 files open simultaneously** — handle values are `1` and `2`.
+- `fileRead` returns **one byte per call**. Heavy reads are slow; buffer into your own array if you need to process large data repeatedly.
+- Passing an **invalid handle** (`0xFF`, a closed slot, or a value other than 1/2) to `fileRead` / `fileSize` / `fileClose` puts the VM into the **Error** state. Programs must check the return of `fileOpen` before using the handle.
+
+### fileOpen(name) → handle
+
+Opens a file by name. Returns a handle (`1` or `2`) on success, or `0xFF` (255) on error. Errors are returned for any of:
+
+- the filesystem is not mounted,
+- the name is not found,
+- the named resource is not a file (e.g. it's a font or image),
+- both file slots are already in use.
+
+The `name` argument must be a string id (produced by `str("...")` or equivalent).
+
+```c
+var h = fileOpen(str("config"));
+if (h == 255) {
+    // open failed — do not touch h further
+    return;
+}
+```
+
+### fileRead(handle) → byte | -1
+
+Reads the next byte and advances the internal read position. Returns a value in `0..255`, or `-1` when the end of the file is reached. Subsequent calls past EOF keep returning `-1`.
+
+```c
+var b;
+while (1) {
+    b = fileRead(h);
+    if (b < 0) { break; }   // EOF
+    // ... process b ...
+}
+```
+
+### fileSize(handle) → int
+
+Returns the total size of the open file in bytes. Does not change the read position.
+
+```c
+var total = fileSize(h);
+```
+
+### fileClose(handle)
+
+Releases the slot so it can be reused by another `fileOpen`. Does not return a value.
+
+```c
+fileClose(h);
+```
+
+### Example: Read a Config File
+
+```c
+fn setup() {
+    var h = fileOpen(str("config"));
+    if (h == 255) {
+        return;
+    }
+    var total = fileSize(h);
+    var sum = 0;
+    var b;
+    while (1) {
+        b = fileRead(h);
+        if (b < 0) { break; }
+        sum = sum + b;
+    }
+    fileClose(h);
+    // use total / sum ...
+}
+```
+
+### Example: Copying Bytes Into an Array
+
+```c
+fn setup() {
+    var h = fileOpen(str("palette"));
+    if (h == 255) { return; }
+
+    var n = fileSize(h);
+    var buf[256];
+    var i = 0;
+    var b;
+    while (i < n) {
+        b = fileRead(h);
+        if (b < 0) { break; }
+        buf[i] = b;
+        i = i + 1;
+    }
+    fileClose(h);
+}
+```
+
 ## Events and Callbacks
 
 Callbacks are functions called by the system in response to events. They are defined as regular functions with special names. The compiler automatically detects them and assigns the correct function kind in the VM image header.
@@ -1105,6 +1221,7 @@ Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnUserMessage
 | Call stack | 8 deep |
 | Callback queue | 8 pending |
 | String pool | 2,048 bytes, 32 slots |
+| Open files | 2 simultaneous (handles 1 and 2) |
 | Bytecode | limited by flash resource or 2KB via USART |
 | Clip rects | 32 rectangles |
 
