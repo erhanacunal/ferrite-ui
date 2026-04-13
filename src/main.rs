@@ -252,7 +252,8 @@ fn init_ports() {
         core::ptr::write_volatile((GPIOB + 0x04) as *mut u32, 0x3333_3333);
 
         // GPIOA CTL0 (PA0-PA7)
-        core::ptr::write_volatile((GPIOA + 0x00) as *mut u32, 0xB4B3_3334);
+        // PA6 nibble = 0x8 (pulled input) — matches original firmware SpiAndPortA_5_6_7_Config
+        core::ptr::write_volatile((GPIOA + 0x00) as *mut u32, 0xB8B3_3334);
 
         // GPIOA CTL1 (PA8-PA15)
         let ctl1 = (GPIOA + 0x04) as *mut u32;
@@ -834,6 +835,14 @@ fn main() -> ! {
         } else {
             // Released early — clear bar, continue normal boot
             ctx.lcd.fill_rect(0, 0, 800, bar_h, COLOR_BLACK);
+        }
+    }
+
+    // 3.5. SD card boot check — flash PROGRAM.BIN or enter recovery via EMPTY.BIN
+    if error_code == 0 {
+        let ret = sd_boot_check(&ctx.lcd, &ctx.flash, ctx.fonts.embedded());
+        if ret != 0 {
+            error_code = ret;
         }
     }
 
