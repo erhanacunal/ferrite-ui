@@ -836,6 +836,12 @@ var len = strLen(s);           // byte length
 var val = parseInt(str("42")); // parse int
 var fv = parseFloat(str("3.14")); // parse float
 
+// Build a string from a byte buffer (e.g. after fileRead loop)
+var buf[64];
+buf[0] = 72; buf[1] = 105;     // 'H', 'i'
+var hi = arrToStr(buf, 2);     // → "Hi"  (takes low byte of each element)
+var full = arrToStr(buf);      // whole array (pads with NUL from unused slots)
+
 // Display on widget
 target(label);
 setText(msg);
@@ -1036,6 +1042,46 @@ fn setup() {
     fileClose(h);
 }
 ```
+
+### Example: Display File Contents as a Label
+
+Use `arrToStr(arr, len)` to turn a byte buffer into a string you can pass to
+`setText` or `drawStr`. The low byte of each array element becomes one
+character — exactly what `fileRead` produces.
+
+```c
+var label;
+
+fn setup() {
+    label = alloc();
+    parent(0);
+    target(label);
+    set(loc, 10, 10);
+    set(size, 400, 40);
+
+    var h = fileOpen(str("message"));
+    if (h == 255) { return; }
+
+    var buf[256];
+    var i = 0;
+    var b;
+    while (i < 256) {
+        b = fileRead(h);
+        if (b < 0) { break; }
+        buf[i] = b;
+        i = i + 1;
+    }
+    fileClose(h);
+
+    var s = arrToStr(buf, i);   // convert first `i` bytes to a string
+    target(label);
+    setText(s);
+}
+```
+
+Passing `arrToStr(buf)` without a length uses the full array — any unused
+slots contribute NUL bytes, so prefer the two-argument form when the valid
+byte count is known (as it is after a `fileRead` loop).
 
 ## Events and Callbacks
 

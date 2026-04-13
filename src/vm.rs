@@ -289,6 +289,7 @@ const OP_FILE_OPEN: u8 = 0xA2;  // pop str_id (name) → push handle (1|2|0xFF)
 const OP_FILE_READ: u8 = 0xA3;  // pop handle → push byte (0..255) or -1 on EOF
 const OP_FILE_SIZE: u8 = 0xA4;  // pop handle → push size
 const OP_FILE_CLOSE: u8 = 0xA5; // pop handle, release slot
+const OP_ARR_TO_STR: u8 = 0xA6; // pop len, pop arr_id → alloc string from low bytes of arr elements (len<0 = full array)
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -1386,6 +1387,33 @@ impl Vm {
                 let handle = self.pop();
                 match self.file_slot_index(handle) {
                     Some(idx) => self.open_files[idx] = None,
+                    None => self.state = VmState::Error,
+                }
+            }
+            OP_ARR_TO_STR => {
+                let len = self.pop();
+                let arr_id = self.pop();
+                match self.find_array(arr_id) {
+                    Some(pos) => {
+                        let data = &self.arrays[pos].data;
+                        let take = if len < 0 {
+                            data.len()
+                        } else {
+                            (len as usize).min(data.len())
+                        };
+                        let mut buf = [0u8; 256];
+                        if take > buf.len() {
+                            self.state = VmState::Error;
+                        } else {
+                            for i in 0..take {
+                                buf[i] = data[i] as u8;
+                            }
+                            match ctx.strpool.alloc(&buf[..take]) {
+                                Some(id) => self.push(id as i32),
+                                None => self.state = VmState::Error,
+                            }
+                        }
+                    }
                     None => self.state = VmState::Error,
                 }
             }

@@ -2330,6 +2330,25 @@ class CodeGen:
             self.asm.arr_free()
             return
 
+        if name == 'arrToStr':
+            # arrToStr(arr) or arrToStr(arr, len) → str_id
+            # Bytes are the low byte of each array element (arr[i] & 0xFF).
+            # If len omitted, full array is used. Typical use: after fileRead loop.
+            if len(node.args) not in (1, 2):
+                raise CompileError("arrToStr() takes 1 or 2 arguments: arr, [len]", node.line)
+            arg = node.args[0]
+            if isinstance(arg, VarRef) and arg.name in self.array_vars:
+                slot = self._var_slot(arg.name, node.line)
+                self.asm.load(slot)
+            else:
+                self._gen_expr(arg)
+            if len(node.args) == 2:
+                self._gen_expr(node.args[1])
+            else:
+                self.asm.push(-1)  # sentinel: use full array
+            self.asm.builtin(Builtin.ARR_TO_STR)
+            return
+
         # --- Built-in: rounded rect & arc ---
 
         if name == 'roundedRect':

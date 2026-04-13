@@ -183,6 +183,7 @@ class Builtin:
     FILE_READ = 35  # (handle) → byte(0..255) or -1 on EOF
     FILE_SIZE = 36  # (handle) → size in bytes
     FILE_CLOSE = 37 # (handle) — release slot
+    ARR_TO_STR = 38 # (arr_id, len) → str_id  (len<0 = full array; bytes are low byte of each element)
 
 
 class Prop:
@@ -908,6 +909,8 @@ OP_NAMES = {
     0x9A: 'rtcRead', 0x9B: 'rtcWrite', 0x9C: 'millis',
     0x9D: 'fpgaCmd', 0x9E: 'fpgaData', 0x9F: 'critical',
     0xA0: 'setBrightness', 0xA1: 'brightness',
+    0xA2: 'fileOpen', 0xA3: 'fileRead', 0xA4: 'fileSize', 0xA5: 'fileClose',
+    0xA6: 'arrToStr',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -937,7 +940,7 @@ PROP_NAMES = {
 _NO_ARG_OPS = (
     set(range(0x00, 0x1C)) |           # 0x00-0x1B
     set(range(0x20, 0x2E)) |           # 0x20-0x2D
-    {op for op in range(0x80, 0xA2)    # 0x80-0xA1 except 0x86, 0x88
+    {op for op in range(0x80, 0xA7)    # 0x80-0xA6 except 0x86, 0x88
      if op not in (0x86, 0x88)} |
     set(range(0xC0, 0xCD))             # 0xC0-0xCC
 )
