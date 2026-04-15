@@ -19,6 +19,12 @@ pub const FLAG_DIRTY_B: u16 = 1 << 8;
 /// Combined mask: dirty in both buffers. Used by mark_dirty().
 pub const FLAG_DIRTY_AB: u16 = FLAG_DIRTY_A | FLAG_DIRTY_B;
 
+/// Set when the widget has been drawn at least once since its last erase.
+/// Used by `render_dirty`'s erase pass to skip widgets that were never
+/// rendered — prevents "phantom erase" of animated-but-invisible widgets
+/// (e.g. a progress bar on a hidden tab that keeps marking itself dirty).
+pub const FLAG_RENDERED: u16 = 1 << 9;
+
 // --- Widget Kind ---
 
 pub const KIND_BASE: u8 = 0;

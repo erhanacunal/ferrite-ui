@@ -3,9 +3,29 @@ name = "ferrite-ui"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["firmware"]
+firmware = ["dep:cortex-m", "dep:cortex-m-rt"]
+host = ["dep:minifb"]
+
 [dependencies]
-cortex-m = "0.7"
-cortex-m-rt = { version = "0.7", features = ["device"] }
+cortex-m = { version = "0.7", optional = true }
+cortex-m-rt = { version = "0.7", features = ["device"], optional = true }
+minifb = { version = "0.27", optional = true }
+
+[lib]
+name = "ferrite_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferrite-ui"
+path = "src/main.rs"
+required-features = ["firmware"]
+
+[[bin]]
+name = "sim"
+path = "src/bin/sim.rs"
+required-features = ["host"]
 
 [profile.release]
 opt-level = "s"

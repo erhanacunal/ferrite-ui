@@ -4,8 +4,8 @@ use crate::lcd::{self, Lcd};
 use crate::types::{Color, Edges, Rect};
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_PRESSED,
-    KIND_CHECKBOX, KIND_GAUGE, KIND_INPUT, KIND_LABEL, KIND_PROGRESS, KIND_RADIO, KIND_SLIDER,
-    Widget, WidgetExt, WidgetId, WidgetTree,
+    FLAG_RENDERED, KIND_CHECKBOX, KIND_GAUGE, KIND_INPUT, KIND_LABEL, KIND_PROGRESS, KIND_RADIO,
+    KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
 };
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
@@ -54,6 +54,7 @@ pub fn render_buffered_content(ctx: &mut Ctx) {
         }
 
         draw_widget(ctx, id, &abs);
+        ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
     }
 
     // Draw scrollbars on top
@@ -112,6 +113,7 @@ fn render_all_iterative(ctx: &mut Ctx) {
                 && abs.bottom() <= viewport.bottom()
             {
                 draw_widget(ctx, id, &abs);
+                ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
             } else {
                 // Outside or partially visible — skip entire subtree
                 let mut end = i + 1;
@@ -123,6 +125,7 @@ fn render_all_iterative(ctx: &mut Ctx) {
             }
         } else {
             draw_widget(ctx, id, &abs);
+            ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
         }
         i += 1;
     }
@@ -158,17 +161,24 @@ pub fn render_dirty(ctx: &mut Ctx) {
         return;
     }
 
-    // Pass 1: erase dirty widgets that became invisible
+    // Pass 1: erase dirty widgets that became invisible.
+    // Only erase widgets that were actually drawn before (FLAG_RENDERED).
+    // Without this gate, an animated widget on a hidden page (e.g. a progress
+    // bar still being ticked by loop()) would repaint its stale rect every
+    // frame with the ancestor bg, overwriting whatever sibling page is shown.
     for di in 0..dfs.len() {
         let id = dfs[di];
         if !ctx.tree.get(id).is_dirty() {
             continue;
         }
         if !ctx.tree.is_tree_visible(id) {
-            let abs = ctx.tree.absolute_rect(id);
-            if !abs.is_empty() {
-                let bg = ancestor_bg(&ctx.tree, id);
-                fill_rect_screen(&ctx.lcd, abs, bg);
+            if ctx.tree.get(id).flags & FLAG_RENDERED != 0 {
+                let abs = ctx.tree.absolute_rect(id);
+                if !abs.is_empty() {
+                    let bg = ancestor_bg(&ctx.tree, id);
+                    fill_rect_screen(&ctx.lcd, abs, bg);
+                }
+                ctx.tree.get_mut(id).flags &= !FLAG_RENDERED;
             }
         }
     }
@@ -237,6 +247,7 @@ pub fn render_dirty(ctx: &mut Ctx) {
 
             if !clip.is_empty() {
                 draw_widget_clipped(ctx, sid, &sabs, &clip);
+                ctx.tree.get_mut(sid).flags |= FLAG_RENDERED;
             }
         }
     }

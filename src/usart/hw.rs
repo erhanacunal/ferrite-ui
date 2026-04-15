@@ -13,7 +13,7 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-// --- Donanım adresleri ---
+use super::UsartBackend;
 
 const USART0_BASE: u32 = 0x4001_3800;
 const USART_STAT: u32 = USART0_BASE + 0x00;
@@ -23,19 +23,16 @@ const USART_CTL0: u32 = USART0_BASE + 0x0C;
 const USART_CTL1: u32 = USART0_BASE + 0x10;
 const USART_CTL2: u32 = USART0_BASE + 0x14;
 
-// NVIC
-const NVIC_ISER1: u32 = 0xE000_E104; // IRQ 32–63 enable
+const NVIC_ISER1: u32 = 0xE000_E104;
 
-// USART_STAT bitleri
-const STAT_TBE: u32 = 1 << 7;  // Transmit data buffer empty
-const STAT_TC: u32 = 1 << 6;   // Transmission complete
-const STAT_RBNE: u32 = 1 << 5; // Read data buffer not empty
+const STAT_TBE: u32 = 1 << 7;
+const STAT_TC: u32 = 1 << 6;
+const STAT_RBNE: u32 = 1 << 5;
 
-// USART_CTL0 bitleri
-const CTL0_UEN: u32 = 1 << 13;   // USART enable
-const CTL0_TE: u32 = 1 << 3;     // Transmitter enable
-const CTL0_RE: u32 = 1 << 2;     // Receiver enable
-const CTL0_RBNEIE: u32 = 1 << 5; // RBNE interrupt enable
+const CTL0_UEN: u32 = 1 << 13;
+const CTL0_TE: u32 = 1 << 3;
+const CTL0_RE: u32 = 1 << 2;
+const CTL0_RBNEIE: u32 = 1 << 5;
 
 // --- RX Ring Buffer ---
 // ISR yazar (head), main okur (tail). SPSC — lock gerekmez.
@@ -44,14 +41,10 @@ const RX_BUF_SIZE: usize = 128;
 const RX_BUF_MASK: u8 = (RX_BUF_SIZE - 1) as u8;
 
 static mut RX_BUF: [u8; RX_BUF_SIZE] = [0; RX_BUF_SIZE];
-static mut RX_HEAD: u8 = 0; // sonraki yazma pozisyonu (sadece ISR yazar)
-static mut RX_TAIL: u8 = 0; // sonraki okuma pozisyonu (sadece main yazar)
+static mut RX_HEAD: u8 = 0;
+static mut RX_TAIL: u8 = 0;
 static RX_READY: AtomicBool = AtomicBool::new(false);
 
-// --- USART0 ISR ---
-
-/// USART0 interrupt handler — RBNE tetikler.
-/// Ring buffer'a byte yazar, taşma durumunda eski veriyi ezer (head ilerler).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn USART0() {
     unsafe {
@@ -66,7 +59,6 @@ pub unsafe extern "C" fn USART0() {
             let new_head = (head.wrapping_add(1)) & RX_BUF_MASK;
             write_volatile(&raw mut RX_HEAD, new_head);
 
-            // Taşma: tail'i ilerlet (en eski byte kaybolur)
             let tail = read_volatile(&raw const RX_TAIL);
             if new_head == tail {
                 write_volatile(&raw mut RX_TAIL, (tail.wrapping_add(1)) & RX_BUF_MASK);
@@ -77,77 +69,51 @@ pub unsafe extern "C" fn USART0() {
     }
 }
 
-// --- Usart driver ---
-
-pub struct Usart {
+pub struct Hw {
     _private: (),
 }
 
-impl Usart {
-    /// USART0 başlat: 115200 8N1, RX interrupt aktif.
-    /// GPIO ve clock init_ports()'ta yapıldı.
+impl Hw {
     pub fn init() -> Self {
         unsafe {
-            // USART0 devre dışı bırak (temiz başlangıç)
             write_volatile(USART_CTL0 as *mut u32, 0);
-
-            // Baud rate: 115200 @ 108MHz APB2
-            // USARTDIV = 108_000_000 / (16 × 115200) = 58.59375
-            // Register = round(58.59375 × 16) = 938 = 0x3AA
             write_volatile(USART_BAUD as *mut u32, 0x3AA);
-
-            // CTL1: 1 stop bit (00), varsayılan
             write_volatile(USART_CTL1 as *mut u32, 0);
-
-            // CTL2: flow control yok, varsayılan
             write_volatile(USART_CTL2 as *mut u32, 0);
-
-            // CTL0: 8N1, TX + RX enable, RBNE interrupt enable, USART enable
             write_volatile(
                 USART_CTL0 as *mut u32,
                 CTL0_UEN | CTL0_TE | CTL0_RE | CTL0_RBNEIE,
             );
 
-            // NVIC: USART0 = IRQ 37 → ISER1 bit 5
             let val = read_volatile(NVIC_ISER1 as *const u32);
             write_volatile(NVIC_ISER1 as *mut u32, val | (1 << 5));
         }
 
-        Usart { _private: () }
+        Hw { _private: () }
     }
+}
 
-    /// Tek byte gönder (bloklayıcı — TBE bekler).
-    pub fn write_byte(&self, byte: u8) {
+impl UsartBackend for Hw {
+    fn write_byte(&self, byte: u8) {
         unsafe {
             while read_volatile(USART_STAT as *const u32) & STAT_TBE == 0 {}
             write_volatile(USART_DATA as *mut u32, byte as u32);
         }
     }
 
-    /// Byte dizisi gönder.
-    pub fn write(&self, data: &[u8]) {
-        for &b in data {
-            self.write_byte(b);
-        }
-    }
-
-    /// Transmission complete bekle.
-    pub fn flush(&self) {
+    fn flush(&self) {
         unsafe {
             while read_volatile(USART_STAT as *const u32) & STAT_TC == 0 {}
         }
     }
 }
 
-// --- RX public API (main loop'tan çağrılır) ---
+// --- RX public API (free fns) ---
 
-/// Ring buffer'da okunacak veri var mı?
 pub fn rx_has_data() -> bool {
     RX_READY.load(Ordering::Acquire)
 }
 
-/// Ring buffer'dan tek byte oku. Boşsa None döner.
-/// Buffer tamamen boşalınca ready flag otomatik temizlenir.
 pub fn rx_read_byte() -> Option<u8> {
     unsafe {
         let tail = read_volatile(&raw const RX_TAIL);
@@ -162,7 +128,6 @@ pub fn rx_read_byte() -> Option<u8> {
         let new_tail = (tail.wrapping_add(1)) & RX_BUF_MASK;
         write_volatile(&raw mut RX_TAIL, new_tail);
 
-        // Buffer boşaldıysa flag'i temizle
         if new_tail == read_volatile(&raw const RX_HEAD) {
             RX_READY.store(false, Ordering::Release);
         }
@@ -171,7 +136,6 @@ pub fn rx_read_byte() -> Option<u8> {
     }
 }
 
-/// Ring buffer'daki mevcut byte sayısı.
 pub fn rx_len() -> u8 {
     unsafe {
         let head = read_volatile(&raw const RX_HEAD);
@@ -180,9 +144,8 @@ pub fn rx_len() -> u8 {
     }
 }
 
-// --- Debug output (free functions, no Usart instance needed) ---
+// --- Debug output (free fns, no Usart instance) ---
 
-/// Write debug bytes directly to USART hardware (blocking).
 pub fn dbg(data: &[u8]) {
     unsafe {
         for &b in data {
@@ -192,7 +155,6 @@ pub fn dbg(data: &[u8]) {
     }
 }
 
-/// Write a u16 as decimal digits to USART.
 pub fn dbg_u16(val: u16) {
     let mut buf = [0u8; 5];
     let mut n = val;
@@ -209,7 +171,6 @@ pub fn dbg_u16(val: u16) {
     dbg(&buf[pos..]);
 }
 
-/// Ring buffer'ı sıfırla.
 pub fn rx_clear() {
     unsafe {
         cortex_m::interrupt::free(|_| {

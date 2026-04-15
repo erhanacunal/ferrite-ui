@@ -64,7 +64,7 @@ fn panic(info: &PanicInfo) -> ! {
 
     // Construct LCD from raw GPIO (zero-sized, no state needed)
     let gpio = Gpio::init();
-    let mut lcd = Lcd::new(gpio);
+    let lcd = Lcd::new(gpio);
 
     // Construct embedded font (all data in ROM)
     let font = Font::from_embedded(
