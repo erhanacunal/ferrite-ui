@@ -175,8 +175,7 @@ pub fn render_dirty(ctx: &mut Ctx) {
             if ctx.tree.get(id).flags & FLAG_RENDERED != 0 {
                 let abs = ctx.tree.absolute_rect(id);
                 if !abs.is_empty() {
-                    let bg = ancestor_bg(&ctx.tree, id);
-                    fill_rect_screen(&ctx.lcd, abs, bg);
+                    erase_widget_area(&ctx.tree, &ctx.lcd, id, abs);
                 }
                 ctx.tree.get_mut(id).flags &= !FLAG_RENDERED;
             }
@@ -267,25 +266,6 @@ pub fn render_dirty(ctx: &mut Ctx) {
 
 // --- Drawing ---
 
-/// Find the nearest ancestor with a non-zero background color.
-fn ancestor_bg(tree: &WidgetTree, id: WidgetId) -> Color {
-    let mut pid = tree.get(id).parent;
-    let max = tree.count();
-    let mut depth = 0usize;
-    while pid.is_some() {
-        let bg = tree.get(pid).background_color;
-        if bg != 0 {
-            return bg;
-        }
-        pid = tree.get(pid).parent;
-        depth += 1;
-        if depth > max {
-            break;
-        }
-    }
-    0
-}
-
 /// Effective background color for a widget.
 /// If the widget is pressed and has press_color, returns press_color.
 /// If a parent is pressed and this widget shares the same background,
@@ -327,6 +307,9 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
     let r = ext.border_radius;
     let bg_color = effective_bg(&ctx.tree, widget, ext);
     let draw_bg = bg_color != 0 || widget.kind != KIND_LABEL;
+    // Only apply gradient when the widget is in its normal (non-pressed) state.
+    let gdir = if bg_color == widget.background_color { ctx.tree.gradient_dir(id) } else { 0 };
+    let gcol = if gdir != 0 { ctx.tree.gradient_color(id) } else { 0 };
 
     if r > 0 {
         let bw = b.top.max(b.bottom).max(b.left).max(b.right);
@@ -349,7 +332,11 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
             let bg = inner_rect(abs, &b);
             if !bg.is_empty() {
                 let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
-                fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+                if gdir != 0 {
+                    fill_gradient_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color, gcol, gdir);
+                } else {
+                    fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+                }
             }
         }
     } else {
@@ -398,7 +385,11 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
         if draw_bg {
             let bg = inner_rect(abs, &b);
             if !bg.is_empty() {
-                fill_rect_screen(&ctx.lcd, bg, bg_color);
+                if gdir != 0 {
+                    fill_gradient_rect_screen(&ctx.lcd, bg, bg, bg_color, gcol, gdir);
+                } else {
+                    fill_rect_screen(&ctx.lcd, bg, bg_color);
+                }
             }
         }
     }
@@ -446,6 +437,8 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     let r = ext.border_radius;
     let bg_color = effective_bg(&ctx.tree, widget, ext);
     let draw_bg = bg_color != 0 || widget.kind != KIND_LABEL;
+    let gdir = if bg_color == widget.background_color { ctx.tree.gradient_dir(id) } else { 0 };
+    let gcol = if gdir != 0 { ctx.tree.gradient_color(id) } else { 0 };
 
     if r > 0 {
         let bw = b.top.max(b.bottom).max(b.left).max(b.right);
@@ -468,7 +461,12 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
             let bg = inner_rect(abs, &b);
             if !bg.is_empty() {
                 let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
-                fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+                // Rounded rect clip is not applied (same as solid — too complex to clip a rounded fill).
+                if gdir != 0 {
+                    fill_gradient_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color, gcol, gdir);
+                } else {
+                    fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+                }
             }
         }
     } else {
@@ -503,7 +501,11 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
         if draw_bg {
             let bg = inner_rect(abs, &b);
             if !bg.is_empty() {
-                fill_clipped(&ctx.lcd, &bg, bg_color, clip);
+                if gdir != 0 {
+                    fill_gradient_clipped(&ctx.lcd, &bg, bg_color, gcol, gdir, clip);
+                } else {
+                    fill_clipped(&ctx.lcd, &bg, bg_color, clip);
+                }
             }
         }
     }
@@ -790,10 +792,59 @@ fn fill_clipped(lcd: &Lcd, rect: &Rect, color: Color, clip: &ClipRegion) {
     }
 }
 
+/// Draw gradient rect clipped against clip region.
+/// `full_rect` is the logical gradient area; each visible sub-rect is filled
+/// with the correct gradient slice relative to that area.
+fn fill_gradient_clipped(
+    lcd: &Lcd,
+    full_rect: &Rect,
+    c1: Color, c2: Color, dir: u8,
+    clip: &ClipRegion,
+) {
+    for cr in clip.iter() {
+        if let Some(visible) = full_rect.intersection(cr) {
+            fill_gradient_rect_screen(lcd, visible, *full_rect, c1, c2, dir);
+        }
+    }
+}
+
 /// Draw rect clipped to screen bounds.
 fn fill_rect_screen(lcd: &Lcd, rect: Rect, color: Color) {
     if let Some(r) = rect.intersection(&SCREEN) {
         lcd.fill_rect(r.x as u16, r.y as u16, r.w, r.h, color);
+    }
+}
+
+/// Fill gradient rect clipped to screen bounds.
+/// `full_rect` is the logical gradient area so the slice is correctly computed
+/// even when `rect` is a clipped sub-region.
+fn fill_gradient_rect_screen(
+    lcd: &Lcd,
+    rect: Rect,
+    full_rect: Rect,
+    c1: Color, c2: Color, dir: u8,
+) {
+    if let Some(r) = rect.intersection(&SCREEN) {
+        let x_off = (r.x as i32 - full_rect.x as i32).max(0) as u16;
+        let y_off = (r.y as i32 - full_rect.y as i32).max(0) as u16;
+        lcd.fill_gradient_rect(
+            r.x as u16, r.y as u16, r.w, r.h,
+            c1, c2, dir,
+            x_off, y_off,
+            full_rect.w, full_rect.h,
+        );
+    }
+}
+
+/// Fill gradient rounded rect clipped to screen bounds.
+fn fill_gradient_rounded_rect_screen(
+    lcd: &Lcd,
+    rect: Rect,
+    radius: u16,
+    c1: Color, c2: Color, dir: u8,
+) {
+    if let Some(r) = rect.intersection(&SCREEN) {
+        lcd.fill_gradient_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, c1, c2, dir);
     }
 }
 
@@ -809,6 +860,35 @@ fn fill_rounded_rect_screen(lcd: &Lcd, rect: Rect, radius: u16, color: Color) {
     if let Some(r) = rect.intersection(&SCREEN) {
         lcd.fill_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, color);
     }
+}
+
+/// Erase the area of a widget that is becoming invisible by repainting the
+/// nearest ancestor background.  Handles both solid and gradient ancestors so
+/// a gradient parent is not corrupted by a solid-color erase rectangle.
+fn erase_widget_area(tree: &WidgetTree, lcd: &Lcd, id: WidgetId, abs: Rect) {
+    let mut pid = tree.get(id).parent;
+    let max = tree.count();
+    let mut depth = 0usize;
+    while pid.is_some() {
+        let bg = tree.get(pid).background_color;
+        if bg != 0 {
+            let gdir = tree.gradient_dir(pid);
+            if gdir != 0 {
+                let gcol = tree.gradient_color(pid);
+                let parent_abs = tree.absolute_rect(pid);
+                let parent_b = tree.border(pid);
+                let parent_bg_rect = inner_rect(&parent_abs, &parent_b);
+                fill_gradient_rect_screen(lcd, abs, parent_bg_rect, bg, gcol, gdir);
+            } else {
+                fill_rect_screen(lcd, abs, bg);
+            }
+            return;
+        }
+        pid = tree.get(pid).parent;
+        depth += 1;
+        if depth > max { break; }
+    }
+    fill_rect_screen(lcd, abs, 0);
 }
 
 /// Compute inner area (background area) from border box.

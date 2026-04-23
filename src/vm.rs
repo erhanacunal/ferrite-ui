@@ -9,7 +9,8 @@ use crate::systick;
 use crate::proto::{
     self, PROP_BG_COLOR, PROP_BORDER_B,
     PROP_BORDER_COLOR, PROP_BORDER_EDGES, PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_T,
-    PROP_CLICKABLE, PROP_ENABLED, PROP_FONT_ID, PROP_KIND, PROP_LOCATION, PROP_LOC_X, PROP_LOC_Y,
+    PROP_CLICKABLE, PROP_ENABLED, PROP_FONT_ID, PROP_GRADIENT_COLOR, PROP_GRADIENT_DIR,
+    PROP_KIND, PROP_LOCATION, PROP_LOC_X, PROP_LOC_Y,
     PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L, PROP_MARGIN_R, PROP_MARGIN_T, PROP_PADDING,
     PROP_IMAGE_ID, PROP_ON_CLICK, PROP_ON_PAINT, PROP_ON_TAP, PROP_BORDER_RADIUS, PROP_VALUE, PROP_CHECKED,
     PROP_MAX_LENGTH, PROP_CURSOR_POS, PROP_ON_CHANGE, PROP_SCROLL_Y, PROP_CLIP_CHILDREN,
@@ -175,8 +176,10 @@ pub struct FuncEntry {
 
 /// Image header size v1/v2: version(1) + function_count(2) + reserved(2) = 5 bytes.
 /// Image header size v3: + flags(2) = 7 bytes.
+/// Image header size v4: + widget_count(1) + ext_count(1) = 9 bytes.
 const IMAGE_HEADER_SIZE_V2: usize = 5;
 const IMAGE_HEADER_SIZE_V3: usize = 7;
+const IMAGE_HEADER_SIZE_V4: usize = 9;
 /// Each function entry: func_id(2) + kind(1) + pad(1) + offset(4) + length(4) = 12 bytes.
 const FUNC_ENTRY_SIZE: usize = 12;
 
@@ -424,6 +427,9 @@ pub struct Vm {
     global_count: u8,
     // Render mode from image header
     pub render_mode: RenderMode,
+    // Widget allocation hint from v4 image header (0 = unknown, use fallback).
+    pub widget_count: u8,
+    pub ext_count: u8,
     // Open file slots — index 0 = handle 1, index 1 = handle 2.
     open_files: [Option<OpenFile>; 2],
 }
@@ -460,6 +466,8 @@ impl Vm {
             frame_size: 0,
             global_count: 0,
             render_mode: RenderMode::Dirty,
+            widget_count: 0,
+            ext_count: 0,
             open_files: [None, None],
         }
     }
@@ -499,7 +507,7 @@ impl Vm {
     /// Load a VM image from RAM bytes. Parses the image header and keeps
     /// opcodes in a Vec<u8>. Returns false if the header is invalid.
     pub fn load_ram(&mut self, image: &[u8]) -> bool {
-        if let Some((funcs, opcode_start, gc, rm)) = parse_image_header(image) {
+        if let Some((funcs, opcode_start, gc, rm, wc, ec)) = parse_image_header(image) {
             let opcodes = image[opcode_start..].to_vec();
             self.code = VmCode::Ram(opcodes);
             self.functions = funcs;
@@ -507,6 +515,8 @@ impl Vm {
             self.frame_base = gc;
             self.frame_size = 0;
             self.render_mode = rm;
+            self.widget_count = wc;
+            self.ext_count = ec;
             true
         } else {
             false
@@ -517,12 +527,12 @@ impl Vm {
     /// opcodes are read on demand from flash via SPI.
     pub fn load_flash(&mut self, flash: &Flash, base: u32, total_len: usize) -> bool {
         // Read header into a stack buffer
-        let hdr_max = IMAGE_HEADER_SIZE_V3 + FUNC_ENTRY_SIZE * 64; // max 64 functions
+        let hdr_max = IMAGE_HEADER_SIZE_V4 + FUNC_ENTRY_SIZE * 64; // max 64 functions
         let read_len = total_len.min(hdr_max);
-        let mut hdr_buf = [0u8; IMAGE_HEADER_SIZE_V3 + FUNC_ENTRY_SIZE * 64]; // 775 bytes on stack
+        let mut hdr_buf = [0u8; IMAGE_HEADER_SIZE_V4 + FUNC_ENTRY_SIZE * 64]; // 777 bytes on stack
         flash.read(base, &mut hdr_buf[..read_len]);
 
-        if let Some((funcs, opcode_start, gc, rm)) = parse_image_header(&hdr_buf[..read_len]) {
+        if let Some((funcs, opcode_start, gc, rm, wc, ec)) = parse_image_header(&hdr_buf[..read_len]) {
             let opcode_base = base + opcode_start as u32;
             let opcode_len = total_len.saturating_sub(opcode_start);
             self.code = VmCode::Flash {
@@ -538,6 +548,8 @@ impl Vm {
             self.frame_base = gc;
             self.frame_size = 0;
             self.render_mode = rm;
+            self.widget_count = wc;
+            self.ext_count = ec;
             true
         } else {
             false
@@ -1525,6 +1537,8 @@ impl Vm {
                 PROP_CURSOR_POS => ext.value = val as i16,
                 PROP_ON_CHANGE => ext.on_tap = val as u16,
                 PROP_SCROLL_Y => ext.value = val as i16,
+                PROP_GRADIENT_COLOR => ext.gradient_color = val as u16,
+                PROP_GRADIENT_DIR => ext.gradient_dir = val as u8,
                 _ => {}
             }
         }
@@ -1573,6 +1587,8 @@ impl Vm {
             PROP_CURSOR_POS => ctx.tree.value(self.target) as i32,
             PROP_ON_CHANGE => ctx.tree.on_tap(self.target) as i32,
             PROP_SCROLL_Y => ctx.tree.value(self.target) as i32,
+            PROP_GRADIENT_COLOR => ctx.tree.gradient_color(self.target) as i32,
+            PROP_GRADIENT_DIR => ctx.tree.gradient_dir(self.target) as i32,
             _ => 0,
         }
     }
@@ -1737,22 +1753,25 @@ impl Vm {
 
 // === Image header parser ===
 
-/// Parse VM image header. Returns (function table, opcode start offset).
+/// Parse VM image header. Returns (function table, opcode start, global_count, render_mode,
+/// widget_count, ext_count). widget_count/ext_count are 0 for v1-v3 images.
 ///
 /// Format v1/v2:
 ///   version(u8) + function_count(u16 LE) + global_count(u16 LE)
 ///   + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
 /// Format v3 (adds flags):
 ///   version(u8) + function_count(u16 LE) + global_count(u16 LE) + flags(u16 LE)
-///   + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
+///   + [...]
+/// Format v4 (adds widget/ext counts):
+///   v3 header + widget_count(u8) + ext_count(u8) + [...]
 ///   flags bit 0: render_mode (0=dirty, 1=buffered)
-fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderMode)> {
+fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderMode, u8, u8)> {
     if data.len() < IMAGE_HEADER_SIZE_V2 {
         return None;
     }
 
     let version = data[0];
-    if version < 1 || version > 3 {
+    if version < 1 || version > 4 {
         return None;
     }
 
@@ -1764,16 +1783,23 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderM
         0
     };
 
-    // v3: flags field after global_count
-    let (header_size, render_mode) = if version >= 3 {
+    // v3+: flags field after global_count
+    let (header_size, render_mode, widget_count, ext_count) = if version >= 4 {
+        if data.len() < IMAGE_HEADER_SIZE_V4 {
+            return None;
+        }
+        let flags = u16::from_le_bytes([data[5], data[6]]);
+        let rm = if flags & 0x01 != 0 { RenderMode::Buffered } else { RenderMode::Dirty };
+        (IMAGE_HEADER_SIZE_V4, rm, data[7], data[8])
+    } else if version >= 3 {
         if data.len() < IMAGE_HEADER_SIZE_V3 {
             return None;
         }
         let flags = u16::from_le_bytes([data[5], data[6]]);
         let rm = if flags & 0x01 != 0 { RenderMode::Buffered } else { RenderMode::Dirty };
-        (IMAGE_HEADER_SIZE_V3, rm)
+        (IMAGE_HEADER_SIZE_V3, rm, 0u8, 0u8)
     } else {
-        (IMAGE_HEADER_SIZE_V2, RenderMode::Dirty)
+        (IMAGE_HEADER_SIZE_V2, RenderMode::Dirty, 0u8, 0u8)
     };
 
     let table_size = func_count * FUNC_ENTRY_SIZE;
@@ -1806,7 +1832,7 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderM
         });
     }
 
-    Some((functions, opcode_start, global_count, render_mode))
+    Some((functions, opcode_start, global_count, render_mode, widget_count, ext_count))
 }
 
 // --- Packed u32 helper ---

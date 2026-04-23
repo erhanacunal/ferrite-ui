@@ -2717,14 +2717,16 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
 
 
 def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty"):
-    """Compile source to VM image format (v3 header).
+    """Compile source to VM image format (v4 header).
 
-    Image format (v3):
-      version(u8=3) + function_count(u16 LE) + global_count(u16 LE) + flags(u16 LE)
+    Image format (v4):
+      version(u8=4) + function_count(u16 LE) + global_count(u16 LE) + flags(u16 LE)
+      + widget_count(u8) + ext_count(u8)
       + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
       + opcodes...
 
     Flags bit 0: render_mode (0=dirty, 1=buffered)
+    widget_count: number of alloc() call sites for firmware Vec pre-allocation.
 
     Requires fn setup() and fn loop() in the source.
     Global variables (top-level var) are supported.
@@ -2760,7 +2762,16 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
                 func_names[offset] = fn_name
 
         flags = 0x01 if render_mode == "buffered" else 0x00
-        header = cc.build_image_header(global_count=len(codegen.global_vars), flags=flags)
+        # widget_count = alloc() call sites in the program (root widget 0 excluded).
+        # ext_count is set equal to widget_count — conservative but accurate for typical UIs.
+        widget_count = codegen.next_widget_id - 1
+        ext_count = widget_count
+        header = cc.build_image_header(
+            global_count=len(codegen.global_vars),
+            flags=flags,
+            widget_count=widget_count,
+            ext_count=ext_count,
+        )
         image = header + bytecode
 
         # Stash function name map on the bytes object for CLI use
@@ -2821,7 +2832,12 @@ def _extract_labels(image):
 
 def _image_header_size(version, func_count):
     """Return header size in bytes for the given version."""
-    base = 7 if version >= 3 else 5
+    if version >= 4:
+        base = 9
+    elif version >= 3:
+        base = 7
+    else:
+        base = 5
     return base + func_count * 12
 
 
@@ -2831,7 +2847,7 @@ def _print_image_header(output):
     version = output[0]
     func_count = struct.unpack_from('<H', output, 1)[0]
     global_count = struct.unpack_from('<H', output, 3)[0]
-    hdr_base = 7 if version >= 3 else 5
+    hdr_base = _image_header_size(version, 0)  # fixed part only
     opcode_start = hdr_base + func_count * 12
 
     extra = ''
@@ -2839,6 +2855,9 @@ def _print_image_header(output):
         flags = struct.unpack_from('<H', output, 5)[0]
         rm = 'buffered' if flags & 0x01 else 'dirty'
         extra = f', render={rm}'
+    if version >= 4:
+        wc, ec = output[7], output[8]
+        extra += f', widgets={wc}, exts={ec}'
 
     print(f'; image v{version}: {func_count} functions, {global_count} globals, opcodes={len(output) - opcode_start}B{extra}')
     for i in range(func_count):

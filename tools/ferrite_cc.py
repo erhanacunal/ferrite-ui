@@ -231,6 +231,8 @@ class Prop:
     ON_CHANGE = 0x28
     SCROLL_Y = 0x29
     CLIP_CHILDREN = 0x2A
+    GRADIENT_COLOR = 0x2B  # End color of background gradient
+    GRADIENT_DIR = 0x2C    # 0=none, 1=horizontal (L→R), 2=vertical (T→B)
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -1153,6 +1155,8 @@ PROP_MAP = {
     'on_change': (Prop.ON_CHANGE, False),
     'scroll_y': (Prop.SCROLL_Y, False),
     'clip_children': (Prop.CLIP_CHILDREN, False),
+    'gradient_color': (Prop.GRADIENT_COLOR, False),
+    'gradient_dir': (Prop.GRADIENT_DIR, False),
     'text': (Prop.TEXT, True),
     'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }
@@ -1419,24 +1423,29 @@ class Compiler:
         fid, kind, offset, _ = self._funcs[name]
         self._funcs[name] = (fid, kind, offset, length)
 
-    def build_image_header(self, global_count=0, flags=0):
+    def build_image_header(self, global_count=0, flags=0, widget_count=0, ext_count=0):
         """Build VM image header binary.
 
-        Format (v3):
+        Format (v4):
           version(u8) + function_count(u16 LE) + global_count(u16 LE) + flags(u16 LE)
+          + widget_count(u8) + ext_count(u8)
           + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
 
         Flags:
           bit 0: render_mode (0=dirty, 1=buffered)
 
+        widget_count: number of alloc() call sites (used by firmware for Vec pre-allocation).
+        ext_count: number of widgets expected to need WidgetExt (conservative = widget_count).
+
         Each function entry is 12 bytes.
         """
         func_list = list(self._funcs.values())
         buf = bytearray()
-        buf.append(3)  # version 3: adds flags field
+        buf.append(4)  # version 4: adds widget_count + ext_count fields
         buf.extend(struct.pack('<H', len(func_list)))
         buf.extend(struct.pack('<H', global_count))
         buf.extend(struct.pack('<H', flags))
+        buf.extend(struct.pack('BB', min(widget_count, 255), min(ext_count, 255)))
         for func_id, kind, offset, length in func_list:
             buf.extend(struct.pack('<HBBI', func_id, kind, 0, offset))
             buf.extend(struct.pack('<I', length))

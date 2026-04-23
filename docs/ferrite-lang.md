@@ -498,6 +498,76 @@ set(border_color, 0xFFFF);
 set(border_radius, 12);    // 12px rounded corners
 ```
 
+### Gradient Fill
+
+Any widget can have a linear gradient background instead of a solid color.  Two
+properties control it:
+
+| Property | Values | Description |
+|---|---|---|
+| `gradient_color` | RGB565 color | End color of the gradient |
+| `gradient_dir` | `0` / `1` / `2` | Direction: 0=solid (no gradient), 1=horizontal (left→right), 2=vertical (top→bottom) |
+
+`bg_color` is always the *start* color (top for vertical, left for horizontal).
+`gradient_color` is the *end* color.  Setting `gradient_dir = 0` (default) disables
+the gradient and falls back to a solid `bg_color` fill.
+
+```c
+fn rgb565(r, g, b) {
+    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
+}
+
+fn setup() {
+    // Panel with a vertical gradient (dark blue → cyan)
+    var panel = alloc();
+    panel.size = [400, 200];
+    panel.bg_color = rgb565(0, 20, 80);       // top color
+    panel.gradient_color = rgb565(0, 180, 220); // bottom color
+    panel.gradient_dir = 2;                    // vertical
+    parent(0);
+
+    // Button with a horizontal gradient
+    var btn = alloc();
+    btn.location = [50, 50];
+    btn.size = [200, 60];
+    btn.bg_color = rgb565(200, 0, 0);          // left color
+    btn.gradient_color = rgb565(255, 180, 0);  // right color
+    btn.gradient_dir = 1;                      // horizontal
+    btn.border_radius = 8;
+    btn.clickable = 1;
+    parent(panel);
+
+    render();
+    return 0;
+}
+```
+
+Gradient direction constants (define in your program for readability):
+
+```c
+const GRADIENT_NONE = 0;
+const GRADIENT_H    = 1;   // horizontal
+const GRADIENT_V    = 2;   // vertical
+```
+
+**project.json syntax:**
+
+```json
+{
+  "type": "base",
+  "size": [400, 200],
+  "background_color": "0x0014FF",
+  "gradient_color": "0x00B4DC",
+  "gradient_dir": 2
+}
+```
+
+**Performance notes:**
+- Vertical gradients render nearly as fast as solid fills — one `fill_rect` call per row.
+- Horizontal gradients use per-pixel writes — slower for wide widgets; prefer vertical for large areas.
+- Gradient is suppressed when the widget is in pressed state (`press_color` takes priority).
+- In **dirty render mode**, widgets disappearing from a gradient-background parent may leave a solid-color artifact.  Use **buffered render mode** (`render_mode: "buffered"`) for UIs where widgets are frequently shown/hidden over gradient backgrounds.
+
 ### Progress Bar & Slider
 
 Widgets with `kind=3` (progress) or `kind=4` (slider) display a horizontal fill bar.

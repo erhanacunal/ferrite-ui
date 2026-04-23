@@ -298,6 +298,153 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
     }
 
+    /// Fill a rectangle with a linear gradient.
+    ///
+    /// `dir`: 1 = horizontal (left→right), 2 = vertical (top→bottom).
+    /// `c1` is the start color, `c2` the end color.
+    /// `x_off`/`y_off` is the offset of the visible rect within the full gradient
+    /// extent (`full_w` × `full_h`), so clipped sub-rects still show the correct
+    /// gradient slice.
+    pub fn fill_gradient_rect(
+        &self,
+        x: u16, y: u16, w: u16, h: u16,
+        c1: u16, c2: u16, dir: u8,
+        x_off: u16, y_off: u16,
+        full_w: u16, full_h: u16,
+    ) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        match dir {
+            1 => {
+                // Horizontal: one begin_pixels covers the full rect; FPGA auto-advances rows.
+                let grad_w = full_w.saturating_sub(1);
+                self.begin_pixels(x, y, w, h);
+                for _row in 0..h {
+                    for col in 0..w {
+                        self.write_pixel(lerp_rgb565(c1, c2, x_off + col, grad_w));
+                    }
+                }
+            }
+            _ => {
+                // Vertical (default): one color per row — efficient full-row fill.
+                let grad_h = full_h.saturating_sub(1);
+                for row in 0..h {
+                    let color = lerp_rgb565(c1, c2, y_off + row, grad_h);
+                    self.fill_rect(x, y + row, w, 1, color);
+                }
+            }
+        }
+    }
+
+    /// Fill a rounded rectangle with a linear gradient.
+    ///
+    /// Uses the same Midpoint Circle algorithm as `fill_rounded_rect` but
+    /// computes the gradient color per horizontal span.  `c1` is the start
+    /// color (top / left), `c2` the end color.  `dir`: 1=horizontal,
+    /// 2=vertical.
+    pub fn fill_gradient_rounded_rect(
+        &self,
+        x: u16, y: u16, w: u16, h: u16, r: u16,
+        c1: u16, c2: u16, dir: u8,
+    ) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let r = r.min(w / 2).min(h / 2);
+        if r == 0 {
+            self.fill_gradient_rect(x, y, w, h, c1, c2, dir, 0, 0, w, h);
+            return;
+        }
+
+        let xi = x as i16;
+        let yi = y as i16;
+        let wi = w as i16;
+        let hi = h as i16;
+        let ri = r as i16;
+
+        let cx_l = xi + ri;
+        let cx_r = xi + wi - ri - 1;
+        let cy_t = yi + ri;
+        let cy_b = yi + hi - ri - 1;
+
+        match dir {
+            1 => {
+                // Horizontal gradient — per-pixel horizontal spans.
+                let grad_w = w.saturating_sub(1);
+                // Middle band
+                for row_y in (y + r)..(y + h - r) {
+                    self.hspan_gradient(xi, xi + wi - 1, row_y as i16, xi, grad_w, c1, c2);
+                }
+                // Rounded corners — skip second pair when px==py (same row, would double-draw).
+                let mut px: i16 = 0;
+                let mut py: i16 = ri;
+                let mut d: i16 = 1 - ri;
+                while px <= py {
+                    self.hspan_gradient(cx_l - py, cx_r + py, cy_t - px, xi, grad_w, c1, c2);
+                    self.hspan_gradient(cx_l - py, cx_r + py, cy_b + px, xi, grad_w, c1, c2);
+                    if px != py {
+                        self.hspan_gradient(cx_l - px, cx_r + px, cy_t - py, xi, grad_w, c1, c2);
+                        self.hspan_gradient(cx_l - px, cx_r + px, cy_b + py, xi, grad_w, c1, c2);
+                    }
+                    if d < 0 { d += 2 * px + 3; } else { d += 2 * (px - py) + 5; py -= 1; }
+                    px += 1;
+                }
+            }
+            _ => {
+                // Vertical gradient — one color per horizontal span row.
+                let grad_h = h.saturating_sub(1);
+                // Middle band
+                for row_y in (y + r)..(y + h - r) {
+                    let color = lerp_rgb565(c1, c2, row_y - y, grad_h);
+                    self.hline_clipped(xi, xi + wi - 1, row_y as i16, color);
+                }
+                // Rounded corners — skip second pair when px==py (same row, would double-draw).
+                let mut px: i16 = 0;
+                let mut py: i16 = ri;
+                let mut d: i16 = 1 - ri;
+                while px <= py {
+                    let c_tp = lerp_rgb565(c1, c2, (cy_t - px - yi).max(0) as u16, grad_h);
+                    let c_bp = lerp_rgb565(c1, c2, (cy_b + px - yi).max(0) as u16, grad_h);
+                    self.hline_clipped(cx_l - py, cx_r + py, cy_t - px, c_tp);
+                    self.hline_clipped(cx_l - py, cx_r + py, cy_b + px, c_bp);
+                    if px != py {
+                        let c_tq = lerp_rgb565(c1, c2, (cy_t - py - yi).max(0) as u16, grad_h);
+                        let c_bq = lerp_rgb565(c1, c2, (cy_b + py - yi).max(0) as u16, grad_h);
+                        self.hline_clipped(cx_l - px, cx_r + px, cy_t - py, c_tq);
+                        self.hline_clipped(cx_l - px, cx_r + px, cy_b + py, c_bq);
+                    }
+                    if d < 0 { d += 2 * px + 3; } else { d += 2 * (px - py) + 5; py -= 1; }
+                    px += 1;
+                }
+            }
+        }
+    }
+
+    /// Draw a horizontal gradient span — clips to screen, then writes
+    /// each pixel individually with its interpolated color.
+    fn hspan_gradient(
+        &self,
+        x0: i16, x1: i16, y: i16,
+        full_x: i16, grad_w: u16,
+        c1: u16, c2: u16,
+    ) {
+        if y < 0 || y >= HEIGHT as i16 {
+            return;
+        }
+        let left = x0.max(0) as u16;
+        let right = x1.min(WIDTH as i16 - 1);
+        if right < 0 || left > right as u16 {
+            return;
+        }
+        let w = right as u16 - left + 1;
+        let x_base = left.saturating_sub(full_x.max(0) as u16);
+        self.begin_pixels(left, y as u16, w, 1);
+        for col in 0..w {
+            self.write_pixel(lerp_rgb565(c1, c2, x_base + col, grad_w));
+        }
+    }
+
     pub fn draw_arc(&self, cx: i16, cy: i16, r: i16, start: i16, end: i16, color: u16) {
         if r <= 0 {
             return;
@@ -343,6 +490,31 @@ impl Lcd {
     pub fn new(fb: sim::Framebuffer) -> Self {
         Self::with_backend(sim::SimLcd::new(fb))
     }
+}
+
+// === RGB565 gradient interpolation ===
+
+/// Linear interpolation between two RGB565 colors.
+/// `t` is the position in \[0, `n`\]; returns `c1` when `t`=0, `c2` when `t`=`n`.
+/// One division normalises `t` to 0–256; three channel blends use shifts only
+/// (Cortex-M3 has no hardware divide, so this saves ~2 UDIV calls per pixel).
+#[inline]
+pub fn lerp_rgb565(c1: u16, c2: u16, t: u16, n: u16) -> u16 {
+    if n == 0 {
+        return c1;
+    }
+    let r1 = (c1 >> 11) as u32;
+    let g1 = ((c1 >> 5) & 0x3F) as u32;
+    let b1 = (c1 & 0x1F) as u32;
+    let r2 = (c2 >> 11) as u32;
+    let g2 = ((c2 >> 5) & 0x3F) as u32;
+    let b2 = (c2 & 0x1F) as u32;
+    let t8 = (t.min(n) as u32 * 256) / n as u32;
+    let nt8 = 256 - t8;
+    let r = (r1 * nt8 + r2 * t8) >> 8;
+    let g = (g1 * nt8 + g2 * t8) >> 8;
+    let b = (b1 * nt8 + b2 * t8) >> 8;
+    ((r as u16) << 11) | ((g as u16) << 5) | (b as u16)
 }
 
 // === Sin/Cos lookup table (Q8 fixed-point, 0..90 degrees) ===

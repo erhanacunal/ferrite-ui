@@ -332,6 +332,10 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
             cc.set_prop("text_color", parse_color(w["text_color"]))
         if "press_color" in w:
             cc.set_prop("press_color", parse_color(w["press_color"]))
+        if "gradient_color" in w:
+            cc.set_prop("gradient_color", parse_color(w["gradient_color"]))
+        if "gradient_dir" in w:
+            cc.set_prop("gradient_dir", int(w["gradient_dir"]))
 
         # Flags
         if w.get("clickable", False):

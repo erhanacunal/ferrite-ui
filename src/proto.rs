@@ -57,6 +57,8 @@ pub const PROP_CURSOR_POS: u8 = 0x27;
 pub const PROP_ON_CHANGE: u8 = 0x28;
 pub const PROP_SCROLL_Y: u8 = 0x29;
 pub const PROP_CLIP_CHILDREN: u8 = 0x2A;
+pub const PROP_GRADIENT_COLOR: u8 = 0x2B; // End color of background gradient
+pub const PROP_GRADIENT_DIR: u8 = 0x2C;  // 0=none, 1=horizontal, 2=vertical
 
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;

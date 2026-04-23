@@ -1,0 +1,182 @@
+// gradient_demo.fl — Gradient Fill Showcase (800x480)
+//
+// 3×3 grid of gradient swatches:
+//   Col 1 — Vertical:    Navy→Cyan, DarkRed→Orange, Purple→Pink
+//   Col 2 — Horizontal:  Red→Yellow, Navy→Teal, Black→LightGray
+//   Col 3 — Rounded:     rounded vertical, interactive (press suppresses
+//                        gradient), live-animated (end color cycles hues)
+
+#include "core.fl"
+#include "color.fl"
+
+const GRADIENT_H = 1;
+const GRADIENT_V = 2;
+
+var anim_panel;
+var anim_color;
+var anim_step;
+
+fn next_hue(h) {
+    if (h == BLUE)    { return CYAN; }
+    if (h == CYAN)    { return GREEN; }
+    if (h == GREEN)   { return YELLOW; }
+    if (h == YELLOW)  { return ORANGE; }
+    if (h == ORANGE)  { return RED; }
+    if (h == RED)     { return MAGENTA; }
+    if (h == MAGENTA) { return PURPLE; }
+    return BLUE;
+}
+
+fn setup() {
+    anim_color = BLUE;
+    anim_step  = 0;
+
+    // ── Title ──
+    var l = alloc(); target(l);
+    set(kind, KIND_LABEL);
+    set(size, 800, 30);
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER);
+    set(text, "Gradient Fill Demo");
+    parent(0);
+
+    // ── Column headers ──
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 15, 32); set(size, 240, 16);
+    set(text_color, LIGHT_GRAY); set(text, "VERTICAL");
+    parent(0);
+
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 280, 32); set(size, 240, 16);
+    set(text_color, LIGHT_GRAY); set(text, "HORIZONTAL");
+    parent(0);
+
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 545, 32); set(size, 240, 16);
+    set(text_color, LIGHT_GRAY); set(text, "ROUNDED + LIVE");
+    parent(0);
+
+    // ════════════════════════════════
+    //  ROW 1
+    // ════════════════════════════════
+
+    // Sky: Navy → Cyan  (vertical)
+    var p = alloc(); target(p);
+    set(location, 15, 50); set(size, 240, 110);
+    set(bg_color, NAVY); set(gradient_color, CYAN); set(gradient_dir, GRADIENT_V);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 15, 162); set(size, 240, 14);
+    set(text_color, GRAY); set(text, "Navy - Cyan");
+    parent(0);
+
+    // Fire: Red → Yellow  (horizontal)
+    p = alloc(); target(p);
+    set(location, 280, 50); set(size, 240, 110);
+    set(bg_color, RED); set(gradient_color, YELLOW); set(gradient_dir, GRADIENT_H);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 280, 162); set(size, 240, 14);
+    set(text_color, GRAY); set(text, "Red - Yellow");
+    parent(0);
+
+    // Rounded vertical: Navy → Sky Blue
+    p = alloc(); target(p);
+    set(location, 545, 50); set(size, 240, 110);
+    set(bg_color, NAVY); set(gradient_color, SKY_BLUE); set(gradient_dir, GRADIENT_V);
+    set(border_radius, 18);
+    set(border, 2, 2, 2, 2); set(border_color, SKY_BLUE);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 545, 162); set(size, 240, 14);
+    set(text_color, GRAY); set(text, "Rounded vertical");
+    parent(0);
+
+    // ════════════════════════════════
+    //  ROW 2
+    // ════════════════════════════════
+
+    // Sunset: Dark Red → Orange  (vertical)
+    p = alloc(); target(p);
+    set(location, 15, 180); set(size, 240, 110);
+    set(bg_color, DARK_RED); set(gradient_color, ORANGE); set(gradient_dir, GRADIENT_V);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 15, 292); set(size, 240, 14);
+    set(text_color, GRAY); set(text, "Dark Red - Orange");
+    parent(0);
+
+    // Ocean: Navy → Teal  (horizontal)
+    p = alloc(); target(p);
+    set(location, 280, 180); set(size, 240, 110);
+    set(bg_color, NAVY); set(gradient_color, TEAL); set(gradient_dir, GRADIENT_H);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 280, 292); set(size, 240, 14);
+    set(text_color, GRAY); set(text, "Navy - Teal");
+    parent(0);
+
+    // Interactive: gradient suppressed on press
+    p = alloc(); target(p);
+    set(location, 545, 180); set(size, 240, 110);
+    set(bg_color, DARK_GREEN); set(gradient_color, LIME); set(gradient_dir, GRADIENT_H);
+    set(border_radius, 14);
+    set(border, 2, 2, 2, 2); set(border_color, LIME);
+    set(clickable, ON); set(press_color, DARK_GREEN);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 545, 292); set(size, 240, 14);
+    set(text_color, GRAY); set(text, "Press: gradient suppressed");
+    parent(0);
+
+    // ════════════════════════════════
+    //  ROW 3
+    // ════════════════════════════════
+
+    // Dusk: Purple → Pink  (vertical)
+    p = alloc(); target(p);
+    set(location, 15, 312); set(size, 240, 110);
+    set(bg_color, PURPLE); set(gradient_color, PINK); set(gradient_dir, GRADIENT_V);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 15, 424); set(size, 240, 14);
+    set(text_color, GRAY); set(text, "Purple - Pink");
+    parent(0);
+
+    // Grayscale: Black → Light Gray  (horizontal)
+    p = alloc(); target(p);
+    set(location, 280, 312); set(size, 240, 110);
+    set(bg_color, BLACK); set(gradient_color, LIGHT_GRAY); set(gradient_dir, GRADIENT_H);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 280, 424); set(size, 240, 14);
+    set(text_color, GRAY); set(text, "Black - Light Gray");
+    parent(0);
+
+    // Live-animated: cycles end color through rainbow hues
+    anim_panel = alloc(); target(anim_panel);
+    set(location, 545, 312); set(size, 240, 110);
+    set(bg_color, BLACK); set(gradient_color, BLUE); set(gradient_dir, GRADIENT_H);
+    set(border_radius, 14);
+    set(border, 2, 2, 2, 2); set(border_color, DARK_GRAY);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 545, 424); set(size, 240, 14);
+    set(text_color, GRAY); set(text, "Live: end color cycles");
+    parent(0);
+
+    render();
+    return 0;
+}
+
+fn loop() {
+    anim_step += 1;
+    if (anim_step >= 60) {
+        anim_step = 0;
+        anim_color = next_hue(anim_color);
+        target(anim_panel);
+        set(gradient_color, anim_color);
+        dirty();
+        render();
+    }
+    delay(33);
+}

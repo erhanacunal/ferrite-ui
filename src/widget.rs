@@ -150,7 +150,7 @@ impl Widget {
     }
 }
 
-// --- WidgetExt (32 bytes) ---
+// --- WidgetExt (36 bytes) ---
 
 /// Extension data for widgets that need edges, text, callbacks, etc.
 /// Allocated on demand -- simple containers skip this entirely.
@@ -181,6 +181,10 @@ pub struct WidgetExt {
 
     // Value (2 bytes)
     pub value: i16,
+
+    // Gradient (3 bytes)
+    pub gradient_color: Color, // End color (background_color is start)
+    pub gradient_dir: u8,      // 0=none, 1=horizontal (L→R), 2=vertical (T→B)
 }
 
 impl WidgetExt {
@@ -202,6 +206,8 @@ impl WidgetExt {
         on_paint: 0,
         on_tap: 0,
         value: 0,
+        gradient_color: 0,
+        gradient_dir: 0,
     };
 
     fn new() -> Self {
@@ -214,8 +220,8 @@ impl WidgetExt {
 /// Heap-allocated widget tree with on-demand extensions.
 ///
 /// Base widgets (18B each) hold tree links + layout.
-/// Extensions (32B each) hold edges, text, callbacks -- allocated only
-/// when a non-default property is set. Pure containers pay 18B instead of 48B.
+/// Extensions (36B each) hold edges, text, callbacks, gradient -- allocated
+/// only when a non-default property is set.
 ///
 /// DFS order is cached and rebuilt lazily when the tree structure changes.
 pub struct WidgetTree {
@@ -235,6 +241,15 @@ impl WidgetTree {
             dfs_cache: Vec::new(),
             dfs_valid: false,
         }
+    }
+
+    /// Pre-allocate capacity for widget_count user widgets and ext_count extensions.
+    /// Called once after image header is parsed, before any alloc() calls run.
+    /// This prevents heap fragmentation from interleaved Vec doublings.
+    pub fn reserve(&mut self, widget_count: usize, ext_count: usize) {
+        self.widgets.reserve(widget_count);
+        self.extensions.reserve(ext_count);
+        self.dfs_cache.reserve(widget_count + 1);
     }
 
     /// Remove all widgets and reset root. Frees heap memory.
@@ -366,6 +381,14 @@ impl WidgetTree {
 
     pub fn value(&self, id: WidgetId) -> i16 {
         self.ext(id).map_or(0, |e| e.value)
+    }
+
+    pub fn gradient_color(&self, id: WidgetId) -> Color {
+        self.ext(id).map_or(0, |e| e.gradient_color)
+    }
+
+    pub fn gradient_dir(&self, id: WidgetId) -> u8 {
+        self.ext(id).map_or(0, |e| e.gradient_dir)
     }
 
     // --- Tree operations ---

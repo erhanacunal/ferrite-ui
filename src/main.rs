@@ -886,6 +886,12 @@ fn main() -> ! {
                         }
                         // img_buf freed here — VM owns the opcodes via VmCode::Ram
                     }
+                    // Pre-allocate tree capacity from v4 header counts (one contiguous
+                    // allocation per Vec, no fragmentation from incremental doubling).
+                    // Falls back to 96 for v1-v3 images without count metadata.
+                    let wc = if vm.widget_count > 0 { vm.widget_count as usize } else { 96 };
+                    let ec = if vm.ext_count > 0 { vm.ext_count as usize } else { 96 };
+                    ctx.tree.reserve(wc, ec);
                 }
                 None => {
                     error_code = ERR_PROGRAM_NOT_FOUND;
@@ -1037,6 +1043,10 @@ fn main() -> ! {
                         // Fallback: treat as raw bytecode (no header)
                         vm.load_raw(prog);
                     }
+                    // Pre-allocate tree capacity from v4 header (fallback 96 for v1-v3).
+                    let wc = if vm.widget_count > 0 { vm.widget_count as usize } else { 96 };
+                    let ec = if vm.ext_count > 0 { vm.ext_count as usize } else { 96 };
+                    ctx.tree.reserve(wc, ec);
                     protocol.free_program();
 
                     error_code = 0;

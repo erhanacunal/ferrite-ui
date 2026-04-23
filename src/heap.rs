@@ -1,6 +1,6 @@
 /// Simple linked-list heap allocator for bare-metal use.
 ///
-/// 16KB static heap buffer. First-fit allocation with free-block coalescing.
+/// 14KB static heap buffer. First-fit allocation with free-block coalescing.
 /// Single-threaded (no locking) — safe for Cortex-M3 bare-metal.
 ///
 /// Usage:
@@ -11,42 +11,65 @@ use core::ptr;
 
 const HEAP_SIZE: usize = 14 * 1024;
 
-/// Minimum block size (header + at least 1 usable byte, aligned)
+/// Minimum block size (header + at least 1 usable byte, aligned to 4)
 const MIN_BLOCK: usize = HEADER_SIZE + 4;
 
-static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+/// Sentinel: free_list / next == NULL_OFFSET means end of list.
+/// Safe because valid offsets are always < HEAP_SIZE (14336) < 0xFFFF.
+const NULL_OFFSET: u16 = 0xFFFF;
 
-/// Block header — sits immediately before the user data.
-/// When free: part of the free list (next points to next free block).
-/// When allocated: size is preserved, next is unused.
+#[repr(C, align(4))]
+struct HeapStorage([u8; HEAP_SIZE]);
+static mut HEAP_MEM: HeapStorage = HeapStorage([0; HEAP_SIZE]);
+
+/// Block header — 4 bytes total (was 8 with usize+ptr on a 32-bit target).
+///
+/// `size` is the total block size including this header (max = 14336 < u16::MAX).
+/// `next` is the byte offset from the start of HEAP_MEM to the next free block,
+/// or NULL_OFFSET when this is the last free block. Only meaningful when free.
 #[repr(C)]
 struct BlockHeader {
-    /// Total block size including this header
-    size: usize,
-    /// Next free block (null = end of list). Only valid when block is free.
-    next: *mut BlockHeader,
+    size: u16,
+    next: u16,
 }
 
-const HEADER_SIZE: usize = core::mem::size_of::<BlockHeader>();
+const HEADER_SIZE: usize = core::mem::size_of::<BlockHeader>(); // 4
 
 /// Global allocator state
 struct FerriHeap {
-    free_list: *mut BlockHeader,
+    free_list: u16, // offset of first free block; NULL_OFFSET = empty
     initialized: bool,
 }
 
 static mut HEAP: FerriHeap = FerriHeap {
-    free_list: ptr::null_mut(),
+    free_list: 0, // value unused until initialized = true
     initialized: false,
 };
+
+// === Offset helpers ===
+
+#[inline]
+unsafe fn heap_base() -> *mut u8 {
+    (&raw mut HEAP_MEM).cast::<u8>()
+}
+
+#[inline]
+unsafe fn block_at(offset: u16) -> *mut BlockHeader {
+    heap_base().add(offset as usize).cast()
+}
+
+#[inline]
+unsafe fn offset_of(block: *mut BlockHeader) -> u16 {
+    (block as usize - heap_base() as usize) as u16
+}
 
 /// Initialize the heap. Must be called once at startup before any allocation.
 pub fn init() {
     unsafe {
-        let start = (&raw mut HEAP_MEM) as *mut u8 as *mut BlockHeader;
-        (*start).size = HEAP_SIZE;
-        (*start).next = ptr::null_mut();
-        HEAP.free_list = start;
+        let first = block_at(0);
+        (*first).size = HEAP_SIZE as u16;
+        (*first).next = NULL_OFFSET;
+        HEAP.free_list = 0;
         HEAP.initialized = true;
     }
 }
@@ -56,14 +79,13 @@ pub fn stats() -> (usize, usize) {
     unsafe {
         let mut total = 0usize;
         let mut largest = 0usize;
-        let mut block = HEAP.free_list;
-        while !block.is_null() {
-            let size = (*block).size;
+        let mut off = HEAP.free_list;
+        while off != NULL_OFFSET {
+            let block = block_at(off);
+            let size = (*block).size as usize;
             total += size;
-            if size > largest {
-                largest = size;
-            }
-            block = (*block).next;
+            if size > largest { largest = size; }
+            off = (*block).next;
         }
         (total, largest)
     }
@@ -78,46 +100,54 @@ unsafe fn alloc_inner(layout: Layout) -> *mut u8 {
         return ptr::null_mut();
     }
 
-    // Required size: header + user data, aligned
-    let align = layout.align().max(core::mem::align_of::<BlockHeader>());
+    // Required size: header + user data, aligned to at least BlockHeader alignment
+    let align = layout.align().max(4);
     let size = align_up(layout.size() + HEADER_SIZE, align).max(MIN_BLOCK);
 
-    // First-fit search
-    let mut prev: *mut BlockHeader = ptr::null_mut();
-    let mut current = HEAP.free_list;
+    if size > HEAP_SIZE {
+        return ptr::null_mut();
+    }
+    let size16 = size as u16;
 
-    while !current.is_null() {
-        if (*current).size >= size {
-            let remaining = (*current).size - size;
+    // First-fit search using offsets
+    let mut prev_off = NULL_OFFSET;
+    let mut cur_off = HEAP.free_list;
 
-            if remaining >= MIN_BLOCK {
+    while cur_off != NULL_OFFSET {
+        let current = block_at(cur_off);
+        let cur_size = (*current).size;
+
+        if cur_size >= size16 {
+            let remaining = cur_size - size16;
+
+            if remaining >= MIN_BLOCK as u16 {
                 // Split: create new free block after this allocation
-                let new_free = (current as *mut u8).add(size) as *mut BlockHeader;
+                let new_off = cur_off + size16;
+                let new_free = block_at(new_off);
                 (*new_free).size = remaining;
                 (*new_free).next = (*current).next;
-                (*current).size = size;
+                (*current).size = size16;
 
-                // Remove current from free list, insert new_free
-                if prev.is_null() {
-                    HEAP.free_list = new_free;
+                if prev_off == NULL_OFFSET {
+                    HEAP.free_list = new_off;
                 } else {
-                    (*prev).next = new_free;
+                    (*block_at(prev_off)).next = new_off;
                 }
             } else {
                 // Use entire block (no split)
-                if prev.is_null() {
+                if prev_off == NULL_OFFSET {
                     HEAP.free_list = (*current).next;
                 } else {
-                    (*prev).next = (*current).next;
+                    (*block_at(prev_off)).next = (*current).next;
                 }
             }
 
             // Return pointer past the header
-            return (current as *mut u8).add(HEADER_SIZE);
+            return heap_base().add(cur_off as usize + HEADER_SIZE);
         }
 
-        prev = current;
-        current = (*current).next;
+        prev_off = cur_off;
+        cur_off = (*current).next;
     }
 
     ptr::null_mut() // OOM
@@ -128,39 +158,40 @@ unsafe fn dealloc_inner(ptr: *mut u8, _layout: Layout) {
         return;
     }
 
-    // Recover header (sits just before the user pointer)
-    let block = (ptr as *mut BlockHeader).sub(1);
+    // Recover block start: sits HEADER_SIZE bytes before the user pointer
+    let block_off = (ptr as usize - heap_base() as usize - HEADER_SIZE) as u16;
+    let block = block_at(block_off);
 
-    // Insert into free list sorted by address (enables coalescing)
-    let mut prev: *mut BlockHeader = ptr::null_mut();
-    let mut current = HEAP.free_list;
+    // Insert into free list sorted by offset (enables coalescing with neighbours)
+    let mut prev_off = NULL_OFFSET;
+    let mut cur_off = HEAP.free_list;
 
-    while !current.is_null() && (current as usize) < (block as usize) {
-        prev = current;
-        current = (*current).next;
+    while cur_off != NULL_OFFSET && cur_off < block_off {
+        prev_off = cur_off;
+        cur_off = (*block_at(cur_off)).next;
     }
 
-    // Insert block between prev and current
-    (*block).next = current;
-    if prev.is_null() {
-        HEAP.free_list = block;
+    (*block).next = cur_off;
+    if prev_off == NULL_OFFSET {
+        HEAP.free_list = block_off;
     } else {
-        (*prev).next = block;
+        (*block_at(prev_off)).next = block_off;
     }
 
     // Coalesce with next block if adjacent
-    if !current.is_null() {
-        let block_end = (block as *mut u8).add((*block).size);
-        if block_end == current as *mut u8 {
-            (*block).size += (*current).size;
-            (*block).next = (*current).next;
+    if cur_off != NULL_OFFSET {
+        let block_end = block_off + (*block).size;
+        if block_end == cur_off {
+            (*block).size += (*block_at(cur_off)).size;
+            (*block).next = (*block_at(cur_off)).next;
         }
     }
 
     // Coalesce with previous block if adjacent
-    if !prev.is_null() {
-        let prev_end = (prev as *mut u8).add((*prev).size);
-        if prev_end == block as *mut u8 {
+    if prev_off != NULL_OFFSET {
+        let prev = block_at(prev_off);
+        let prev_end = prev_off + (*prev).size;
+        if prev_end == block_off {
             (*prev).size += (*block).size;
             (*prev).next = (*block).next;
         }
