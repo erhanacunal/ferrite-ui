@@ -22,7 +22,7 @@ pub struct Size {
 }
 
 /// Ekran koordinatlarında dikdörtgen
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rect {
     pub x: i16,
     pub y: i16,
@@ -84,6 +84,18 @@ impl Rect {
         } else {
             None
         }
+    }
+
+    /// Axis-aligned bounding box of two rects. Empty rects are ignored
+    /// (returning the other), so union(empty, R) == R.
+    pub fn union(&self, other: &Rect) -> Rect {
+        if self.is_empty() { return *other; }
+        if other.is_empty() { return *self; }
+        let x1 = self.x.min(other.x);
+        let y1 = self.y.min(other.y);
+        let x2 = self.right().max(other.right());
+        let y2 = self.bottom().max(other.bottom());
+        Rect::new(x1, y1, (x2 - x1) as u16, (y2 - y1) as u16)
     }
 }
 

@@ -20,7 +20,7 @@ use crate::proto::{
 };
 use crate::render;
 use crate::types::{Edges, Offset, Size};
-use crate::widget::{WidgetId, FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_VISIBLE, FLAG_DIRTY_AB};
+use crate::widget::{WidgetId, FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_VISIBLE};
 
 // === Code source — owned by VM ===
 
@@ -252,6 +252,7 @@ const OP_ARR_ALLOC: u8 = 0x3E; // + u8 size
 const OP_ARR_INIT: u8 = 0x3F;  // + u8 count + i32 values LE
 const OP_F_READ: u8 = 0x40;    // + u32 addr + u16 len
 const OP_F_WRITE: u8 = 0x41;   // + u32 addr + u8 len + data
+const OP_W_TARGET_S: u8 = 0x42; // widget id from stack (dynamic target)
 
 // Builtins as first-class opcodes (args on stack)
 const OP_FILL_RECT: u8 = 0x80;
@@ -655,7 +656,13 @@ impl Vm {
         self.mode = VmMode::Callback;
         self.state = VmState::Running;
         self.critical = false;
-        self.frame_base = self.global_count;
+        // Place the callback's frame above the interrupted function's live
+        // locals so its L0.. slots don't alias (and overwrite) them. Matches
+        // the OP_CALL convention: new frame_base = frame_base + frame_size.
+        // Clamp to at least global_count so the very first callback (setup)
+        // doesn't collide with the globals when frame_base is still 0.
+        let above = self.frame_base.wrapping_add(self.frame_size);
+        self.frame_base = if above > self.global_count { above } else { self.global_count };
         self.frame_size = 0;
     }
 
@@ -883,9 +890,7 @@ impl Vm {
             OP_W_RENDER => match self.render_mode {
                 RenderMode::Buffered => {
                     if render::buffered_has_dirty(ctx) {
-                        ctx.lcd.begin_frame();
-                        render::render_buffered_content(ctx);
-                        ctx.lcd.end_frame();
+                        render::render_buffered(ctx);
                     }
                 }
                 RenderMode::Dirty => render::render_dirty(ctx),
@@ -1005,6 +1010,10 @@ impl Vm {
             }
             OP_W_TARGET => {
                 let wid = self.read_u8();
+                self.target = WidgetId(wid);
+            }
+            OP_W_TARGET_S => {
+                let wid = self.pop() as u8;
                 self.target = WidgetId(wid);
             }
             OP_W_SET => {
@@ -1489,10 +1498,26 @@ impl Vm {
     fn set_scalar_prop(&mut self, ctx: &mut Ctx, prop_id: u8, val: i32) {
         // Base widget fields (no extension needed)
         match prop_id {
-            PROP_LOC_X => { ctx.tree.get_mut(self.target).location.x = val as i16; return; }
-            PROP_LOC_Y => { ctx.tree.get_mut(self.target).location.y = val as i16; return; }
-            PROP_SIZE_W => { ctx.tree.get_mut(self.target).size.w = val as u16; return; }
-            PROP_SIZE_H => { ctx.tree.get_mut(self.target).size.h = val as u16; return; }
+            PROP_LOC_X => {
+                ctx.tree.get_mut(self.target).location.x = val as i16;
+                ctx.tree.mark_dirty(self.target);
+                return;
+            }
+            PROP_LOC_Y => {
+                ctx.tree.get_mut(self.target).location.y = val as i16;
+                ctx.tree.mark_dirty(self.target);
+                return;
+            }
+            PROP_SIZE_W => {
+                ctx.tree.get_mut(self.target).size.w = val as u16;
+                ctx.tree.mark_dirty(self.target);
+                return;
+            }
+            PROP_SIZE_H => {
+                ctx.tree.get_mut(self.target).size.h = val as u16;
+                ctx.tree.mark_dirty(self.target);
+                return;
+            }
             PROP_VISIBLE => {
                 set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_VISIBLE, val != 0);
                 ctx.tree.mark_dirty(self.target);
@@ -1614,11 +1639,13 @@ impl Vm {
             PROP_LOCATION if count >= 2 => {
                 let w = ctx.tree.get_mut(self.target);
                 w.location = Offset { x: vals[0] as i16, y: vals[1] as i16 };
+                ctx.tree.mark_dirty(self.target);
                 return;
             }
             PROP_SIZE if count >= 2 => {
                 let w = ctx.tree.get_mut(self.target);
                 w.size = Size { w: vals[0] as u16, h: vals[1] as u16 };
+                ctx.tree.mark_dirty(self.target);
                 return;
             }
             _ => {}

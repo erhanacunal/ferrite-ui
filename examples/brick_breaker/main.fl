@@ -1,0 +1,383 @@
+// Brick Breaker — ferrite-ui demo
+// 800x480, buffered render mode, touch-controlled paddle
+
+// 58 widgets at runtime (50 bricks allocated in loop — auto-detect undercounts)
+#hint_widgets 60
+
+#include "core.fl"
+#include "color.fl"
+
+// ── Layout constants ──
+const BRICK_COLS    = 10;
+const BRICK_ROWS    = 5;
+const BRICK_W       = 75;
+const BRICK_H       = 24;
+const BRICK_CELL_W  = 80;   // brick + gap
+const BRICK_CELL_H  = 28;
+const BRICK_Y_START = 55;   // first row top (below header)
+
+const HEADER_H      = 50;
+const SCREEN_W      = 800;
+const SCREEN_H      = 480;
+
+const PADDLE_W      = 110;
+const PADDLE_H      = 14;
+const PADDLE_Y      = 452;
+
+const BALL_SIZE     = 12;
+const BALL_SPEED    = 5;
+
+// Row colors: red → orange → yellow → green → blue
+const COLOR_R0 = 0xF800;
+const COLOR_R1 = 0xFD20;
+const COLOR_R2 = 0xFFE0;
+const COLOR_R3 = 0x07E0;
+const COLOR_R4 = 0x2C9F;
+
+// ── Globals ──
+var bricks[50];         // widget IDs for each brick
+var brick_alive[50];    // 1=alive, 0=destroyed
+var bricks_alive;       // count of remaining bricks
+
+var paddle;
+var ball;
+var score_lbl;
+var lives_lbl;
+var over_lbl;
+
+var ball_x;
+var ball_y;
+var ball_dx;
+var ball_dy;
+var paddle_x;
+var score;
+var lives;
+var game_state;     // 0=playing, 1=lost, 2=won
+
+// ── Helpers ──
+
+fn row_color(r) {
+    if (r == 0) { return COLOR_R0; }
+    if (r == 1) { return COLOR_R1; }
+    if (r == 2) { return COLOR_R2; }
+    if (r == 3) { return COLOR_R3; }
+    return COLOR_R4;
+}
+
+fn update_score() {
+    target(score_lbl);
+    var s = concat(str("Score: "), itos(score));
+    set(text, s);
+    dirty();
+    strClear();
+}
+
+fn update_lives() {
+    target(lives_lbl);
+    var s = concat(str("Lives: "), itos(lives));
+    set(text, s);
+    dirty();
+    strClear();
+}
+
+fn reset_ball() {
+    ball_x = SCREEN_W / 2 - BALL_SIZE / 2;
+    ball_y = 360;
+    ball_dx = BALL_SPEED;
+    ball_dy = 0 - BALL_SPEED;
+    target(ball);
+    set(location, ball_x, ball_y);
+    dirty();
+}
+
+// ── Touch callbacks ──
+
+fn on_touch_move(x, y) {
+    if (game_state == 0) {
+        paddle_x = x - PADDLE_W / 2;
+        if (paddle_x < 0) { paddle_x = 0; }
+        if (paddle_x > SCREEN_W - PADDLE_W) { paddle_x = SCREEN_W - PADDLE_W; }
+        target(paddle);
+        set(location, paddle_x, PADDLE_Y);
+        dirty();
+    }
+}
+
+fn on_touch_down(x, y) {
+    if (game_state != 0) {
+        restart_game();
+    } else {
+        on_touch_move(x, y);
+    }
+}
+
+// ── Brick collision — called each frame ──
+
+fn check_bricks() {
+    var i = 0;
+    var hit = 0;
+    while (i < 50 && hit == 0) {
+        if (brick_alive[i]) {
+            var bc = i % BRICK_COLS;
+            var br = i / BRICK_COLS;
+            var bx = bc * BRICK_CELL_W + 2;
+            var by = BRICK_Y_START + br * BRICK_CELL_H;
+
+            if (ball_x < bx + BRICK_W &&
+                ball_x + BALL_SIZE > bx &&
+                ball_y < by + BRICK_H &&
+                ball_y + BALL_SIZE > by) {
+
+                brick_alive[i] = 0;
+                bricks_alive = bricks_alive - 1;
+                target(bricks[i]);
+                set(visible, OFF);
+                dirty();
+
+                score = score + 10;
+                update_score();
+
+                // Determine bounce axis from penetration depth
+                var ovx;
+                var ovy;
+                if (ball_x + BALL_SIZE - bx < bx + BRICK_W - ball_x) {
+                    ovx = ball_x + BALL_SIZE - bx;
+                } else {
+                    ovx = bx + BRICK_W - ball_x;
+                }
+                if (ball_y + BALL_SIZE - by < by + BRICK_H - ball_y) {
+                    ovy = ball_y + BALL_SIZE - by;
+                } else {
+                    ovy = by + BRICK_H - ball_y;
+                }
+                if (ovx < ovy) {
+                    ball_dx = 0 - ball_dx;
+                } else {
+                    ball_dy = 0 - ball_dy;
+                }
+
+                if (bricks_alive == 0) {
+                    game_state = 2;
+                    target(over_lbl);
+                    set(bg_color, 0x0320);
+                    set(text, "YOU WIN!  Tap to restart");
+                    set(visible, ON);
+                    dirty();
+                }
+                hit = 1;
+            }
+        }
+        i++;
+    }
+}
+
+// ── Restart ──
+
+fn restart_game() {
+    score = 0;
+    lives = 3;
+    bricks_alive = BRICK_ROWS * BRICK_COLS;
+    game_state = 0;
+    update_score();
+    update_lives();
+
+    target(over_lbl);
+    set(visible, OFF);
+    dirty();
+
+    var i = 0;
+    while (i < 50) {
+        brick_alive[i] = 1;
+        target(bricks[i]);
+        set(visible, ON);
+        dirty();
+        i++;
+    }
+
+    paddle_x = SCREEN_W / 2 - PADDLE_W / 2;
+    target(paddle);
+    set(location, paddle_x, PADDLE_Y);
+    dirty();
+
+    reset_ball();
+    render();
+}
+
+// ── Setup ──
+
+fn setup() {
+    bricks_alive = BRICK_ROWS * BRICK_COLS;
+    score = 0;
+    lives = 3;
+    game_state = 0;
+    paddle_x = SCREEN_W / 2 - PADDLE_W / 2;
+
+    setBrightness(100);
+
+    // Full-screen dark background
+    var bg = alloc();
+    target(bg);
+    set(size, SCREEN_W, SCREEN_H);
+    set(bg_color, 0x0841);
+    parent(0);
+
+    // Header bar
+    var hdr = alloc();
+    target(hdr);
+    set(size, SCREEN_W, HEADER_H);
+    set(bg_color, 0x0421);
+    parent(0);
+
+    var title_lbl = alloc();
+    target(title_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 0, 11);
+    set(size, 250, 28);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(text, "BRICK BREAKER");
+    parent(hdr);
+
+    score_lbl = alloc();
+    target(score_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 290, 11);
+    set(size, 220, 28);
+    set(text_color, YELLOW);
+    set(text, "Score: 0");
+    score_lbl.bg_color = 0x0421;
+    parent(hdr);
+
+    lives_lbl = alloc();
+    target(lives_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 560, 11);
+    set(size, 200, 28);
+    set(text_color, 0xFC18);
+    set(text, "Lives: 3");
+    lives_lbl.bg_color = 0x0421;
+    parent(hdr);
+
+    // Bricks (children of root — absolute screen positions)
+    var row = 0;
+    while (row < BRICK_ROWS) {
+        var col = 0;
+        var color = row_color(row);
+        while (col < BRICK_COLS) {
+            var idx = row * BRICK_COLS + col;
+            var b = alloc();
+            target(b);
+            set(location, col * BRICK_CELL_W + 2, BRICK_Y_START + row * BRICK_CELL_H);
+            set(size, BRICK_W, BRICK_H);
+            set(bg_color, color);
+            parent(0);
+            bricks[idx] = b;
+            brick_alive[idx] = 1;
+            col++;
+        }
+        row++;
+    }
+
+    // Paddle
+    paddle = alloc();
+    target(paddle);
+    set(location, paddle_x, PADDLE_Y);
+    set(size, PADDLE_W, PADDLE_H);
+    set(bg_color, WHITE);
+    parent(0);
+
+    // Ball
+    ball = alloc();
+    target(ball);
+    set(location, SCREEN_W / 2 - BALL_SIZE / 2, 360);
+    set(size, BALL_SIZE, BALL_SIZE);
+    set(bg_color, YELLOW);
+    parent(0);
+
+    ball_x = SCREEN_W / 2 - BALL_SIZE / 2;
+    ball_y = 360;
+    ball_dx = BALL_SPEED;
+    ball_dy = 0 - BALL_SPEED;
+
+    // Overlay label (game over / win — hidden initially)
+    over_lbl = alloc();
+    target(over_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 180, 185);
+    set(size, 440, 60);
+    set(bg_color, 0xA000);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(text, "GAME OVER  Tap to restart");
+    set(visible, OFF);
+    parent(0);
+
+    render();
+    return 0;
+}
+
+// ── Main loop ──
+// Compiler wraps this body in while(true){ ... yield; } — never use return.
+
+fn loop() {
+    if (game_state != 0) {
+        delay(80);
+    } else {
+        // Move ball
+        ball_x = ball_x + ball_dx;
+        ball_y = ball_y + ball_dy;
+
+        // Left / right walls
+        if (ball_x <= 0) {
+            ball_x = 0;
+            ball_dx = 0 - ball_dx;
+        }
+        if (ball_x + BALL_SIZE >= SCREEN_W) {
+            ball_x = SCREEN_W - BALL_SIZE;
+            ball_dx = 0 - ball_dx;
+        }
+
+        // Top wall (below header)
+        if (ball_y <= HEADER_H) {
+            ball_y = HEADER_H;
+            ball_dy = 0 - ball_dy;
+        }
+
+        // Paddle collision
+        if (ball_dy > 0 &&
+            ball_y + BALL_SIZE >= PADDLE_Y &&
+            ball_y + BALL_SIZE <= PADDLE_Y + PADDLE_H + BALL_SPEED &&
+            ball_x + BALL_SIZE > paddle_x &&
+            ball_x < paddle_x + PADDLE_W) {
+            ball_y  = PADDLE_Y - BALL_SIZE;
+            ball_dy = 0 - ball_dy;
+        }
+
+        // Brick collisions
+        check_bricks();
+
+        // Ball lost (fell off screen)
+        if (ball_y >= SCREEN_H) {
+            lives = lives - 1;
+            update_lives();
+            if (lives <= 0) {
+                game_state = 1;
+                target(over_lbl);
+                set(bg_color, 0xA000);
+                set(text, "GAME OVER  Tap to restart");
+                set(visible, ON);
+                dirty();
+            } else {
+                reset_ball();
+            }
+        }
+
+        // Update ball widget position
+        target(ball);
+        set(location, ball_x, ball_y);
+        dirty();
+
+        render();
+        delay(16);
+    }
+}

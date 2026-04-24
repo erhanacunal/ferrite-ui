@@ -25,6 +25,7 @@ pub const FLAG_DIRTY_AB: u16 = FLAG_DIRTY_A | FLAG_DIRTY_B;
 /// (e.g. a progress bar on a hidden tab that keeps marking itself dirty).
 pub const FLAG_RENDERED: u16 = 1 << 9;
 
+
 // --- Widget Kind ---
 
 pub const KIND_BASE: u8 = 0;
@@ -185,6 +186,14 @@ pub struct WidgetExt {
     // Gradient (3 bytes)
     pub gradient_color: Color, // End color (background_color is start)
     pub gradient_dir: u8,      // 0=none, 1=horizontal (L→R), 2=vertical (T→B)
+
+    // Rect at which the widget was last drawn to buffers A and B.
+    // The renderer compares each against the current absolute_rect and, when
+    // they differ, redraws the widgets behind `prev_rect_X` clipped to that
+    // area before drawing the widget at its new rect. Per-buffer tracking
+    // avoids an ever-growing union under continuous motion.
+    pub prev_rect_a: Rect,
+    pub prev_rect_b: Rect,
 }
 
 impl WidgetExt {
@@ -208,6 +217,8 @@ impl WidgetExt {
         value: 0,
         gradient_color: 0,
         gradient_dir: 0,
+        prev_rect_a: Rect::new(0, 0, 0, 0),
+        prev_rect_b: Rect::new(0, 0, 0, 0),
     };
 
     fn new() -> Self {
@@ -581,6 +592,7 @@ impl WidgetTree {
             child = self.widgets[child.index()].next_sibling;
         }
     }
+
 
     /// Rebuild DFS cache if invalidated.
     fn rebuild_dfs(&mut self) {

@@ -95,6 +95,7 @@ class Op:
     ARR_INIT   = 0x3F  # + u8 count + i32 values (LE)
     F_READ     = 0x40  # + u32 addr + u16 len
     F_WRITE    = 0x41  # + u32 addr + u8 len + data
+    W_TARGET_S = 0x42  # widget id from stack (dynamic target)
 
     # Builtins as first-class opcodes (all no-arg, operands on stack)
     FILL_RECT       = 0x80
@@ -586,6 +587,10 @@ class Asm:
         self._emit(Op.W_TARGET)
         self._emit_u8(widget_id)
 
+    def w_target_s(self):
+        """Set target from stack (widget id is TOS)."""
+        self._emit(Op.W_TARGET_S)
+
     def w_set(self, prop_id):
         """Set scalar property (value from stack)."""
         self._emit(Op.W_SET)
@@ -898,6 +903,7 @@ OP_NAMES = {
     0x39: 'W_TARGET', 0x3A: 'W_SET', 0x3B: 'W_GET', 0x3C: 'W_PARENT',
     0x3D: 'W_SET_LEN', 0x3E: 'ARR_ALLOC', 0x3F: 'ARR_INIT',
     0x40: 'F_READ', 0x41: 'F_WRITE',
+    0x42: 'W_TARGET_S',
 
     0x80: 'fillRect', 0x81: 'rect', 0x82: 'line', 0x83: 'circle',
     0x84: 'fillCircle', 0x85: 'drawImage', 0x86: 'drawTextLit',

@@ -36,10 +36,27 @@ class CompileError(Exception):
 
 
 # ============================================================
-# Preprocessor — #include "file.fl"
+# Preprocessor — #include "file.fl"  /  #hint_widgets N [M]
 # ============================================================
 
 _INCLUDE_RE = re.compile(r'^[ \t]*#include\s+"([^"]+)"', re.MULTILINE)
+# #hint_widgets <widget_count> [<ext_count>]
+# Overrides the compiler's static alloc()-site count for Vec pre-allocation.
+# Use when alloc() is called inside loops so the firmware reserves enough capacity.
+_HINT_WIDGETS_RE = re.compile(
+    r'^[ \t]*#hint_widgets\s+(\d+)(?:\s+(\d+))?[ \t]*(?://[^\n]*)?$',
+    re.MULTILINE,
+)
+
+
+def _extract_hint_widgets(source):
+    """Return (widget_count, ext_count) from a #hint_widgets directive, or (0, 0)."""
+    m = _HINT_WIDGETS_RE.search(source)
+    if not m:
+        return 0, 0
+    wc = min(int(m.group(1)), 255)
+    ec = min(int(m.group(2)), 255) if m.group(2) else wc
+    return wc, ec
 
 
 def preprocess(source, filename="<input>", include_dirs=None, _included=None):
@@ -78,7 +95,11 @@ def preprocess(source, filename="<input>", include_dirs=None, _included=None):
         # Recursively preprocess the included file
         return preprocess(inc_source, full_path, include_dirs, _included)
 
-    return _INCLUDE_RE.sub(_replace, source)
+    source = _INCLUDE_RE.sub(_replace, source)
+    # Strip #hint_widgets lines so the tokenizer never sees them.
+    # _extract_hint_widgets() reads them from the raw source before this call.
+    source = _HINT_WIDGETS_RE.sub('', source)
+    return source
 
 
 # ============================================================
@@ -2065,9 +2086,25 @@ class CodeGen:
                 self._current_target = arg.name
                 return
             self._last_alltar_var = None
-            wid = self._resolve_widget_id(arg)
-            self.asm.w_target(wid)
-            self._current_target = arg.name if isinstance(arg, VarRef) else None
+            if isinstance(arg, NumLit):
+                # Literal integer (e.g. target(0) for root) → static W_TARGET
+                self.asm.w_target(arg.value)
+                self._current_target = None
+            elif isinstance(arg, VarRef):
+                # Named widget variable → load runtime ID, use W_TARGET_S
+                # Static prediction fails when widgets are allocated inside loops,
+                # so always resolve at runtime.
+                if arg.name not in self.widget_ids:
+                    raise CompileError(
+                        f"'{arg.name}' is not a widget variable", arg.line)
+                self._gen_expr(arg)
+                self.asm.w_target_s()
+                self._current_target = arg.name
+            else:
+                # General expression (array subscript, etc.) → evaluate, W_TARGET_S
+                self._gen_expr(arg)
+                self.asm.w_target_s()
+                self._current_target = None
             return
 
         # --- Built-in: parent(widget) ---
@@ -2732,6 +2769,9 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
     Global variables (top-level var) are supported.
     """
     try:
+        # Extract #hint_widgets from raw source before preprocessing strips the directive.
+        hint_wc, hint_ec = _extract_hint_widgets(source)
+
         source = preprocess(source, filename, include_dirs)
         tokens = tokenize(source)
         parser = Parser(tokens)
@@ -2762,10 +2802,10 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
                 func_names[offset] = fn_name
 
         flags = 0x01 if render_mode == "buffered" else 0x00
-        # widget_count = alloc() call sites in the program (root widget 0 excluded).
-        # ext_count is set equal to widget_count — conservative but accurate for typical UIs.
-        widget_count = codegen.next_widget_id - 1
-        ext_count = widget_count
+        # Use #hint_widgets if provided; fall back to static alloc()-site count.
+        auto_wc = codegen.next_widget_id - 1
+        widget_count = hint_wc if hint_wc > 0 else auto_wc
+        ext_count    = hint_ec if hint_wc > 0 else widget_count
         header = cc.build_image_header(
             global_count=len(codegen.global_vars),
             flags=flags,

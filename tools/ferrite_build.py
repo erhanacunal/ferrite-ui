@@ -567,6 +567,8 @@ def build(project_path: str, output_path: str) -> dict:
 
     # 4. Programs — .fl → VM image (header + opcodes, metadata embedded)
     render_mode = project.get("render_mode", "dirty")
+    prog_widget_count = 0
+    prog_widget_hinted = False
     for prog in project.get("programs", []):
         name = prog["name"]
         source = project_dir / prog["source"]
@@ -575,6 +577,12 @@ def build(project_path: str, output_path: str) -> dict:
         exec_mode = prog.get("exec_mode", "ram")
         prog_flags = RES_FLAG_FLASH_EXEC if exec_mode == "flash" else 0
         resources.append((name, RES_PROGRAM, image_data, prog_flags))
+        # Read widget_count back from v4 header (byte 7)
+        if len(image_data) >= 9 and image_data[0] >= 4:
+            prog_widget_count = max(prog_widget_count, image_data[7])
+            # A hint was used if widget_count > static auto-count (next_widget_id)
+            if image_data[7] > next_id:
+                prog_widget_hinted = True
 
     # 5. Files — raw user data accessible from ferrite programs via fileOpen/Read.
     #    Max 15-char names; no processing — bytes stored verbatim.
@@ -594,11 +602,14 @@ def build(project_path: str, output_path: str) -> dict:
     # Stats
     header_and_table = HEADER_SIZE + len(resources) * ENTRY_SIZE
     data_size = len(fs_binary) - header_and_table
+    effective_widget_count = max(next_id, prog_widget_count)
     return {
         "resources": len(resources),
         "data_size": data_size,
         "total_size": len(fs_binary),
         "next_widget_id": next_id,
+        "widget_count": effective_widget_count,
+        "widget_count_hinted": prog_widget_hinted,
         "details": [(name, kind, len(data)) for name, kind, data, _flags in resources],
     }
 
@@ -676,7 +687,10 @@ def main():
     print(f"  Resources: {stats['resources']}")
     print(f"  Data size: {stats['data_size']} bytes")
     print(f"  Total:     {stats['total_size']} bytes ({stats['total_size'] / 1024:.1f} KB)")
-    print(f"  Widgets:   {stats['next_widget_id']} IDs allocated")
+    wc_label = (f"{stats['widget_count']} (hinted)"
+                if stats.get('widget_count_hinted') else
+                f"{stats['widget_count']} (auto)")
+    print(f"  Widgets:   {wc_label}")
     print()
 
     KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE", RES_FILE: "FILE"}

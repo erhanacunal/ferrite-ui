@@ -3,9 +3,9 @@ use crate::ctx::Ctx;
 use crate::lcd::{self, Lcd};
 use crate::types::{Color, Edges, Rect};
 use crate::widget::{
-    ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_PRESSED,
-    FLAG_RENDERED, KIND_CHECKBOX, KIND_GAUGE, KIND_INPUT, KIND_LABEL, KIND_PROGRESS, KIND_RADIO,
-    KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
+    ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED,
+    FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_GAUGE, KIND_INPUT, KIND_LABEL,
+    KIND_PROGRESS, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
 };
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
@@ -24,17 +24,44 @@ pub fn buffered_has_dirty(ctx: &mut Ctx) -> bool {
     false
 }
 
-/// Draw only dirty widgets to the current back buffer.
-/// Caller must call lcd.begin_frame() before and lcd.end_frame() after.
-/// This allows the caller to draw overlays (keyboard) between widgets and swap.
+/// Full buffered-mode render: begin_frame + erase stale rects + draw dirty
+/// widgets + end_frame. Call this instead of the 3-step pattern. The inner
+/// `render_buffered_content` remains public for callers that need to interleave
+/// overlays (e.g. the keyboard) between widget draw and buffer swap.
+pub fn render_buffered(ctx: &mut Ctx) {
+    ctx.lcd.begin_frame();
+    render_buffered_content(ctx);
+    ctx.lcd.end_frame();
+}
+
+/// Draw dirty widgets to the current back buffer. For each dirty widget, if
+/// its previously-drawn rect in this buffer differs from the current rect,
+/// the widgets behind it are redrawn clipped to the stale rect first — so
+/// moving widgets don't leave a trail. Per-buffer `prev_rect` tracking keeps
+/// the erase area bounded even under continuous motion.
+/// Caller must bracket with lcd.begin_frame() / lcd.end_frame().
 pub fn render_buffered_content(ctx: &mut Ctx) {
     let buf = ctx.lcd.back_buf();
-    let dfs = ctx.tree.dfs_order();
+    let dfs = ctx.tree.dfs_order().to_vec();
 
-    // Partial redraw: only widgets dirty in this buffer
+    // Pass 1: for each dirty widget whose rect in THIS buffer is stale,
+    // redraw everything behind it clipped to the stale rect.
     for i in 0..dfs.len() {
         let id = dfs[i];
-        if !ctx.tree.get(id).is_dirty_buf(buf) || !ctx.tree.is_tree_visible(id) {
+        let w = ctx.tree.get(id);
+        if !w.is_dirty_buf(buf) { continue; }
+        let stale = buf_prev_rect(&ctx.tree, id, buf);
+        if stale.is_empty() { continue; }
+        let current = if w.is_visible() { ctx.tree.absolute_rect(id) } else { Rect::new(0,0,0,0) };
+        if stale == current { continue; } // rect unchanged — no trail to clean
+        redraw_behind(ctx, i, &dfs, stale);
+    }
+
+    // Pass 2: draw dirty visible widgets at their current rect
+    for i in 0..dfs.len() {
+        let id = dfs[i];
+        let w = ctx.tree.get(id);
+        if !w.is_dirty_buf(buf) || !ctx.tree.is_tree_visible(id) {
             continue;
         }
 
@@ -69,9 +96,60 @@ pub fn render_buffered_content(ctx: &mut Ctx) {
         }
     }
 
-    // Clear only this buffer's dirty flags
+    // Record this buffer's state and clear its dirty flag for each widget.
     for i in 0..dfs.len() {
-        ctx.tree.get_mut(dfs[i]).clear_dirty_buf(buf);
+        let id = dfs[i];
+        if ctx.tree.get(id).is_dirty_buf(buf) {
+            let drawn_rect = if ctx.tree.is_tree_visible(id) {
+                ctx.tree.absolute_rect(id)
+            } else {
+                Rect::new(0, 0, 0, 0)
+            };
+            set_buf_prev_rect(&mut ctx.tree, id, buf, drawn_rect);
+        }
+        ctx.tree.get_mut(id).clear_dirty_buf(buf);
+    }
+}
+
+/// Read this widget's prev_rect for the given buffer index (0=A, 1=B).
+fn buf_prev_rect(tree: &WidgetTree, id: WidgetId, buf: u8) -> Rect {
+    match tree.ext(id) {
+        Some(ext) if buf == 0 => ext.prev_rect_a,
+        Some(ext) => ext.prev_rect_b,
+        None => Rect::new(0, 0, 0, 0),
+    }
+}
+
+/// Store this widget's drawn rect for the given buffer. Allocates ext on
+/// demand — returns silently if the widget isn't visible AND the stored
+/// rect would be empty (nothing to track).
+fn set_buf_prev_rect(tree: &mut WidgetTree, id: WidgetId, buf: u8, rect: Rect) {
+    // Skip if both old and new are empty — nothing to remember.
+    if rect.is_empty() {
+        if tree.ext(id).map(|e| {
+            if buf == 0 { e.prev_rect_a.is_empty() } else { e.prev_rect_b.is_empty() }
+        }).unwrap_or(true) {
+            return;
+        }
+    }
+    if let Some(ext) = tree.ensure_ext(id) {
+        if buf == 0 { ext.prev_rect_a = rect; } else { ext.prev_rect_b = rect; }
+    }
+}
+
+/// Redraw widgets that sit behind widget `target_idx` (earlier in DFS order),
+/// clipped to `stale`. Used to restore pixels under a moved/hidden widget.
+fn redraw_behind(ctx: &mut Ctx, target_idx: usize, dfs: &[WidgetId], stale: Rect) {
+    let mut clip = ClipRegion::from_rect(stale);
+    clip.clip_to_bounds(&SCREEN);
+    if clip.is_empty() { return; }
+
+    for i in 0..target_idx {
+        let uid = dfs[i];
+        if !ctx.tree.is_tree_visible(uid) { continue; }
+        let u_abs = ctx.tree.absolute_rect(uid);
+        if !u_abs.intersects(&stale) { continue; }
+        draw_widget_clipped(ctx, uid, &u_abs, &clip);
     }
 }
 
@@ -180,6 +258,21 @@ pub fn render_dirty(ctx: &mut Ctx) {
                 ctx.tree.get_mut(id).flags &= !FLAG_RENDERED;
             }
         }
+    }
+
+    // Pass 1b: for each dirty visible widget whose rect in buffer A is stale,
+    // redraw everything behind it clipped to the stale rect (restores pixels
+    // hidden by the widget's previous position).
+    let dfs_snap = dfs.to_vec();
+    for di in 0..dfs_snap.len() {
+        let id = dfs_snap[di];
+        let w = ctx.tree.get(id);
+        if !w.is_dirty() { continue; }
+        let stale = buf_prev_rect(&ctx.tree, id, 0);
+        if stale.is_empty() { continue; }
+        let current = if w.is_visible() { ctx.tree.absolute_rect(id) } else { Rect::new(0,0,0,0) };
+        if stale == current { continue; }
+        redraw_behind(ctx, di, &dfs_snap, stale);
     }
 
     // Pass 2: draw dirty visible widgets with clipping

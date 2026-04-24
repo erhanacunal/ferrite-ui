@@ -502,9 +502,7 @@ fn render_phase(ctx: &mut Ctx, vm: &mut Vm) {
         RenderMode::Dirty => render::render_dirty(ctx),
         RenderMode::Buffered => {
             if render::buffered_has_dirty(ctx) {
-                ctx.lcd.begin_frame();
-                render::render_buffered_content(ctx);
-                ctx.lcd.end_frame();
+                render::render_buffered(ctx);
             }
         }
     }
