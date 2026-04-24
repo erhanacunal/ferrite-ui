@@ -58,6 +58,10 @@ Hold the top-left corner for 3 seconds at boot. A red progress bar fills while h
 |------------------|-------------------|
 | ![Check Tab](docs/images/widgets_demo_3.jpeg) | ![Canvas Tab](docs/images/widgets_demo_4.jpeg) |
 
+| Brick Breaker | Gradient Fill |
+|---------------|---------------|
+| ![Brick Breaker](docs/images/brick_breaker_game.jpeg) | ![Gradient Demo](docs/images/gradient_demo.jpeg) |
+
 ### New Components
 
 | Gauge | Scroll List | Text Input + Keyboard |
