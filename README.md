@@ -1,8 +1,8 @@
 # ferrite-ui
 
-Bare-metal HMI framework for the Nextion NX8048K070 display, written in Rust. Replaces the original Nextion firmware with a clean-room implementation.
+Bare-metal HMI framework for the Nextion NX8048K070 display, written in Rust. It replaces the original Nextion firmware with a clean-room implementation.
 
-For the some bricked Nextion Displays :)
+For some bricked Nextion displays :)
 
 ## Hardware
 
@@ -23,18 +23,18 @@ For the some bricked Nextion Displays :)
 
 ## Features
 
-- **Widget system** -- HTML-like tree structure with CSS box model, split-struct design (18B base + 32B extension on demand)
-- **Widget types** -- Base (container), Label, Button, Progress, Slider, Checkbox, Radio, Text Input, Gauge
+- **Widget system** -- HTML-like tree structure with CSS box model, split-struct design (20B base + 36B extension on demand)
+- **Widget types** -- Base (container), Label, Button, Progress, Slider, Checkbox, Radio, Text Input, Gauge, Dropdown
 - **Dirty redraw** -- Two-pass clip-based painter's algorithm (erase hidden, then draw visible)
 - **Double buffering** -- FPGA back/front buffer swap, dual-buffer dirty tracking (only changed widgets redrawn per buffer)
-- **Bytecode VM** -- 57+ opcodes, stack-based locals (FRAME prologue), 128 globals + 128 locals per frame, 8-deep call stack
+- **Bytecode VM** -- 100+ opcode values, stack-based locals (FRAME prologue), globals, callbacks, arrays, strings, float32, and an 8-deep call stack
 - **Drawing primitives** -- fillRect, rect, line, circle, fillCircle, roundedRect, fillRoundedRect, arc, drawImage, drawText
 - **Float32 arithmetic** -- Software float (add/sub/mul/div/neg + comparisons + conversion)
 - **String pool** -- Heap-allocated strings with auto-incrementing IDs, smart GC preserving widget text
 - **Touch input** -- Debounced press/hold/release events, hit testing, on_click and on_tap callbacks, on-screen keyboard
 - **Scrollable containers** -- FLAG_CLIP_CHILDREN on any widget, scrollbar, virtual rendering (off-screen children skipped)
 - **Custom paint** -- on_paint callback for widget custom drawing
-- **Flash filesystem** -- TOC-based, named resources (fonts, images, programs, pages)
+- **Flash filesystem** -- TOC-based, named resources (fonts, images, programs, pages, files)
 - **Font rendering** -- Adafruit GFX compatible bitmap fonts (flash + embedded)
 - **Image format** -- Ferrite Image (FI): raw/RLE/indexed+RLE, streaming decode
 - **Recovery mode** -- Hold top-left corner 3s at boot for USART-only reflash mode (see below)
@@ -67,6 +67,8 @@ Hold the top-left corner for 3 seconds at boot. A red progress bar fills while h
 | Gauge | Scroll List | Text Input + Keyboard |
 |-------|-------------|----------------------|
 | ![Gauge](docs/images/gauge.JPG) | ![Scroll List](docs/images/list.JPG) | ![Text Input](docs/images/text_input_keyboard.JPG) |
+
+Example projects live under [examples/](examples/), including clock, widget demo, touch test, brick breaker, gradient demo, gauge, scroll list, text input, printer menu, and dropdown demos.
 
 ## Ferrite Language
 
@@ -114,6 +116,8 @@ while (true) {
 ```
 
 See [docs/ferrite-lang.md](docs/ferrite-lang.md) for the full language reference and [examples/](examples/) for complete programs.
+See [docs/protocol.md](docs/protocol.md) for the USART protocol reference used by `tools/ferrite_cli.py`.
+See [docs/bytecode.md](docs/bytecode.md) for the VM image format, opcode, and widget property reference.
 
 ## Toolchain
 
@@ -142,34 +146,47 @@ python tools/ferrite_analyze.py program.fl -v
 
 ## Building
 
-Requires Rust nightly with the `thumbv7m-none-eabi` target:
+Requires a Rust toolchain with the `thumbv7m-none-eabi` target. Rust 2024 edition is stable on Rust 1.85 and newer.
 
 ```bash
 rustup target add thumbv7m-none-eabi
+rustup component add llvm-tools-preview
+cargo install cargo-binutils
+
 cargo build --release --target thumbv7m-none-eabi
-cargo objcopy --release -- -O binary firmware.bin 
+cargo objcopy --release --target thumbv7m-none-eabi --bin ferrite-ui -- -O binary firmware.bin
 
 # flash to device
-
 st-flash.exe write .\firmware.bin 0x08000000
 ```
 
 Binary output: `target/thumbv7m-none-eabi/release/ferrite-ui`
 
-## Resource Usage
+### Host Simulator
 
-| Resource | Used | Total | % |
-|----------|------|-------|---|
-| Flash (text) | 31 KB | 128 KB | 24% |
-| RAM (bss) | 6.3 KB | 20 KB | 31% |
+Use the root `sim.bat` helper to build an example's flash image and launch the host simulator from the command line:
 
-### RAM Breakdown
+```bash
+sim.bat examples\dropdown
+sim.bat examples\widget_demo
+```
 
-| Component | Size |
-|-----------|------|
-| Heap (linked-list allocator) | 14 KB |
-| Clip region (32 rects) | 256 B |
-| USART RX ring buffer | 128 B |
+The repository default target is embedded, so pass a host target if you run the simulator manually:
+
+```bash
+python tools\ferrite_build.py examples\dropdown\project.json -o examples\dropdown\flash.bin
+cargo run --target x86_64-pc-windows-msvc --features host --bin sim -- --fsimage examples\dropdown\flash.bin
+```
+
+## Resource Notes
+
+Exact firmware size changes as features are added; inspect the current build artifacts instead of relying on fixed README numbers.
+
+- MCU flash: 128 KB
+- MCU RAM: 20 KB
+- Heap allocator: 14 KB region in firmware RAM
+- Clip region pool: 32 rects, 256 B
+- USART RX ring buffer: 128 B
 
 Heap-allocated: Ctx (WidgetTree + extensions, FontList, ImageList, StringPool), VM (stack-based locals, arrays, callback queue), fonts.
 
@@ -179,36 +196,50 @@ Heap-allocated: Ctx (WidgetTree + extensions, FontList, ImageList, StringPool), 
 ferrite-ui/
 ├── src/
 │   ├── main.rs          Entry point, startup, main loop
+│   ├── lib.rs           Host-simulator library exports
 │   ├── ctx.rs           Shared application context (Ctx struct)
-│   ├── vm.rs            Bytecode VM (57+ opcodes, stack frames, f32)
+│   ├── vm.rs            Bytecode VM (stack frames, callbacks, arrays, f32)
 │   ├── widget.rs        Widget + WidgetExt split, tree, box model
 │   ├── render.rs        Painter's algorithm, dirty redraw, clip
-│   ├── lcd.rs           FPGA display protocol, double buffer, drawing primitives
 │   ├── clip.rs          Clip region (rect subtract algorithm)
-│   ├── touch.rs         XPT2046 driver, hit test, debounce
-│   ├── flash.rs         W25Q256 SPI flash driver
 │   ├── font.rs          Adafruit GFX bitmap font renderer
 │   ├── image.rs         Ferrite Image (FI) decoder
 │   ├── fs.rs            Flash filesystem (TOC, named resources)
 │   ├── strpool.rs       Heap string pool (itos/ftos/concat/GC)
 │   ├── heap.rs          Linked-list heap allocator (14KB)
-│   ├── systick.rs       SysTick 1ms timer
 │   ├── protocol.rs      USART protobuf protocol
-│   ├── usart.rs         USART0 driver + RX interrupt
-│   ├── backlight.rs     LCD backlight PWM
 │   ├── gpio.rs          GPIO, 16-bit data bus, clock
 │   ├── proto.rs         Protobuf encoding/decoding primitives
 │   ├── irq.rs           Interrupt vector table
-│   └── embedded_font.rs Built-in FreeMono 9pt font
+│   ├── panic.rs         Custom panic handler
+│   ├── keyboard.rs      On-screen keyboard for input widgets
+│   ├── fat.rs           FAT16/32 reader for SD boot path
+│   ├── embedded_font.rs Built-in FreeMono 9pt font
+│   ├── bin/sim.rs       Host simulator binary
+│   ├── lcd/             LCD backend abstraction, hardware + simulator
+│   ├── flash/           W25Q256 backend abstraction, hardware + simulator
+│   ├── touch/           XPT2046/touch backend abstraction, hardware + simulator
+│   ├── usart/           USART backend abstraction, hardware + simulator
+│   ├── backlight/       Backlight backend abstraction, hardware + simulator
+│   ├── rtc/             RTC backend abstraction, hardware + simulator
+│   ├── systick/         SysTick/timing backend abstraction
+│   └── sdcard/          SD card backend abstraction
 ├── tools/
 │   ├── ferrite_lang.py  Language compiler (.fl -> bytecode)
 │   ├── ferrite_cc.py    Assembler / disassembler / compiler API
 │   ├── ferrite_cli.py   Serial communication tool
 │   ├── ferrite_img.py   PNG to Ferrite Image converter
 │   ├── ferrite_analyze.py  Bytecode memory/instruction profiler
+│   ├── ferrite_designer.py Visual designer
 │   └── ferrite_build.py JSON project builder (flash image)
+├── lib/
+│   ├── core.fl          Ferrite language widget constants
+│   └── color.fl         RGB565 color constants
+├── examples/            Ferrite project examples
 ├── docs/
-│   └── ferrite-lang.md  Language reference
+│   ├── ferrite-lang.md  Language reference
+│   ├── protocol.md      USART protocol reference
+│   └── bytecode.md      VM image/opcode reference
 ├── memory.x             Linker script (128KB Flash, 20KB RAM)
 └── CLAUDE.md            Internal development notes
 ```
@@ -216,11 +247,11 @@ ferrite-ui/
 ## Architecture
 
 - **Custom heap allocator** -- 14KB linked-list allocator, all large structures heap-allocated via Box/Vec
-- **No OS, no runtime** -- `#![no_std]`, `#![no_main]`, `cortex-m-rt` entry point
+- **No OS, no std firmware** -- `#![no_std]`, `#![no_main]`, `cortex-m-rt` entry point
 - **No frame buffer in CPU RAM** -- pixels are written directly to the FPGA over a 16-bit GPIO bus
 - **Double buffered** -- FPGA handles front/back buffer swap, tear-free rendering
 - **Two-pass dirty redraw** -- erase hidden widgets first, then draw visible ones with clip-based painter's algorithm
-- **Split-struct widgets** -- 18B base (tree links, layout, colors) + 32B extension on demand (edges, text, callbacks)
+- **Split-struct widgets** -- 20B base (tree links, layout, colors) + 36B extension on demand (edges, text, callbacks, render bookkeeping)
 - **Stack-based VM locals** -- FRAME prologue per function, locals isolated across CALL/RET, supports recursion
 - **Shared context** -- Ctx struct bundles LCD, Flash, WidgetTree, FontList, ImageList, StringPool, Fs
 

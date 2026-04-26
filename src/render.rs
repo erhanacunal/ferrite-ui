@@ -4,8 +4,9 @@ use crate::lcd::{self, Lcd};
 use crate::types::{Color, Edges, Rect};
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED,
-    FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_GAUGE, KIND_INPUT, KIND_LABEL,
-    KIND_PROGRESS, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
+    FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_DROPDOWN, KIND_GAUGE, KIND_INPUT,
+    KIND_LABEL, KIND_PROGRESS, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId,
+    WidgetTree,
 };
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
@@ -515,6 +516,11 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
         draw_input_text(ctx, widget, abs, ext);
     }
 
+    // Dropdown selected text + arrow
+    if widget.kind == KIND_DROPDOWN {
+        draw_dropdown(ctx, widget, abs, ext);
+    }
+
     // Gauge arc
     if widget.kind == KIND_GAUGE {
         let inner = inner_rect(abs, &ext.border);
@@ -629,6 +635,11 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     // Input text + cursor
     if widget.kind == KIND_INPUT {
         draw_input_text(ctx, widget, abs, ext);
+    }
+
+    // Dropdown selected text + arrow
+    if widget.kind == KIND_DROPDOWN {
+        draw_dropdown(ctx, widget, abs, ext);
     }
 
     // Gauge arc
@@ -756,6 +767,56 @@ fn draw_input_text(ctx: &Ctx, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
     }
 }
 
+/// Draw dropdown selected text and the disclosure arrow in the content area.
+fn draw_dropdown(ctx: &Ctx, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    let font = match ctx.fonts.resolve(ext.font_id) {
+        Some(f) => f,
+        None => return,
+    };
+
+    let b = ext.border;
+    let p = ext.padding;
+    let cx = abs.x + b.left as i16 + p.left as i16;
+    let cy = abs.y + b.top as i16 + p.top as i16;
+    let cw = abs
+        .w
+        .saturating_sub(b.left as u16 + b.right as u16 + p.left as u16 + p.right as u16);
+    let ch = abs
+        .h
+        .saturating_sub(b.top as u16 + b.bottom as u16 + p.top as u16 + p.bottom as u16);
+
+    if cw == 0 || ch == 0 {
+        return;
+    }
+
+    let arrow_w: u16 = 18;
+    let text_w = cw.saturating_sub(arrow_w + 4);
+    let lh = font.line_height() as i16;
+    let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
+    let bg_color = effective_bg(&ctx.tree, widget, ext);
+    let bg = if bg_color == 0 { None } else { Some(bg_color) };
+
+    if ext.text_id != 0xFFFF && text_w > 0 {
+        let text = ctx.strpool.get(ext.text_id);
+        if !text.is_empty() {
+            font.draw_str(&ctx.lcd, &ctx.flash, text, cx, ty, ext.text_color, bg);
+        }
+    }
+
+    if cw >= arrow_w && ch >= 8 {
+        let ax = cx + cw as i16 - arrow_w as i16 + 4;
+        let mid_y = cy + ch as i16 / 2;
+        let color = if ext.text_color != 0 { ext.text_color } else { 0xFFFF };
+        if widget.flags & FLAG_CHECKED != 0 {
+            ctx.lcd.draw_line(ax, mid_y + 3, ax + 5, mid_y - 3, color);
+            ctx.lcd.draw_line(ax + 5, mid_y - 3, ax + 10, mid_y + 3, color);
+        } else {
+            ctx.lcd.draw_line(ax, mid_y - 3, ax + 5, mid_y + 3, color);
+            ctx.lcd.draw_line(ax + 5, mid_y + 3, ax + 10, mid_y - 3, color);
+        }
+    }
+}
+
 /// Draw gauge arc/dial inside the inner rect.
 ///
 /// 270° arc from 135° (bottom-left) to 45° (bottom-right), clockwise through top.
@@ -847,7 +908,7 @@ const SCROLLBAR_THUMB: Color = 0x6B4D;  // medium gray
 const SCROLLBAR_MIN_THUMB: u16 = 16;    // minimum thumb height
 
 /// Draw scrollbar on the right side of a scroll container.
-fn draw_scrollbar(ctx: &Ctx, id: WidgetId, abs: &Rect) {
+fn draw_scrollbar(ctx: &Ctx, id: WidgetId, _abs: &Rect) {
     let content_h = ctx.tree.content_height(id);
     let cr = ctx.tree.content_rect(id);
     if cr.h == 0 || content_h <= cr.h {

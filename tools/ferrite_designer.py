@@ -52,9 +52,26 @@ KIND_PROGRESS = 3
 KIND_SLIDER = 4
 KIND_CHECKBOX = 5
 KIND_RADIO = 6
+KIND_DROPDOWN = 9
 
-KIND_NAMES = ["Base", "Label", "Button", "Progress", "Slider", "Checkbox", "Radio"]
-KIND_PREFIXES = ["panel", "lbl", "btn", "progress", "slider", "cb", "radio"]
+KIND_NAMES = ["Base", "Label", "Button", "Progress", "Slider", "Checkbox", "Radio", "Dropdown"]
+KIND_VALUES = [KIND_BASE, KIND_LABEL, KIND_BUTTON, KIND_PROGRESS, KIND_SLIDER, KIND_CHECKBOX, KIND_RADIO, KIND_DROPDOWN]
+KIND_PREFIXES = {
+    KIND_BASE: "panel",
+    KIND_LABEL: "lbl",
+    KIND_BUTTON: "btn",
+    KIND_PROGRESS: "progress",
+    KIND_SLIDER: "slider",
+    KIND_CHECKBOX: "cb",
+    KIND_RADIO: "radio",
+    KIND_DROPDOWN: "dropdown",
+}
+
+
+def kind_name(kind):
+    if kind in KIND_VALUES:
+        return KIND_NAMES[KIND_VALUES.index(kind)]
+    return "?"
 
 HANDLE_SIZE = 8
 CANVAS_MARGIN = 40
@@ -349,10 +366,10 @@ class DesignerModel(QWidget):
         if parent is None:
             parent = self.selected if self.selected else self.root
         self._counter += 1
-        name = f"{KIND_PREFIXES[kind]}{self._counter}"
+        name = f"{KIND_PREFIXES.get(kind, 'widget')}{self._counter}"
         while any(w.name == name for w in self.widgets):
             self._counter += 1
-            name = f"{KIND_PREFIXES[kind]}{self._counter}"
+            name = f"{KIND_PREFIXES.get(kind, 'widget')}{self._counter}"
         node = WidgetNode(name, kind)
         node.parent = parent
         parent.children.append(node)
@@ -393,6 +410,14 @@ class DesignerModel(QWidget):
             node.bg_color = 0x2104
             node.text_color = 0xFFFF
             node.press_color = 0x001F
+            node.clickable = True
+        elif kind == KIND_DROPDOWN:
+            node.size_w = 220
+            node.size_h = 38
+            node.text = "Dropdown"
+            node.bg_color = 0x2104
+            node.border_color = 0xFFFF
+            node.text_color = 0xFFFF
             node.clickable = True
         self.widgets.append(node)
         self.tree_changed.emit()
@@ -772,6 +797,19 @@ class WidgetItem(QGraphicsItem):
                 painter.setBrush(QBrush(fc))
                 painter.drawEllipse(QPointF(cx, cy), outer_r * 0.5, outer_r * 0.5)
 
+        # Dropdown arrow
+        if node.kind == KIND_DROPDOWN:
+            color = rgb565_to_qcolor(node.text_color)
+            painter.setPen(QPen(color, 2))
+            ax = w - node.border[1] - node.padding[1] - 18
+            ay = h / 2
+            if node.checked:
+                painter.drawLine(QPointF(ax, ay + 4), QPointF(ax + 6, ay - 3))
+                painter.drawLine(QPointF(ax + 6, ay - 3), QPointF(ax + 12, ay + 4))
+            else:
+                painter.drawLine(QPointF(ax, ay - 3), QPointF(ax + 6, ay + 4))
+                painter.drawLine(QPointF(ax + 6, ay + 4), QPointF(ax + 12, ay - 3))
+
         # Image preview
         if node.image_id and self.res_cache:
             pixmap = self.res_cache.get_image(node.image_id)
@@ -1060,8 +1098,7 @@ class TreePanel(QTreeWidget):
         node_items = {}
 
         def add_node(node, parent_item=None):
-            kind_name = KIND_NAMES[node.kind] if node.kind < len(KIND_NAMES) else "?"
-            text = f"{node.name} ({kind_name}, {node.size_w}x{node.size_h})"
+            text = f"{node.name} ({kind_name(node.kind)}, {node.size_w}x{node.size_h})"
             if parent_item is None:
                 item = QTreeWidgetItem(self, [text])
             else:
@@ -1409,7 +1446,7 @@ class PropertyEditor(QScrollArea):
             node.name = value
             self.model.tree_changed.emit()
         elif attr == "kind":
-            node.kind = value
+            node.kind = KIND_VALUES[value] if 0 <= value < len(KIND_VALUES) else KIND_BASE
             self.model.tree_changed.emit()
         elif attr == "parent_w":
             combo = self._editors["parent_w"]
@@ -1526,6 +1563,9 @@ class PropertyEditor(QScrollArea):
                 # Resource combo: find by data (resource ID)
                 idx = editor.findData(int(value))
                 editor.setCurrentIndex(max(0, idx))
+            elif editor is self._editors.get("kind"):
+                idx = KIND_VALUES.index(int(value)) if int(value) in KIND_VALUES else 0
+                editor.setCurrentIndex(idx)
             else:
                 editor.setCurrentIndex(int(value))
             editor.blockSignals(False)
@@ -2690,8 +2730,8 @@ class DesignerWindow(QMainWindow):
     def _build_toolbar(self):
         tb = self.addToolBar("Widgets")
         tb.setMovable(False)
-        for kind in range(7):
-            act = QAction(f"+ {KIND_NAMES[kind]}", self)
+        for idx, kind in enumerate(KIND_VALUES):
+            act = QAction(f"+ {KIND_NAMES[idx]}", self)
             act.triggered.connect(lambda checked, k=kind: self.model.add_widget(k))
             tb.addAction(act)
         tb.addSeparator()

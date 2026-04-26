@@ -1,0 +1,127 @@
+// main.fl — Dropdown Demo (800x480)
+//
+// A KIND_DROPDOWN displays its selected text. Direct child widgets are the
+// popup options; keep them initially hidden and clickable.
+
+#include "core.fl"
+#include "color.fl"
+
+var title_lbl;
+var dropdown;
+var opt_fast;
+var opt_quality;
+var opt_silent;
+var status_lbl;
+
+fn setup() {
+    title_lbl = alloc();
+    target(title_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 0, 32);
+    set(size, 800, 40);
+    set(text, "Dropdown Widget Demo");
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(font_id, 0);
+    parent(0);
+
+    dropdown = alloc();
+    target(dropdown);
+    set(kind, KIND_DROPDOWN);
+    set(location, 250, 110);
+    set(size, 300, 42);
+    set(bg_color, 0x2104);
+    set(border, 1, 1, 1, 1);
+    set(border_color, SKY_BLUE);
+    set(border_radius, 5);
+    set(padding, 10, 10, 10, 10);
+    set(text, "Fast print");
+    set(text_color, WHITE);
+    set(font_id, 0);
+    set(clickable, ON);
+    set(on_click, @on_dropdown_changed);
+    parent(0);
+
+    opt_fast = alloc();
+    target(opt_fast);
+    set(kind, KIND_LABEL);
+    set(location, 0, 42);
+    set(size, 300, 36);
+    set(bg_color, 0x3186);
+    set(press_color, 0x2104);
+    set(border, 1, 1, 0, 1);
+    set(border_color, SKY_BLUE);
+    set(padding, 10, 10, 10, 10);
+    set(text, "Fast print");
+    set(text_color, WHITE);
+    set(font_id, 0);
+    set(clickable, ON);
+    set(visible, OFF);
+    parent(dropdown);
+
+    opt_quality = alloc();
+    target(opt_quality);
+    set(kind, KIND_LABEL);
+    set(location, 0, 78);
+    set(size, 300, 36);
+    set(bg_color, 0x3186);
+    set(press_color, 0x2104);
+    set(border, 1, 1, 0, 1);
+    set(border_color, SKY_BLUE);
+    set(padding, 10, 10, 10, 10);
+    set(text, "High quality");
+    set(text_color, WHITE);
+    set(font_id, 0);
+    set(clickable, ON);
+    set(visible, OFF);
+    parent(dropdown);
+
+    opt_silent = alloc();
+    target(opt_silent);
+    set(kind, KIND_LABEL);
+    set(location, 0, 114);
+    set(size, 300, 36);
+    set(bg_color, 0x3186);
+    set(press_color, 0x2104);
+    set(border, 1, 1, 1, 1);
+    set(border_color, SKY_BLUE);
+    set(padding, 10, 10, 10, 10);
+    set(text, "Silent mode");
+    set(text_color, WHITE);
+    set(font_id, 0);
+    set(clickable, ON);
+    set(visible, OFF);
+    parent(dropdown);
+
+    status_lbl = alloc();
+    target(status_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 0, 300);
+    set(size, 800, 32);
+    set(text, "Selected: Fast print");
+    set(text_color, LIGHT_GRAY);
+    set(text_align, ALIGN_CENTER);
+    set(font_id, 0);
+    set(bg_color,1);
+    parent(0);
+
+    render();
+    return 0;
+}
+
+fn loop() {
+}
+
+fn on_dropdown_changed(wid) {
+    target(dropdown);
+    var selected = get(value);
+    target(status_lbl);
+    if (selected == 0) {
+        set(text, "Selected: Fast print");
+    } else if (selected == 1) {
+        set(text, "Selected: High quality");
+    } else {
+        set(text, "Selected: Silent mode");
+    }
+    dirty();
+}

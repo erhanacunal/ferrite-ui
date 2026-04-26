@@ -37,6 +37,7 @@ pub const KIND_CHECKBOX: u8 = 5;
 pub const KIND_RADIO: u8 = 6;
 pub const KIND_INPUT: u8 = 7;
 pub const KIND_GAUGE: u8 = 8;
+pub const KIND_DROPDOWN: u8 = 9;
 
 // --- Text Alignment ---
 
@@ -454,16 +455,21 @@ impl WidgetTree {
             }
             let p = &self.widgets[pid.index()];
             let pm = self.margin(pid);
-            let pb = self.border(pid);
-            let pp = self.padding(pid);
-            x += p.location.x
-                + pm.left as i16
-                + pb.left as i16
-                + pp.left as i16;
-            y += p.location.y
-                + pm.top as i16
-                + pb.top as i16
-                + pp.top as i16;
+            if p.kind == KIND_DROPDOWN {
+                x += p.location.x + pm.left as i16;
+                y += p.location.y + pm.top as i16;
+            } else {
+                let pb = self.border(pid);
+                let pp = self.padding(pid);
+                x += p.location.x
+                    + pm.left as i16
+                    + pb.left as i16
+                    + pp.left as i16;
+                y += p.location.y
+                    + pm.top as i16
+                    + pb.top as i16
+                    + pp.top as i16;
+            }
             // Scroll offset: shift children by -scroll_y
             if p.flags & FLAG_CLIP_CHILDREN != 0 {
                 let scroll_y = self.value(pid);

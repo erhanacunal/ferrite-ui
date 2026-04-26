@@ -698,6 +698,79 @@ fn fire_on_change(ctx: &Ctx, vm: &mut Box<Vm>, id: widget::WidgetId) {
     }
 }
 
+fn dropdown_parent(ctx: &Ctx, id: widget::WidgetId) -> widget::WidgetId {
+    if id.is_none() {
+        return widget::WidgetId::NONE;
+    }
+    let parent = ctx.tree.get(id).parent;
+    if parent.is_some() && ctx.tree.get(parent).kind == widget::KIND_DROPDOWN {
+        parent
+    } else {
+        widget::WidgetId::NONE
+    }
+}
+
+fn dropdown_child_index(ctx: &Ctx, dropdown: widget::WidgetId, option: widget::WidgetId) -> i16 {
+    let mut idx: i16 = 0;
+    let mut child = ctx.tree.get(dropdown).first_child;
+    let max = ctx.tree.count();
+    let mut guard = 0usize;
+    while child.is_some() {
+        if child == option {
+            return idx;
+        }
+        child = ctx.tree.get(child).next_sibling;
+        idx += 1;
+        guard += 1;
+        if guard > max {
+            break;
+        }
+    }
+    0
+}
+
+fn set_dropdown_options_visible(ctx: &mut Ctx, dropdown: widget::WidgetId, visible: bool) {
+    let mut child = ctx.tree.get(dropdown).first_child;
+    let max = ctx.tree.count();
+    let mut guard = 0usize;
+    while child.is_some() {
+        if visible {
+            ctx.tree.get_mut(child).flags |= widget::FLAG_VISIBLE;
+        } else {
+            ctx.tree.get_mut(child).flags &= !widget::FLAG_VISIBLE;
+        }
+        ctx.tree.mark_dirty(child);
+        child = ctx.tree.get(child).next_sibling;
+        guard += 1;
+        if guard > max {
+            break;
+        }
+    }
+    ctx.tree.mark_dirty(dropdown);
+}
+
+fn toggle_dropdown(ctx: &mut Ctx, dropdown: widget::WidgetId) {
+    let expanded = ctx.tree.get(dropdown).flags & widget::FLAG_CHECKED != 0;
+    if expanded {
+        ctx.tree.get_mut(dropdown).flags &= !widget::FLAG_CHECKED;
+        set_dropdown_options_visible(ctx, dropdown, false);
+    } else {
+        ctx.tree.get_mut(dropdown).flags |= widget::FLAG_CHECKED;
+        set_dropdown_options_visible(ctx, dropdown, true);
+    }
+}
+
+fn select_dropdown_option(ctx: &mut Ctx, dropdown: widget::WidgetId, option: widget::WidgetId) {
+    let text_id = ctx.tree.text_id(option);
+    let selected = dropdown_child_index(ctx, dropdown, option);
+    if let Some(ext) = ctx.tree.ensure_ext(dropdown) {
+        ext.text_id = text_id;
+        ext.value = selected;
+    }
+    ctx.tree.get_mut(dropdown).flags &= !widget::FLAG_CHECKED;
+    set_dropdown_options_visible(ctx, dropdown, false);
+}
+
 /// Set scroll position from a touch Y coordinate on the scrollbar track.
 fn scrollbar_set_position(ctx: &mut Ctx, scroll_id: widget::WidgetId, touch_y: u16) {
     let cr = ctx.tree.content_rect(scroll_id);
@@ -1308,6 +1381,18 @@ fn main() -> ! {
                         }
 
                         // Checkbox: toggle checked state on click
+                        let dropdown = dropdown_parent(&ctx, clicked_id);
+                        if dropdown.is_some() {
+                            select_dropdown_option(&mut ctx, dropdown, clicked_id);
+                            clicked_id = dropdown;
+                            clicked_func = ctx.tree.on_click(dropdown);
+                        } else if clicked_id.is_some()
+                            && ctx.tree.get(clicked_id).kind == widget::KIND_DROPDOWN
+                        {
+                            toggle_dropdown(&mut ctx, clicked_id);
+                            clicked_func = 0;
+                        }
+
                         if clicked_id.is_some()
                             && ctx.tree.get(clicked_id).kind == widget::KIND_CHECKBOX
                         {

@@ -26,7 +26,8 @@ use ferrite_ui::touch::sim::MouseState;
 use ferrite_ui::types::{Rect, Size};
 use ferrite_ui::vm::{FunctionKind, RenderMode, Vm, VmState};
 use ferrite_ui::widget::{
-    self, FLAG_CHECKED, FLAG_PRESSED, KIND_CHECKBOX, KIND_RADIO, KIND_SLIDER, WidgetId, WidgetTree,
+    self, FLAG_CHECKED, FLAG_PRESSED, KIND_CHECKBOX, KIND_DROPDOWN, KIND_RADIO, KIND_SLIDER,
+    WidgetId, WidgetTree,
 };
 use ferrite_ui::backlight::Backlight;
 use ferrite_ui::embedded_font;
@@ -327,6 +328,79 @@ fn touch_to_slider_value(abs: &Rect, touch_x: u16) -> i16 {
     }
 }
 
+fn dropdown_parent(ctx: &Ctx, id: WidgetId) -> WidgetId {
+    if id.is_none() {
+        return WidgetId::NONE;
+    }
+    let parent = ctx.tree.get(id).parent;
+    if parent.is_some() && ctx.tree.get(parent).kind == KIND_DROPDOWN {
+        parent
+    } else {
+        WidgetId::NONE
+    }
+}
+
+fn dropdown_child_index(ctx: &Ctx, dropdown: WidgetId, option: WidgetId) -> i16 {
+    let mut idx: i16 = 0;
+    let mut child = ctx.tree.get(dropdown).first_child;
+    let max = ctx.tree.count();
+    let mut guard = 0usize;
+    while child.is_some() {
+        if child == option {
+            return idx;
+        }
+        child = ctx.tree.get(child).next_sibling;
+        idx += 1;
+        guard += 1;
+        if guard > max {
+            break;
+        }
+    }
+    0
+}
+
+fn set_dropdown_options_visible(ctx: &mut Ctx, dropdown: WidgetId, visible: bool) {
+    let mut child = ctx.tree.get(dropdown).first_child;
+    let max = ctx.tree.count();
+    let mut guard = 0usize;
+    while child.is_some() {
+        if visible {
+            ctx.tree.get_mut(child).flags |= widget::FLAG_VISIBLE;
+        } else {
+            ctx.tree.get_mut(child).flags &= !widget::FLAG_VISIBLE;
+        }
+        ctx.tree.mark_dirty(child);
+        child = ctx.tree.get(child).next_sibling;
+        guard += 1;
+        if guard > max {
+            break;
+        }
+    }
+    ctx.tree.mark_dirty(dropdown);
+}
+
+fn toggle_dropdown(ctx: &mut Ctx, dropdown: WidgetId) {
+    let expanded = ctx.tree.get(dropdown).flags & FLAG_CHECKED != 0;
+    if expanded {
+        ctx.tree.get_mut(dropdown).flags &= !FLAG_CHECKED;
+        set_dropdown_options_visible(ctx, dropdown, false);
+    } else {
+        ctx.tree.get_mut(dropdown).flags |= FLAG_CHECKED;
+        set_dropdown_options_visible(ctx, dropdown, true);
+    }
+}
+
+fn select_dropdown_option(ctx: &mut Ctx, dropdown: WidgetId, option: WidgetId) {
+    let text_id = ctx.tree.text_id(option);
+    let selected = dropdown_child_index(ctx, dropdown, option);
+    if let Some(ext) = ctx.tree.ensure_ext(dropdown) {
+        ext.text_id = text_id;
+        ext.value = selected;
+    }
+    ctx.tree.get_mut(dropdown).flags &= !FLAG_CHECKED;
+    set_dropdown_options_visible(ctx, dropdown, false);
+}
+
 fn dispatch_touch(ctx: &mut Ctx, vm: &mut Vm, event: &TouchEvent) {
     match event.kind {
         TouchEventKind::Press => {
@@ -420,6 +494,16 @@ fn dispatch_touch(ctx: &mut Ctx, vm: &mut Vm, event: &TouchEvent) {
             }
 
             // Checkbox toggle
+            let dropdown = dropdown_parent(ctx, clicked_id);
+            if dropdown.is_some() {
+                select_dropdown_option(ctx, dropdown, clicked_id);
+                clicked_id = dropdown;
+                clicked_func = ctx.tree.on_click(dropdown);
+            } else if clicked_id.is_some() && ctx.tree.get(clicked_id).kind == KIND_DROPDOWN {
+                toggle_dropdown(ctx, clicked_id);
+                clicked_func = 0;
+            }
+
             if clicked_id.is_some() && ctx.tree.get(clicked_id).kind == KIND_CHECKBOX {
                 let w = ctx.tree.get_mut(clicked_id);
                 w.flags ^= FLAG_CHECKED;

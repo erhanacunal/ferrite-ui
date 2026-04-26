@@ -90,6 +90,7 @@ RES_FLAG_FLASH_EXEC = 0x01
 KIND_BASE = 0
 KIND_LABEL = 1
 KIND_BUTTON = 2
+KIND_DROPDOWN = 9
 
 ALIGN_MAP = {"left": 0, "center": 1, "right": 2}
 
@@ -290,6 +291,8 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
             cc.set_prop("kind", KIND_LABEL)
         elif wtype == "button":
             cc.set_prop("kind", KIND_BUTTON)
+        elif wtype == "dropdown":
+            cc.set_prop("kind", KIND_DROPDOWN)
 
         # Location
         if "location" in w:

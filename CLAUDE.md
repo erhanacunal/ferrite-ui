@@ -68,7 +68,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - `location` → relative offset from parent content area
   - `size` → border box dimensions
 - **Flags:** `VISIBLE` (0x01), `ENABLED` (0x02), `CLICKABLE` (0x04), `DIRTY` (0x08), `PRESSED` (0x10), `CHECKED` (0x20)
-- **Widget types:** `KIND_BASE` (0, container), `KIND_LABEL` (1, text), `KIND_BUTTON` (2, clickable container), `KIND_PROGRESS` (3, progress bar), `KIND_SLIDER` (4, slider), `KIND_CHECKBOX` (5, checkbox), `KIND_RADIO` (6, radio button)
+- **Widget types:** `KIND_BASE` (0, container), `KIND_LABEL` (1, text), `KIND_BUTTON` (2, clickable container), `KIND_PROGRESS` (3, progress bar), `KIND_SLIDER` (4, slider), `KIND_CHECKBOX` (5, checkbox), `KIND_RADIO` (6, radio button), `KIND_INPUT` (7, text input), `KIND_GAUGE` (8, gauge), `KIND_DROPDOWN` (9, dropdown)
 - **Label:** text_color, font_id, text_align (LEFT/CENTER/RIGHT), text (from StringPool)
 - **Button:** press_color (background when pressed), accepts child widgets
 - **Color:** RGB565 (`background_color`, `border_color`, `text_color`, `press_color`)
