@@ -238,6 +238,9 @@ fn run_window(
         };
         mouse.update(mx, my, pressed && pos.is_some());
 
+        // Resume a suspended showModal if its result is ready.
+        vm.try_resume_modal(ctx);
+
         // --- VM step (Running / Yielded / Waiting) ---
         match vm.state {
             VmState::Running | VmState::Yielded => {
@@ -252,6 +255,10 @@ fn run_window(
                 if systick::millis().wrapping_sub(vm.wait_until) < 0x8000_0000 {
                     vm.state = VmState::Running;
                 }
+            }
+            VmState::AwaitingModal => {
+                // Suspended showModal — touch dispatch + drain_callbacks
+                // continue normally so a callback can fire setDialogResult.
             }
             _ => {}
         }

@@ -96,6 +96,7 @@ class Op:
     F_READ     = 0x40  # + u32 addr + u16 len
     F_WRITE    = 0x41  # + u32 addr + u8 len + data
     W_TARGET_S = 0x42  # widget id from stack (dynamic target)
+    W_PARENT_S = 0x43  # parent id from stack (dynamic parent)
 
     # Builtins as first-class opcodes (all no-arg, operands on stack)
     FILL_RECT       = 0x80
@@ -185,6 +186,8 @@ class Builtin:
     FILE_SIZE = 36  # (handle) → size in bytes
     FILE_CLOSE = 37 # (handle) — release slot
     ARR_TO_STR = 38 # (arr_id, len) → str_id  (len<0 = full array; bytes are low byte of each element)
+    SHOW_MODAL = 39 # (builder_fn, overlay_click_fn) → result; suspends VM until setDialogResult
+    SET_DIALOG_RESULT = 40 # (result) → void; latches result on innermost modal frame
 
 
 class Prop:
@@ -622,6 +625,11 @@ class Asm:
         self._emit(Op.W_PARENT)
         self._emit_u8(parent_id)
 
+    def w_parent_s(self):
+        """Set parent from stack (parent id is TOS). Used when the parent is a
+        widget variable whose runtime id is stored in its var slot."""
+        self._emit(Op.W_PARENT_S)
+
     # --- Array ops ---
 
     def arr_alloc(self, size):
@@ -904,6 +912,7 @@ OP_NAMES = {
     0x3D: 'W_SET_LEN', 0x3E: 'ARR_ALLOC', 0x3F: 'ARR_INIT',
     0x40: 'F_READ', 0x41: 'F_WRITE',
     0x42: 'W_TARGET_S',
+    0x43: 'W_PARENT_S',
 
     0x80: 'fillRect', 0x81: 'rect', 0x82: 'line', 0x83: 'circle',
     0x84: 'fillCircle', 0x85: 'drawImage', 0x86: 'drawTextLit',
@@ -919,6 +928,7 @@ OP_NAMES = {
     0xA0: 'setBrightness', 0xA1: 'brightness',
     0xA2: 'fileOpen', 0xA3: 'fileRead', 0xA4: 'fileSize', 0xA5: 'fileClose',
     0xA6: 'arrToStr',
+    0xA7: 'showModal', 0xA8: 'setDialogResult',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -948,7 +958,8 @@ PROP_NAMES = {
 _NO_ARG_OPS = (
     set(range(0x00, 0x1C)) |           # 0x00-0x1B
     set(range(0x20, 0x2E)) |           # 0x20-0x2D
-    {op for op in range(0x80, 0xA7)    # 0x80-0xA6 except 0x86, 0x88
+    {0x42, 0x43} |                     # W_TARGET_S, W_PARENT_S
+    {op for op in range(0x80, 0xA9)    # 0x80-0xA8 except 0x86, 0x88
      if op not in (0x86, 0x88)} |
     set(range(0xC0, 0xCD))             # 0xC0-0xCC
 )

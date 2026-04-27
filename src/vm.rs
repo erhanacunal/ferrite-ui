@@ -1,6 +1,5 @@
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 use crate::ctx::Ctx;
 use crate::flash::Flash;
@@ -253,6 +252,7 @@ const OP_ARR_INIT: u8 = 0x3F;  // + u8 count + i32 values LE
 const OP_F_READ: u8 = 0x40;    // + u32 addr + u16 len
 const OP_F_WRITE: u8 = 0x41;   // + u32 addr + u8 len + data
 const OP_W_TARGET_S: u8 = 0x42; // widget id from stack (dynamic target)
+const OP_W_PARENT_S: u8 = 0x43; // parent id from stack (dynamic parent)
 
 // Builtins as first-class opcodes (args on stack)
 const OP_FILL_RECT: u8 = 0x80;
@@ -294,6 +294,8 @@ const OP_FILE_READ: u8 = 0xA3;  // pop handle → push byte (0..255) or -1 on EO
 const OP_FILE_SIZE: u8 = 0xA4;  // pop handle → push size
 const OP_FILE_CLOSE: u8 = 0xA5; // pop handle, release slot
 const OP_ARR_TO_STR: u8 = 0xA6; // pop len, pop arr_id → alloc string from low bytes of arr elements (len<0 = full array)
+const OP_SHOW_MODAL: u8 = 0xA7; // pop click_fn, pop builder_fn → suspend until setDialogResult, push result on resume
+const OP_SET_DIALOG_RESULT: u8 = 0xA8; // pop result → record on top modal frame; void return
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -319,6 +321,10 @@ pub enum VmState {
     Halted,
     Yielded,
     Waiting,
+    /// Suspended after `showModal`; the user program is paused until
+    /// `setDialogResult` fires (typically from a callback) and the main loop
+    /// calls `try_resume_modal`.
+    AwaitingModal,
     Error,
 }
 
@@ -396,6 +402,54 @@ const FILE_HANDLE_ERR: i32 = 0xFF;
 /// EOF marker returned by fileRead when past end-of-file.
 const FILE_EOF: i32 = -1;
 
+// --- Modal dialog state ---
+
+/// Standard dialog result codes (mirrored in lib/modal.fl).
+/// Programs can pass arbitrary i32 values to setDialogResult — these are the
+/// conventional set used by Cancel auto-close and by lib/modal.fl handlers.
+pub const DLG_OK: i32 = 1;
+pub const DLG_CANCEL: i32 = 2;
+
+/// Maximum nested modals. A second `showModal` from inside a callback while
+/// a modal is open pushes another frame; this caps that depth.
+const MODAL_STACK_MAX: usize = 4;
+
+/// Phase of an open modal frame.
+#[derive(Clone, Copy, PartialEq)]
+enum ModalState {
+    /// `showModal` issued the call to the builder; we're waiting for the
+    /// builder to return its overlay widget id via OP_RET.
+    AwaitingBuilderReturn,
+    /// Builder returned. Overlay is wired and visible. We wait for
+    /// `setDialogResult` to set `result`, after which the main loop's
+    /// `try_resume_modal` destroys the overlay and resumes the user program.
+    AwaitingResult,
+}
+
+/// One frame on `Vm::modal_stack`. Each `showModal` pushes a frame; each
+/// completed dialog pops one.
+#[derive(Clone, Copy)]
+struct ModalFrame {
+    /// Widget id returned by the builder, or NONE while
+    /// `state == AwaitingBuilderReturn`.
+    overlay_id: WidgetId,
+    /// Function id (from `@func_name`) wired into overlay.on_click. The
+    /// compiler injects `@modalDefaultOverlayClick` from lib/modal.fl when the
+    /// caller omits the second showModal argument.
+    overlay_click_fn: u16,
+    /// Result value latched by `setDialogResult`. Only valid when
+    /// `has_result == true`.
+    result: i32,
+    /// Set true the first time `setDialogResult` fires for this frame.
+    /// Subsequent calls are ignored (first-write-wins).
+    has_result: bool,
+    state: ModalState,
+    /// `call_sp` at the moment we issued the call to the builder. When the
+    /// builder finally returns (its OP_RET drops `call_sp` below this value),
+    /// we capture its return value as `overlay_id`.
+    builder_call_depth: u8,
+}
+
 pub struct Vm {
     pc: u16,
     stack: [i32; STACK_SIZE],
@@ -414,8 +468,11 @@ pub struct Vm {
     functions: Vec<FuncEntry>,
     // Normal or callback execution mode
     pub mode: VmMode,
-    // Saved state while a callback is running
-    saved: Option<Box<VmSnapshot>>,
+    // Stack of saved states for nested callback execution. A callback that
+    // suspends on a modal (showModal) leaves its frame in place while later
+    // callbacks (e.g. setDialogResult) run on top, then resumes once the
+    // modal closes — see try_resume_modal.
+    saved: Vec<VmSnapshot>,
     // Callback queue — FIFO ring buffer
     cb_queue: [CbRequest; CB_QUEUE_SIZE],
     cb_head: u8,
@@ -433,6 +490,8 @@ pub struct Vm {
     pub ext_count: u8,
     // Open file slots — index 0 = handle 1, index 1 = handle 2.
     open_files: [Option<OpenFile>; 2],
+    // Open modal dialogs (innermost = last). Empty when no dialog is showing.
+    modal_stack: Vec<ModalFrame>,
 }
 
 impl Vm {
@@ -458,7 +517,7 @@ impl Vm {
             code: VmCode::None,
             functions: Vec::new(),
             mode: VmMode::Normal,
-            saved: None,
+            saved: Vec::new(),
             cb_queue: [EMPTY_CB; CB_QUEUE_SIZE],
             cb_head: 0,
             cb_tail: 0,
@@ -470,6 +529,7 @@ impl Vm {
             widget_count: 0,
             ext_count: 0,
             open_files: [None, None],
+            modal_stack: Vec::new(),
         }
     }
 
@@ -603,6 +663,11 @@ impl Vm {
 
     /// Run one queued callback to completion. Saves/restores VM state.
     /// Returns false if the queue was empty.
+    ///
+    /// A callback that suspends on a modal dialog (showModal) leaves its
+    /// frame on the saved stack — pop_state runs only when the callback
+    /// actually finishes (Halted/Yielded). The suspended frame is later
+    /// resumed by `try_resume_modal` when `setDialogResult` fires.
     pub fn run_next_callback(&mut self, ctx: &mut Ctx) -> bool {
         if self.cb_head == self.cb_tail {
             return false;
@@ -615,6 +680,11 @@ impl Vm {
             self.push_arg(req.args[i]);
         }
         self.run(ctx);
+        if self.state == VmState::AwaitingModal {
+            // Callback is suspended on showModal. Leave its frame in place;
+            // try_resume_modal will resume + pop_state when result arrives.
+            return true;
+        }
         self.pop_state();
         true
     }
@@ -630,6 +700,153 @@ impl Vm {
         self.push_state(offset);
         self.run(ctx);
         self.pop_state();
+    }
+
+    // === Modal dialog support ===
+
+    /// Implements OP_SHOW_MODAL. Pops `overlay_click_fn` then `builder_fn`
+    /// from the eval stack, pushes a modal frame, and issues a CALL to the
+    /// builder function. The user program is left dangling at the byte after
+    /// OP_SHOW_MODAL — the builder's eventual OP_RET drops us into
+    /// `handle_builder_return`, which transitions VM state to AwaitingModal.
+    fn handle_show_modal(&mut self, _ctx: &mut Ctx) {
+        let click_fn = self.pop() as u16;
+        let builder_fn = self.pop() as u16;
+
+        if self.modal_stack.len() >= MODAL_STACK_MAX {
+            // Nested too deep — emulate immediate Cancel.
+            self.push(DLG_CANCEL);
+            return;
+        }
+
+        // Resolve builder function id → entry offset.
+        let builder_offset = match self.find_func(builder_fn) {
+            Some(f) => f.offset as u16,
+            None => {
+                // Bad fn id; emulate Cancel rather than VM error so the user
+                // program keeps running.
+                self.push(DLG_CANCEL);
+                return;
+            }
+        };
+
+        if (self.call_sp as usize) >= CALL_STACK_SIZE {
+            self.state = VmState::Error;
+            return;
+        }
+
+        // Mirror OP_CALL: push frame, advance frame_base past caller's locals,
+        // jump to builder. The builder runs as a normal function call; its
+        // OP_RET will eventually pop this frame back into the post-showModal pc.
+        self.call_stack[self.call_sp as usize] = CallFrame {
+            ret_addr: self.pc,
+            frame_base: self.frame_base,
+            frame_size: self.frame_size,
+        };
+        self.call_sp += 1;
+        self.frame_base = self.frame_base.wrapping_add(self.frame_size);
+        self.frame_size = 0;
+        self.pc = builder_offset;
+
+        self.modal_stack.push(ModalFrame {
+            overlay_id: WidgetId::NONE,
+            overlay_click_fn: click_fn,
+            result: 0,
+            has_result: false,
+            state: ModalState::AwaitingBuilderReturn,
+            builder_call_depth: self.call_sp,
+        });
+    }
+
+    /// Called from OP_RET when the modal builder has just returned. Pops the
+    /// overlay widget id from the eval stack, wires it for clicks, and
+    /// suspends VM execution until `setDialogResult` fires.
+    fn handle_builder_return(&mut self, ctx: &mut Ctx) {
+        let overlay_raw = self.pop();
+        let click_fn = match self.modal_stack.last() {
+            Some(t) => t.overlay_click_fn,
+            None => return,
+        };
+
+        let overlay = if (0..0xFFFF).contains(&overlay_raw) {
+            WidgetId(overlay_raw as u16)
+        } else {
+            WidgetId::NONE
+        };
+
+        if !ctx.tree.is_live(overlay) {
+            // Builder returned a bogus id — pop modal, emulate Cancel.
+            self.modal_stack.pop();
+            self.push(DLG_CANCEL);
+            return;
+        }
+
+        // Wire overlay click → setDialogResult(CANCEL) by default, or the
+        // user-supplied handler (passed as the 2nd showModal arg). The
+        // compiler injects @modalDefaultOverlayClick from lib/modal.fl when
+        // omitted, so this path always has a real func_id.
+        if let Some(ext) = ctx.tree.ensure_ext(overlay) {
+            ext.on_click = click_fn;
+        }
+        ctx.tree.get_mut(overlay).flags |= crate::widget::FLAG_CLICKABLE;
+        // Repaint the whole screen on next frame so the overlay's full-screen
+        // backdrop covers everything underneath in both buffers.
+        ctx.tree.mark_dirty(WidgetId(0));
+
+        let top = self.modal_stack.last_mut().unwrap();
+        top.overlay_id = overlay;
+        top.state = ModalState::AwaitingResult;
+
+        self.state = VmState::AwaitingModal;
+    }
+
+    /// Called by the main loop each tick. If a modal has had its result set
+    /// by `setDialogResult`, destroy the overlay subtree, push the result onto
+    /// the eval stack as `showModal`'s return value, and resume the VM.
+    ///
+    /// If the suspended showModal was issued from inside a callback (saved
+    /// stack non-empty), this pumps the callback to completion and then
+    /// pop_state's its frame — the callback is effectively synchronous from
+    /// the outside, even though main-loop event processing happened during
+    /// the dialog.
+    pub fn try_resume_modal(&mut self, ctx: &mut Ctx) {
+        if !matches!(self.state, VmState::AwaitingModal) {
+            return;
+        }
+        let (overlay, result) = match self.modal_stack.last() {
+            Some(top) if top.has_result => (top.overlay_id, top.result),
+            _ => return,
+        };
+        self.modal_stack.pop();
+
+        if ctx.tree.is_live(overlay) {
+            ctx.tree.destroy_subtree(overlay);
+            // Repaint background under the now-gone overlay in both buffers.
+            ctx.tree.mark_dirty(WidgetId(0));
+        }
+
+        self.push(result);
+        self.state = VmState::Running;
+
+        // If we suspended inside a callback, finish it now so its scope's
+        // "var r = showModal(...); if (r == YES) { ... }" runs to completion
+        // and its frame is properly torn down. Without this the callback
+        // would keep its slot on `saved` forever.
+        if !self.saved.is_empty() {
+            self.run(ctx);
+            // Callback completed (Halted/Yielded/Error) or hit another nested
+            // showModal. Only pop_state for completion; nested suspension
+            // leaves the new frame in place.
+            if self.state != VmState::AwaitingModal {
+                self.pop_state();
+            }
+        }
+    }
+
+    /// True if a modal dialog is open (regardless of phase). Useful for the
+    /// main loop, e.g. to skip routine input if a dialog has visual focus.
+    pub fn modal_active(&self) -> bool {
+        !self.modal_stack.is_empty()
     }
 
     // --- Internal: save/restore VM state for callback execution ---
@@ -648,7 +865,7 @@ impl Vm {
             frame_base: self.frame_base,
             frame_size: self.frame_size,
         };
-        self.saved = Some(Box::new(snapshot));
+        self.saved.push(snapshot);
         self.pc = offset;
         self.sp = 0;
         self.call_sp = 0;
@@ -667,7 +884,7 @@ impl Vm {
     }
 
     fn pop_state(&mut self) {
-        if let Some(snap) = self.saved.take() {
+        if let Some(snap) = self.saved.pop() {
             self.pc = snap.pc;
             self.sp = snap.sp;
             self.stack = snap.stack;
@@ -679,7 +896,13 @@ impl Vm {
             self.critical = snap.critical;
             self.frame_base = snap.frame_base;
             self.frame_size = snap.frame_size;
-            self.mode = VmMode::Normal;
+            // Outer level still in a callback if more frames remain on the
+            // stack. Otherwise we're back in the main user program.
+            self.mode = if self.saved.is_empty() {
+                VmMode::Normal
+            } else {
+                VmMode::Callback
+            };
         }
     }
 
@@ -730,7 +953,7 @@ impl Vm {
         self.code = VmCode::None;
         self.functions.clear();
         self.mode = VmMode::Normal;
-        self.saved = None;
+        self.saved.clear();
         self.frame_base = 0;
         self.frame_size = 0;
         self.global_count = 0;
@@ -739,6 +962,7 @@ impl Vm {
         self.critical = false;
         self.render_mode = RenderMode::Dirty;
         self.open_files = [None, None];
+        self.modal_stack.clear();
     }
 
     pub fn has_code(&self) -> bool {
@@ -873,6 +1097,21 @@ impl Vm {
                     self.pc = frame.ret_addr;
                     self.frame_base = frame.frame_base;
                     self.frame_size = frame.frame_size;
+
+                    // Modal builder return interception: if we just popped the
+                    // call frame for a modal dialog's builder, capture its
+                    // returned overlay id and suspend the VM until
+                    // setDialogResult fires.
+                    let intercept = match self.modal_stack.last() {
+                        Some(top) => {
+                            top.state == ModalState::AwaitingBuilderReturn
+                                && self.call_sp < top.builder_call_depth
+                        }
+                        None => false,
+                    };
+                    if intercept {
+                        self.handle_builder_return(ctx);
+                    }
                 } else if self.mode == VmMode::Callback {
                     // Callback complete — halt cleanly
                     self.state = VmState::Halted;
@@ -1009,11 +1248,15 @@ impl Vm {
                 }
             }
             OP_W_TARGET => {
+                // Static target with u8-encoded id (0..254). Used for widgets
+                // allocated at fixed positions (e.g. root). Dynamically
+                // allocated widgets use W_TARGET_S, which takes a u16 id from
+                // the stack.
                 let wid = self.read_u8();
-                self.target = WidgetId(wid);
+                self.target = WidgetId(wid as u16);
             }
             OP_W_TARGET_S => {
-                let wid = self.pop() as u8;
+                let wid = self.pop() as u16;
                 self.target = WidgetId(wid);
             }
             OP_W_SET => {
@@ -1043,7 +1286,17 @@ impl Vm {
                 }
             }
             OP_W_PARENT => {
+                // Static parent id (u8). Used for parent(0) and other literal
+                // widget references that fit in u8.
                 let parent = self.read_u8();
+                if self.target.is_some() {
+                    ctx.tree.add_child(WidgetId(parent as u16), self.target);
+                }
+            }
+            OP_W_PARENT_S => {
+                // Dynamic parent — id from stack. Used when the parent is a
+                // widget variable (its slot stores the runtime id from alloc).
+                let parent = self.pop() as u16;
                 if self.target.is_some() {
                     ctx.tree.add_child(WidgetId(parent), self.target);
                 }
@@ -1409,6 +1662,18 @@ impl Vm {
                 match self.file_slot_index(handle) {
                     Some(idx) => self.open_files[idx] = None,
                     None => self.state = VmState::Error,
+                }
+            }
+            OP_SHOW_MODAL => {
+                self.handle_show_modal(ctx);
+            }
+            OP_SET_DIALOG_RESULT => {
+                let result = self.pop();
+                if let Some(top) = self.modal_stack.last_mut() {
+                    if !top.has_result {
+                        top.result = result;
+                        top.has_result = true;
+                    }
                 }
             }
             OP_ARR_TO_STR => {

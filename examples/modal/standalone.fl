@@ -1,0 +1,108 @@
+// modal.fl — Modal dialog smoke test
+//
+// Exercises lib/modal.fl helpers:
+//   showAlert(title, message)        → OK / CANCEL
+//   showConfirmation(title, message) → YES / NO / CANCEL
+//
+// Tap "Confirm" → confirmation dialog (Yes/No).
+// Tap "Info"    → alert dialog (single OK button).
+// Tap on the backdrop in either case → CANCEL.
+
+#include "modal.fl"
+
+var status_lbl;
+
+fn on_confirm_click() {
+    var r = showConfirmation(str("Are you sure?"),
+                             str("This action cannot be undone."));
+    if (r == YES) {
+        status_lbl.text = "Confirmed";
+        status_lbl.text_color = 0x07E0;  // GREEN
+    }
+    if (r == NO) {
+        status_lbl.text = "Declined";
+        status_lbl.text_color = 0xF800;  // RED
+    }
+    if (r == CANCEL) {
+        status_lbl.text = "Cancelled";
+        status_lbl.text_color = 0x8410;  // GRAY
+    }
+    dirty();
+    render();
+}
+
+fn on_info_click() {
+    showAlert(str("Information"),
+              str("This is a sample alert dialog."));
+    status_lbl.text = "Alert dismissed";
+    status_lbl.text_color = LIGHT_GRAY;
+    dirty();
+    render();
+}
+
+fn setup() {
+    target(0);
+    set(bg_color, 0x18C3);
+
+    var title_lbl = alloc();
+    parent(0);
+    set(kind, KIND_LABEL);
+    set(loc_x, 0);
+    set(loc_y, 40);
+    set(size_w, 800);
+    set(size_h, 40);
+    set(bg_color, 0x18C3);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Modal dialog smoke test");
+
+    var confirm_btn = alloc();
+    parent(0);
+    set(kind, KIND_LABEL);
+    set(loc_x, 220);
+    set(loc_y, 200);
+    set(size_w, 160);
+    set(size_h, 50);
+    set(bg_color, BLUE);
+    set(text_color, WHITE);
+    set(press_color, NAVY);
+    set(border_radius, 6);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Confirm");
+    set(clickable, ON);
+    set(on_click, @on_confirm_click);
+
+    var info_btn = alloc();
+    parent(0);
+    set(kind, KIND_LABEL);
+    set(loc_x, 420);
+    set(loc_y, 200);
+    set(size_w, 160);
+    set(size_h, 50);
+    set(bg_color, TEAL);
+    set(text_color, WHITE);
+    set(press_color, DARK_GREEN);
+    set(border_radius, 6);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Info");
+    set(clickable, ON);
+    set(on_click, @on_info_click);
+
+    status_lbl = alloc();
+    parent(0);
+    set(kind, KIND_LABEL);
+    set(loc_x, 280);
+    set(loc_y, 290);
+    set(size_w, 240);
+    set(size_h, 30);
+    set(bg_color, 0x18C3);
+    set(text_color, LIGHT_GRAY);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Tap a button to begin");
+
+    return 0;
+}
+
+fn loop() {
+    delay(50);
+}

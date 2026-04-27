@@ -1022,6 +1022,11 @@ fn main() -> ! {
     let mut protocol = Protocol::new();
 
     loop {
+        // If a modal is open and its result has been set (typically by a
+        // callback that ran on the previous loop iteration), destroy the
+        // overlay and resume the suspended showModal call.
+        vm.try_resume_modal(&mut ctx);
+
         // --- VM step (only when Running or Yielded) ---
         match vm.state {
             VmState::Running | VmState::Yielded => {
@@ -1052,6 +1057,12 @@ fn main() -> ! {
                 if systick::millis().wrapping_sub(vm.wait_until) < 0x8000_0000 {
                     vm.state = VmState::Running;
                 }
+            }
+            VmState::AwaitingModal => {
+                // Suspended showModal — main loop continues to poll touch /
+                // drain callbacks; setDialogResult will eventually flip the
+                // modal's `has_result` so the next try_resume_modal at the
+                // top of this loop unblocks us.
             }
             _ => {} // Halted, Error, Ready → skip
         }

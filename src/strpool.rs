@@ -219,10 +219,15 @@ impl StringPool {
 
         let wcount = tree.count();
 
-        // Phase 1: Build keep bitmask from widget text_ids
+        // Phase 1: Build keep bitmask from widget text_ids. Skip destroyed
+        // widgets — their text references are about to be reclaimed.
         let mut keep: u64 = 0;
         for i in 0..wcount {
-            let text_id = tree.text_id(WidgetId(i as u8));
+            let wid = WidgetId(i as u16);
+            if !tree.is_live(wid) {
+                continue;
+            }
+            let text_id = tree.text_id(wid);
             if text_id != STR_NONE && (text_id as usize) < MAX_STRINGS {
                 keep |= 1u64 << text_id;
             }
@@ -270,9 +275,12 @@ impl StringPool {
         self.count = new_id;
         self.next = write_pos;
 
-        // Phase 3: Remap widget text_id references
+        // Phase 3: Remap widget text_id references (live widgets only).
         for i in 0..wcount {
-            let wid = WidgetId(i as u8);
+            let wid = WidgetId(i as u16);
+            if !tree.is_live(wid) {
+                continue;
+            }
             let text_id = tree.text_id(wid);
             if text_id != STR_NONE && (text_id as usize) < old_count {
                 let new = remap[text_id as usize];

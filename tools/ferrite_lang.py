@@ -934,6 +934,7 @@ NO_VALUE_BUILTINS = {
     'sendUsart',
     'rtcWrite',
     'fileClose',
+    'setDialogResult',
 }
 
 
@@ -2111,8 +2112,22 @@ class CodeGen:
         if name == 'parent':
             if len(node.args) != 1:
                 raise CompileError("parent() takes 1 argument", node.line)
-            wid = self._resolve_widget_id(node.args[0])
-            self.asm.w_parent(wid)
+            arg = node.args[0]
+            if isinstance(arg, NumLit):
+                # Literal id (typically parent(0) = root) → static W_PARENT.
+                self.asm.w_parent(arg.value)
+            elif isinstance(arg, VarRef):
+                # Widget variable → load runtime id, use W_PARENT_S so this
+                # stays correct after destroy/realloc cycles (modal dialogs).
+                if arg.name not in self.widget_ids:
+                    raise CompileError(
+                        f"'{arg.name}' is not a widget variable", arg.line)
+                self._gen_expr(arg)
+                self.asm.w_parent_s()
+            else:
+                # General expression → evaluate and use W_PARENT_S.
+                self._gen_expr(arg)
+                self.asm.w_parent_s()
             return
 
         # --- Built-in: set(prop, values...) ---
@@ -2547,6 +2562,44 @@ class CodeGen:
             self.asm.builtin(Builtin.FILE_CLOSE)
             return
 
+        if name == 'showModal':
+            # showModal(builderFn, [overlayClickFn]) → result
+            # Suspends the VM until setDialogResult fires (typically from a
+            # callback on a widget inside the dialog). The builder runs as a
+            # normal function; its return value (the dialog overlay widget id)
+            # is captured by the runtime. The optional second arg is the
+            # overlay's on_click handler — if omitted, the compiler injects
+            # @modalDefaultOverlayClick from lib/modal.fl.
+            if len(node.args) not in (1, 2):
+                raise CompileError(
+                    "showModal() takes 1 or 2 arguments: builderFn, [overlayClickFn]",
+                    node.line)
+            self._gen_expr(node.args[0])
+            if len(node.args) == 2:
+                self._gen_expr(node.args[1])
+            else:
+                # Synthesize @modalDefaultOverlayClick. Resolves now (will fail
+                # with a clear error if the user did not #include "modal.fl").
+                if 'modalDefaultOverlayClick' not in self.func_ids:
+                    raise CompileError(
+                        'showModal() without explicit handler requires '
+                        '#include "modal.fl"',
+                        node.line)
+                fn_id = self.func_ids['modalDefaultOverlayClick']
+                self.asm.push(fn_id)
+            self.asm.builtin(Builtin.SHOW_MODAL)
+            return
+
+        if name == 'setDialogResult':
+            # setDialogResult(result) — record on the innermost open modal
+            # frame. Subsequent calls within the same dialog are ignored
+            # (first-write-wins). No-op when no dialog is open.
+            if len(node.args) != 1:
+                raise CompileError("setDialogResult() takes 1 argument: result", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.SET_DIALOG_RESULT)
+            return
+
         # --- User-defined function ---
         if name not in self.functions:
             raise CompileError(f"undefined function: {name}", node.line)
@@ -2613,14 +2666,20 @@ class CodeGen:
             self.asm.w_set(prop_id)
 
     def _emit_target(self, var_name, line):
-        """Emit W_TARGET for a widget variable, skipping if already targeted."""
+        """Emit dynamic target for a widget variable: LOAD slot + W_TARGET_S.
+        The variable's slot holds the runtime widget id (set by W_ALLTAR), so
+        this stays correct even when widgets are destroyed and reallocated —
+        which static W_TARGET <id> would not, since the slot can be reused for
+        a different widget (e.g. dialog overlay → next dialog's overlay).
+        Skips emission when this widget is already the current target."""
         if var_name not in self.widget_ids:
             raise CompileError(
                 f"'{var_name}' is not a widget variable (use var {var_name} = alloc())",
                 line)
         if self._current_target != var_name:
-            wid = self.widget_ids[var_name]
-            self.asm.w_target(wid)
+            slot = self._var_slot(var_name, line)
+            self.asm.load(slot)
+            self.asm.w_target_s()
             self._current_target = var_name
 
     def _gen_dot_assign(self, node):

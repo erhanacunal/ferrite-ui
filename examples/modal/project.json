@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "screen": [800, 480],
+  "include_dirs": ["../../lib"],
+  "fonts": [],
+  "images": [],
+  "render_mode": "buffered",
+  "programs": [
+    {
+      "name": "main",
+      "source": "standalone.fl"
+    }
+  ]
+}

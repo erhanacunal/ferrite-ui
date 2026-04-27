@@ -1,0 +1,216 @@
+// modal.fl — Modal dialog support
+//
+// Pulls in core.fl + color.fl so callers don't have to repeat the includes
+// when they only need showAlert / showConfirmation.
+
+#include "core.fl"
+#include "color.fl"
+
+// === Standard dialog result codes ===
+// Mirrored in src/vm.rs (DLG_OK, DLG_CANCEL).
+const OK         = 1;
+const CANCEL     = 2;
+const YES        = 3;
+const NO         = 4;
+const YES_TO_ALL = 5;
+const NO_TO_ALL  = 6;
+
+// === Default overlay click handler ===
+// Wired automatically by showModal when the caller omits the optional
+// overlayClickFunctionId argument. Click outside the dialog box → CANCEL.
+fn modalDefaultOverlayClick() {
+    setDialogResult(CANCEL);
+}
+
+// =============================================================
+// Pre-built dialogs: showAlert and showConfirmation
+// =============================================================
+//
+// These wrap showModal with ready-made layouts. Title and message are
+// passed as str_ids — use str("...") at the call site:
+//
+//   showAlert(str("Saved"), str("File written successfully"));
+//   var r = showConfirmation(str("Delete?"), str("Cannot be undone"));
+//   if (r == YES) { delete(); }
+//
+// The builders read the title/message from globals, since showModal calls
+// the builder with no arguments. This means dialogs are NOT re-entrant
+// (showAlert from inside showAlert would clobber the title/message of the
+// outer dialog before its overlay is destroyed). For nested dialogs, write
+// a custom builder that closes over its own state.
+
+var __modal_title;
+var __modal_message;
+
+// --- Click handlers ---
+fn __modalOk()  { setDialogResult(OK);  }
+fn __modalYes() { setDialogResult(YES); }
+fn __modalNo()  { setDialogResult(NO);  }
+
+// --- Builder: alert dialog with single OK button ---
+fn __modalAlertBuilder() {
+    // Translucent full-screen backdrop. Background click → CANCEL via
+    // modalDefaultOverlayClick (wired by showModal when no override given).
+    var overlay = alloc();
+    parent(0);
+    set(loc_x, 0);
+    set(loc_y, 0);
+    set(size_w, 800);
+    set(size_h, 480);
+    set(bg_color, 0x2104);
+    set(clickable, ON);
+
+    // Centred white box. clickable=ON absorbs clicks so the backdrop's
+    // CANCEL handler doesn't fire when the user taps inside the dialog.
+    var box = alloc();
+    parent(overlay);
+    set(loc_x, 200);
+    set(loc_y, 140);
+    set(size_w, 400);
+    set(size_h, 200);
+    set(bg_color, WHITE);
+    set(border_color, GRAY);
+    set(border_radius, 8);
+    set(clickable, ON);
+
+    var title = alloc();
+    parent(box);
+    set(kind, KIND_LABEL);
+    set(loc_x, 16);
+    set(loc_y, 16);
+    set(size_w, 368);
+    set(size_h, 30);
+    set(bg_color, WHITE);
+    set(text_color, BLACK);
+    set(text_align, ALIGN_CENTER);
+    set(text, __modal_title);
+
+    var msg = alloc();
+    parent(box);
+    set(kind, KIND_LABEL);
+    set(loc_x, 16);
+    set(loc_y, 60);
+    set(size_w, 368);
+    set(size_h, 70);
+    set(bg_color, WHITE);
+    set(text_color, DARK_GRAY);
+    set(text_align, ALIGN_CENTER);
+    set(text, __modal_message);
+
+    var ok_btn = alloc();
+    parent(box);
+    set(kind, KIND_LABEL);
+    set(loc_x, 150);
+    set(loc_y, 145);
+    set(size_w, 100);
+    set(size_h, 40);
+    set(bg_color, BLUE);
+    set(text_color, WHITE);
+    set(press_color, NAVY);
+    set(border_radius, 6);
+    set(text_align, ALIGN_CENTER);
+    set(text, "OK");
+    set(clickable, ON);
+    set(on_click, @__modalOk);
+
+    return overlay;
+}
+
+// --- Builder: confirmation dialog with Yes / No buttons ---
+fn __modalConfirmBuilder() {
+    var overlay = alloc();
+    parent(0);
+    set(loc_x, 0);
+    set(loc_y, 0);
+    set(size_w, 800);
+    set(size_h, 480);
+    set(bg_color, 0x2104);
+    set(clickable, ON);
+
+    var box = alloc();
+    parent(overlay);
+    set(loc_x, 200);
+    set(loc_y, 140);
+    set(size_w, 400);
+    set(size_h, 200);
+    set(bg_color, WHITE);
+    set(border_color, GRAY);
+    set(border_radius, 8);
+    set(clickable, ON);
+
+    var title = alloc();
+    parent(box);
+    set(kind, KIND_LABEL);
+    set(loc_x, 16);
+    set(loc_y, 16);
+    set(size_w, 368);
+    set(size_h, 30);
+    set(bg_color, WHITE);
+    set(text_color, BLACK);
+    set(text_align, ALIGN_CENTER);
+    set(text, __modal_title);
+
+    var msg = alloc();
+    parent(box);
+    set(kind, KIND_LABEL);
+    set(loc_x, 16);
+    set(loc_y, 60);
+    set(size_w, 368);
+    set(size_h, 70);
+    set(bg_color, WHITE);
+    set(text_color, DARK_GRAY);
+    set(text_align, ALIGN_CENTER);
+    set(text, __modal_message);
+
+    var yes_btn = alloc();
+    parent(box);
+    set(kind, KIND_LABEL);
+    set(loc_x, 70);
+    set(loc_y, 145);
+    set(size_w, 110);
+    set(size_h, 40);
+    set(bg_color, GREEN);
+    set(text_color, WHITE);
+    set(press_color, DARK_GREEN);
+    set(border_radius, 6);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Yes");
+    set(clickable, ON);
+    set(on_click, @__modalYes);
+
+    var no_btn = alloc();
+    parent(box);
+    set(kind, KIND_LABEL);
+    set(loc_x, 220);
+    set(loc_y, 145);
+    set(size_w, 110);
+    set(size_h, 40);
+    set(bg_color, RED);
+    set(text_color, WHITE);
+    set(press_color, DARK_RED);
+    set(border_radius, 6);
+    set(text_align, ALIGN_CENTER);
+    set(text, "No");
+    set(clickable, ON);
+    set(on_click, @__modalNo);
+
+    return overlay;
+}
+
+// --- Public helpers ---
+
+// Show an informational dialog with a single OK button.
+// Returns OK when the user taps OK, or CANCEL when they tap the backdrop.
+fn showAlert(title, message) {
+    __modal_title = title;
+    __modal_message = message;
+    return showModal(@__modalAlertBuilder);
+}
+
+// Show a Yes / No confirmation dialog.
+// Returns YES, NO, or CANCEL (backdrop tap).
+fn showConfirmation(title, message) {
+    __modal_title = title;
+    __modal_message = message;
+    return showModal(@__modalConfirmBuilder);
+}
