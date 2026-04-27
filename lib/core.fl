@@ -12,6 +12,7 @@ const KIND_RADIO    = 6;
 const KIND_INPUT    = 7;
 const KIND_GAUGE    = 8;
 const KIND_DROPDOWN = 9;
+const KIND_GRAPH    = 10;
 
 // Text alignment
 const ALIGN_LEFT   = 0;

@@ -269,7 +269,7 @@ fn run_window(
             // Press in firmware triggers an immediate render_dirty to reflect
             // the pressed highlight without waiting for the frame render.
             if event.kind == TouchEventKind::Press && vm.render_mode == RenderMode::Dirty {
-                render::render_dirty(ctx);
+                render::render_dirty(ctx, vm);
             }
         }
 
@@ -590,10 +590,10 @@ fn render_phase(ctx: &mut Ctx, vm: &mut Vm) {
     }
 
     match vm.render_mode {
-        RenderMode::Dirty => render::render_dirty(ctx),
+        RenderMode::Dirty => render::render_dirty(ctx, vm),
         RenderMode::Buffered => {
             if render::buffered_has_dirty(ctx) {
-                render::render_buffered(ctx);
+                render::render_buffered(ctx, vm);
             }
         }
     }

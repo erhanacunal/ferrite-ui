@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
+#![allow(dead_code, unused_imports)]
 
 extern crate alloc;
 
 use alloc::boxed::Box;
 use ctx::Ctx;
-mod panic;
 mod backlight;
 mod clip;
 mod config;
@@ -21,6 +21,7 @@ mod image;
 mod irq;
 mod keyboard;
 mod lcd;
+mod panic;
 mod proto;
 mod protocol;
 mod render;
@@ -450,7 +451,15 @@ fn sd_boot_check(lcd: &Lcd, flash: &Flash, font: &Font) -> u8 {
     }
 
     // Card detected — show status and do full init
-    font.draw_str(lcd, flash, b"SD card found...", 300, 235, 0x4208, Some(0x0000));
+    font.draw_str(
+        lcd,
+        flash,
+        b"SD card found...",
+        300,
+        235,
+        0x4208,
+        Some(0x0000),
+    );
 
     let sd = match sdcard::SdCard::init() {
         Ok(sd) => sd,
@@ -459,13 +468,24 @@ fn sd_boot_check(lcd: &Lcd, flash: &Flash, font: &Font) -> u8 {
 
     let mut fat = match fat::Fat::mount(&sd) {
         Ok(f) => f,
-        Err(_) => { sd.release_bus(); return 0; }
+        Err(_) => {
+            sd.release_bus();
+            return 0;
+        }
     };
 
     // Check EMPTY.BIN — recovery mode
     if fat.find_by_name(&sd, b"EMPTY.BIN").is_some() {
         lcd.fill_rect(0, 200, 800, 30, 0x0000);
-        font.draw_str(lcd, flash, b"SD: recovery mode", 280, 220, COLOR_WHITE, Some(0x0000));
+        font.draw_str(
+            lcd,
+            flash,
+            b"SD: recovery mode",
+            280,
+            220,
+            COLOR_WHITE,
+            Some(0x0000),
+        );
         sd.release_bus();
         delay_ms(1000);
         return ERR_EMPTY_RUN;
@@ -474,7 +494,10 @@ fn sd_boot_check(lcd: &Lcd, flash: &Flash, font: &Font) -> u8 {
     // Check PROGRAM.BIN — flash update
     let entry = match fat.find_by_name(&sd, b"PROGRAM.BIN") {
         Some(e) => e,
-        None => { sd.release_bus(); return 0; }
+        None => {
+            sd.release_bus();
+            return 0;
+        }
     };
 
     let file_size = entry.size;
@@ -485,7 +508,15 @@ fn sd_boot_check(lcd: &Lcd, flash: &Flash, font: &Font) -> u8 {
 
     // Show progress
     lcd.fill_rect(0, 200, 800, 60, 0x0000);
-    font.draw_str(lcd, flash, b"SD: flashing program...", 250, 220, COLOR_WHITE, Some(0x0000));
+    font.draw_str(
+        lcd,
+        flash,
+        b"SD: flashing program...",
+        250,
+        220,
+        COLOR_WHITE,
+        Some(0x0000),
+    );
 
     // Write file to external flash sector by sector (4KB)
     const SECTOR: usize = 4096;
@@ -496,7 +527,11 @@ fn sd_boot_check(lcd: &Lcd, flash: &Flash, font: &Font) -> u8 {
 
     while offset < file_size {
         let remaining = (file_size - offset) as usize;
-        let chunk = if remaining < SECTOR { remaining } else { SECTOR };
+        let chunk = if remaining < SECTOR {
+            remaining
+        } else {
+            SECTOR
+        };
 
         // Read from SD
         let read = fat.read_file(&sd, &entry, offset, &mut buf[..chunk]);
@@ -511,7 +546,10 @@ fn sd_boot_check(lcd: &Lcd, flash: &Flash, font: &Font) -> u8 {
         let mut page_off = 0;
         while page_off < read {
             let page_len = (read - page_off).min(PAGE);
-            flash.write(dest_base + offset + page_off as u32, &buf[page_off..page_off + page_len]);
+            flash.write(
+                dest_base + offset + page_off as u32,
+                &buf[page_off..page_off + page_len],
+            );
             page_off += page_len;
         }
 
@@ -527,7 +565,15 @@ fn sd_boot_check(lcd: &Lcd, flash: &Flash, font: &Font) -> u8 {
     // buf freed here (Vec dropped)
 
     lcd.fill_rect(0, 200, 800, 60, 0x0000);
-    font.draw_str(lcd, flash, b"SD: flash complete!", 270, 220, 0x07E0, Some(0x0000));
+    font.draw_str(
+        lcd,
+        flash,
+        b"SD: flash complete!",
+        270,
+        220,
+        0x07E0,
+        Some(0x0000),
+    );
     delay_ms(1000);
 
     0
@@ -895,14 +941,22 @@ fn main() -> ! {
             ctx.lcd.fill_rect(0, 0, 800, bar_h, COLOR_RED);
             ctx.lcd.fill_rect(0, bar_h, 800, 480 - bar_h, COLOR_BLACK);
             ctx.fonts.embedded().draw_str(
-                &ctx.lcd, &ctx.flash,
-                b"RECOVERY MODE", 290, 230,
-                COLOR_RED, Some(COLOR_BLACK),
+                &ctx.lcd,
+                &ctx.flash,
+                b"RECOVERY MODE",
+                290,
+                230,
+                COLOR_RED,
+                Some(COLOR_BLACK),
             );
             ctx.fonts.embedded().draw_str(
-                &ctx.lcd, &ctx.flash,
-                b"Use writefs to flash new program", 210, 260,
-                0x4208, Some(COLOR_BLACK),
+                &ctx.lcd,
+                &ctx.flash,
+                b"Use writefs to flash new program",
+                210,
+                260,
+                0x4208,
+                Some(COLOR_BLACK),
             );
             error_code = ERR_EMPTY_RUN;
         } else {
@@ -935,7 +989,7 @@ fn main() -> ! {
         w.background_color = COLOR_BLACK;
     }
     ctx.tree.root = root;
-    
+
     // 6. Single VM — heap allocated, owns code and function table
     let mut vm = Box::new(Vm::new());
 
@@ -962,8 +1016,16 @@ fn main() -> ! {
                     // Pre-allocate tree capacity from v4 header counts (one contiguous
                     // allocation per Vec, no fragmentation from incremental doubling).
                     // Falls back to 96 for v1-v3 images without count metadata.
-                    let wc = if vm.widget_count > 0 { vm.widget_count as usize } else { 96 };
-                    let ec = if vm.ext_count > 0 { vm.ext_count as usize } else { 96 };
+                    let wc = if vm.widget_count > 0 {
+                        vm.widget_count as usize
+                    } else {
+                        96
+                    };
+                    let ec = if vm.ext_count > 0 {
+                        vm.ext_count as usize
+                    } else {
+                        96
+                    };
                     ctx.tree.reserve(wc, ec);
                 }
                 None => {
@@ -974,7 +1036,6 @@ fn main() -> ! {
     }
 
     if error_code == 0 && vm.has_code() {
-
         // Run setup() function — must return 0 for success
         if let Some(entry) = vm.find_by_kind(FunctionKind::Setup) {
             let offset = entry.offset as u16;
@@ -1098,7 +1159,7 @@ fn main() -> ! {
                     let cal = touch::run_calibration(&mut touch, &ctx.lcd);
                     cfg.write(&ctx.flash, config::KEY_TOUCH_CAL, &cal.to_bytes());
                     protocol::send_touch_cal(&usart, &cal);
-                    render::render_all(&mut ctx);
+                    render::render_all(&mut ctx, &vm);
                 }
 
                 RxEvent::ProgramReady => {
@@ -1128,8 +1189,16 @@ fn main() -> ! {
                         vm.load_raw(prog);
                     }
                     // Pre-allocate tree capacity from v4 header (fallback 96 for v1-v3).
-                    let wc = if vm.widget_count > 0 { vm.widget_count as usize } else { 96 };
-                    let ec = if vm.ext_count > 0 { vm.ext_count as usize } else { 96 };
+                    let wc = if vm.widget_count > 0 {
+                        vm.widget_count as usize
+                    } else {
+                        96
+                    };
+                    let ec = if vm.ext_count > 0 {
+                        vm.ext_count as usize
+                    } else {
+                        96
+                    };
                     ctx.tree.reserve(wc, ec);
                     protocol.free_program();
 
@@ -1215,13 +1284,21 @@ fn main() -> ! {
                         // In dirty mode, draw only the pressed key immediately.
                         // In buffered mode, keyboard is redrawn fully in next frame.
                         if vm.render_mode == RenderMode::Dirty {
-                            kb.draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, kb.pressed_key, true);
+                            kb.draw_key_by_code(
+                                &ctx.lcd,
+                                &ctx.fonts,
+                                &ctx.flash,
+                                kb.pressed_key,
+                                true,
+                            );
                         }
                     } else {
                         let hit = touch::hit_test(&mut ctx.tree, event.x, event.y);
 
                         // Dismiss keyboard if tapping outside an input
-                        if kb.visible && (!hit.is_some() || ctx.tree.get(hit).kind != widget::KIND_INPUT) {
+                        if kb.visible
+                            && (!hit.is_some() || ctx.tree.get(hit).kind != widget::KIND_INPUT)
+                        {
                             dismiss_keyboard(&mut kb, &mut ctx);
                         }
 
@@ -1290,7 +1367,7 @@ fn main() -> ! {
 
                             ctx.tree.mark_dirty(hit);
                             if vm.render_mode == RenderMode::Dirty {
-                                render::render_dirty(&mut ctx);
+                                render::render_dirty(&mut ctx, &vm);
                             }
                         }
 
@@ -1310,7 +1387,7 @@ fn main() -> ! {
                         if scroll_active && scroll_id.is_some() {
                             scrollbar_set_position(&mut ctx, scroll_id, event.y);
                             if vm.render_mode == RenderMode::Dirty {
-                                render::render_dirty(&mut ctx);
+                                render::render_dirty(&mut ctx, &vm);
                             }
                         }
 
@@ -1318,7 +1395,8 @@ fn main() -> ! {
                         let dfs = ctx.tree.dfs_order();
                         for i in 0..dfs.len() {
                             let w = ctx.tree.get(dfs[i]);
-                            if w.flags & widget::FLAG_PRESSED != 0 && w.kind == widget::KIND_SLIDER {
+                            if w.flags & widget::FLAG_PRESSED != 0 && w.kind == widget::KIND_SLIDER
+                            {
                                 let abs = ctx.tree.absolute_rect(dfs[i]);
                                 let new_val = touch_to_slider_value(&abs, event.x);
                                 if let Some(ext) = ctx.tree.ensure_ext(dfs[i]) {
@@ -1326,7 +1404,7 @@ fn main() -> ! {
                                 }
                                 ctx.tree.mark_dirty(dfs[i]);
                                 if vm.render_mode == RenderMode::Dirty {
-                                    render::render_dirty(&mut ctx);
+                                    render::render_dirty(&mut ctx, &vm);
                                 }
 
                                 if vm.has_code() {
@@ -1413,7 +1491,9 @@ fn main() -> ! {
                         }
 
                         // Radio: uncheck siblings, check self
-                        if clicked_id.is_some() && ctx.tree.get(clicked_id).kind == widget::KIND_RADIO {
+                        if clicked_id.is_some()
+                            && ctx.tree.get(clicked_id).kind == widget::KIND_RADIO
+                        {
                             let parent = ctx.tree.get(clicked_id).parent;
                             if parent.is_some() {
                                 let mut sib = ctx.tree.get(parent).first_child;
@@ -1442,7 +1522,7 @@ fn main() -> ! {
                         }
 
                         if vm.render_mode == RenderMode::Dirty {
-                            render::render_dirty(&mut ctx);
+                            render::render_dirty(&mut ctx, &vm);
                         }
 
                         // Enqueue on_click callback
@@ -1453,13 +1533,15 @@ fn main() -> ! {
                         }
 
                         // Enqueue on_tap callback (widget_id, packed x|y) — skip for KIND_INPUT
-                        if clicked_id.is_some() && vm.has_code()
+                        if clicked_id.is_some()
+                            && vm.has_code()
                             && ctx.tree.get(clicked_id).kind != widget::KIND_INPUT
                         {
                             let tap_func = ctx.tree.on_tap(clicked_id);
                             if tap_func > 0 {
                                 if let Some(entry) = vm.find_func(tap_func) {
-                                    let packed_xy = ((event.x as u32) << 16 | event.y as u32) as i32;
+                                    let packed_xy =
+                                        ((event.x as u32) << 16 | event.y as u32) as i32;
                                     vm.enqueue_callback(
                                         entry.offset as u16,
                                         &[clicked_id.0 as i32, packed_xy],
@@ -1506,7 +1588,7 @@ fn main() -> ! {
                 RenderMode::Buffered => {
                     if render::buffered_has_dirty(&mut ctx) {
                         ctx.lcd.begin_frame();
-                        render::render_buffered_content(&mut ctx);
+                        render::render_buffered_content(&mut ctx, &vm);
                         if kb.visible {
                             kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
                         }
@@ -1514,7 +1596,7 @@ fn main() -> ! {
                     }
                 }
                 RenderMode::Dirty => {
-                    render::render_dirty(&mut ctx);
+                    render::render_dirty(&mut ctx, &vm);
                     if kb.visible && kb.dirty {
                         kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
                         kb.dirty = false;
@@ -1542,7 +1624,7 @@ fn main() -> ! {
                 RenderMode::Buffered => {
                     if render::buffered_has_dirty(&mut ctx) {
                         ctx.lcd.begin_frame();
-                        render::render_buffered_content(&mut ctx);
+                        render::render_buffered_content(&mut ctx, &vm);
                         if kb.visible {
                             kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
                         }
@@ -1550,7 +1632,7 @@ fn main() -> ! {
                     }
                 }
                 RenderMode::Dirty => {
-                    render::render_dirty(&mut ctx);
+                    render::render_dirty(&mut ctx, &vm);
                     if kb.visible && kb.dirty {
                         kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
                         kb.dirty = false;

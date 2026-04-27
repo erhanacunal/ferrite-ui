@@ -2662,7 +2662,16 @@ class CodeGen:
         else:
             if len(value_args) != 1:
                 raise CompileError(f"set({prop_name}) takes 1 value", node.line)
-            self._gen_expr(value_args[0])
+            # set(graph_arr, samples) — `samples` is an array variable; load its
+            # slot (which holds the runtime arr_id) instead of expanding it as
+            # an indexed read. Same pattern as arrFree/arrToStr.
+            arg = value_args[0]
+            if (prop_id == Prop.GRAPH_ARR and isinstance(arg, VarRef)
+                    and arg.name in self.array_vars):
+                slot = self._var_slot(arg.name, node.line)
+                self.asm.load(slot)
+            else:
+                self._gen_expr(arg)
             self.asm.w_set(prop_id)
 
     def _emit_target(self, var_name, line):

@@ -16,6 +16,7 @@ use crate::proto::{
     PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
     PROP_PRESS_COLOR, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W,
     PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VISIBLE,
+    PROP_GRAPH_ARR, PROP_GRAPH_COUNT, PROP_GRAPH_FLAGS,
 };
 use crate::render;
 use crate::types::{Edges, Offset, Size};
@@ -1129,10 +1130,12 @@ impl Vm {
             OP_W_RENDER => match self.render_mode {
                 RenderMode::Buffered => {
                     if render::buffered_has_dirty(ctx) {
-                        render::render_buffered(ctx);
+                        // Reborrow self as immutable while ctx stays mut —
+                        // render reads array data via Vm::array_slice.
+                        render::render_buffered(ctx, &*self);
                     }
                 }
-                RenderMode::Dirty => render::render_dirty(ctx),
+                RenderMode::Dirty => render::render_dirty(ctx, &*self),
             },
             OP_ARR_LOAD => {
                 let idx = self.pop();
@@ -1829,6 +1832,11 @@ impl Vm {
                 PROP_SCROLL_Y => ext.value = val as i16,
                 PROP_GRADIENT_COLOR => ext.gradient_color = val as u16,
                 PROP_GRADIENT_DIR => ext.gradient_dir = val as u8,
+                // KIND_GRAPH props share storage with value/max_length/image_id;
+                // safe because a single widget kind is exclusive.
+                PROP_GRAPH_ARR => ext.value = val as i16,
+                PROP_GRAPH_COUNT => ext.max_length = val as u8,
+                PROP_GRAPH_FLAGS => ext.image_id = val as u8,
                 _ => {}
             }
         }
@@ -1879,6 +1887,9 @@ impl Vm {
             PROP_SCROLL_Y => ctx.tree.value(self.target) as i32,
             PROP_GRADIENT_COLOR => ctx.tree.gradient_color(self.target) as i32,
             PROP_GRADIENT_DIR => ctx.tree.gradient_dir(self.target) as i32,
+            PROP_GRAPH_ARR => ctx.tree.value(self.target) as i32,
+            PROP_GRAPH_COUNT => ctx.tree.max_length(self.target) as i32,
+            PROP_GRAPH_FLAGS => ctx.tree.image_id(self.target) as i32,
             _ => 0,
         }
     }
@@ -1989,6 +2000,13 @@ impl Vm {
             Some(pos) => self.push(self.arrays[pos].data.len() as i32),
             None => self.state = VmState::Error,
         }
+    }
+
+    /// Borrow a VM array's data by id. Used by the renderer (e.g. graph
+    /// widget) to read sample buffers without copying. Returns None when the
+    /// id does not name a live array.
+    pub fn array_slice(&self, arr_id: u16) -> Option<&[i32]> {
+        self.arrays.iter().find(|a| a.id == arr_id).map(|a| a.data.as_slice())
     }
 
     // --- File ops ---

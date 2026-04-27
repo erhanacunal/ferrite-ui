@@ -237,6 +237,10 @@ class Prop:
     CLIP_CHILDREN = 0x2A
     GRADIENT_COLOR = 0x2B  # End color of background gradient
     GRADIENT_DIR = 0x2C    # 0=none, 1=horizontal (L→R), 2=vertical (T→B)
+    # Graph widget (KIND_GRAPH) — aliased onto value/max_length/image_id.
+    GRAPH_ARR = 0x2D       # VM array id holding sample values (i32 each)
+    GRAPH_COUNT = 0x2E     # Cap on samples drawn (0 = full array length)
+    GRAPH_FLAGS = 0x2F     # bit 0: 0=spline / 1=linear, bit 1: fill area
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -950,6 +954,8 @@ PROP_NAMES = {
     0x20: 'ON_CLICK', 0x21: 'ON_PAINT', 0x22: 'ON_TAP', 0x23: 'BORDER_RADIUS', 0x24: 'VALUE', 0x25: 'CHECKED',
     0x26: 'MAX_LENGTH', 0x27: 'CURSOR_POS', 0x28: 'ON_CHANGE',
     0x29: 'SCROLL_Y', 0x2A: 'CLIP_CHILDREN',
+    0x2B: 'GRADIENT_COLOR', 0x2C: 'GRADIENT_DIR',
+    0x2D: 'GRAPH_ARR', 0x2E: 'GRAPH_COUNT', 0x2F: 'GRAPH_FLAGS',
     0x40: 'LOCATION', 0x41: 'SIZE', 0x42: 'MARGIN',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -1174,6 +1180,10 @@ PROP_MAP = {
     'clip_children': (Prop.CLIP_CHILDREN, False),
     'gradient_color': (Prop.GRADIENT_COLOR, False),
     'gradient_dir': (Prop.GRADIENT_DIR, False),
+    'graph_arr': (Prop.GRAPH_ARR, False),
+    'graph_array': (Prop.GRAPH_ARR, False),
+    'graph_count': (Prop.GRAPH_COUNT, False),
+    'graph_flags': (Prop.GRAPH_FLAGS, False),
     'text': (Prop.TEXT, True),
     'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }

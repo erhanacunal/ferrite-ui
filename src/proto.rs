@@ -60,6 +60,15 @@ pub const PROP_CLIP_CHILDREN: u8 = 0x2A;
 pub const PROP_GRADIENT_COLOR: u8 = 0x2B; // End color of background gradient
 pub const PROP_GRADIENT_DIR: u8 = 0x2C;  // 0=none, 1=horizontal, 2=vertical
 
+// Graph widget (KIND_GRAPH). Aliased onto existing ext fields:
+//   GRAPH_ARR   -> ext.value (i16 holds the VM array id)
+//   GRAPH_COUNT -> ext.max_length (u8 cap; 0 = use the array's full length)
+//   GRAPH_FLAGS -> ext.image_id (bit 0: 0=spline / 1=linear, bit 1: fill area)
+// They live under KIND_GRAPH so don't collide with label/input/image meanings.
+pub const PROP_GRAPH_ARR: u8 = 0x2D;
+pub const PROP_GRAPH_COUNT: u8 = 0x2E;
+pub const PROP_GRAPH_FLAGS: u8 = 0x2F;
+
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;
 pub const PROP_SIZE: u8 = 0x41;

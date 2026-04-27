@@ -2,11 +2,12 @@ use crate::clip::ClipRegion;
 use crate::ctx::Ctx;
 use crate::lcd::{self, Lcd};
 use crate::types::{Color, Edges, Rect};
+use crate::vm::Vm;
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED,
-    FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_DROPDOWN, KIND_GAUGE, KIND_INPUT,
-    KIND_LABEL, KIND_PROGRESS, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId,
-    WidgetTree,
+    FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_DROPDOWN, KIND_GAUGE, KIND_GRAPH,
+    KIND_INPUT, KIND_LABEL, KIND_PROGRESS, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt,
+    WidgetId, WidgetTree,
 };
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
@@ -29,9 +30,12 @@ pub fn buffered_has_dirty(ctx: &mut Ctx) -> bool {
 /// widgets + end_frame. Call this instead of the 3-step pattern. The inner
 /// `render_buffered_content` remains public for callers that need to interleave
 /// overlays (e.g. the keyboard) between widget draw and buffer swap.
-pub fn render_buffered(ctx: &mut Ctx) {
+///
+/// `vm` is borrowed read-only so the renderer can resolve sample data for
+/// KIND_GRAPH widgets via `Vm::array_slice` without copying.
+pub fn render_buffered(ctx: &mut Ctx, vm: &Vm) {
     ctx.lcd.begin_frame();
-    render_buffered_content(ctx);
+    render_buffered_content(ctx, vm);
     ctx.lcd.end_frame();
 }
 
@@ -41,7 +45,7 @@ pub fn render_buffered(ctx: &mut Ctx) {
 /// moving widgets don't leave a trail. Per-buffer `prev_rect` tracking keeps
 /// the erase area bounded even under continuous motion.
 /// Caller must bracket with lcd.begin_frame() / lcd.end_frame().
-pub fn render_buffered_content(ctx: &mut Ctx) {
+pub fn render_buffered_content(ctx: &mut Ctx, vm: &Vm) {
     let buf = ctx.lcd.back_buf();
     let dfs = ctx.tree.dfs_order().to_vec();
 
@@ -55,7 +59,7 @@ pub fn render_buffered_content(ctx: &mut Ctx) {
         if stale.is_empty() { continue; }
         let current = if w.is_visible() { ctx.tree.absolute_rect(id) } else { Rect::new(0,0,0,0) };
         if stale == current { continue; } // rect unchanged — no trail to clean
-        redraw_behind(ctx, i, &dfs, stale);
+        redraw_behind(ctx, vm, i, &dfs, stale);
     }
 
     // Pass 2: draw dirty visible widgets at their current rect
@@ -81,7 +85,7 @@ pub fn render_buffered_content(ctx: &mut Ctx) {
             }
         }
 
-        draw_widget(ctx, id, &abs);
+        draw_widget(ctx, vm, id, &abs);
         ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
     }
 
@@ -140,7 +144,7 @@ fn set_buf_prev_rect(tree: &mut WidgetTree, id: WidgetId, buf: u8, rect: Rect) {
 
 /// Redraw widgets that sit behind widget `target_idx` (earlier in DFS order),
 /// clipped to `stale`. Used to restore pixels under a moved/hidden widget.
-fn redraw_behind(ctx: &mut Ctx, target_idx: usize, dfs: &[WidgetId], stale: Rect) {
+fn redraw_behind(ctx: &mut Ctx, vm: &Vm, target_idx: usize, dfs: &[WidgetId], stale: Rect) {
     let mut clip = ClipRegion::from_rect(stale);
     clip.clip_to_bounds(&SCREEN);
     if clip.is_empty() { return; }
@@ -150,7 +154,7 @@ fn redraw_behind(ctx: &mut Ctx, target_idx: usize, dfs: &[WidgetId], stale: Rect
         if !ctx.tree.is_tree_visible(uid) { continue; }
         let u_abs = ctx.tree.absolute_rect(uid);
         if !u_abs.intersects(&stale) { continue; }
-        draw_widget_clipped(ctx, uid, &u_abs, &clip);
+        draw_widget_clipped(ctx, vm, uid, &u_abs, &clip);
     }
 }
 
@@ -158,14 +162,14 @@ fn redraw_behind(ctx: &mut Ctx, target_idx: usize, dfs: &[WidgetId], stale: Rect
 
 /// Draw the entire widget tree from scratch (initial draw or full redraw).
 /// Iterative DFS using cached order — no recursion, no stack growth.
-pub fn render_all(ctx: &mut Ctx) {
-    render_all_iterative(ctx);
+pub fn render_all(ctx: &mut Ctx, vm: &Vm) {
+    render_all_iterative(ctx, vm);
     clear_all_dirty(ctx);
 }
 
 /// Iterative full redraw: walk DFS order, skip invisible subtrees.
 /// Children of scroll containers are clipped to the viewport.
-fn render_all_iterative(ctx: &mut Ctx) {
+fn render_all_iterative(ctx: &mut Ctx, vm: &Vm) {
     let dfs = ctx.tree.dfs_order();
     let mut i = 0;
     while i < dfs.len() {
@@ -191,7 +195,7 @@ fn render_all_iterative(ctx: &mut Ctx) {
                 && abs.right() <= viewport.right()
                 && abs.bottom() <= viewport.bottom()
             {
-                draw_widget(ctx, id, &abs);
+                draw_widget(ctx, vm, id, &abs);
                 ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
             } else {
                 // Outside or partially visible — skip entire subtree
@@ -203,7 +207,7 @@ fn render_all_iterative(ctx: &mut Ctx) {
                 continue;
             }
         } else {
-            draw_widget(ctx, id, &abs);
+            draw_widget(ctx, vm, id, &abs);
             ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
         }
         i += 1;
@@ -226,7 +230,7 @@ fn render_all_iterative(ctx: &mut Ctx) {
 /// Two-pass approach: erase invisible widgets first, then draw visible ones.
 /// This prevents hidden panels from overwriting visible siblings that share
 /// the same screen area (e.g. tab panels stacked at the same position).
-pub fn render_dirty(ctx: &mut Ctx) {
+pub fn render_dirty(ctx: &mut Ctx, vm: &Vm) {
     let dfs = ctx.tree.dfs_order();
 
     let mut has_dirty = false;
@@ -273,7 +277,7 @@ pub fn render_dirty(ctx: &mut Ctx) {
         if stale.is_empty() { continue; }
         let current = if w.is_visible() { ctx.tree.absolute_rect(id) } else { Rect::new(0,0,0,0) };
         if stale == current { continue; }
-        redraw_behind(ctx, di, &dfs_snap, stale);
+        redraw_behind(ctx, vm, di, &dfs_snap, stale);
     }
 
     // Pass 2: draw dirty visible widgets with clipping
@@ -339,7 +343,7 @@ pub fn render_dirty(ctx: &mut Ctx) {
             }
 
             if !clip.is_empty() {
-                draw_widget_clipped(ctx, sid, &sabs, &clip);
+                draw_widget_clipped(ctx, vm, sid, &sabs, &clip);
                 ctx.tree.get_mut(sid).flags |= FLAG_RENDERED;
             }
         }
@@ -394,7 +398,7 @@ fn effective_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
 }
 
 /// Draw widget without clipping (full render path).
-fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
+fn draw_widget(ctx: &Ctx, vm: &Vm, id: WidgetId, abs: &Rect) {
     let widget = ctx.tree.get(id);
     let ext = ctx.tree.ext(id).unwrap_or(&WidgetExt::DEFAULT);
     let b = ext.border;
@@ -488,8 +492,9 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
         }
     }
 
-    // Background image
-    if ext.image_id != 0 {
+    // Background image. KIND_GRAPH repurposes ext.image_id as graph flags,
+    // so skip the image lookup for graphs.
+    if ext.image_id != 0 && widget.kind != KIND_GRAPH {
         let bg = inner_rect(abs, &b);
         draw_bg_image(ctx, ext.image_id, &bg);
     }
@@ -526,10 +531,16 @@ fn draw_widget(ctx: &Ctx, id: WidgetId, abs: &Rect) {
         let inner = inner_rect(abs, &ext.border);
         draw_gauge(&ctx.lcd, widget, &inner, ext);
     }
+
+    // Spline graph
+    if widget.kind == KIND_GRAPH {
+        let inner = inner_rect(abs, &b);
+        draw_graph(&ctx.lcd, vm, widget, &inner, ext);
+    }
 }
 
 /// Draw widget with clip region (dirty render path).
-fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
+fn draw_widget_clipped(ctx: &Ctx, vm: &Vm, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     let widget = ctx.tree.get(id);
     let ext = ctx.tree.ext(id).unwrap_or(&WidgetExt::DEFAULT);
     let b = ext.border;
@@ -609,8 +620,9 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
         }
     }
 
-    // Background image
-    if ext.image_id != 0 {
+    // Background image. KIND_GRAPH repurposes ext.image_id as graph flags,
+    // so skip the image lookup for graphs.
+    if ext.image_id != 0 && widget.kind != KIND_GRAPH {
         let bg = inner_rect(abs, &b);
         draw_bg_image(ctx, ext.image_id, &bg);
     }
@@ -646,6 +658,13 @@ fn draw_widget_clipped(ctx: &Ctx, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     if widget.kind == KIND_GAUGE {
         let inner = inner_rect(abs, &ext.border);
         draw_gauge(&ctx.lcd, widget, &inner, ext);
+    }
+
+    // Spline graph (clip region already applied via screen-clipped fill calls
+    // below; pixel writes are cheap so we just bound to inner).
+    if widget.kind == KIND_GRAPH {
+        let inner = inner_rect(abs, &b);
+        draw_graph(&ctx.lcd, vm, widget, &inner, ext);
     }
 }
 
@@ -898,6 +917,166 @@ fn draw_gauge(lcd: &Lcd, widget: &Widget, inner: &Rect, ext: &WidgetExt) {
         let tx1 = cx + (((outer_r + 6) as i32 * cos_v as i32) >> 8) as i16;
         let ty1 = cy + (((outer_r + 6) as i32 * sin_v as i32) >> 8) as i16;
         lcd.draw_line(tx0, ty0, tx1, ty1, tick_color);
+    }
+}
+
+// --- Spline graph ---
+//
+// Reads samples from a VM array (id stored in `ext.value`) and draws them
+// across the inner rect. Catmull-Rom interpolation between samples gives a
+// smooth curve without storing per-pixel splines on the device. Sample-space
+// → pixel-space mapping happens before interpolation, so the cubic terms stay
+// in i32 range even for full-display widgets.
+//
+// Field layout for KIND_GRAPH (aliased onto WidgetExt):
+//   ext.value     -> graph_arr_id (u16)
+//   ext.max_length-> sample-count cap (u8; 0 means use full array length)
+//   ext.image_id  -> flags: bit 0 linear (else spline), bit 1 fill area
+//   ext.text_color-> line color
+//   ext.gradient_color (when fill flag set) -> fill color under the curve
+
+const GRAPH_FLAG_LINEAR: u8 = 1 << 0;
+const GRAPH_FLAG_FILL: u8 = 1 << 1;
+
+fn draw_graph(lcd: &Lcd, vm: &Vm, _widget: &Widget, inner: &Rect, ext: &WidgetExt) {
+    if inner.is_empty() || inner.w < 2 || inner.h < 2 {
+        return;
+    }
+
+    let arr_id = ext.value as u16;
+    let samples = match vm.array_slice(arr_id) {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    let cap = ext.max_length as usize;
+    let count = if cap == 0 { samples.len() } else { cap.min(samples.len()) };
+    if count < 2 {
+        return;
+    }
+
+    // Auto-range from data so the curve always fills the widget vertically.
+    // A flat series (min == max) gets a unit span so the line lands mid-rect.
+    let mut y_min = samples[0];
+    let mut y_max = samples[0];
+    for &v in &samples[..count] {
+        if v < y_min { y_min = v; }
+        if v > y_max { y_max = v; }
+    }
+    let mut y_span = (y_max - y_min) as i64;
+    if y_span <= 0 { y_span = 1; }
+
+    let inner_x0 = inner.x as i32;
+    let inner_y0 = inner.y as i32;
+    let inner_w = inner.w as i32 - 1;
+    let inner_h = inner.h as i32 - 1;
+    let denom = (count as i32 - 1).max(1);
+
+    // No pre-mapped pixel buffers: the device only has 20KB RAM and most of
+    // it is heap, so a [i16; 256] pair (1KB on stack) corrupts globals. Each
+    // (px, py) is recomputed from `samples` on demand instead.
+    let plot_x = |i: usize| -> i32 {
+        inner_x0 + (i as i32 * inner_w) / denom
+    };
+    let plot_y = |sample: i32| -> i32 {
+        let v = sample as i64 - y_min as i64;
+        inner_y0 + inner_h - ((v * inner_h as i64) / y_span) as i32
+    };
+    // Index clamp for the 4-point Catmull-Rom window at the ends.
+    let sample_at = |i: isize| -> i32 {
+        let idx = if i < 0 { 0 } else if (i as usize) >= count { count - 1 } else { i as usize };
+        samples[idx]
+    };
+
+    let line_color = if ext.text_color != 0 && ext.text_color != 0xFFFF {
+        ext.text_color
+    } else {
+        0xFFFF
+    };
+    let flags = ext.image_id;
+    let linear = flags & GRAPH_FLAG_LINEAR != 0;
+    let do_fill = flags & GRAPH_FLAG_FILL != 0 && ext.gradient_color != 0;
+    let baseline_y = (inner_y0 + inner_h) as i16;
+
+    let mut prev_x = plot_x(0) as i16;
+    let mut prev_y = plot_y(samples[0]) as i16;
+
+    if linear {
+        for i in 1..count {
+            let cx = plot_x(i) as i16;
+            let cy = plot_y(samples[i]) as i16;
+            if do_fill {
+                fill_under_segment(lcd, prev_x, prev_y, cx, cy, baseline_y, ext.gradient_color);
+            }
+            lcd.draw_line(prev_x, prev_y, cx, cy, line_color);
+            prev_x = cx;
+            prev_y = cy;
+        }
+        return;
+    }
+
+    // Catmull-Rom: for each segment p1→p2, evaluate the cubic at every pixel
+    // step in x. Endpoints duplicate (p0=p1 at start, p3=p2 at end) to keep
+    // the curve from over-shooting at the borders.
+    for i in 0..count - 1 {
+        let p0 = plot_y(sample_at(i as isize - 1));
+        let p1 = plot_y(samples[i]);
+        let p2 = plot_y(samples[i + 1]);
+        let p3 = plot_y(sample_at(i as isize + 2));
+
+        let x1 = plot_x(i);
+        let x2 = plot_x(i + 1);
+        let steps = (x2 - x1).max(1);
+
+        for s in 1..=steps {
+            // t in Q8 fixed-point (0..=256 over the segment).
+            let t: i32 = (s * 256) / steps;
+            let t2 = (t * t) >> 8;
+            let t3 = (t2 * t) >> 8;
+            // 2 * P(t) in Q8 — divide by 2 at the end keeps an even integer.
+            let two_pt = (2 * p1) * 256
+                + (-p0 + p2) * t
+                + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+                + (-p0 + 3 * p1 - 3 * p2 + p3) * t3;
+            let cy = ((two_pt / 2) >> 8) as i16;
+            let cx = (x1 + s) as i16;
+            if do_fill {
+                fill_under_segment(lcd, prev_x, prev_y, cx, cy, baseline_y, ext.gradient_color);
+            }
+            lcd.draw_line(prev_x, prev_y, cx, cy, line_color);
+            prev_x = cx;
+            prev_y = cy;
+        }
+    }
+}
+
+/// Fill a 1-pixel-wide vertical column at each x along the line a→b down to
+/// the baseline. Used when GRAPH_FLAG_FILL is set: gives a slim shaded region
+/// under the curve without a separate polygon rasterizer.
+fn fill_under_segment(
+    lcd: &Lcd, x0: i16, y0: i16, x1: i16, y1: i16, baseline_y: i16, color: Color,
+) {
+    if x1 == x0 {
+        let top = y0.min(baseline_y);
+        let bot = y0.max(baseline_y);
+        if bot > top {
+            fill_rect_screen(lcd, Rect::new(x0, top, 1, (bot - top) as u16), color);
+        }
+        return;
+    }
+    let dx = (x1 - x0) as i32;
+    let dy = (y1 - y0) as i32;
+    let step: i32 = if dx > 0 { 1 } else { -1 };
+    let mut x = x0 as i32;
+    while x != x1 as i32 {
+        let t_num = x - x0 as i32;
+        let y = y0 as i32 + (dy * t_num) / dx;
+        let top = (y as i16).min(baseline_y);
+        let bot = (y as i16).max(baseline_y);
+        if bot > top {
+            fill_rect_screen(lcd, Rect::new(x as i16, top, 1, (bot - top) as u16), color);
+        }
+        x += step;
     }
 }
 

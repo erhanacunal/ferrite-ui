@@ -42,6 +42,7 @@ pub const KIND_RADIO: u8 = 6;
 pub const KIND_INPUT: u8 = 7;
 pub const KIND_GAUGE: u8 = 8;
 pub const KIND_DROPDOWN: u8 = 9;
+pub const KIND_GRAPH: u8 = 10;
 
 // --- Text Alignment ---
 

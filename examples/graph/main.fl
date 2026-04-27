@@ -1,0 +1,104 @@
+// main.fl — Spline graph smoke test (800x480)
+//
+// Two KIND_GRAPH widgets sharing the same VM array as a sliding-window
+// data source. The top graph renders Catmull-Rom spline + filled area;
+// the bottom one draws the same samples as straight line segments so the
+// smoothing is easy to compare.
+//
+// Each loop tick, samples are refilled from a 64-entry sine LUT with an
+// advancing phase — the array is the only thing the widget reads, so
+// updating it is enough to redraw the curve.
+
+#include "core.fl"
+#include "color.fl"
+
+const N = 64;
+
+var sin_lut[64] = [
+       0,   10,   20,   29,   38,   47,   56,   63,
+      71,   77,   83,   88,   92,   95,   98,   99,
+     100,   99,   98,   95,   92,   88,   83,   77,
+      71,   63,   56,   47,   38,   29,   20,   10,
+       0,  -10,  -20,  -29,  -38,  -47,  -56,  -63,
+     -71,  -77,  -83,  -88,  -92,  -95,  -98,  -99,
+    -100,  -99,  -98,  -95,  -92,  -88,  -83,  -77,
+     -71,  -63,  -56,  -47,  -38,  -29,  -20,  -10
+];
+
+var samples[64];
+var spline_w;
+var linear_w;
+var phase;
+
+fn refill() {
+    var i = 0;
+    while (i < N) {
+        samples[i] = sin_lut[(phase + i) & 63];
+        i = i + 1;
+    }
+}
+
+fn setup() {
+    phase = 0;
+    refill();
+
+    target(0);
+    set(bg_color, 0x18C3);
+
+    var title = alloc();
+    parent(0);
+    set(kind, KIND_LABEL);
+    set(loc_x, 0);
+    set(loc_y, 12);
+    set(size_w, 800);
+    set(size_h, 28);
+    set(bg_color, 0x18C3);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Spline graph (Catmull-Rom + fill, vs linear)");
+
+    // --- Top: spline with filled area ---
+    spline_w = alloc();
+    parent(0);
+    set(kind, KIND_GRAPH);
+    set(loc_x, 40);
+    set(loc_y, 60);
+    set(size_w, 720);
+    set(size_h, 180);
+    set(bg_color, BLACK);
+    set(border, 1, 1, 1, 1);
+    set(border_color, GRAY);
+    set(text_color, 0x07FF);     // line: cyan
+    set(gradient_color, 0x0010); // fill: deep blue
+    set(graph_arr, samples);
+    set(graph_count, N);
+    set(graph_flags, 2);          // bit 1 = fill area under curve
+
+    // --- Bottom: same samples, linear segments, no fill ---
+    linear_w = alloc();
+    parent(0);
+    set(kind, KIND_GRAPH);
+    set(loc_x, 40);
+    set(loc_y, 260);
+    set(size_w, 720);
+    set(size_h, 180);
+    set(bg_color, BLACK);
+    set(border, 1, 1, 1, 1);
+    set(border_color, GRAY);
+    set(text_color, 0x07E0);     // line: green
+    set(graph_arr, samples);
+    set(graph_count, N);
+    set(graph_flags, 1);          // bit 0 = linear
+
+    return 0;
+}
+
+fn loop() {
+    phase = (phase + 1) & 63;
+    refill();
+    target(spline_w);
+    dirty();
+    target(linear_w);
+    dirty();
+    delay(40);
+}
