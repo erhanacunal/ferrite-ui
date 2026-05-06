@@ -182,16 +182,41 @@ Binary output: `target/thumbv7m-none-eabi/release/ferrite-ui`
 
 ### ESP32-S3 (e-paper)
 
-```bash
-rustup target add xtensa-esp32s3-none-elf   # requires espup / xtensa Rust toolchain
+Use the included `epaper.ps1` script — it sources the ESP toolchain environment, invokes `cargo +esp` with the correct flags, and optionally flashes via `espflash`.
 
-# Build ferrite_fs.bin first (or a placeholder is embedded automatically)
-python tools/ferrite_build.py examples/epaper_clock/project.json -o ferrite_fs.bin
+```powershell
+# Build only
+.\epaper.ps1
 
-cargo build --release --features epaper --target xtensa-esp32s3-none-elf --bin epaper
+# Build and flash (auto-detect port)
+.\epaper.ps1 flash
+
+# Build and flash to a specific port
+.\epaper.ps1 flash COM3
+
+# Build, flash, and open serial monitor
+.\epaper.ps1 monitor
 ```
 
-The build script detects the xtensa target, embeds `ferrite_fs.bin` into the binary as a flash image (XIP-safe reads), and links with `linkall.x`.
+**Prerequisites** (one-time setup):
+
+```powershell
+# Install espup and the Xtensa Rust toolchain
+cargo install espup
+espup install          # creates %USERPROFILE%\export-esp.ps1
+
+# Install the flash tool
+cargo install espflash
+```
+
+`epaper.ps1` automatically sources `%USERPROFILE%\export-esp.ps1` before building. The build script embeds `ferrite_fs.bin` into the binary for XIP-safe flash reads; build the filesystem image first if you have a project ready:
+
+```powershell
+python tools/ferrite_build.py examples/epaper_clock/project.json -o ferrite_fs.bin
+.\epaper.ps1 flash COM3
+```
+
+If `ferrite_fs.bin` is absent a zero-filled placeholder is embedded automatically (the filesystem will report `BadMagic` at runtime until a real image is provided).
 
 ### Host Simulator
 
