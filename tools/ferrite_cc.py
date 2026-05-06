@@ -143,6 +143,18 @@ class Op:
     FGE  = 0xCB
     FNE  = 0xCC
 
+    # String formatting
+    SPRINTF = 0xA9  # + u8 argc (number of format args after the fmt string)
+
+    # Float math (trig / sqrt / rounding)
+    FSIN   = 0xCD
+    FCOS   = 0xCE
+    FSQRT  = 0xCF
+    FABS   = 0xD0
+    FATAN2 = 0xD1  # pop x, pop y → push atan2(y, x)
+    FFLOOR = 0xD2
+    FCEIL  = 0xD3
+
 
 # Backwards compatibility -- Builtin constants map to method IDs (0-based).
 # Used by ferrite_lang.py via asm.builtin(Builtin.XXX)
@@ -716,6 +728,16 @@ class Asm:
         """Pop two f32, push i32 (1 if a != b, else 0)."""
         self._emit(Op.FNE)
 
+    # --- Float math (trig / sqrt / rounding) ---
+
+    def fsin(self):   self._emit(Op.FSIN)
+    def fcos(self):   self._emit(Op.FCOS)
+    def fsqrt(self):  self._emit(Op.FSQRT)
+    def fabs(self):   self._emit(Op.FABS)
+    def fatan2(self): self._emit(Op.FATAN2)
+    def ffloor(self): self._emit(Op.FFLOOR)
+    def fceil(self):  self._emit(Op.FCEIL)
+
     # --- Built-in methods ---
 
     def builtin(self, method_id):
@@ -808,6 +830,11 @@ class Asm:
     def str_ftos(self):
         """Pop f32 bits, push str_id of float representation."""
         self._emit(Op.FTOS)
+
+    def str_sprintf(self, argc):
+        """sprintf(fmt, arg0..argN) → str_id. argc = number of format args."""
+        self._emit(Op.SPRINTF)
+        self._emit_u8(argc)
 
     def str_concat(self):
         """Pop [str_b, str_a], push concatenated str_id."""
@@ -932,12 +959,14 @@ OP_NAMES = {
     0xA0: 'setBrightness', 0xA1: 'brightness',
     0xA2: 'fileOpen', 0xA3: 'fileRead', 0xA4: 'fileSize', 0xA5: 'fileClose',
     0xA6: 'arrToStr',
-    0xA7: 'showModal', 0xA8: 'setDialogResult',
+    0xA7: 'showModal', 0xA8: 'setDialogResult', 0xA9: 'sprintf',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
     0xC7: 'feq', 0xC8: 'flt', 0xC9: 'fle',
     0xCA: 'fgt', 0xCB: 'fge', 0xCC: 'fne',
+    0xCD: 'fsin', 0xCE: 'fcos', 0xCF: 'fsqrt',
+    0xD0: 'fabs', 0xD1: 'fatan2', 0xD2: 'ffloor', 0xD3: 'fceil',
 }
 
 PROP_NAMES = {
@@ -971,18 +1000,42 @@ _NO_ARG_OPS = (
 )
 
 
-def _slot_name(slot):
-    """Format slot byte: 0x80+ = local Ln, else global Gn."""
+def _current_symbol_function(symbols, addr):
+    if not symbols or addr is None:
+        return None
+    for fn in symbols.get('functions', []):
+        start = fn.get('offset')
+        length = fn.get('length')
+        if start is None:
+            continue
+        end = start + length if length is not None else None
+        if addr >= start and (end is None or addr < end):
+            return fn
+    return None
+
+
+def _slot_name(slot, symbols=None, addr=None):
+    """Format slot byte, using optional source symbols when available."""
     if slot & 0x80:
-        return f'L{slot & 0x7F}'
+        idx = slot & 0x7F
+        fn = _current_symbol_function(symbols, addr)
+        if fn:
+            name = fn.get('locals', {}).get(str(idx))
+            if name:
+                return name
+        return f'L{idx}'
+    name = (symbols or {}).get('globals', {}).get(str(slot))
+    if name:
+        return name
     return f'G{slot}'
 
 
-def disassemble(data, labels=None):
+def disassemble(data, labels=None, symbols=None):
     """Disassemble bytecode to human-readable text.
 
     labels: optional dict {offset: "label"} — inserts '; --- label ---'
             comment lines before the instruction at that offset.
+    symbols: optional debug sidecar dict with globals/functions/locals maps.
     """
     labels = labels or {}
     lines = []
@@ -996,8 +1049,16 @@ def disassemble(data, labels=None):
         pos += 1
         name = OP_NAMES.get(op, f'??? (0x{op:02X})')
 
+        # Specialized LOAD_n / STORE_n short forms (local slots 0..4)
+        if Op.LOAD_0 <= op <= Op.LOAD_4:
+            slot = 0x80 | (op - Op.LOAD_0)
+            lines.append(f'{addr:04X}: LOAD {_slot_name(slot, symbols, addr)}')
+        elif Op.STORE_0 <= op <= Op.STORE_4:
+            slot = 0x80 | (op - Op.STORE_0)
+            lines.append(f'{addr:04X}: STORE {_slot_name(slot, symbols, addr)}')
+
         # No-arg ops
-        if op in _NO_ARG_OPS:
+        elif op in _NO_ARG_OPS:
             lines.append(f'{addr:04X}: {name}')
 
         # PUSH_I8
@@ -1026,10 +1087,10 @@ def disassemble(data, labels=None):
         # LOAD / STORE with u8 slot (bit 7 = local)
         elif op == Op.LOAD:
             slot = data[pos]; pos += 1
-            lines.append(f'{addr:04X}: LOAD {_slot_name(slot)}')
+            lines.append(f'{addr:04X}: LOAD {_slot_name(slot, symbols, addr)}')
         elif op == Op.STORE:
             slot = data[pos]; pos += 1
-            lines.append(f'{addr:04X}: STORE {_slot_name(slot)}')
+            lines.append(f'{addr:04X}: STORE {_slot_name(slot, symbols, addr)}')
 
         # JMP/JZ/JNZ/CALL with u16 target
         elif op in (Op.JMP, Op.JZ, Op.JNZ, Op.CALL):
@@ -1040,7 +1101,7 @@ def disassemble(data, labels=None):
         # W_ALLTAR with u8 var slot
         elif op == Op.W_ALLTAR:
             slot = data[pos]; pos += 1
-            lines.append(f'{addr:04X}: W_ALLTAR {_slot_name(slot)}')
+            lines.append(f'{addr:04X}: W_ALLTAR {_slot_name(slot, symbols, addr)}')
 
         # W_TARGET, W_SET, W_GET, W_PARENT with u8 arg
         elif op == Op.W_TARGET:
@@ -1106,6 +1167,11 @@ def disassemble(data, labels=None):
             flen = data[pos]; pos += 1
             pos += flen
             lines.append(f'{addr:04X}: F_WRITE 0x{faddr:08X} len={flen}')
+
+        # SPRINTF: u8 argc (number of format args after fmt string)
+        elif op == Op.SPRINTF:
+            argc = data[pos]; pos += 1
+            lines.append(f'{addr:04X}: sprintf argc={argc}')
 
         # DRAW_TEXT_LIT, STR_LIT: u8 len + text
         elif op in (Op.DRAW_TEXT_LIT, Op.STR_LIT):

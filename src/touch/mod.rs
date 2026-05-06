@@ -1,9 +1,11 @@
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub mod hw;
 #[cfg(feature = "host")]
 pub mod sim;
+#[cfg(feature = "epaper")]
+pub mod epaper;
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub use hw::{check_recovery_touch, penirq_active_pub, run_calibration};
 
 // Hit test is pure widget-tree logic — available on both firmware and host.
@@ -196,13 +198,16 @@ impl<B: TouchBackend> TouchImpl<B> {
 
 // --- Type alias: pick backend by build feature ---
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub type Touch = TouchImpl<hw::XptTouch>;
 
 #[cfg(feature = "host")]
 pub type Touch = TouchImpl<sim::MouseTouch>;
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "epaper")]
+pub type Touch = TouchImpl<epaper::EpdButtons>;
+
+#[cfg(feature = "firmware")]
 impl Touch {
     pub fn init() -> Self {
         Self::with_backend(hw::XptTouch::new())
@@ -213,5 +218,12 @@ impl Touch {
 impl Touch {
     pub fn new(mouse: sim::MouseState) -> Self {
         Self::with_backend(sim::MouseTouch::new(mouse))
+    }
+}
+
+#[cfg(feature = "epaper")]
+impl Touch {
+    pub fn init() -> Self {
+        Self::with_backend(epaper::EpdButtons::new())
     }
 }

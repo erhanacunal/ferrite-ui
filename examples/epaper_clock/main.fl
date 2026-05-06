@@ -1,0 +1,195 @@
+// epaper_clock — Digital clock for LilyGo T5-ePaper-S3 (960×540, 4-bit gray)
+//
+// EPD refresh is slow (~5 seconds for 15 waveform frames), so updates are
+// throttled to once per minute.  A full flush is triggered on minute change
+// or when the user presses the refresh button.
+//
+// Colors (RGB565 → 4-bit gray, EPD renders grayscale):
+//   0x0000 = black  (gray4 = 0)
+//   0xFFFF = white  (gray4 = 15)
+//   0x8410 = mid gray (gray4 ≈ 7)
+//   0xC618 = light gray (gray4 ≈ 11)
+
+#include "core.fl"
+#include "color.fl"
+
+// ---- Globals ----
+var w_time;      // large HH:MM label
+var w_sec;       // :SS suffix label
+var w_date;      // date label
+
+var last_min = -1;    // previous minute — triggers EPD flush on change
+var needs_flush = 1;  // set by refresh button to force flush
+
+// Scratch (freed each frame)
+var time_arr;
+var hh;
+var mm;
+var ss;
+var dd;
+var mo;
+var yy;
+
+// ---- Helpers ----
+
+fn pad2(n) {
+    if (n < 10) {
+        return concat(str("0"), itos(n));
+    }
+    return itos(n);
+}
+
+fn read_rtc() {
+    time_arr = rtcRead();
+    ss = time_arr[0];
+    mm = time_arr[1];
+    hh = time_arr[2];
+    dd = time_arr[3];
+    mo = time_arr[5];
+    yy = time_arr[6];
+    arrFree(time_arr);
+}
+
+// ---- Refresh button callback ----
+
+fn on_refresh(wid) {
+    needs_flush = 1;
+}
+
+// ---- Setup ----
+
+fn setup() {
+    // ── Header bar (black, white title) ──    
+    var hdr = alloc(); target(hdr);
+    set(size, 960, 60);
+    set(bg_color, WHITE);
+    parent(0);
+
+    var htl = alloc(); target(htl);
+    set(kind, KIND_LABEL);
+    set(size, 960, 60);
+    set(bg_color, WHITE);
+    set(text_color, BLACK);
+    set(text_align, ALIGN_CENTER);
+    set(text, "LilyGo T5-ePaper-S3 Clock");
+    parent(hdr);
+
+    // Thin rule below header
+    var r1 = alloc(); target(r1);
+    set(location, 0, 60); set(size, 960, 3);
+    set(bg_color, BLACK);
+    parent(0);
+
+    // ── Large time label (HH:MM) ──
+    w_time = alloc(); target(w_time);
+    set(kind, KIND_LABEL);
+    set(location, 160, 130); set(size, 560, 160);
+    set(bg_color, WHITE);
+    set(text_color, BLACK);
+    set(text_align, ALIGN_CENTER);
+    set(text, "--:--");
+    parent(0);
+
+    // ── Seconds label (:SS) to the right of time ──
+    w_sec = alloc(); target(w_sec);
+    set(kind, KIND_LABEL);
+    set(location, 720, 210); set(size, 140, 80);
+    set(bg_color, WHITE);
+    set(text_color, BLACK);
+    set(text_align, ALIGN_LEFT);
+    set(text, ":--");
+    parent(0);
+
+    // ── Date label (DD / MM / 20YY) ──
+    w_date = alloc(); target(w_date);
+    set(kind, KIND_LABEL);
+    set(location, 240, 310); set(size, 480, 60);
+    set(bg_color, WHITE);
+    set(text_color, BLACK);
+    set(text_align, ALIGN_CENTER);
+    set(text, "-- / -- / ----");
+    parent(0);
+
+    // ── Thin rule above footer ──
+    var r2 = alloc(); target(r2);
+    set(location, 0, 470); set(size, 960, 3);
+    set(bg_color, WHITE);
+    parent(0);
+
+    // ── Footer bar (light gray) ──
+    var ftr = alloc(); target(ftr);
+    set(location, 0, 473); set(size, 960, 67);
+    set(bg_color, WHITE);
+    parent(0);
+
+    // Status text (bottom-left)
+    var wst = alloc(); target(wst);
+    set(kind, KIND_LABEL);
+    set(location, 20, 7); set(size, 600, 40);
+    set(bg_color, WHITE);
+    set(text_color, BLACK);
+    set(text_align, ALIGN_LEFT);
+    set(text, "EPD refreshes once per minute");
+    parent(ftr);
+
+    // Refresh button (bottom-right)
+    var btn = alloc(); target(btn);
+    set(location, 770, 5); set(size, 160, 44);
+    set(bg_color, BLACK);
+    set(press_color, WHITE);
+    set(border, 2, 2, 2, 2);
+    set(border_color, WHITE);
+    set(border_radius, 6);
+    set(clickable, ON);
+    set(on_click, @on_refresh);
+    parent(ftr);
+
+    var btnl = alloc(); target(btnl);
+    set(kind, KIND_LABEL);
+    set(size, 160, 44);
+    set(text_color, 0xFFFF);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Refresh");
+    parent(btn);
+
+    return 0;
+}
+
+// ---- Main loop ----
+
+fn loop() {
+    read_rtc();
+
+    // Build and update time string (HH:MM)
+    var ts = concat(pad2(hh), str(":"));
+    ts = concat(ts, pad2(mm));
+    target(w_time); set(text, ts); dirty();
+
+    // Seconds (:SS)
+    var sc = concat(str(":"), pad2(ss));
+    target(w_sec); set(text, sc); dirty();
+
+    // Date (DD / MM / 20YY)
+    var ds = concat(pad2(dd), str(" / "));
+    ds = concat(ds, pad2(mo));
+    ds = concat(ds, str(" / 20"));
+    ds = concat(ds, pad2(yy));
+    target(w_date); set(text, ds); dirty();
+
+    // Release all temporary strings (smart_clear keeps widget text intact)
+    strClear();
+
+    // Flush EPD only on minute change or manual refresh request
+    if (mm != last_min) {
+        last_min = mm;
+        needs_flush = 1;
+    }
+
+    if (needs_flush) {
+        needs_flush = 0;
+        render();
+    }
+
+    // Poll every 10 seconds — EPD flush itself takes ~5 seconds
+    delay(10000);
+}

@@ -1,7 +1,9 @@
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub mod hw;
 #[cfg(feature = "host")]
 pub mod sim;
+#[cfg(feature = "epaper")]
+pub mod epaper;
 
 pub trait BacklightBackend {
     fn set_brightness(&self, percent: u8);
@@ -28,13 +30,16 @@ impl<B: BacklightBackend> BacklightImpl<B> {
     }
 }
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub type Backlight = BacklightImpl<hw::Pwm>;
 
 #[cfg(feature = "host")]
 pub type Backlight = BacklightImpl<sim::StubBacklight>;
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "epaper")]
+pub type Backlight = BacklightImpl<epaper::EpdBacklight>;
+
+#[cfg(feature = "firmware")]
 impl Backlight {
     pub fn init() -> Self {
         Self::with_backend(hw::Pwm::init())
@@ -45,5 +50,12 @@ impl Backlight {
 impl Backlight {
     pub fn new() -> Self {
         Self::with_backend(sim::StubBacklight::new())
+    }
+}
+
+#[cfg(feature = "epaper")]
+impl Backlight {
+    pub fn init() -> Self {
+        Self::with_backend(epaper::EpdBacklight::new())
     }
 }

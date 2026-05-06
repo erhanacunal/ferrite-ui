@@ -26,7 +26,7 @@ try:
         QSpinBox, QLineEdit, QComboBox, QCheckBox, QPushButton,
         QLabel, QSplitter, QToolBar, QStatusBar, QGroupBox,
         QFileDialog, QColorDialog, QMessageBox, QDialog, QTextEdit,
-        QDialogButtonBox, QTabWidget, QPlainTextEdit,
+        QDialogButtonBox, QTabWidget, QPlainTextEdit, QStyle,
     )
     from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QSettings, QRegularExpression
     from PySide6.QtGui import (
@@ -38,12 +38,72 @@ except ImportError:
     print("PySide6 is required: pip install PySide6")
     sys.exit(1)
 
+try:
+    import qtawesome as qta
+except ImportError:
+    qta = None
+
+
+def designer_icon(qta_name, fallback=None):
+    """Return a QIcon from qtawesome, falling back to Qt's built-in icons."""
+    if qta is not None and qta_name:
+        try:
+            return qta.icon(qta_name)
+        except Exception:
+            pass
+    if fallback is not None:
+        return QApplication.style().standardIcon(fallback)
+    return None
+
+
+def set_icon(widget, qta_name, fallback=None):
+    icon = designer_icon(qta_name, fallback)
+    if icon is not None:
+        widget.setIcon(icon)
+
 
 # ============================================================
 # Constants
 # ============================================================
 
 SCREEN_W, SCREEN_H = 800, 480
+
+DEVICE_SPECS = {
+    "nextion": {
+        "name": "Nextion NX8048K070 / GD32",
+        "screen": (800, 480),
+        "color_model": "RGB565",
+        "color_count": 65536,
+        "render_mode": "dirty",
+        "image_max_colors": 256,
+        "root_bg": 0x0000,
+        "text_color": 0xFFFF,
+    },
+    "epaper": {
+        "name": "LilyGo T5 e-Paper S3",
+        "screen": (960, 540),
+        "color_model": "4-bit grayscale",
+        "color_count": 16,
+        "render_mode": "epaper",
+        "image_max_colors": 16,
+        "root_bg": 0xFFFF,
+        "text_color": 0x0000,
+    },
+}
+
+DEFAULT_DEVICE_ID = "nextion"
+
+
+def device_spec(device_id):
+    return DEVICE_SPECS.get(device_id, DEVICE_SPECS[DEFAULT_DEVICE_ID])
+
+
+def infer_device_id(screen, render_mode):
+    if render_mode == "epaper":
+        return "epaper"
+    if list(screen or []) == [960, 540]:
+        return "epaper"
+    return DEFAULT_DEVICE_ID
 
 KIND_BASE = 0
 KIND_LABEL = 1
@@ -91,6 +151,26 @@ def rgb565_to_qcolor(c):
 
 def qcolor_to_rgb565(qc):
     return ((qc.red() >> 3) << 11) | ((qc.green() >> 2) << 5) | (qc.blue() >> 3)
+
+
+def rgb565_to_gray4(c):
+    r = ((c >> 11) & 0x1F) * 255 // 31
+    g = ((c >> 5) & 0x3F) * 255 // 63
+    b = (c & 0x1F) * 255 // 31
+    gray = (r * 30 + g * 59 + b * 11) // 100
+    return min(15, max(0, round(gray * 15 / 255)))
+
+
+def gray4_to_rgb565(gray4):
+    v = min(15, max(0, int(gray4))) * 255 // 15
+    return ((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3)
+
+
+def quantize_color_for_device(color, device_id):
+    color &= 0xFFFF
+    if device_spec(device_id)["color_model"] == "4-bit grayscale":
+        return gray4_to_rgb565(rgb565_to_gray4(color))
+    return color
 
 
 # ============================================================
@@ -340,12 +420,15 @@ class DesignerModel(QWidget):
     tree_changed = Signal()
     selection_changed = Signal()
 
-    def __init__(self):
+    def __init__(self, device_id=DEFAULT_DEVICE_ID):
         super().__init__()
+        self.device_id = device_id
+        spec = device_spec(self.device_id)
+        self.screen_w, self.screen_h = spec["screen"]
         self.root = WidgetNode("root", KIND_BASE)
-        self.root.size_w = SCREEN_W
-        self.root.size_h = SCREEN_H
-        self.root.bg_color = 0x0000
+        self.root.size_w = self.screen_w
+        self.root.size_h = self.screen_h
+        self.root.bg_color = spec["root_bg"]
         self.widgets = [self.root]
         self.selected = None
         self._counter = 0
@@ -359,8 +442,14 @@ class DesignerModel(QWidget):
         self._res_gen = 0   # bumped when fonts/images change, for cache invalidation
         self.include_dirs = []  # extra include dirs for compilation
         self.exec_mode = "flash"  # default exec_mode for the main program
-        self.render_mode = "dirty"  # "dirty" (partial update) or "buffered" (full redraw)
+        self.render_mode = spec["render_mode"]  # "dirty", "buffered", or "epaper"
         self.main_fl = DEFAULT_MAIN_FL  # user code — embedded in .fui
+
+    def set_device(self, device_id):
+        self.device_id = device_id if device_id in DEVICE_SPECS else DEFAULT_DEVICE_ID
+        spec = device_spec(self.device_id)
+        self.screen_w, self.screen_h = spec["screen"]
+        self.render_mode = spec["render_mode"]
 
     def add_widget(self, kind, parent=None):
         if parent is None:
@@ -419,6 +508,23 @@ class DesignerModel(QWidget):
             node.border_color = 0xFFFF
             node.text_color = 0xFFFF
             node.clickable = True
+        if self.device_id == "epaper":
+            node.text_color = 0x0000
+            if kind == KIND_LABEL:
+                node.bg_color = 0x0000  # transparent in generated Ferrite code
+            elif kind in (KIND_BUTTON, KIND_DROPDOWN):
+                node.bg_color = 0xBDF7
+                node.press_color = 0x7BEF
+            elif kind in (KIND_PROGRESS, KIND_SLIDER):
+                node.bg_color = 0xDEFB
+                node.press_color = 0x4208
+            elif kind in (KIND_CHECKBOX, KIND_RADIO):
+                node.bg_color = 0xFFFF
+                node.press_color = 0x4208
+        node.bg_color = quantize_color_for_device(node.bg_color, self.device_id)
+        node.border_color = quantize_color_for_device(node.border_color, self.device_id)
+        node.text_color = quantize_color_for_device(node.text_color, self.device_id)
+        node.press_color = quantize_color_for_device(node.press_color, self.device_id)
         self.widgets.append(node)
         self.tree_changed.emit()
         self.select(node)
@@ -474,10 +580,14 @@ class DesignerModel(QWidget):
                 stack.append(c)
         return result
 
-    def clear(self):
+    def clear(self, device_id=None):
+        if device_id is not None:
+            self.set_device(device_id)
+        spec = device_spec(self.device_id)
         self.root = WidgetNode("root", KIND_BASE)
-        self.root.size_w = SCREEN_W
-        self.root.size_h = SCREEN_H
+        self.root.size_w = self.screen_w
+        self.root.size_h = self.screen_h
+        self.root.bg_color = spec["root_bg"]
         self.widgets = [self.root]
         self.selected = None
         self._counter = 0
@@ -486,7 +596,7 @@ class DesignerModel(QWidget):
         self.programs = []
         self.include_dirs = []
         self.exec_mode = "flash"
-        self.render_mode = "dirty"
+        self.render_mode = spec["render_mode"]
         self.main_fl = DEFAULT_MAIN_FL
         self.tree_changed.emit()
         self.selection_changed.emit()
@@ -494,6 +604,9 @@ class DesignerModel(QWidget):
     def save_to_file(self, path):
         data = {
             "version": 2,
+            "device": self.device_id,
+            "screen": [self.screen_w, self.screen_h],
+            "color_model": device_spec(self.device_id)["color_model"],
             "counter": self._counter,
             "widgets": [w.to_dict() for w in self.dfs_order()],
             "main_fl": base64.b64encode(self.main_fl.encode("utf-8")).decode("ascii"),
@@ -511,6 +624,16 @@ class DesignerModel(QWidget):
     def load_from_file(self, path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        screen = data.get("screen")
+        has_render_mode = "render_mode" in data
+        render_mode = data.get("render_mode", "dirty")
+        self.device_id = data.get("device") or infer_device_id(screen, render_mode)
+        if self.device_id not in DEVICE_SPECS:
+            self.device_id = DEFAULT_DEVICE_ID
+        spec = device_spec(self.device_id)
+        self.screen_w, self.screen_h = tuple(screen) if screen else spec["screen"]
+        if not has_render_mode:
+            render_mode = spec["render_mode"]
         nodes = {}
         order = []
         for wd in data.get("widgets", []):
@@ -522,6 +645,8 @@ class DesignerModel(QWidget):
                 node.parent = nodes[pname]
                 nodes[pname].children.append(node)
         self.root = nodes.get("root", order[0][0] if order else WidgetNode("root"))
+        self.root.size_w = self.screen_w
+        self.root.size_h = self.screen_h
         self.widgets = [n for n, _ in order] if order else [self.root]
         self._counter = data.get("counter", len(self.widgets))
 
@@ -589,7 +714,7 @@ class DesignerModel(QWidget):
 
         self.include_dirs = data.get("include_dirs", [])
         self.exec_mode = data.get("exec_mode", "flash")
-        self.render_mode = data.get("render_mode", "dirty")
+        self.render_mode = render_mode
         self._path = path
         self._res_gen += 1
         self.selected = None
@@ -682,7 +807,8 @@ class DesignerModel(QWidget):
             dirs.insert(0, ".")
         proj = {
             "version": 2,
-            "screen": [SCREEN_W, SCREEN_H],
+            "device": self.device_id,
+            "screen": [self.screen_w, self.screen_h],
             "include_dirs": dirs,
             "render_mode": self.render_mode,
             "fonts": font_entries,
@@ -970,22 +1096,26 @@ class DesignerScene(QGraphicsScene):
         self.res_cache = ResourceCache(model)
         self.items_map = {}
         self.handles = []
-        self.setSceneRect(-CANVAS_MARGIN, -CANVAS_MARGIN,
-                          SCREEN_W + 2 * CANVAS_MARGIN,
-                          SCREEN_H + 2 * CANVAS_MARGIN)
+        self._update_scene_rect()
         model.tree_changed.connect(self.rebuild)
         model.changed.connect(self.refresh)
         model.selection_changed.connect(self.update_selection)
         self.rebuild()
+
+    def _update_scene_rect(self):
+        self.setSceneRect(-CANVAS_MARGIN, -CANVAS_MARGIN,
+                          self.model.screen_w + 2 * CANVAS_MARGIN,
+                          self.model.screen_h + 2 * CANVAS_MARGIN)
 
     def drawBackground(self, painter, rect):
         # Dark gray background outside the screen
         painter.fillRect(rect, QColor(50, 50, 50))
         # Screen boundary
         painter.setPen(QPen(QColor(100, 100, 100), 1))
-        painter.drawRect(QRectF(-1, -1, SCREEN_W + 2, SCREEN_H + 2))
+        painter.drawRect(QRectF(-1, -1, self.model.screen_w + 2, self.model.screen_h + 2))
 
     def rebuild(self):
+        self._update_scene_rect()
         for item in list(self.items_map.values()):
             self.removeItem(item)
         self.items_map.clear()
@@ -1148,8 +1278,9 @@ class ColorButton(QPushButton):
     """Button that shows a color swatch and opens a color picker."""
     color_changed = Signal(int)
 
-    def __init__(self, value=0):
+    def __init__(self, value=0, model=None):
         super().__init__()
+        self.model = model
         self._value = value
         self.setFixedSize(60, 24)
         self._update_style()
@@ -1169,9 +1300,15 @@ class ColorButton(QPushButton):
 
     def _pick(self):
         qc = rgb565_to_qcolor(self._value)
-        color = QColorDialog.getColor(qc, self, "Pick Color")
+        title = "Pick Color"
+        if self.model and device_spec(self.model.device_id)["color_model"] == "4-bit grayscale":
+            title = "Pick Color (quantized to 16 grayscale levels)"
+        color = QColorDialog.getColor(qc, self, title)
         if color.isValid():
-            self._value = qcolor_to_rgb565(color)
+            value = qcolor_to_rgb565(color)
+            if self.model:
+                value = quantize_color_for_device(value, self.model.device_id)
+            self._value = value
             self._update_style()
             self.color_changed.emit(self._value)
 
@@ -1337,7 +1474,7 @@ class PropertyEditor(QScrollArea):
         rl = QHBoxLayout(row)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(4)
-        btn = ColorButton()
+        btn = ColorButton(model=self.model)
         btn.color_changed.connect(lambda v, a=attr: self._set_attr(a, v))
         hex_label = QLabel("0x0000")
         hex_label.setFixedWidth(52)
@@ -1456,6 +1593,9 @@ class PropertyEditor(QScrollArea):
                 self.model.reparent(node, new_parent)
         elif attr in ("border", "margin", "padding"):
             setattr(node, attr, list(value))
+            self.model.notify_changed()
+        elif attr in ("bg_color", "border_color", "text_color", "press_color"):
+            setattr(node, attr, quantize_color_for_device(int(value), self.model.device_id))
             self.model.notify_changed()
         else:
             setattr(node, attr, value)
@@ -1608,8 +1748,10 @@ class ResourcePanel(QWidget):
         layout.addWidget(self.font_list)
         fb = QHBoxLayout()
         add_font_btn = QPushButton("+ Font")
+        set_icon(add_font_btn, "fa5s.font", QStyle.SP_FileIcon)
         add_font_btn.clicked.connect(self._add_font)
         rm_font_btn = QPushButton("- Font")
+        set_icon(rm_font_btn, "fa5s.trash", QStyle.SP_TrashIcon)
         rm_font_btn.clicked.connect(self._rm_font)
         fb.addWidget(add_font_btn)
         fb.addWidget(rm_font_btn)
@@ -1625,8 +1767,10 @@ class ResourcePanel(QWidget):
         layout.addWidget(self.image_list)
         ib = QHBoxLayout()
         add_img_btn = QPushButton("+ Image")
+        set_icon(add_img_btn, "fa5s.image", QStyle.SP_FileIcon)
         add_img_btn.clicked.connect(self._add_image)
         rm_img_btn = QPushButton("- Image")
+        set_icon(rm_img_btn, "fa5s.trash", QStyle.SP_TrashIcon)
         rm_img_btn.clicked.connect(self._rm_image)
         ib.addWidget(add_img_btn)
         ib.addWidget(rm_img_btn)
@@ -1642,8 +1786,10 @@ class ResourcePanel(QWidget):
         layout.addWidget(self.prog_list)
         pb = QHBoxLayout()
         add_prog_btn = QPushButton("+ Program")
+        set_icon(add_prog_btn, "fa5s.file-code", QStyle.SP_FileIcon)
         add_prog_btn.clicked.connect(self._add_program)
         rm_prog_btn = QPushButton("- Program")
+        set_icon(rm_prog_btn, "fa5s.trash", QStyle.SP_TrashIcon)
         rm_prog_btn.clicked.connect(self._rm_program)
         pb.addWidget(add_prog_btn)
         pb.addWidget(rm_prog_btn)
@@ -1667,7 +1813,7 @@ class ResourcePanel(QWidget):
         em_row.addSpacing(20)
         em_row.addWidget(QLabel("Render mode:"))
         self.render_combo = QComboBox()
-        self.render_combo.addItems(["dirty", "buffered"])
+        self.render_combo.addItems(["dirty", "buffered", "epaper"])
         self.render_combo.currentTextChanged.connect(lambda v: setattr(model, 'render_mode', v))
         em_row.addWidget(self.render_combo)
         em_row.addStretch()
@@ -1778,7 +1924,7 @@ class ResourcePanel(QWidget):
         self.model.images.append({
             "name": name, "image_id": iid,
             "source_name": os.path.basename(source),
-            "mode": "auto", "max_colors": 256,
+            "mode": "auto", "max_colors": device_spec(self.model.device_id)["image_max_colors"],
             "data_b64": data_b64,
         })
         self.model._res_gen += 1
@@ -2221,9 +2367,11 @@ class CodeEditorPanel(QWidget):
         tb.addWidget(self._file_label)
         tb.addStretch()
         save_btn = QPushButton("Save to Project")
+        set_icon(save_btn, "fa5s.save", QStyle.SP_DialogSaveButton)
         save_btn.clicked.connect(self.save_file)
         tb.addWidget(save_btn)
         reload_btn = QPushButton("Revert")
+        set_icon(reload_btn, "fa5s.undo", QStyle.SP_BrowserReload)
         reload_btn.clicked.connect(self.load_file)
         tb.addWidget(reload_btn)
         layout.addLayout(tb)
@@ -2287,7 +2435,9 @@ class CodeDialog(QDialog):
         layout.addWidget(self.editor)
         btns = QDialogButtonBox()
         copy_btn = btns.addButton("Copy", QDialogButtonBox.ActionRole)
+        set_icon(copy_btn, "fa5s.copy", QStyle.SP_FileIcon)
         save_btn = btns.addButton("Save .fl", QDialogButtonBox.ActionRole)
+        set_icon(save_btn, "fa5s.save", QStyle.SP_DialogSaveButton)
         btns.addButton(QDialogButtonBox.Close)
         copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(code))
         save_btn.clicked.connect(lambda: self._save(code))
@@ -2299,6 +2449,54 @@ class CodeDialog(QDialog):
         if path:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(code)
+
+
+# ============================================================
+# Project device selection
+# ============================================================
+
+class DeviceChoiceDialog(QDialog):
+    """Choose the target device for a new designer project."""
+
+    def __init__(self, parent=None, device_id=DEFAULT_DEVICE_ID):
+        super().__init__(parent)
+        self.setWindowTitle("Choose Device")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Select the target device for this project:"))
+
+        self.combo = QComboBox()
+        for key, spec in DEVICE_SPECS.items():
+            w, h = spec["screen"]
+            self.combo.addItem(f"{spec['name']} ({w}x{h}, {spec['color_model']})", key)
+        idx = self.combo.findData(device_id)
+        self.combo.setCurrentIndex(max(0, idx))
+        self.combo.currentIndexChanged.connect(self._update_details)
+        layout.addWidget(self.combo)
+
+        self.details = QLabel()
+        self.details.setWordWrap(True)
+        layout.addWidget(self.details)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._update_details()
+
+    def selected_device(self):
+        return self.combo.currentData() or DEFAULT_DEVICE_ID
+
+    def _update_details(self):
+        spec = device_spec(self.selected_device())
+        w, h = spec["screen"]
+        self.details.setText(
+            f"Screen: {w}x{h}\n"
+            f"Colors: {spec['color_model']} ({spec['color_count']} supported)\n"
+            f"Default render mode: {spec['render_mode']}"
+        )
 
 
 # ============================================================
@@ -2335,6 +2533,7 @@ class DeviceDialog(QDialog):
         self.port_combo.currentIndexChanged.connect(self._auto_ping)
         port_row.addWidget(self.port_combo)
         refresh_btn = QPushButton("Refresh")
+        set_icon(refresh_btn, "fa5s.sync", QStyle.SP_BrowserReload)
         refresh_btn.clicked.connect(self._refresh_ports)
         port_row.addWidget(refresh_btn)
         self.status_label = QLabel("")
@@ -2346,12 +2545,15 @@ class DeviceDialog(QDialog):
         # Action buttons
         btn_row = QHBoxLayout()
         ping_btn = QPushButton("Ping")
+        set_icon(ping_btn, "fa5s.satellite-dish", QStyle.SP_DialogYesButton)
         ping_btn.clicked.connect(self._ping)
         btn_row.addWidget(ping_btn)
         restart_btn = QPushButton("Restart")
+        set_icon(restart_btn, "fa5s.power-off", QStyle.SP_BrowserReload)
         restart_btn.clicked.connect(self._restart)
         btn_row.addWidget(restart_btn)
         meminfo_btn = QPushButton("MemInfo")
+        set_icon(meminfo_btn, "fa5s.memory", QStyle.SP_FileDialogInfoView)
         meminfo_btn.clicked.connect(self._meminfo)
         btn_row.addWidget(meminfo_btn)
         btn_row.addStretch()
@@ -2370,15 +2572,18 @@ class DeviceDialog(QDialog):
         ug_layout.addWidget(info_label)
 
         build_upload_btn = QPushButton("Build && Upload Flash Image")
+        set_icon(build_upload_btn, "fa5s.cloud-upload-alt", QStyle.SP_ArrowUp)
         build_upload_btn.setStyleSheet("font-weight: bold; padding: 8px;")
         build_upload_btn.clicked.connect(self._build_and_writefs)
         ug_layout.addWidget(build_upload_btn)
 
         file_row = QHBoxLayout()
         writefs_btn = QPushButton("Upload flash.bin...")
+        set_icon(writefs_btn, "fa5s.upload", QStyle.SP_ArrowUp)
         writefs_btn.clicked.connect(self._writefs_file)
         file_row.addWidget(writefs_btn)
         exec_btn = QPushButton("Execute .bin...")
+        set_icon(exec_btn, "fa5s.play", QStyle.SP_MediaPlay)
         exec_btn.clicked.connect(self._execute_file)
         file_row.addWidget(exec_btn)
         ug_layout.addLayout(file_row)
@@ -2393,6 +2598,7 @@ class DeviceDialog(QDialog):
 
         # Close button
         close_btn = QPushButton("Close")
+        set_icon(close_btn, "fa5s.times", QStyle.SP_DialogCloseButton)
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
 
@@ -2725,36 +2931,74 @@ class DesignerWindow(QMainWindow):
 
         self._build_toolbar()
         self._build_menu()
-        self.statusBar().showMessage("Ready")
+        self.statusBar().showMessage(self._device_status())
+
+    def _device_status(self):
+        spec = device_spec(self.model.device_id)
+        return f"{spec['name']} - {self.model.screen_w}x{self.model.screen_h}, {spec['color_model']}"
+
+    def _set_window_title(self, path=None):
+        spec = device_spec(self.model.device_id)
+        suffix = f" - {spec['name']}"
+        if path:
+            self.setWindowTitle(f"Ferrite UI Designer - {os.path.basename(path)}{suffix}")
+        else:
+            self.setWindowTitle(f"Ferrite UI Designer{suffix}")
+
+    def _apply_new_device(self, device_id):
+        self.model.clear(device_id)
+        self.model._path = None
+        self.resources.refresh()
+        self.code_editor.load_file()
+        self.center_tabs.setCurrentIndex(0)
+        self.canvas.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        self._set_window_title()
+        self.statusBar().showMessage(self._device_status(), 5000)
 
     def _build_toolbar(self):
         tb = self.addToolBar("Widgets")
         tb.setMovable(False)
+        kind_icons = {
+            KIND_BASE: "fa5s.square",
+            KIND_LABEL: "fa5s.font",
+            KIND_BUTTON: "fa5s.hand-pointer",
+            KIND_PROGRESS: "fa5s.tasks",
+            KIND_SLIDER: "fa5s.sliders-h",
+            KIND_CHECKBOX: "fa5s.check-square",
+            KIND_RADIO: "fa5s.dot-circle",
+            KIND_DROPDOWN: "fa5s.caret-square-down",
+        }
         for idx, kind in enumerate(KIND_VALUES):
             act = QAction(f"+ {KIND_NAMES[idx]}", self)
+            set_icon(act, kind_icons.get(kind), QStyle.SP_FileIcon)
             act.triggered.connect(lambda checked, k=kind: self.model.add_widget(k))
             tb.addAction(act)
         tb.addSeparator()
         del_act = QAction("Delete", self)
-        del_act.setShortcut(QKeySequence.Delete)
+        set_icon(del_act, "fa5s.trash", QStyle.SP_TrashIcon)
+        del_act.setToolTip("Delete selected widget (Del)")
         del_act.triggered.connect(self._delete_selected)
         tb.addAction(del_act)
         tb.addSeparator()
         snap_act = QAction("Snap Grid", self)
+        set_icon(snap_act, "fa5s.th", QStyle.SP_FileDialogDetailedView)
         snap_act.setCheckable(True)
         snap_act.toggled.connect(lambda v: setattr(self.model, 'snap_to_grid', v))
         tb.addAction(snap_act)
         tb.addSeparator()
         code_act = QAction("Generate Code", self)
+        set_icon(code_act, "fa5s.code", QStyle.SP_FileIcon)
         code_act.setShortcut(QKeySequence("Ctrl+G"))
         code_act.triggered.connect(self._show_code)
         tb.addAction(code_act)
         tb.addSeparator()
         build_act = QAction("Build Flash", self)
+        set_icon(build_act, "fa5s.hammer", QStyle.SP_DriveHDIcon)
         build_act.setShortcut(QKeySequence("Ctrl+B"))
         build_act.triggered.connect(self._build_flash)
         tb.addAction(build_act)
         upload_act = QAction("Upload", self)
+        set_icon(upload_act, "fa5s.upload", QStyle.SP_ArrowUp)
         upload_act.setShortcut(QKeySequence("Ctrl+U"))
         upload_act.triggered.connect(self._build_and_upload)
         tb.addAction(upload_act)
@@ -2767,6 +3011,7 @@ class DesignerWindow(QMainWindow):
         self.port_combo.setMinimumWidth(100)
         tb.addWidget(self.port_combo)
         refresh_act = QAction("Scan", self)
+        set_icon(refresh_act, "fa5s.sync", QStyle.SP_BrowserReload)
         refresh_act.triggered.connect(self._refresh_ports)
         tb.addAction(refresh_act)
         self._refresh_ports()
@@ -2776,15 +3021,19 @@ class DesignerWindow(QMainWindow):
 
         file_menu = mb.addMenu("&File")
         new_act = file_menu.addAction("&New")
+        set_icon(new_act, "fa5s.file", QStyle.SP_FileIcon)
         new_act.setShortcut(QKeySequence.New)
         new_act.triggered.connect(self._new_project)
         open_act = file_menu.addAction("&Open...")
+        set_icon(open_act, "fa5s.folder-open", QStyle.SP_DialogOpenButton)
         open_act.setShortcut(QKeySequence.Open)
         open_act.triggered.connect(self._open_project)
         save_act = file_menu.addAction("&Save")
+        set_icon(save_act, "fa5s.save", QStyle.SP_DialogSaveButton)
         save_act.setShortcut(QKeySequence.Save)
         save_act.triggered.connect(self._save_project)
         saveas_act = file_menu.addAction("Save &As...")
+        set_icon(saveas_act, "fa5s.save", QStyle.SP_DialogSaveButton)
         saveas_act.setShortcut(QKeySequence("Ctrl+Shift+S"))
         saveas_act.triggered.connect(self._save_project_as)
         file_menu.addSeparator()
@@ -2792,33 +3041,40 @@ class DesignerWindow(QMainWindow):
         self._rebuild_recent_menu()
         file_menu.addSeparator()
         export_act = file_menu.addAction("&Export .fl...")
+        set_icon(export_act, "fa5s.file-export", QStyle.SP_FileIcon)
         export_act.setShortcut(QKeySequence("Ctrl+E"))
         export_act.triggered.connect(self._export_fl)
         file_menu.addSeparator()
         build_act2 = file_menu.addAction("&Build Flash Image")
+        set_icon(build_act2, "fa5s.hammer", QStyle.SP_DriveHDIcon)
         build_act2.setShortcut(QKeySequence("Ctrl+B"))
         build_act2.triggered.connect(self._build_flash)
         file_menu.addSeparator()
         quit_act = file_menu.addAction("&Quit")
+        set_icon(quit_act, "fa5s.times", QStyle.SP_DialogCloseButton)
         quit_act.setShortcut(QKeySequence.Quit)
         quit_act.triggered.connect(self.close)
 
         edit_menu = mb.addMenu("&Edit")
         del_act = edit_menu.addAction("&Delete Widget")
+        set_icon(del_act, "fa5s.trash", QStyle.SP_TrashIcon)
         del_act.setShortcut(QKeySequence.Delete)
         del_act.triggered.connect(self._delete_selected)
 
         device_menu = mb.addMenu("&Device")
         device_act = device_menu.addAction("&Device Manager...")
+        set_icon(device_act, "fa5s.microchip", QStyle.SP_ComputerIcon)
         device_act.setShortcut(QKeySequence("Ctrl+D"))
         device_act.triggered.connect(self._show_device)
         device_menu.addSeparator()
         build_upload_act = device_menu.addAction("Build && &Upload")
+        set_icon(build_upload_act, "fa5s.cloud-upload-alt", QStyle.SP_ArrowUp)
         build_upload_act.setShortcut(QKeySequence("Ctrl+U"))
         build_upload_act.triggered.connect(self._build_and_upload)
 
         view_menu = mb.addMenu("&View")
         fit_act = view_menu.addAction("&Fit to Window")
+        set_icon(fit_act, "fa5s.expand-arrows-alt", QStyle.SP_DesktopIcon)
         fit_act.setShortcut(QKeySequence("Ctrl+0"))
         fit_act.triggered.connect(lambda: self.canvas.fitInView(
             self.scene.sceneRect(), Qt.KeepAspectRatio))
@@ -2880,7 +3136,7 @@ class DesignerWindow(QMainWindow):
             return
         try:
             self.model.load_from_file(path)
-            self.setWindowTitle(f"Ferrite UI Designer — {os.path.basename(path)}")
+            self._set_window_title(path)
             self.resources.refresh()
             self._add_recent(path)
             self.code_editor.load_file()
@@ -2906,11 +3162,10 @@ class DesignerWindow(QMainWindow):
     def _new_project(self):
         if QMessageBox.question(self, "New Project",
                                 "Discard current project?") == QMessageBox.Yes:
-            self.model.clear()
-            self.model._path = None
-            self.code_editor.load_file()  # loads DEFAULT_MAIN_FL from model
-            self.center_tabs.setCurrentIndex(0)
-            self.setWindowTitle("Ferrite UI Designer")
+            dlg = DeviceChoiceDialog(self, self.model.device_id)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            self._apply_new_device(dlg.selected_device())
 
     def _open_project(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Project", "",
@@ -2918,7 +3173,7 @@ class DesignerWindow(QMainWindow):
         if path:
             try:
                 self.model.load_from_file(path)
-                self.setWindowTitle(f"Ferrite UI Designer — {os.path.basename(path)}")
+                self._set_window_title(path)
                 self.resources.refresh()
                 self._add_recent(path)
                 self.code_editor.load_file()
@@ -2945,7 +3200,7 @@ class DesignerWindow(QMainWindow):
         if path:
             self.model.save_to_file(path)
             self._add_recent(path)
-            self.setWindowTitle(f"Ferrite UI Designer — {os.path.basename(path)}")
+            self._set_window_title(path)
             self.statusBar().showMessage("Saved", 3000)
 
     def _show_device(self):
@@ -3165,11 +3420,16 @@ def main():
     if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
         try:
             window.model.load_from_file(sys.argv[1])
-            window.setWindowTitle(f"Ferrite UI Designer — {os.path.basename(sys.argv[1])}")
+            window._set_window_title(sys.argv[1])
             window._add_recent(sys.argv[1])
             window.resources.refresh()
         except Exception as e:
             QMessageBox.critical(window, "Error", f"Failed to open: {e}")
+    else:
+        dlg = DeviceChoiceDialog(window)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        window._apply_new_device(dlg.selected_device())
 
     window.show()
     sys.exit(app.exec())

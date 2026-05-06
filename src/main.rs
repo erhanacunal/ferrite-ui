@@ -33,6 +33,7 @@ mod touch;
 mod types;
 mod usart;
 mod vm;
+mod watchdog;
 mod widget;
 
 use cortex_m_rt::entry;
@@ -1077,12 +1078,16 @@ fn main() -> ! {
 
     // === MAIN LOOP ===
 
+    watchdog::init();
+
     let mut kb = keyboard::Keyboard::new();
     let mut scroll_id = widget::WidgetId::NONE;
     let mut scroll_active = false; // true when dragging scrollbar
     let mut protocol = Protocol::new();
 
     loop {
+        watchdog::feed();
+
         // If a modal is open and its result has been set (typically by a
         // callback that ran on the previous loop iteration), destroy the
         // overlay and resume the suspended showModal call.
@@ -1283,7 +1288,7 @@ fn main() -> ! {
                         kb.handle_press(event.x, event.y);
                         // In dirty mode, draw only the pressed key immediately.
                         // In buffered mode, keyboard is redrawn fully in next frame.
-                        if vm.render_mode == RenderMode::Dirty {
+                        if vm.render_mode != RenderMode::Buffered {
                             kb.draw_key_by_code(
                                 &ctx.lcd,
                                 &ctx.fonts,
@@ -1366,7 +1371,7 @@ fn main() -> ! {
                             }
 
                             ctx.tree.mark_dirty(hit);
-                            if vm.render_mode == RenderMode::Dirty {
+                            if vm.render_mode != RenderMode::Buffered {
                                 render::render_dirty(&mut ctx, &vm);
                             }
                         }
@@ -1386,7 +1391,7 @@ fn main() -> ! {
                         // Scrollbar drag: update scroll position from touch Y
                         if scroll_active && scroll_id.is_some() {
                             scrollbar_set_position(&mut ctx, scroll_id, event.y);
-                            if vm.render_mode == RenderMode::Dirty {
+                            if vm.render_mode != RenderMode::Buffered {
                                 render::render_dirty(&mut ctx, &vm);
                             }
                         }
@@ -1403,7 +1408,7 @@ fn main() -> ! {
                                     ext.value = new_val;
                                 }
                                 ctx.tree.mark_dirty(dfs[i]);
-                                if vm.render_mode == RenderMode::Dirty {
+                                if vm.render_mode != RenderMode::Buffered {
                                     render::render_dirty(&mut ctx, &vm);
                                 }
 
@@ -1440,7 +1445,7 @@ fn main() -> ! {
                         }
                         // In dirty mode: redraw just the released key (normal state)
                         // In buffered mode: keyboard is redrawn fully in next frame
-                        if vm.render_mode == RenderMode::Dirty && !kb.dirty && kb.visible {
+                        if vm.render_mode != RenderMode::Buffered && !kb.dirty && kb.visible {
                             kb.draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, prev_key, false);
                         }
                     } else {
@@ -1521,7 +1526,7 @@ fn main() -> ! {
                             ctx.tree.mark_dirty(clicked_id);
                         }
 
-                        if vm.render_mode == RenderMode::Dirty {
+                        if vm.render_mode != RenderMode::Buffered {
                             render::render_dirty(&mut ctx, &vm);
                         }
 
@@ -1595,11 +1600,14 @@ fn main() -> ! {
                         ctx.lcd.end_frame();
                     }
                 }
-                RenderMode::Dirty => {
+                RenderMode::Dirty | RenderMode::EPaper => {
                     render::render_dirty(&mut ctx, &vm);
                     if kb.visible && kb.dirty {
                         kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
                         kb.dirty = false;
+                    }
+                    if vm.render_mode == RenderMode::EPaper {
+                        ctx.lcd.flush_dirty();
                     }
                 }
             }
@@ -1631,11 +1639,14 @@ fn main() -> ! {
                         ctx.lcd.end_frame();
                     }
                 }
-                RenderMode::Dirty => {
+                RenderMode::Dirty | RenderMode::EPaper => {
                     render::render_dirty(&mut ctx, &vm);
                     if kb.visible && kb.dirty {
                         kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
                         kb.dirty = false;
+                    }
+                    if vm.render_mode == RenderMode::EPaper {
+                        ctx.lcd.flush_dirty();
                     }
                 }
             }

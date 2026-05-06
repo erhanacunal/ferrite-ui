@@ -1,7 +1,9 @@
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub mod hw;
 #[cfg(feature = "host")]
 pub mod sim;
+#[cfg(feature = "epaper")]
+pub mod epaper;
 
 /// Backend abstraction for the 32MB external flash.
 /// Hardware backend talks to W25Q256 over SPI0+DMA; host backend is file-backed.
@@ -44,13 +46,16 @@ impl<B: FlashBackend> FlashImpl<B> {
 
 // --- Type alias: pick backend by build feature ---
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub type Flash = FlashImpl<hw::FpgaFlash>;
 
 #[cfg(feature = "host")]
 pub type Flash = FlashImpl<sim::FileFlash>;
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "epaper")]
+pub type Flash = FlashImpl<epaper::EspFlash>;
+
+#[cfg(feature = "firmware")]
 impl Flash {
     /// Create a handle assuming hardware was already initialized.
     pub fn new() -> Self {
@@ -74,5 +79,13 @@ impl Flash {
     /// used by internal VM default-init paths.
     pub fn new() -> Self {
         Self::with_backend(sim::FileFlash::new(std::vec::Vec::new()))
+    }
+}
+
+#[cfg(feature = "epaper")]
+impl Flash {
+    /// XIP-backed read-only flash — no hardware init needed.
+    pub fn new() -> Self {
+        Self::with_backend(epaper::EspFlash::new())
     }
 }

@@ -20,7 +20,11 @@ pub struct FpgaLcd {
 
 impl FpgaLcd {
     pub fn new(gpio: Gpio) -> Self {
-        Self { gpio, lcd4: 0, lcd5: 0 }
+        Self {
+            gpio,
+            lcd4: 0,
+            lcd5: 0,
+        }
     }
 
     fn set_address(&self, x1: u16, y1: u16, x2: u16, y2: u16) {

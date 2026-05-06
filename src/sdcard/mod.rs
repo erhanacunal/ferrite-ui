@@ -1,7 +1,9 @@
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub mod hw;
 #[cfg(feature = "host")]
 pub mod sim;
+#[cfg(feature = "epaper")]
+pub mod epaper;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum CardType {
@@ -54,13 +56,16 @@ impl<B: SdCardBackend> SdCardImpl<B> {
     }
 }
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub type SdCard = SdCardImpl<hw::SpiSd>;
 
 #[cfg(feature = "host")]
 pub type SdCard = SdCardImpl<sim::FileSd>;
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "epaper")]
+pub type SdCard = SdCardImpl<epaper::EspSdCard>;
+
+#[cfg(feature = "firmware")]
 impl SdCard {
     /// Quick presence check (CMD0 only). Restores flash baud on exit.
     pub fn probe() -> bool {
@@ -83,5 +88,16 @@ impl SdCard {
     /// Build a sim card from a raw image file.
     pub fn init_from_image(bytes: std::vec::Vec<u8>) -> Result<Self, SdError> {
         Ok(Self::with_backend(sim::FileSd::new(bytes)))
+    }
+}
+
+#[cfg(feature = "epaper")]
+impl SdCard {
+    pub fn probe() -> bool {
+        epaper::probe()
+    }
+
+    pub fn init() -> Result<Self, SdError> {
+        epaper::EspSdCard::init().map(Self::with_backend)
     }
 }

@@ -1,12 +1,16 @@
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub mod hw;
 #[cfg(feature = "host")]
 pub mod sim;
+#[cfg(feature = "epaper")]
+pub mod epaper;
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub use hw::{dbg, dbg_u16, rx_clear, rx_has_data, rx_len, rx_read_byte};
 #[cfg(feature = "host")]
 pub use sim::{dbg, dbg_u16, rx_clear, rx_has_data, rx_len, rx_read_byte};
+#[cfg(feature = "epaper")]
+pub use epaper::{dbg, dbg_u16, rx_clear, rx_has_data, rx_len, rx_read_byte};
 
 pub trait UsartBackend {
     fn write_byte(&self, byte: u8);
@@ -39,13 +43,16 @@ impl<B: UsartBackend> UsartImpl<B> {
     }
 }
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub type Usart = UsartImpl<hw::Hw>;
 
 #[cfg(feature = "host")]
 pub type Usart = UsartImpl<sim::Stdio>;
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "epaper")]
+pub type Usart = UsartImpl<epaper::EspUart>;
+
+#[cfg(feature = "firmware")]
 impl Usart {
     pub fn init() -> Self {
         Self::with_backend(hw::Hw::init())
@@ -56,5 +63,12 @@ impl Usart {
 impl Usart {
     pub fn init() -> Self {
         Self::with_backend(sim::Stdio::new())
+    }
+}
+
+#[cfg(feature = "epaper")]
+impl Usart {
+    pub fn init() -> Self {
+        Self::with_backend(epaper::EspUart::init())
     }
 }

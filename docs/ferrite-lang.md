@@ -892,6 +892,52 @@ if (fgt(temp, 30.0)) { }      // same as: if (temp > 30.0) { }
 | `itof(x)` | float |
 | `ftoi(x)` | int |
 | `get(prop)` | int (widget properties are int) |
+| `sin(x)`, `cos(x)`, `sqrt(x)`, `abs(x)`, `floor(x)`, `ceil(x)` | float |
+| `atan2(y, x)` | float |
+
+## Math Functions
+
+Trigonometry, rounding, and geometric helpers. All work on float values; integer arguments are auto-promoted via `itof`. Results are float.
+
+```c
+var angle = 0.785;      // radians (≈ 45°)
+var s = sin(angle);     // → 0.707...
+var c = cos(angle);     // → 0.707...
+
+var dist = sqrt(fadd(fmul(dx, dx), fmul(dy, dy)));  // Euclidean distance
+
+var bearing = atan2(dy, dx);   // angle from point A to B, in radians
+
+var a = abs(-3.5);      // → 3.5
+var lo = floor(1.9);    // → 1.0
+var hi = ceil(1.1);     // → 2.0
+```
+
+### Gauge needle example
+
+```c
+// Draw a needle from center (cx, cy) at angle deg (0=right, clockwise)
+fn needle(cx, cy, r: float, deg: float, color) {
+    var rad = deg * 3.14159 / 180.0;
+    var x2 = ftoi(itof(cx) + r * cos(rad));
+    var y2 = ftoi(itof(cy) + r * sin(rad));
+    line(cx, cy, x2, y2, color);
+}
+```
+
+### Function reference
+
+| Function | Args | Returns | Description |
+|----------|------|---------|-------------|
+| `sin(x)` | float (radians) | float | sine |
+| `cos(x)` | float (radians) | float | cosine |
+| `sqrt(x)` | float | float | square root |
+| `abs(x)` | float | float | absolute value |
+| `atan2(y, x)` | float, float | float (radians) | arctangent of y/x, full quadrant |
+| `floor(x)` | float | float | round toward −∞ |
+| `ceil(x)` | float | float | round toward +∞ |
+
+All angles are in **radians**. Multiply by `3.14159 / 180.0` to convert from degrees.
 
 ## String Operations
 
@@ -925,6 +971,59 @@ strClear();
 // Free individual string
 strFree(s);
 ```
+
+### sprintf(fmt, ...)
+
+Format one or more values into a new string using printf-style format specifiers. Returns a string ID. Supports up to 8 format arguments. Output is capped at 128 bytes.
+
+```c
+var s = sprintf("Temp: %d C", temp);
+var s = sprintf("V = %.2f", voltage);
+var s = sprintf("%02d:%02d:%02d", h, m, sec);
+var s = sprintf("x=%.1f y=%.1f", px, py);
+var s = sprintf("0x%X", flags);
+```
+
+**Supported specifiers:**
+
+| Specifier | Argument type | Output |
+|-----------|--------------|--------|
+| `%d` / `%i` | int | signed decimal |
+| `%u` | int | unsigned decimal |
+| `%x` | int | lowercase hex |
+| `%X` | int | uppercase hex |
+| `%f` | float | decimal, 2 places by default |
+| `%.Nf` | float | decimal with N places (0–9) |
+| `%s` | str_id | inline string |
+| `%%` | — | literal `%` |
+
+The `%f` specifier reads a float value (stored as bits in an int, same as all float variables). The `%s` specifier reads a string pool ID — pass another str variable or a `str("...")` literal.
+
+```c
+// Sensor readout: float + unit
+var voltage = 3.28;       // float
+var s = sprintf("Batt: %.2f V", voltage);
+target(lbl);
+setText(s);
+strClear();
+
+// Mixed types
+var name = str("MCU");
+var freq = 108;
+var info = sprintf("%s @ %d MHz", name, freq);
+
+// Zero-pad integers: manual approach (sprintf has no %0Nd width yet)
+var h = 9;
+var m = 5;
+// Use conditional concat for zero-padding, or:
+var clock = sprintf("%d:%d", h, m);    // → "9:5"
+
+// Hex dump
+var reg = 0xDEAD;
+var s2 = sprintf("REG=0x%X", reg);    // → "REG=0xDEAD"
+```
+
+> **Note:** `sprintf` is the preferred way to build formatted strings. It is more compact than chained `concat(itos(...), ...)` calls and produces a single string pool entry instead of several intermediates.
 
 ## RTC (Real-Time Clock)
 
@@ -964,31 +1063,20 @@ rtcWrite(t);
 ### Example: Digital Clock
 
 ```c
-var time;
-var h;
-var m;
-var s;
-
 fn setup() {
     return 0;
 }
 
 fn loop() {
-    time = rtcRead();
-    h = time[2];
-    m = time[1];
-    s = time[0];
+    var time = rtcRead();
+    var h = time[2];
+    var m = time[1];
+    var s = time[0];
+    arrFree(time);
 
     beginFrame();
     fillRect(300, 200, 200, 50, 0x0000);
-
-    var hs = itos(h);
-    var ms = itos(m);
-    var ss = itos(s);
-    if (h < 10) { hs = concat(str("0"), hs); }
-    if (m < 10) { ms = concat(str("0"), ms); }
-    if (s < 10) { ss = concat(str("0"), ss); }
-    var text = concat(hs, concat(str(":"), concat(ms, concat(str(":"), ss))));
+    var text = sprintf("%d:%02d:%02d", h, m, s);
     drawStr(340, 235, 0, 0xFFFF, 0x0000, text);
     strClear();
     endFrame();
@@ -996,6 +1084,8 @@ fn loop() {
     delay(1000);
 }
 ```
+
+> **Note:** `%02d` zero-pads to 2 digits (e.g. `9` → `"09"`). Width-and-pad is supported for the `%d`/`%u` family.
 
 ## Files (Flash Filesystem)
 
@@ -1315,12 +1405,15 @@ sendUsart(msg);
 
 ## VM Image Format
 
-The compiler produces a binary image with an embedded function table header:
+The compiler produces a binary image with an embedded function table header (current version: 4):
 
 ```
-version:        u8 (= 1)
+version:        u8  (= 4)
 function_count: u16 LE
-reserved:       u16
+global_count:   u16 LE
+flags:          u16 LE  (bit 0: render_mode — 0=dirty, 1=buffered)
+widget_count:   u8      (pre-allocation hint)
+ext_count:      u8      (pre-allocation hint)
 [func_id: u16, kind: u8, pad: u8, offset: u32, length: u32] × N
 opcodes...
 ```
@@ -1336,7 +1429,7 @@ Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnUserMessage
 | Eval stack | 16 deep |
 | Call stack | 8 deep |
 | Callback queue | 8 pending |
-| String pool | 2,048 bytes, 32 slots |
+| String pool | 2,048 bytes, 64 slots |
 | Open files | 2 simultaneous (handles 1 and 2) |
 | Bytecode | limited by flash resource or 2KB via USART |
 | Clip rects | 32 rectangles |
@@ -1387,13 +1480,10 @@ fn loop() {
     var time = rtcRead();
     var h = time[2];
     var m = time[1];
+    arrFree(time);
 
     beginFrame();
-    var hs = itos(h);
-    var ms = itos(m);
-    if (h < 10) { hs = concat(str("0"), hs); }
-    if (m < 10) { ms = concat(str("0"), ms); }
-    var text = concat(hs, concat(str(":"), ms));
+    var text = sprintf("%02d:%02d", h, m);
     drawStr(360, 30, 0, 0xFFFF, 0x0000, text);
     strClear();
     endFrame();

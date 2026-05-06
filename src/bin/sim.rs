@@ -114,6 +114,7 @@ fn main() -> ExitCode {
                 let mode = match vm.render_mode {
                     RenderMode::Dirty => "Dirty",
                     RenderMode::Buffered => "Buffered",
+                    RenderMode::EPaper => "EPaper",
                 };
                 println!("loaded program 'main' ({} bytes, render_mode={})",
                     img_len, mode);
@@ -268,7 +269,7 @@ fn run_window(
             dispatch_touch(ctx, vm, &event);
             // Press in firmware triggers an immediate render_dirty to reflect
             // the pressed highlight without waiting for the frame render.
-            if event.kind == TouchEventKind::Press && vm.render_mode == RenderMode::Dirty {
+            if event.kind == TouchEventKind::Press && vm.render_mode != RenderMode::Buffered {
                 render::render_dirty(ctx, vm);
             }
         }
@@ -590,7 +591,7 @@ fn render_phase(ctx: &mut Ctx, vm: &mut Vm) {
     }
 
     match vm.render_mode {
-        RenderMode::Dirty => render::render_dirty(ctx, vm),
+        RenderMode::Dirty | RenderMode::EPaper => render::render_dirty(ctx, vm),
         RenderMode::Buffered => {
             if render::buffered_has_dirty(ctx) {
                 render::render_buffered(ctx, vm);

@@ -4,14 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["firmware"]
+default = ["epaper"]
 firmware = ["dep:cortex-m", "dep:cortex-m-rt"]
 host = ["dep:minifb"]
+epaper = ["dep:esp-hal","dep:esp-bootloader-esp-idf", "dep:critical-section", "dep:xtensa-lx", "dep:esp-alloc", "dep:esp-storage"]
 
 [dependencies]
 cortex-m = { version = "0.7", optional = true }
 cortex-m-rt = { version = "0.7", features = ["device"], optional = true }
+libm = "0.2"
 minifb = { version = "0.27", optional = true }
+esp-hal = { version = "1.1.0", features = ["esp32s3", "unstable"], optional = true }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"], optional = true }
+critical-section = { version = "1.2.0", optional = true }
+xtensa-lx = { version = "0.13.0", optional = true }
+esp-alloc = { version = "0.10.0", optional = true }
+esp-storage = { version = "0.9.0", features = ["esp32s3"], optional = true }
 
 [lib]
 name = "ferrite_ui"
@@ -27,7 +35,13 @@ name = "sim"
 path = "src/bin/sim.rs"
 required-features = ["host"]
 
+[[bin]]
+name = "epaper"
+path = "src/epaper_main.rs"
+required-features = ["epaper"]
+
 [profile.release]
+codegen-units = 1
 opt-level = "s"
-lto = true
-debug = false
+lto = 'fat'
+debug = 2

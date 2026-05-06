@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import struct
+import json
 from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
                         FunctionKind as CcFunctionKind,
                         SYSTEM_CALLBACK_KINDS,
@@ -963,6 +964,9 @@ class CodeGen:
         self.const_values = {}  # name -> (value, type) for inlineable consts (no slot needed)
         self._global_init_stmts = None  # set during generate_image()
         self._in_function = False  # True when emitting function body
+        self._current_fn_name = None
+        self.debug_globals = {}    # slot -> source name
+        self.debug_functions = {}  # function name -> {offset, length, locals}
 
     def generate(self, program):
         """Compile program to bytecode (raw, no image header).
@@ -1412,6 +1416,7 @@ class CodeGen:
             if slot >= 128:
                 raise CompileError(f"too many global variables (max 128): {name}", line)
         self.vars[name] = slot
+        self._record_var_symbol(name, slot)
         self.next_slot += 1
         return slot
 
@@ -1420,17 +1425,51 @@ class CodeGen:
             raise CompileError(f"undefined variable: {name}", line)
         return self.vars[name]
 
+    def _record_var_symbol(self, name, slot):
+        if self._in_function and self._current_fn_name:
+            fn = self.debug_functions.setdefault(
+                self._current_fn_name,
+                {'name': self._current_fn_name, 'offset': None,
+                 'length': None, 'locals': {}})
+            fn['locals'][slot & 0x7F] = name
+        elif not (slot & 0x80):
+            self.debug_globals[slot] = name
+
+    def debug_info(self, filename="<input>"):
+        functions = []
+        for name, info in self.functions.items():
+            addr = info.get('addr')
+            if addr is None:
+                continue
+            end_addr = info.get('end_addr') or addr
+            dbg = self.debug_functions.get(name, {})
+            functions.append({
+                'name': name,
+                'offset': addr,
+                'length': end_addr - addr,
+                'locals': {str(k): v for k, v in sorted(
+                    dbg.get('locals', {}).items())},
+            })
+        functions.sort(key=lambda fn: fn['offset'])
+        return {
+            'version': 1,
+            'source': filename,
+            'globals': {str(k): v for k, v in sorted(self.debug_globals.items())},
+            'functions': functions,
+        }
+
     # --- Compile-time type inference (no code emission) ---
 
     # Builtins that return float
     _FLOAT_RETURNING = {
         'itof', 'fadd', 'fsub', 'fmul', 'fdiv', 'fneg',
         'parseFloat',
+        'sin', 'cos', 'sqrt', 'abs', 'atan2', 'floor', 'ceil',
     }
     # Builtins that return int regardless of argument types
     _INT_RETURNING = {
         'ftoi', 'feq', 'fne', 'flt', 'fle', 'fgt', 'fge',
-        'alloc', 'get', 'str', 'itos', 'ftos', 'concat',
+        'alloc', 'get', 'str', 'itos', 'ftos', 'concat', 'sprintf',
         'parseInt', 'strLen', 'millis', 'brightness',
         'arrFree', 'strFree', 'strClear',
     }
@@ -1494,6 +1533,10 @@ class CodeGen:
     def _gen_fn(self, fn):
         info = self.functions[fn.name]
         info['addr'] = self.asm.pos
+        self.debug_functions.setdefault(
+            fn.name,
+            {'name': fn.name, 'offset': info['addr'], 'length': None, 'locals': {}})
+        self.debug_functions[fn.name]['offset'] = info['addr']
 
         # Function locals use stack frames (high bit encoding).
         # Each function starts locals from index 0 (0x80).
@@ -1501,10 +1544,12 @@ class CodeGen:
         saved_types = dict(self.var_types)
         saved_slot = self.next_slot
         saved_in_fn = self._in_function
+        saved_current_fn = self._current_fn_name
         self.vars = dict(self.global_vars)  # globals visible in all functions
         self.var_types = dict(self.global_var_types)
         self.next_slot = self._fn_base  # locals start after globals
         self._in_function = True
+        self._current_fn_name = fn.name
 
         # Emit FRAME prologue: tells VM how many local slots this function needs
         local_count = len(fn.params) + self._count_var_slots(fn.body)
@@ -1545,12 +1590,14 @@ class CodeGen:
                 self.asm.ret()
 
         info['end_addr'] = self.asm.pos
+        self.debug_functions[fn.name]['length'] = info['end_addr'] - info['addr']
 
         # Restore
         self.vars = saved_vars
         self.var_types = saved_types
         self.next_slot = saved_slot
         self._in_function = saved_in_fn
+        self._current_fn_name = saved_current_fn
 
     # --- Statements ---
 
@@ -2282,6 +2329,33 @@ class CodeGen:
             getattr(self.asm, _FLOAT_BINOPS[name])()
             return
 
+        # --- Built-in: trig / math (all operate on f32, auto-promote int args) ---
+
+        _FLOAT_UNARY_MATH = {
+            'sin': 'fsin', 'cos': 'fcos', 'sqrt': 'fsqrt',
+            'abs': 'fabs', 'floor': 'ffloor', 'ceil': 'fceil',
+        }
+        if name in _FLOAT_UNARY_MATH:
+            if len(node.args) != 1:
+                raise CompileError(f"{name}() takes 1 argument", node.line)
+            self._gen_expr(node.args[0])
+            if self._infer_type(node.args[0]) == self.T_INT:
+                self.asm.itof()
+            getattr(self.asm, _FLOAT_UNARY_MATH[name])()
+            return
+
+        if name == 'atan2':
+            if len(node.args) != 2:
+                raise CompileError("atan2() takes 2 arguments (y, x)", node.line)
+            self._gen_expr(node.args[0])
+            if self._infer_type(node.args[0]) == self.T_INT:
+                self.asm.itof()
+            self._gen_expr(node.args[1])
+            if self._infer_type(node.args[1]) == self.T_INT:
+                self.asm.itof()
+            self.asm.fatan2()
+            return
+
         # --- Built-in: string operations ---
 
         if name == 'str':
@@ -2307,6 +2381,17 @@ class CodeGen:
                 raise CompileError("ftos() takes 1 argument", node.line)
             self._gen_expr(node.args[0])
             self.asm.str_ftos()
+            return
+
+        if name == 'sprintf':
+            if len(node.args) < 1:
+                raise CompileError("sprintf() requires at least 1 argument (format string)", node.line)
+            n_fmt_args = len(node.args) - 1
+            if n_fmt_args > 8:
+                raise CompileError("sprintf() supports at most 8 format arguments", node.line)
+            for arg in node.args:
+                self._gen_expr(arg)
+            self.asm.str_sprintf(n_fmt_args)
             return
 
         if name == 'concat':
@@ -2791,7 +2876,8 @@ def compile(source, filename="<input>", include_dirs=None):
         parser = Parser(tokens)
         program = parser.parse()
         codegen = CodeGen()
-        return codegen.generate(program)
+        bytecode = codegen.generate(program)
+        return _ImageBytes(bytecode, debug_symbols=codegen.debug_info(filename))
     except CompileError:
         raise
     except Exception as e:
@@ -2816,13 +2902,13 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
     """Compile source code to (bytecode, metadata_or_None).
 
     Legacy API — wraps build_image internally.
-    Returns (image_bytes, None) since metadata is now embedded.
+    Returns (image_bytes, None); CLI symbol debug is written to a .dbg sidecar.
     """
     return build_image(source, filename, include_dirs), None
 
 
 def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty"):
-    """Compile source to VM image format (v4 header).
+    """Compile source to VM image format (v4 header + opcodes).
 
     Image format (v4):
       version(u8=4) + function_count(u16 LE) + global_count(u16 LE) + flags(u16 LE)
@@ -2830,7 +2916,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
       + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
       + opcodes...
 
-    Flags bit 0: render_mode (0=dirty, 1=buffered)
+    Flags bit 0: render_mode (0=dirty, 1=buffered, 2=epaper)
     widget_count: number of alloc() call sites for firmware Vec pre-allocation.
 
     Requires fn setup() and fn loop() in the source.
@@ -2856,6 +2942,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
 
         codegen = CodeGen()
         bytecode = codegen.generate_image(program)
+        debug_symbols = codegen.debug_info(filename)
 
         # Build the image header with function table
         cc = CcCompiler()
@@ -2868,8 +2955,9 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
                 length = (info['end_addr'] or offset) - offset
                 cc._funcs[fn_name] = (fid, kind, offset, length)
                 func_names[offset] = fn_name
-
-        flags = 0x01 if render_mode == "buffered" else 0x00
+        if render_mode not in ("dirty", "buffered", "epaper"):
+            raise CompileError(f"invalid render mode: {render_mode}")        
+        flags = 0x01 if render_mode == "buffered" else 0x02 if render_mode == "epaper" else 0x00
         # Use #hint_widgets if provided; fall back to static alloc()-site count.
         auto_wc = codegen.next_widget_id - 1
         widget_count = hint_wc if hint_wc > 0 else auto_wc
@@ -2883,7 +2971,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         image = header + bytecode
 
         # Stash function name map on the bytes object for CLI use
-        image = _ImageBytes(image, func_names)
+        image = _ImageBytes(image, func_names, debug_symbols)
         return image
 
     except CompileError:
@@ -2894,16 +2982,19 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
 
 class _ImageBytes(bytes):
     """bytes subclass that carries function name metadata for disassembly."""
-    def __new__(cls, data, func_names=None):
+    def __new__(cls, data, func_names=None, debug_symbols=None):
         obj = super().__new__(cls, data)
         obj.func_names = func_names or {}
+        obj.debug_symbols = debug_symbols or {}
         return obj
 
 
 def compile_page(source, bg_color=0x0000, filename="<input>", include_dirs=None):
     """Compile source to page format: bg_color(u16 LE) + bytecode."""
     bytecode = compile(source, filename, include_dirs)
-    return struct.pack('<H', bg_color) + bytecode
+    return _ImageBytes(
+        struct.pack('<H', bg_color) + bytecode,
+        debug_symbols=getattr(bytecode, 'debug_symbols', {}))
 
 
 # ============================================================
@@ -2918,13 +3009,61 @@ _KIND_NAMES = {
 }
 
 
-def _extract_labels(image):
+def _debug_path_for(path):
+    root, _ = os.path.splitext(path)
+    return root + '.dbg'
+
+
+def _write_debug_file(output_path, output):
+    symbols = getattr(output, 'debug_symbols', None)
+    if not symbols:
+        return None
+    dbg_path = _debug_path_for(output_path)
+    with open(dbg_path, 'w', encoding='utf-8') as f:
+        json.dump(symbols, f, indent=2, sort_keys=True)
+        f.write('\n')
+    return dbg_path
+
+
+def _load_debug_file(binary_path):
+    dbg_path = _debug_path_for(binary_path)
+    if not os.path.isfile(dbg_path):
+        return {}
+    with open(dbg_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _debug_func_names(debug_symbols):
+    names = {}
+    for fn in (debug_symbols or {}).get('functions', []):
+        offset = fn.get('offset')
+        name = fn.get('name')
+        if offset is not None and name:
+            names[offset] = name
+    return names
+
+
+def _looks_like_image(data):
+    if len(data) < 5:
+        return False
+    version = data[0]
+    if version < 1 or version > 4:
+        return False
+    try:
+        func_count = struct.unpack_from('<H', data, 1)[0]
+        return _image_header_size(version, func_count) <= len(data)
+    except Exception:
+        return False
+
+
+def _extract_labels(image, debug_symbols=None):
     """Build {offset: "fn_name()"} labels dict from image header."""
     # Use real function names if available (from _ImageBytes)
-    real_names = getattr(image, 'func_names', {})
+    real_names = dict(_debug_func_names(debug_symbols))
+    real_names.update(getattr(image, 'func_names', {}))
     version = image[0]
     func_count = struct.unpack_from('<H', image, 1)[0]
-    hdr_base = 7 if version >= 3 else 5
+    hdr_base = _image_header_size(version, 0)
     labels = {}
     for i in range(func_count):
         base = hdr_base + i * 12
@@ -2949,9 +3088,10 @@ def _image_header_size(version, func_count):
     return base + func_count * 12
 
 
-def _print_image_header(output):
+def _print_image_header(output, debug_symbols=None):
     """Print image header summary to stdout."""
-    real_names = getattr(output, 'func_names', {})
+    real_names = dict(_debug_func_names(debug_symbols))
+    real_names.update(getattr(output, 'func_names', {}))
     version = output[0]
     func_count = struct.unpack_from('<H', output, 1)[0]
     global_count = struct.unpack_from('<H', output, 3)[0]
@@ -2985,12 +3125,12 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='ferrite-ui language compiler')
-    parser.add_argument('source', help='Source file (.fl)')
+    parser.add_argument('source', help='Source file (.fl), or binary when using --disasm/--hexdump')
     parser.add_argument('-o', '--output', help='Output binary file')
     parser.add_argument('--page', type=str, default=None,
                         help='Page mode: bg_color as hex (e.g. 0x0000)')
     parser.add_argument('--image', action='store_true',
-                        help='Output execute image (header + bytecode + metadata)')
+                        help='Output execute image (header + bytecode)')
     parser.add_argument('--disasm', action='store_true', help='Print disassembly')
     parser.add_argument('--hexdump', action='store_true', help='Print hex dump')
     parser.add_argument('-I', '--include', action='append', default=[],
@@ -2999,51 +3139,87 @@ def main():
                         help='Render mode: dirty (partial update) or buffered (full redraw)')
     args = parser.parse_args()
 
-    try:
-        with open(args.source, 'r', encoding='utf-8') as f:
-            source = f.read()
-    except FileNotFoundError:
-        print(f"error: file not found: {args.source}", file=sys.stderr)
-        sys.exit(1)
-    except OSError as e:
-        print(f"error: cannot read {args.source}: {e}", file=sys.stderr)
-        sys.exit(1)
-
     include_dirs = [os.path.abspath(d) for d in args.include]
+    source_ext = os.path.splitext(args.source)[1].lower()
+    binary_input = (
+        source_ext != '.fl'
+        and args.page is None
+        and (args.disasm or args.hexdump)
+    )
+    debug_symbols = {}
 
-    try:
-        # Expand #include directives before auto-detection
-        source = preprocess(source, args.source, include_dirs)
+    if binary_input:
+        try:
+            with open(args.source, 'rb') as f:
+                output = f.read()
+            debug_symbols = _load_debug_file(args.source)
+        except FileNotFoundError:
+            print(f"error: file not found: {args.source}", file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            print(f"error: cannot read {args.source}: {e}", file=sys.stderr)
+            sys.exit(1)
 
-        # Auto-detect image mode: if source has fn setup() and fn loop(), use --image
-        has_setup_loop = ('fn setup()' in source and 'fn loop()' in source)
-        use_image = args.image or (has_setup_loop and args.page is None)
-
+        use_image = _looks_like_image(output)
         if use_image:
-            output = build_image(source, args.source, render_mode=args.render_mode)
-            # New image format: header + opcodes
-            if len(output) >= 5:
-                version = output[0]
-                func_count = struct.unpack_from('<H', output, 1)[0]
-                opcode_start = _image_header_size(version, func_count)
-                raw_code = output[opcode_start:]
-            else:
-                raw_code = output
-        elif args.page is not None:
-            bg = int(args.page, 0)
-            output = compile_page(source, bg, args.source)
-            raw_code = output[2:]
+            version = output[0]
+            func_count = struct.unpack_from('<H', output, 1)[0]
+            opcode_start = _image_header_size(version, func_count)
+            raw_code = output[opcode_start:]
         else:
-            output = compile(source, args.source)
             raw_code = output
-    except CompileError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
+    else:
+        try:
+            with open(args.source, 'r', encoding='utf-8') as f:
+                source = f.read()
+        except FileNotFoundError:
+            print(f"error: file not found: {args.source}", file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            print(f"error: cannot read {args.source}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            # Expand #include directives before auto-detection.
+            detected_source = preprocess(source, args.source, include_dirs)
+
+            # Auto-detect image mode: if source has fn setup() and fn loop(), use --image
+            has_setup_loop = ('fn setup()' in detected_source and 'fn loop()' in detected_source)
+            use_image = args.image or (has_setup_loop and args.page is None)
+
+            if use_image:
+                output = build_image(source, args.source, include_dirs=include_dirs,
+                                     render_mode=args.render_mode)
+                # New image format: header + opcodes
+                if len(output) >= 5:
+                    version = output[0]
+                    func_count = struct.unpack_from('<H', output, 1)[0]
+                    opcode_start = _image_header_size(version, func_count)
+                    raw_code = output[opcode_start:]
+                else:
+                    raw_code = output
+            elif args.page is not None:
+                bg = int(args.page, 0)
+                output = compile_page(source, bg, args.source, include_dirs=include_dirs)
+                raw_code = output[2:]
+            else:
+                output = compile(source, args.source, include_dirs=include_dirs)
+                raw_code = output
+            debug_symbols = getattr(output, 'debug_symbols', {})
+        except CompileError as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # Build function labels for disassembly
     labels = {}
     if use_image and len(output) >= 5:
-        labels = _extract_labels(output)
+        labels = _extract_labels(output, debug_symbols)
+    elif debug_symbols:
+        labels = {
+            fn['offset']: f"{fn['name']}()"
+            for fn in debug_symbols.get('functions', [])
+            if 'offset' in fn and 'name' in fn
+        }
 
     if args.output:
         with open(args.output, 'wb') as f:
@@ -3054,6 +3230,9 @@ def main():
             func_count = struct.unpack_from('<H', output, 1)[0]
             opcode_start = _image_header_size(version, func_count)
             msg += f" (header: {opcode_start}B, opcodes: {len(output) - opcode_start}B, {func_count} functions)"
+        dbg_path = _write_debug_file(args.output, output)
+        if dbg_path:
+            msg += f", debug: {dbg_path}"
         print(msg)
 
     if args.disasm:
@@ -3061,8 +3240,8 @@ def main():
             bg = struct.unpack_from('<H', output)[0]
             print(f'; page bg_color: 0x{bg:04X}')
         if use_image:
-            _print_image_header(output)
-        print(disassemble(raw_code, labels=labels))
+            _print_image_header(output, debug_symbols)
+        print(disassemble(raw_code, labels=labels, symbols=debug_symbols))
 
     if args.hexdump:
         a = Asm()
@@ -3070,9 +3249,9 @@ def main():
         print(a.hexdump())
 
     if not args.output and not args.disasm and not args.hexdump:
-        if args.image:
-            _print_image_header(output)
-        print(disassemble(raw_code, labels=labels))
+        if use_image:
+            _print_image_header(output, debug_symbols)
+        print(disassemble(raw_code, labels=labels, symbols=debug_symbols))
 
 
 if __name__ == '__main__':

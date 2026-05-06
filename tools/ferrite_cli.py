@@ -127,7 +127,7 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
         tag_byte = ser.read(1)
         if not tag_byte:
             break
-        print(f"DEBUG: received byte 0x{tag_byte[0]:02X} ('{chr(tag_byte[0])}')", file=sys.stderr)
+        # print(f"DEBUG: received byte 0x{tag_byte[0]:02X} ('{chr(tag_byte[0])}')", file=sys.stderr)
 
         tag = tag_byte[0]
 

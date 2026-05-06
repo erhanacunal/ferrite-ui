@@ -273,8 +273,8 @@ impl Font {
 
         if draw_x + glyph.width as i16 <= 0
             || draw_y + glyph.height as i16 <= 0
-            || draw_x >= 800
-            || draw_y >= 480
+            || draw_x >= 2048
+            || draw_y >= 2048
         {
             return glyph.x_advance;
         }

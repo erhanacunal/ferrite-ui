@@ -1,8 +1,25 @@
+#[cfg(not(feature = "epaper"))]
 pub const WIDTH: u16 = 800;
+#[cfg(not(feature = "epaper"))]
 pub const HEIGHT: u16 = 480;
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "epaper")]
+pub const WIDTH: u16 = display::EPD_WIDTH;
+#[cfg(feature = "epaper")]
+pub const HEIGHT: u16 = display::EPD_HEIGHT;
+
+#[cfg(feature = "epaper")]
+pub(crate) mod display;
+#[cfg(feature = "epaper")]
+pub(crate) mod ed047tc1;
+#[cfg(feature = "epaper")]
+pub mod epaper;
+#[cfg(feature = "epaper")]
+pub(crate) mod error;
+#[cfg(feature = "firmware")]
 pub mod hw;
+#[cfg(feature = "epaper")]
+pub(crate) mod rmt;
 #[cfg(feature = "host")]
 pub mod sim;
 
@@ -19,6 +36,8 @@ pub trait LcdBackend {
 
     fn send_command(&self, cmd: u16);
     fn send_data(&self, data: u16);
+
+    fn flush_dirty(&self) {}
 
     fn draw_pixel(&self, x: u16, y: u16, color: u16) {
         if x < WIDTH && y < HEIGHT {
@@ -38,9 +57,15 @@ impl<B: LcdBackend> LcdImpl<B> {
 
     // --- Primitives (pass-through to backend) ---
 
-    pub fn begin_frame(&mut self) { self.be.begin_frame() }
-    pub fn end_frame(&mut self) { self.be.end_frame() }
-    pub fn back_buf(&self) -> u8 { self.be.back_buf() }
+    pub fn begin_frame(&mut self) {
+        self.be.begin_frame()
+    }
+    pub fn end_frame(&mut self) {
+        self.be.end_frame()
+    }
+    pub fn back_buf(&self) -> u8 {
+        self.be.back_buf()
+    }
 
     #[inline]
     pub fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
@@ -63,10 +88,19 @@ impl<B: LcdBackend> LcdImpl<B> {
     }
 
     #[inline(always)]
-    pub fn send_command(&self, cmd: u16) { self.be.send_command(cmd) }
+    pub fn send_command(&self, cmd: u16) {
+        self.be.send_command(cmd)
+    }
 
     #[inline(always)]
-    pub fn send_data(&self, data: u16) { self.be.send_data(data) }
+    pub fn send_data(&self, data: u16) {
+        self.be.send_data(data)
+    }
+
+    #[inline]
+    pub fn flush_dirty(&self) {
+        self.be.flush_dirty()
+    }
 
     // --- Geometry (backend-agnostic, uses only primitives above) ---
 
@@ -138,24 +172,12 @@ impl<B: LcdBackend> LcdImpl<B> {
         if r <= 0 {
             return;
         }
-        let mut x: i16 = 0;
-        let mut y: i16 = r;
-        let mut d: i16 = 1 - r;
 
-        self.hline_clipped(cx - r, cx + r, cy, color);
-
-        while x <= y {
-            x += 1;
-            if d < 0 {
-                d += 2 * x + 1;
-            } else {
-                self.hline_clipped(cx - x + 1, cx + x - 1, cy + y, color);
-                self.hline_clipped(cx - x + 1, cx + x - 1, cy - y, color);
-                y -= 1;
-                d += 2 * (x - y) + 1;
-            }
-            self.hline_clipped(cx - y, cx + y, cy + x, color);
-            self.hline_clipped(cx - y, cx + y, cy - x, color);
+        let rr = r as i32 * r as i32;
+        for dy in -r..=r {
+            let yy = dy as i32 * dy as i32;
+            let dx = isqrt(rr - yy) as i16;
+            self.hline_clipped(cx - dx, cx + dx, cy + dy, color);
         }
     }
 
@@ -307,10 +329,17 @@ impl<B: LcdBackend> LcdImpl<B> {
     /// gradient slice.
     pub fn fill_gradient_rect(
         &self,
-        x: u16, y: u16, w: u16, h: u16,
-        c1: u16, c2: u16, dir: u8,
-        x_off: u16, y_off: u16,
-        full_w: u16, full_h: u16,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        c1: u16,
+        c2: u16,
+        dir: u8,
+        x_off: u16,
+        y_off: u16,
+        full_w: u16,
+        full_h: u16,
     ) {
         if w == 0 || h == 0 {
             return;
@@ -345,8 +374,14 @@ impl<B: LcdBackend> LcdImpl<B> {
     /// 2=vertical.
     pub fn fill_gradient_rounded_rect(
         &self,
-        x: u16, y: u16, w: u16, h: u16, r: u16,
-        c1: u16, c2: u16, dir: u8,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        r: u16,
+        c1: u16,
+        c2: u16,
+        dir: u8,
     ) {
         if w == 0 || h == 0 {
             return;
@@ -387,7 +422,12 @@ impl<B: LcdBackend> LcdImpl<B> {
                         self.hspan_gradient(cx_l - px, cx_r + px, cy_t - py, xi, grad_w, c1, c2);
                         self.hspan_gradient(cx_l - px, cx_r + px, cy_b + py, xi, grad_w, c1, c2);
                     }
-                    if d < 0 { d += 2 * px + 3; } else { d += 2 * (px - py) + 5; py -= 1; }
+                    if d < 0 {
+                        d += 2 * px + 3;
+                    } else {
+                        d += 2 * (px - py) + 5;
+                        py -= 1;
+                    }
                     px += 1;
                 }
             }
@@ -414,7 +454,12 @@ impl<B: LcdBackend> LcdImpl<B> {
                         self.hline_clipped(cx_l - px, cx_r + px, cy_t - py, c_tq);
                         self.hline_clipped(cx_l - px, cx_r + px, cy_b + py, c_bq);
                     }
-                    if d < 0 { d += 2 * px + 3; } else { d += 2 * (px - py) + 5; py -= 1; }
+                    if d < 0 {
+                        d += 2 * px + 3;
+                    } else {
+                        d += 2 * (px - py) + 5;
+                        py -= 1;
+                    }
                     px += 1;
                 }
             }
@@ -423,12 +468,7 @@ impl<B: LcdBackend> LcdImpl<B> {
 
     /// Draw a horizontal gradient span — clips to screen, then writes
     /// each pixel individually with its interpolated color.
-    fn hspan_gradient(
-        &self,
-        x0: i16, x1: i16, y: i16,
-        full_x: i16, grad_w: u16,
-        c1: u16, c2: u16,
-    ) {
+    fn hspan_gradient(&self, x0: i16, x1: i16, y: i16, full_x: i16, grad_w: u16, c1: u16, c2: u16) {
         if y < 0 || y >= HEIGHT as i16 {
             return;
         }
@@ -472,13 +512,16 @@ impl<B: LcdBackend> LcdImpl<B> {
 
 // --- Type alias: pick backend by build feature ---
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub type Lcd = LcdImpl<hw::FpgaLcd>;
 
 #[cfg(feature = "host")]
 pub type Lcd = LcdImpl<sim::SimLcd>;
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "epaper")]
+pub type Lcd = LcdImpl<epaper::EpdLcd>;
+
+#[cfg(feature = "firmware")]
 impl Lcd {
     pub fn new(gpio: crate::gpio::Gpio) -> Self {
         Self::with_backend(hw::FpgaLcd::new(gpio))
@@ -489,6 +532,13 @@ impl Lcd {
 impl Lcd {
     pub fn new(fb: sim::Framebuffer) -> Self {
         Self::with_backend(sim::SimLcd::new(fb))
+    }
+}
+
+#[cfg(feature = "epaper")]
+impl Lcd {
+    pub fn new() -> Self {
+        Self::with_backend(epaper::EpdLcd::new())
     }
 }
 
@@ -520,16 +570,11 @@ pub fn lerp_rgb565(c1: u16, c2: u16, t: u16, n: u16) -> u16 {
 // === Sin/Cos lookup table (Q8 fixed-point, 0..90 degrees) ===
 
 static SIN_TABLE: [u16; 91] = [
-    0, 4, 9, 13, 18, 22, 27, 31, 36, 40,
-    44, 49, 53, 57, 62, 66, 70, 75, 79, 83,
-    87, 91, 96, 100, 104, 108, 112, 116, 120, 124,
-    128, 131, 135, 139, 143, 146, 150, 154, 157, 161,
-    164, 167, 171, 174, 177, 181, 184, 187, 190, 193,
-    196, 198, 201, 204, 207, 209, 212, 214, 217, 219,
-    221, 223, 226, 228, 230, 232, 233, 235, 237, 238,
-    240, 242, 243, 244, 246, 247, 248, 249, 250, 251,
-    252, 252, 253, 254, 254, 255, 255, 255, 256, 256,
-    256,
+    0, 4, 9, 13, 18, 22, 27, 31, 36, 40, 44, 49, 53, 57, 62, 66, 70, 75, 79, 83, 87, 91, 96, 100,
+    104, 108, 112, 116, 120, 124, 128, 131, 135, 139, 143, 146, 150, 154, 157, 161, 164, 167, 171,
+    174, 177, 181, 184, 187, 190, 193, 196, 198, 201, 204, 207, 209, 212, 214, 217, 219, 221, 223,
+    226, 228, 230, 232, 233, 235, 237, 238, 240, 242, 243, 244, 246, 247, 248, 249, 250, 251, 252,
+    252, 253, 254, 254, 255, 255, 255, 256, 256, 256,
 ];
 
 pub fn sin_cos_deg(deg: i16) -> (i16, i16) {
@@ -550,4 +595,26 @@ pub fn sin_cos_deg(deg: i16) -> (i16, i16) {
     };
 
     (sin_val, cos_val)
+}
+
+fn isqrt(n: i32) -> i32 {
+    let mut op = n as u32;
+    let mut res = 0u32;
+    let mut one = 1u32 << 30;
+
+    while one > op {
+        one >>= 2;
+    }
+
+    while one != 0 {
+        if op >= res + one {
+            op -= res + one;
+            res = (res >> 1) + one;
+        } else {
+            res >>= 1;
+        }
+        one >>= 2;
+    }
+
+    res as i32
 }

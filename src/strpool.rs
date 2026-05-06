@@ -468,6 +468,215 @@ pub fn parse_int(pool: &StringPool, id: u16) -> i32 {
     if negative { -result } else { result }
 }
 
+// === Formatting helpers used by sprintf ===
+
+/// Format u32 as decimal into buf. Returns bytes written.
+fn format_u32(n: u32, buf: &mut [u8]) -> usize {
+    if buf.is_empty() { return 0; }
+    if n == 0 { buf[0] = b'0'; return 1; }
+    let mut tmp = [0u8; 10];
+    let mut pos = tmp.len();
+    let mut rem = n;
+    while rem > 0 {
+        pos -= 1;
+        tmp[pos] = b'0' + (rem % 10) as u8;
+        rem /= 10;
+    }
+    let digits = &tmp[pos..];
+    let count = digits.len().min(buf.len());
+    buf[..count].copy_from_slice(&digits[..count]);
+    count
+}
+
+/// Format u32 as hex into buf (lower or upper case). Returns bytes written.
+fn format_hex(n: u32, upper: bool, buf: &mut [u8]) -> usize {
+    if buf.is_empty() { return 0; }
+    if n == 0 { buf[0] = b'0'; return 1; }
+    let digits = if upper { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+    let mut tmp = [0u8; 8];
+    let mut pos = tmp.len();
+    let mut rem = n;
+    while rem > 0 {
+        pos -= 1;
+        tmp[pos] = digits[(rem & 0xF) as usize];
+        rem >>= 4;
+    }
+    let hex = &tmp[pos..];
+    let count = hex.len().min(buf.len());
+    buf[..count].copy_from_slice(&hex[..count]);
+    count
+}
+
+/// Format f32 with configurable decimal places into buf. Returns bytes written.
+fn format_f32_prec(val: f32, decimals: u8, buf: &mut [u8]) -> usize {
+    if buf.len() < 4 { return 0; }
+    if val != val {
+        let s = b"NaN";
+        let n = s.len().min(buf.len());
+        buf[..n].copy_from_slice(&s[..n]);
+        return n;
+    }
+    let mut pos = 0;
+    let v = if val < 0.0 {
+        if pos < buf.len() { buf[pos] = b'-'; pos += 1; }
+        -val
+    } else {
+        val
+    };
+    pos += format_u32(v as u32, &mut buf[pos..]);
+    if decimals == 0 { return pos; }
+    if pos >= buf.len() { return pos; }
+    buf[pos] = b'.';
+    pos += 1;
+    let mut frac = v - (v as u32) as f32;
+    for _ in 0..decimals {
+        if pos >= buf.len() { break; }
+        frac *= 10.0;
+        let d = frac as u32 % 10;
+        buf[pos] = b'0' + d as u8;
+        pos += 1;
+        frac -= d as f32;
+    }
+    pos
+}
+
+/// Write `digits` into `out` with optional zero/space padding to `width`.
+/// Handles negative sign placement for zero-pad: `-00X` → `- 00digits`.
+fn pad_write(digits: &[u8], width: u8, zero_pad: bool, out: &mut [u8]) -> usize {
+    let len = digits.len();
+    let w = width as usize;
+    if w == 0 || len >= w {
+        let n = len.min(out.len());
+        out[..n].copy_from_slice(&digits[..n]);
+        return n;
+    }
+    if w > out.len() { return 0; }
+    let pad = w - len;
+    if zero_pad && !digits.is_empty() && digits[0] == b'-' {
+        out[0] = b'-';
+        for k in 0..pad { out[1 + k] = b'0'; }
+        out[1 + pad..w].copy_from_slice(&digits[1..len]);
+    } else {
+        let pad_char = if zero_pad { b'0' } else { b' ' };
+        for k in 0..pad { out[k] = pad_char; }
+        out[pad..w].copy_from_slice(&digits[..len]);
+    }
+    w
+}
+
+/// Format a string using printf-style specifiers.
+/// Supported: `%[0][width]d/i/u/x/X`, `%[.N]f`, `%s`, `%%`
+/// `%s` args are str_ids resolved from pool. Output is capped at 128 bytes.
+pub fn sprintf(pool: &mut StringPool, fmt: &[u8], args: &[i32]) -> Option<u16> {
+    const OUT_SIZE: usize = 128;
+    let mut out = [0u8; OUT_SIZE];
+    let mut out_pos = 0;
+    let mut arg_idx = 0;
+    let mut i = 0;
+
+    while i < fmt.len() && out_pos < OUT_SIZE {
+        if fmt[i] != b'%' {
+            out[out_pos] = fmt[i];
+            out_pos += 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= fmt.len() { break; }
+
+        // Optional zero-pad flag (consumed separately so '0' in width works)
+        let mut zero_pad = false;
+        if i < fmt.len() && fmt[i] == b'0' {
+            zero_pad = true;
+            i += 1;
+        }
+        // Optional width
+        let mut width: u8 = 0;
+        while i < fmt.len() && fmt[i] >= b'0' && fmt[i] <= b'9' {
+            width = width.saturating_mul(10).saturating_add(fmt[i] - b'0');
+            i += 1;
+        }
+        // Optional precision for floats
+        let mut precision: Option<u8> = None;
+        if i < fmt.len() && fmt[i] == b'.' {
+            i += 1;
+            let mut n = 0u8;
+            while i < fmt.len() && fmt[i] >= b'0' && fmt[i] <= b'9' {
+                n = n.saturating_mul(10).saturating_add(fmt[i] - b'0');
+                i += 1;
+            }
+            precision = Some(n.min(9));
+        }
+
+        if i >= fmt.len() { break; }
+        let spec = fmt[i];
+        i += 1;
+
+        match spec {
+            b'd' | b'i' => {
+                if arg_idx < args.len() {
+                    let mut tmp = [0u8; 16];
+                    let n = format_i32(args[arg_idx], &mut tmp);
+                    out_pos += pad_write(&tmp[..n], width, zero_pad, &mut out[out_pos..]);
+                    arg_idx += 1;
+                }
+            }
+            b'u' => {
+                if arg_idx < args.len() {
+                    let mut tmp = [0u8; 12];
+                    let n = format_u32(args[arg_idx] as u32, &mut tmp);
+                    out_pos += pad_write(&tmp[..n], width, zero_pad, &mut out[out_pos..]);
+                    arg_idx += 1;
+                }
+            }
+            b'x' => {
+                if arg_idx < args.len() {
+                    let mut tmp = [0u8; 10];
+                    let n = format_hex(args[arg_idx] as u32, false, &mut tmp);
+                    out_pos += pad_write(&tmp[..n], width, zero_pad, &mut out[out_pos..]);
+                    arg_idx += 1;
+                }
+            }
+            b'X' => {
+                if arg_idx < args.len() {
+                    let mut tmp = [0u8; 10];
+                    let n = format_hex(args[arg_idx] as u32, true, &mut tmp);
+                    out_pos += pad_write(&tmp[..n], width, zero_pad, &mut out[out_pos..]);
+                    arg_idx += 1;
+                }
+            }
+            b'f' => {
+                if arg_idx < args.len() {
+                    let v = f32::from_bits(args[arg_idx] as u32);
+                    out_pos += format_f32_prec(v, precision.unwrap_or(2), &mut out[out_pos..]);
+                    arg_idx += 1;
+                }
+            }
+            b's' => {
+                if arg_idx < args.len() {
+                    let str_id = args[arg_idx] as u16;
+                    let mut tmp = [0u8; 64];
+                    let copy_n = {
+                        let s = pool.get(str_id);
+                        let n = s.len().min(OUT_SIZE - out_pos).min(tmp.len());
+                        tmp[..n].copy_from_slice(&s[..n]);
+                        n
+                    };
+                    out[out_pos..out_pos + copy_n].copy_from_slice(&tmp[..copy_n]);
+                    out_pos += copy_n;
+                    arg_idx += 1;
+                }
+            }
+            b'%' => {
+                if out_pos < OUT_SIZE { out[out_pos] = b'%'; out_pos += 1; }
+            }
+            _ => {}
+        }
+    }
+
+    pool.alloc(&out[..out_pos])
+}
+
 /// Parse a string (by ID) as f32. Returns f32 bits. Returns 0.0 bits on failure.
 pub fn parse_float(pool: &StringPool, id: u16) -> u32 {
     let data = pool.get(id);

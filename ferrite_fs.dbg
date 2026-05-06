@@ -1,0 +1,67 @@
+{
+  "functions": [
+    {
+      "length": 457,
+      "locals": {
+        "0": "hdr",
+        "1": "htl",
+        "2": "r1",
+        "3": "r2",
+        "4": "ftr",
+        "5": "wst",
+        "6": "btn",
+        "7": "btnl"
+      },
+      "name": "setup",
+      "offset": 0
+    },
+    {
+      "length": 20,
+      "locals": {
+        "0": "n"
+      },
+      "name": "pad2",
+      "offset": 457
+    },
+    {
+      "length": 49,
+      "locals": {},
+      "name": "read_rtc",
+      "offset": 477
+    },
+    {
+      "length": 8,
+      "locals": {
+        "0": "wid"
+      },
+      "name": "on_refresh",
+      "offset": 526
+    },
+    {
+      "length": 123,
+      "locals": {
+        "0": "ts",
+        "1": "sc",
+        "2": "ds"
+      },
+      "name": "loop",
+      "offset": 534
+    }
+  ],
+  "globals": {
+    "0": "w_time",
+    "1": "w_sec",
+    "10": "mo",
+    "11": "yy",
+    "2": "w_date",
+    "3": "last_min",
+    "4": "needs_flush",
+    "5": "time_arr",
+    "6": "hh",
+    "7": "mm",
+    "8": "ss",
+    "9": "dd"
+  },
+  "source": "examples\\epaper_clock\\main.fl",
+  "version": 1
+}

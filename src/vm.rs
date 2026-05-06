@@ -1,26 +1,26 @@
 extern crate alloc;
 
-use alloc::vec::Vec;
 use crate::ctx::Ctx;
 use crate::flash::Flash;
-use crate::strpool;
-use crate::systick;
 use crate::proto::{
-    self, PROP_BG_COLOR, PROP_BORDER_B,
-    PROP_BORDER_COLOR, PROP_BORDER_EDGES, PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_T,
-    PROP_CLICKABLE, PROP_ENABLED, PROP_FONT_ID, PROP_GRADIENT_COLOR, PROP_GRADIENT_DIR,
-    PROP_KIND, PROP_LOCATION, PROP_LOC_X, PROP_LOC_Y,
-    PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L, PROP_MARGIN_R, PROP_MARGIN_T, PROP_PADDING,
-    PROP_IMAGE_ID, PROP_ON_CLICK, PROP_ON_PAINT, PROP_ON_TAP, PROP_BORDER_RADIUS, PROP_VALUE, PROP_CHECKED,
-    PROP_MAX_LENGTH, PROP_CURSOR_POS, PROP_ON_CHANGE, PROP_SCROLL_Y, PROP_CLIP_CHILDREN,
-    PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
-    PROP_PRESS_COLOR, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W,
-    PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VISIBLE,
-    PROP_GRAPH_ARR, PROP_GRAPH_COUNT, PROP_GRAPH_FLAGS,
+    self, PROP_BG_COLOR, PROP_BORDER_B, PROP_BORDER_COLOR, PROP_BORDER_EDGES, PROP_BORDER_L,
+    PROP_BORDER_R, PROP_BORDER_RADIUS, PROP_BORDER_T, PROP_CHECKED, PROP_CLICKABLE,
+    PROP_CLIP_CHILDREN, PROP_CURSOR_POS, PROP_ENABLED, PROP_FONT_ID, PROP_GRADIENT_COLOR,
+    PROP_GRADIENT_DIR, PROP_GRAPH_ARR, PROP_GRAPH_COUNT, PROP_GRAPH_FLAGS, PROP_IMAGE_ID,
+    PROP_KIND, PROP_LOC_X, PROP_LOC_Y, PROP_LOCATION, PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L,
+    PROP_MARGIN_R, PROP_MARGIN_T, PROP_MAX_LENGTH, PROP_ON_CHANGE, PROP_ON_CLICK, PROP_ON_PAINT,
+    PROP_ON_TAP, PROP_PADDING, PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
+    PROP_PRESS_COLOR, PROP_SCROLL_Y, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W, PROP_TEXT,
+    PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VALUE, PROP_VISIBLE,
 };
 use crate::render;
+use crate::strpool;
+use crate::systick;
 use crate::types::{Edges, Offset, Size};
-use crate::widget::{WidgetId, FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_VISIBLE};
+use crate::widget::{
+    FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_VISIBLE, WidgetId,
+};
+use alloc::vec::Vec;
 
 // === Code source — owned by VM ===
 
@@ -60,11 +60,23 @@ impl VmCode {
         match self {
             VmCode::None => 0,
             VmCode::Ram(data) => {
-                if pos < data.len() { data[pos] } else { 0 }
+                if pos < data.len() {
+                    data[pos]
+                } else {
+                    0
+                }
             }
-            VmCode::Flash { flash, base_addr, code_len,
-                            cache, cache_pos, cache_len } => {
-                if pos >= *code_len { return 0; }
+            VmCode::Flash {
+                flash,
+                base_addr,
+                code_len,
+                cache,
+                cache_pos,
+                cache_len,
+            } => {
+                if pos >= *code_len {
+                    return 0;
+                }
                 if pos >= *cache_pos && pos < *cache_pos + *cache_len {
                     return cache[pos - *cache_pos];
                 }
@@ -86,15 +98,25 @@ impl VmCode {
         match self {
             VmCode::None => 0,
             VmCode::Ram(data) => {
-                if pos >= data.len() { return 0; }
+                if pos >= data.len() {
+                    return 0;
+                }
                 let avail = data.len() - pos;
                 let n = buf.len().min(avail);
                 buf[..n].copy_from_slice(&data[pos..pos + n]);
                 n
             }
-            VmCode::Flash { flash, base_addr, code_len,
-                            cache, cache_pos, cache_len } => {
-                if pos >= *code_len { return 0; }
+            VmCode::Flash {
+                flash,
+                base_addr,
+                code_len,
+                cache,
+                cache_pos,
+                cache_len,
+            } => {
+                if pos >= *code_len {
+                    return 0;
+                }
                 let avail = *code_len - pos;
                 let n = buf.len().min(avail);
                 // Check if fully within cache
@@ -163,6 +185,8 @@ pub enum RenderMode {
     Dirty = 0,
     /// Double-buffered full redraw every frame (flicker-free).
     Buffered = 1,
+    /// E-paper partial update: renders dirty rects into a framebuffer, then flushes to EPD.
+    EPaper = 2,
 }
 
 /// Function entry from the image header.
@@ -215,7 +239,7 @@ const OP_ARR_LEN: u8 = 0x19;
 const OP_W_ALLOC: u8 = 0x1A;
 const OP_ARR_FREE: u8 = 0x1B;
 const OP_W_ALLTAR: u8 = 0x1C; // alloc + target + store (combined)
-const OP_FRAME: u8 = 0x1D;   // + u8 local_count (function prologue)
+const OP_FRAME: u8 = 0x1D; // + u8 local_count (function prologue)
 
 // Specialized short forms (1 byte, no args)
 const OP_PUSH_0: u8 = 0x20;
@@ -234,24 +258,24 @@ const OP_STORE_3: u8 = 0x2C;
 const OP_STORE_4: u8 = 0x2D;
 
 // With fixed-size arguments
-const OP_PUSH_I8: u8 = 0x30;   // + i8
-const OP_PUSH_I16: u8 = 0x31;  // + i16 LE
-const OP_PUSH_I32: u8 = 0x32;  // + i32 LE
-const OP_LOAD: u8 = 0x33;      // + u8 slot
-const OP_STORE: u8 = 0x34;     // + u8 slot
-const OP_JMP: u8 = 0x35;       // + u16 target
-const OP_JZ: u8 = 0x36;        // + u16 target
-const OP_JNZ: u8 = 0x37;       // + u16 target
-const OP_CALL: u8 = 0x38;      // + u16 target
-const OP_W_TARGET: u8 = 0x39;  // + u8 widget_id
-const OP_W_SET: u8 = 0x3A;     // + u8 prop_id (value from stack)
-const OP_W_GET: u8 = 0x3B;     // + u8 prop_id
-const OP_W_PARENT: u8 = 0x3C;  // + u8 parent_id
+const OP_PUSH_I8: u8 = 0x30; // + i8
+const OP_PUSH_I16: u8 = 0x31; // + i16 LE
+const OP_PUSH_I32: u8 = 0x32; // + i32 LE
+const OP_LOAD: u8 = 0x33; // + u8 slot
+const OP_STORE: u8 = 0x34; // + u8 slot
+const OP_JMP: u8 = 0x35; // + u16 target
+const OP_JZ: u8 = 0x36; // + u16 target
+const OP_JNZ: u8 = 0x37; // + u16 target
+const OP_CALL: u8 = 0x38; // + u16 target
+const OP_W_TARGET: u8 = 0x39; // + u8 widget_id
+const OP_W_SET: u8 = 0x3A; // + u8 prop_id (value from stack)
+const OP_W_GET: u8 = 0x3B; // + u8 prop_id
+const OP_W_PARENT: u8 = 0x3C; // + u8 parent_id
 const OP_W_SET_LEN: u8 = 0x3D; // + u8 prop_id + u8 len + data
 const OP_ARR_ALLOC: u8 = 0x3E; // + u8 size
-const OP_ARR_INIT: u8 = 0x3F;  // + u8 count + i32 values LE
-const OP_F_READ: u8 = 0x40;    // + u32 addr + u16 len
-const OP_F_WRITE: u8 = 0x41;   // + u32 addr + u8 len + data
+const OP_ARR_INIT: u8 = 0x3F; // + u8 count + i32 values LE
+const OP_F_READ: u8 = 0x40; // + u32 addr + u16 len
+const OP_F_WRITE: u8 = 0x41; // + u32 addr + u8 len + data
 const OP_W_TARGET_S: u8 = 0x42; // widget id from stack (dynamic target)
 const OP_W_PARENT_S: u8 = 0x43; // parent id from stack (dynamic parent)
 
@@ -264,7 +288,7 @@ const OP_FILL_CIRCLE: u8 = 0x84;
 const OP_DRAW_IMAGE: u8 = 0x85;
 const OP_DRAW_TEXT_LIT: u8 = 0x86; // + u8 len + text
 const OP_DELAY: u8 = 0x87;
-const OP_STR_LIT: u8 = 0x88;       // + u8 len + text
+const OP_STR_LIT: u8 = 0x88; // + u8 len + text
 const OP_ITOS: u8 = 0x89;
 const OP_FTOS: u8 = 0x8A;
 const OP_CONCAT: u8 = 0x8B;
@@ -290,13 +314,14 @@ const OP_FPGA_DAT: u8 = 0x9E; // pop data → send_data(data)
 const OP_CRITICAL: u8 = 0x9F; // enter critical section — run until next yield
 const OP_SET_BRIGHTNESS: u8 = 0xA0; // pop percent → set backlight
 const OP_BRIGHTNESS: u8 = 0xA1; // push current backlight percent
-const OP_FILE_OPEN: u8 = 0xA2;  // pop str_id (name) → push handle (1|2|0xFF)
-const OP_FILE_READ: u8 = 0xA3;  // pop handle → push byte (0..255) or -1 on EOF
-const OP_FILE_SIZE: u8 = 0xA4;  // pop handle → push size
+const OP_FILE_OPEN: u8 = 0xA2; // pop str_id (name) → push handle (1|2|0xFF)
+const OP_FILE_READ: u8 = 0xA3; // pop handle → push byte (0..255) or -1 on EOF
+const OP_FILE_SIZE: u8 = 0xA4; // pop handle → push size
 const OP_FILE_CLOSE: u8 = 0xA5; // pop handle, release slot
 const OP_ARR_TO_STR: u8 = 0xA6; // pop len, pop arr_id → alloc string from low bytes of arr elements (len<0 = full array)
 const OP_SHOW_MODAL: u8 = 0xA7; // pop click_fn, pop builder_fn → suspend until setDialogResult, push result on resume
 const OP_SET_DIALOG_RESULT: u8 = 0xA8; // pop result → record on top modal frame; void return
+const OP_SPRINTF: u8 = 0xA9; // + u8 argc — pop argc args + fmt str_id → push result str_id
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -312,6 +337,15 @@ const OP_FLE: u8 = 0xC9;
 const OP_FGT: u8 = 0xCA;
 const OP_FGE: u8 = 0xCB;
 const OP_FNE: u8 = 0xCC;
+
+// Float math (trig / sqrt / rounding) — all no-arg, operate on f32 stack values
+const OP_FSIN: u8 = 0xCD;
+const OP_FCOS: u8 = 0xCE;
+const OP_FSQRT: u8 = 0xCF;
+const OP_FABS: u8 = 0xD0;
+const OP_FATAN2: u8 = 0xD1; // pop x, pop y → push atan2(y,x)
+const OP_FFLOOR: u8 = 0xD2;
+const OP_FCEIL: u8 = 0xD3;
 
 // --- VM State ---
 
@@ -370,6 +404,9 @@ struct VmSnapshot {
     call_stack: [CallFrame; CALL_STACK_SIZE],
     target: WidgetId,
     state: VmState,
+    #[cfg(feature = "epaper")]
+    wait_until: u64,
+    #[cfg(not(feature = "epaper"))]
     wait_until: u32,
     critical: bool,
     frame_base: u8,
@@ -462,6 +499,9 @@ pub struct Vm {
     pub state: VmState,
     arrays: Vec<VmArray>,
     next_arr_id: u16,
+    #[cfg(feature = "epaper")]
+    pub wait_until: u64,
+    #[cfg(not(feature = "epaper"))]
     pub wait_until: u32,
     // Code source — owned by VM
     code: VmCode,
@@ -498,10 +538,14 @@ pub struct Vm {
 impl Vm {
     pub fn new() -> Self {
         const EMPTY_CB: CbRequest = CbRequest {
-            offset: 0, arg_count: 0, args: [0; CB_MAX_ARGS],
+            offset: 0,
+            arg_count: 0,
+            args: [0; CB_MAX_ARGS],
         };
         const EMPTY_FRAME: CallFrame = CallFrame {
-            ret_addr: 0, frame_base: 0, frame_size: 0,
+            ret_addr: 0,
+            frame_base: 0,
+            frame_size: 0,
         };
         Self {
             pc: 0,
@@ -548,7 +592,9 @@ impl Vm {
 
     fn var_get(&self, slot: u16) -> i32 {
         for v in &self.vars {
-            if v.id == slot { return v.val; }
+            if v.id == slot {
+                return v.val;
+            }
         }
         0
     }
@@ -577,6 +623,10 @@ impl Vm {
             self.frame_base = gc;
             self.frame_size = 0;
             self.render_mode = rm;
+            #[cfg(feature = "epaper")]
+            {
+                self.render_mode = RenderMode::EPaper;
+            }
             self.widget_count = wc;
             self.ext_count = ec;
             true
@@ -594,7 +644,9 @@ impl Vm {
         let mut hdr_buf = [0u8; IMAGE_HEADER_SIZE_V4 + FUNC_ENTRY_SIZE * 64]; // 777 bytes on stack
         flash.read(base, &mut hdr_buf[..read_len]);
 
-        if let Some((funcs, opcode_start, gc, rm, wc, ec)) = parse_image_header(&hdr_buf[..read_len]) {
+        if let Some((funcs, opcode_start, gc, rm, wc, ec)) =
+            parse_image_header(&hdr_buf[..read_len])
+        {
             let opcode_base = base + opcode_start as u32;
             let opcode_len = total_len.saturating_sub(opcode_start);
             self.code = VmCode::Flash {
@@ -610,6 +662,10 @@ impl Vm {
             self.frame_base = gc;
             self.frame_size = 0;
             self.render_mode = rm;
+            #[cfg(feature = "epaper")]
+            {
+                self.render_mode = RenderMode::EPaper;
+            }
             self.widget_count = wc;
             self.ext_count = ec;
             true
@@ -880,7 +936,11 @@ impl Vm {
         // Clamp to at least global_count so the very first callback (setup)
         // doesn't collide with the globals when frame_base is still 0.
         let above = self.frame_base.wrapping_add(self.frame_size);
-        self.frame_base = if above > self.global_count { above } else { self.global_count };
+        self.frame_base = if above > self.global_count {
+            above
+        } else {
+            self.global_count
+        };
         self.frame_size = 0;
     }
 
@@ -1065,8 +1125,13 @@ impl Vm {
         match op {
             // --- No-arg: stack, arithmetic, logic, comparison ---
             OP_HALT => self.state = VmState::Halted,
-            OP_POP => { self.pop(); }
-            OP_DUP => { let v = self.peek(); self.push(v); }
+            OP_POP => {
+                self.pop();
+            }
+            OP_DUP => {
+                let v = self.peek();
+                self.push(v);
+            }
             OP_SWAP => {
                 if self.sp >= 2 {
                     let i = (self.sp - 1) as usize;
@@ -1076,21 +1141,79 @@ impl Vm {
                     self.state = VmState::Error;
                 }
             }
-            OP_ADD => { let b = self.pop(); let a = self.pop(); self.push(a.wrapping_add(b)); }
-            OP_SUB => { let b = self.pop(); let a = self.pop(); self.push(a.wrapping_sub(b)); }
-            OP_MUL => { let b = self.pop(); let a = self.pop(); self.push(a.wrapping_mul(b)); }
-            OP_DIV => { let b = self.pop(); let a = self.pop(); self.push(if b != 0 { a / b } else { 0 }); }
-            OP_MOD => { let b = self.pop(); let a = self.pop(); self.push(if b != 0 { a % b } else { 0 }); }
-            OP_NEG => { let a = self.pop(); self.push(a.wrapping_neg()); }
-            OP_AND => { let b = self.pop(); let a = self.pop(); self.push(a & b); }
-            OP_OR  => { let b = self.pop(); let a = self.pop(); self.push(a | b); }
-            OP_NOT => { let a = self.pop(); self.push(if a == 0 { 1 } else { 0 }); }
-            OP_EQ  => { let b = self.pop(); let a = self.pop(); self.push(if a == b { 1 } else { 0 }); }
-            OP_NE  => { let b = self.pop(); let a = self.pop(); self.push(if a != b { 1 } else { 0 }); }
-            OP_LT  => { let b = self.pop(); let a = self.pop(); self.push(if a < b { 1 } else { 0 }); }
-            OP_LE  => { let b = self.pop(); let a = self.pop(); self.push(if a <= b { 1 } else { 0 }); }
-            OP_GT  => { let b = self.pop(); let a = self.pop(); self.push(if a > b { 1 } else { 0 }); }
-            OP_GE  => { let b = self.pop(); let a = self.pop(); self.push(if a >= b { 1 } else { 0 }); }
+            OP_ADD => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(a.wrapping_add(b));
+            }
+            OP_SUB => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(a.wrapping_sub(b));
+            }
+            OP_MUL => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(a.wrapping_mul(b));
+            }
+            OP_DIV => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(if b != 0 { a / b } else { 0 });
+            }
+            OP_MOD => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(if b != 0 { a % b } else { 0 });
+            }
+            OP_NEG => {
+                let a = self.pop();
+                self.push(a.wrapping_neg());
+            }
+            OP_AND => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(a & b);
+            }
+            OP_OR => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(a | b);
+            }
+            OP_NOT => {
+                let a = self.pop();
+                self.push(if a == 0 { 1 } else { 0 });
+            }
+            OP_EQ => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(if a == b { 1 } else { 0 });
+            }
+            OP_NE => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(if a != b { 1 } else { 0 });
+            }
+            OP_LT => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(if a < b { 1 } else { 0 });
+            }
+            OP_LE => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(if a <= b { 1 } else { 0 });
+            }
+            OP_GT => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(if a > b { 1 } else { 0 });
+            }
+            OP_GE => {
+                let b = self.pop();
+                let a = self.pop();
+                self.push(if a >= b { 1 } else { 0 });
+            }
             OP_RET => {
                 if self.call_sp > 0 {
                     self.call_sp -= 1;
@@ -1125,7 +1248,9 @@ impl Vm {
                 self.state = VmState::Yielded;
             }
             OP_W_DIRTY => {
-                if self.target.is_some() { ctx.tree.mark_dirty(self.target); }
+                if self.target.is_some() {
+                    ctx.tree.mark_dirty(self.target);
+                }
             }
             OP_W_RENDER => match self.render_mode {
                 RenderMode::Buffered => {
@@ -1136,6 +1261,15 @@ impl Vm {
                     }
                 }
                 RenderMode::Dirty => render::render_dirty(ctx, &*self),
+                RenderMode::EPaper => {
+                    // Ghost-erase: drive all pixels to white so previous dark
+                    // content doesn't bleed through the next render.
+                    #[cfg(feature = "epaper")]
+                    crate::lcd::epaper::clear();
+                    // Full redraw — guarantees all rows are tainted for flush.
+                    render::render_all(ctx, &*self);
+                    ctx.lcd.flush_dirty();
+                }
             },
             OP_ARR_LOAD => {
                 let idx = self.pop();
@@ -1180,21 +1314,61 @@ impl Vm {
             }
 
             // --- Specialized short forms ---
-            OP_PUSH_0  => self.push(0),
-            OP_PUSH_1  => self.push(1),
-            OP_PUSH_2  => self.push(2),
+            OP_PUSH_0 => self.push(0),
+            OP_PUSH_1 => self.push(1),
+            OP_PUSH_2 => self.push(2),
             OP_PUSH_M1 => self.push(-1),
             // Short forms: LOAD/STORE local slots 0-4
-            OP_LOAD_0  => { let s = self.frame_base as u16; let v = self.var_get(s); self.push(v); }
-            OP_LOAD_1  => { let s = self.frame_base as u16 + 1; let v = self.var_get(s); self.push(v); }
-            OP_LOAD_2  => { let s = self.frame_base as u16 + 2; let v = self.var_get(s); self.push(v); }
-            OP_LOAD_3  => { let s = self.frame_base as u16 + 3; let v = self.var_get(s); self.push(v); }
-            OP_LOAD_4  => { let s = self.frame_base as u16 + 4; let v = self.var_get(s); self.push(v); }
-            OP_STORE_0 => { let s = self.frame_base as u16; let v = self.pop(); self.var_set(s, v); }
-            OP_STORE_1 => { let s = self.frame_base as u16 + 1; let v = self.pop(); self.var_set(s, v); }
-            OP_STORE_2 => { let s = self.frame_base as u16 + 2; let v = self.pop(); self.var_set(s, v); }
-            OP_STORE_3 => { let s = self.frame_base as u16 + 3; let v = self.pop(); self.var_set(s, v); }
-            OP_STORE_4 => { let s = self.frame_base as u16 + 4; let v = self.pop(); self.var_set(s, v); }
+            OP_LOAD_0 => {
+                let s = self.frame_base as u16;
+                let v = self.var_get(s);
+                self.push(v);
+            }
+            OP_LOAD_1 => {
+                let s = self.frame_base as u16 + 1;
+                let v = self.var_get(s);
+                self.push(v);
+            }
+            OP_LOAD_2 => {
+                let s = self.frame_base as u16 + 2;
+                let v = self.var_get(s);
+                self.push(v);
+            }
+            OP_LOAD_3 => {
+                let s = self.frame_base as u16 + 3;
+                let v = self.var_get(s);
+                self.push(v);
+            }
+            OP_LOAD_4 => {
+                let s = self.frame_base as u16 + 4;
+                let v = self.var_get(s);
+                self.push(v);
+            }
+            OP_STORE_0 => {
+                let s = self.frame_base as u16;
+                let v = self.pop();
+                self.var_set(s, v);
+            }
+            OP_STORE_1 => {
+                let s = self.frame_base as u16 + 1;
+                let v = self.pop();
+                self.var_set(s, v);
+            }
+            OP_STORE_2 => {
+                let s = self.frame_base as u16 + 2;
+                let v = self.pop();
+                self.var_set(s, v);
+            }
+            OP_STORE_3 => {
+                let s = self.frame_base as u16 + 3;
+                let v = self.pop();
+                self.var_set(s, v);
+            }
+            OP_STORE_4 => {
+                let s = self.frame_base as u16 + 4;
+                let v = self.pop();
+                self.var_set(s, v);
+            }
 
             // --- With arguments ---
             OP_PUSH_I8 => {
@@ -1227,11 +1401,15 @@ impl Vm {
             }
             OP_JZ => {
                 let target = self.read_u16();
-                if self.pop() == 0 { self.pc = target; }
+                if self.pop() == 0 {
+                    self.pc = target;
+                }
             }
             OP_JNZ => {
                 let target = self.read_u16();
-                if self.pop() != 0 { self.pc = target; }
+                if self.pop() != 0 {
+                    self.pc = target;
+                }
             }
             OP_CALL => {
                 let target = self.read_u16();
@@ -1393,7 +1571,8 @@ impl Vm {
                 let color = self.pop() as u16;
                 let (x1, y1) = unpack_pair(self.pop());
                 let (x0, y0) = unpack_pair(self.pop());
-                ctx.lcd.draw_line(x0 as i16, y0 as i16, x1 as i16, y1 as i16, color);
+                ctx.lcd
+                    .draw_line(x0 as i16, y0 as i16, x1 as i16, y1 as i16, color);
             }
             OP_CIRCLE => {
                 let color = self.pop() as u16;
@@ -1429,14 +1608,26 @@ impl Vm {
                     let (x, y) = unpack_pair(self.pop());
                     if let Some(font) = ctx.fonts.resolve(font_id) {
                         let bg_opt = if bg == 0 { None } else { Some(bg) };
-                        font.draw_str(&ctx.lcd, &ctx.flash, &buf[..n], x as i16, y as i16, fg, bg_opt);
+                        font.draw_str(
+                            &ctx.lcd,
+                            &ctx.flash,
+                            &buf[..n],
+                            x as i16,
+                            y as i16,
+                            fg,
+                            bg_opt,
+                        );
                     }
                 } else {
                     self.state = VmState::Error;
                 }
             }
             OP_DELAY => {
+                #[cfg(feature = "epaper")]
+                let ms = self.pop() as u64;
+                #[cfg(not(feature = "epaper"))]
                 let ms = self.pop() as u32;
+
                 self.wait_until = systick::millis().wrapping_add(ms);
                 self.state = VmState::Waiting;
             }
@@ -1536,16 +1727,17 @@ impl Vm {
                 let start = self.pop() as i16;
                 let radius = self.pop() as i16;
                 let (cx, cy) = unpack_pair(self.pop());
-                ctx.lcd.draw_arc(cx as i16, cy as i16, radius, start, end, color);
+                ctx.lcd
+                    .draw_arc(cx as i16, cy as i16, radius, start, end, color);
             }
             OP_BEGIN_FRAME => {
-                // In buffered mode, render_buffered handles begin/end frame
-                if self.render_mode != RenderMode::Buffered {
+                // Buffered and EPaper modes manage their own frame lifecycle
+                if self.render_mode == RenderMode::Dirty {
                     ctx.lcd.begin_frame();
                 }
             }
             OP_END_FRAME => {
-                if self.render_mode != RenderMode::Buffered {
+                if self.render_mode == RenderMode::Dirty {
                     ctx.lcd.end_frame();
                 }
             }
@@ -1567,8 +1759,12 @@ impl Vm {
                 let rtc = crate::rtc::Rtc::init();
                 let dt = rtc.read_time();
                 let data = alloc::vec![
-                    dt.second as i32, dt.minute as i32, dt.hour as i32,
-                    dt.day as i32, dt.weekday as i32, dt.month as i32,
+                    dt.second as i32,
+                    dt.minute as i32,
+                    dt.hour as i32,
+                    dt.day as i32,
+                    dt.weekday as i32,
+                    dt.month as i32,
                     dt.year as i32,
                 ];
                 let id = self.next_arr_id;
@@ -1707,6 +1903,27 @@ impl Vm {
                 }
             }
 
+            OP_SPRINTF => {
+                let argc = self.read_u8() as usize;
+                let mut args = [0i32; 8];
+                let actual = argc.min(8);
+                for i in (0..actual).rev() {
+                    args[i] = self.pop();
+                }
+                let fmt_id = self.pop() as u16;
+                let mut fmt_buf = [0u8; 128];
+                let fmt_len = {
+                    let fmt = ctx.strpool.get(fmt_id);
+                    let n = fmt.len().min(128);
+                    fmt_buf[..n].copy_from_slice(&fmt[..n]);
+                    n
+                };
+                match strpool::sprintf(&mut ctx.strpool, &fmt_buf[..fmt_len], &args[..actual]) {
+                    Some(id) => self.push(id as i32),
+                    None => self.state = VmState::Error,
+                }
+            }
+
             // --- Float32 (soft-float) ---
             OP_ITOF => {
                 let i = self.pop();
@@ -1716,17 +1933,91 @@ impl Vm {
                 let bits = self.pop() as u32;
                 self.push(f32::from_bits(bits) as i32);
             }
-            OP_FADD => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push((a + b).to_bits() as i32); }
-            OP_FSUB => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push((a - b).to_bits() as i32); }
-            OP_FMUL => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push((a * b).to_bits() as i32); }
-            OP_FDIV => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if b != 0.0 { a / b } else { 0.0 }.to_bits() as i32); }
-            OP_FNEG => { let a = f32::from_bits(self.pop() as u32); self.push((-a).to_bits() as i32); }
-            OP_FEQ => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a == b { 1 } else { 0 }); }
-            OP_FLT => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a < b { 1 } else { 0 }); }
-            OP_FLE => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a <= b { 1 } else { 0 }); }
-            OP_FGT => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a > b { 1 } else { 0 }); }
-            OP_FGE => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a >= b { 1 } else { 0 }); }
-            OP_FNE => { let b = f32::from_bits(self.pop() as u32); let a = f32::from_bits(self.pop() as u32); self.push(if a != b { 1 } else { 0 }); }
+            OP_FADD => {
+                let b = f32::from_bits(self.pop() as u32);
+                let a = f32::from_bits(self.pop() as u32);
+                self.push((a + b).to_bits() as i32);
+            }
+            OP_FSUB => {
+                let b = f32::from_bits(self.pop() as u32);
+                let a = f32::from_bits(self.pop() as u32);
+                self.push((a - b).to_bits() as i32);
+            }
+            OP_FMUL => {
+                let b = f32::from_bits(self.pop() as u32);
+                let a = f32::from_bits(self.pop() as u32);
+                self.push((a * b).to_bits() as i32);
+            }
+            OP_FDIV => {
+                let b = f32::from_bits(self.pop() as u32);
+                let a = f32::from_bits(self.pop() as u32);
+                self.push(if b != 0.0 { a / b } else { 0.0 }.to_bits() as i32);
+            }
+            OP_FNEG => {
+                let a = f32::from_bits(self.pop() as u32);
+                self.push((-a).to_bits() as i32);
+            }
+            OP_FEQ => {
+                let b = f32::from_bits(self.pop() as u32);
+                let a = f32::from_bits(self.pop() as u32);
+                self.push(if a == b { 1 } else { 0 });
+            }
+            OP_FLT => {
+                let b = f32::from_bits(self.pop() as u32);
+                let a = f32::from_bits(self.pop() as u32);
+                self.push(if a < b { 1 } else { 0 });
+            }
+            OP_FLE => {
+                let b = f32::from_bits(self.pop() as u32);
+                let a = f32::from_bits(self.pop() as u32);
+                self.push(if a <= b { 1 } else { 0 });
+            }
+            OP_FGT => {
+                let b = f32::from_bits(self.pop() as u32);
+                let a = f32::from_bits(self.pop() as u32);
+                self.push(if a > b { 1 } else { 0 });
+            }
+            OP_FGE => {
+                let b = f32::from_bits(self.pop() as u32);
+                let a = f32::from_bits(self.pop() as u32);
+                self.push(if a >= b { 1 } else { 0 });
+            }
+            OP_FNE => {
+                let b = f32::from_bits(self.pop() as u32);
+                let a = f32::from_bits(self.pop() as u32);
+                self.push(if a != b { 1 } else { 0 });
+            }
+
+            // --- Float math (trig / sqrt / rounding) ---
+            OP_FSIN => {
+                let v = f32::from_bits(self.pop() as u32);
+                self.push(libm::sinf(v).to_bits() as i32);
+            }
+            OP_FCOS => {
+                let v = f32::from_bits(self.pop() as u32);
+                self.push(libm::cosf(v).to_bits() as i32);
+            }
+            OP_FSQRT => {
+                let v = f32::from_bits(self.pop() as u32);
+                self.push(libm::sqrtf(v).to_bits() as i32);
+            }
+            OP_FABS => {
+                let v = f32::from_bits(self.pop() as u32);
+                self.push(libm::fabsf(v).to_bits() as i32);
+            }
+            OP_FATAN2 => {
+                let x = f32::from_bits(self.pop() as u32);
+                let y = f32::from_bits(self.pop() as u32);
+                self.push(libm::atan2f(y, x).to_bits() as i32);
+            }
+            OP_FFLOOR => {
+                let v = f32::from_bits(self.pop() as u32);
+                self.push(libm::floorf(v).to_bits() as i32);
+            }
+            OP_FCEIL => {
+                let v = f32::from_bits(self.pop() as u32);
+                self.push(libm::ceilf(v).to_bits() as i32);
+            }
 
             _ => self.state = VmState::Error,
         }
@@ -1787,17 +2078,58 @@ impl Vm {
                 return;
             }
             PROP_VISIBLE => {
-                set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_VISIBLE, val != 0);
+                set_flag(
+                    &mut ctx.tree.get_mut(self.target).flags,
+                    FLAG_VISIBLE,
+                    val != 0,
+                );
                 ctx.tree.mark_dirty(self.target);
                 return;
             }
-            PROP_ENABLED => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_ENABLED, val != 0); return; }
-            PROP_CLICKABLE => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_CLICKABLE, val != 0); return; }
-            PROP_CHECKED => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_CHECKED, val != 0); return; }
-            PROP_CLIP_CHILDREN => { set_flag(&mut ctx.tree.get_mut(self.target).flags, FLAG_CLIP_CHILDREN, val != 0); return; }
-            PROP_BG_COLOR => { ctx.tree.get_mut(self.target).background_color = val as u16; return; }
-            PROP_BORDER_COLOR => { ctx.tree.get_mut(self.target).border_color = val as u16; return; }
-            PROP_KIND => { ctx.tree.get_mut(self.target).kind = val as u8; return; }
+            PROP_ENABLED => {
+                set_flag(
+                    &mut ctx.tree.get_mut(self.target).flags,
+                    FLAG_ENABLED,
+                    val != 0,
+                );
+                return;
+            }
+            PROP_CLICKABLE => {
+                set_flag(
+                    &mut ctx.tree.get_mut(self.target).flags,
+                    FLAG_CLICKABLE,
+                    val != 0,
+                );
+                return;
+            }
+            PROP_CHECKED => {
+                set_flag(
+                    &mut ctx.tree.get_mut(self.target).flags,
+                    FLAG_CHECKED,
+                    val != 0,
+                );
+                return;
+            }
+            PROP_CLIP_CHILDREN => {
+                set_flag(
+                    &mut ctx.tree.get_mut(self.target).flags,
+                    FLAG_CLIP_CHILDREN,
+                    val != 0,
+                );
+                return;
+            }
+            PROP_BG_COLOR => {
+                ctx.tree.get_mut(self.target).background_color = val as u16;
+                return;
+            }
+            PROP_BORDER_COLOR => {
+                ctx.tree.get_mut(self.target).border_color = val as u16;
+                return;
+            }
+            PROP_KIND => {
+                ctx.tree.get_mut(self.target).kind = val as u8;
+                return;
+            }
             _ => {}
         }
 
@@ -1850,11 +2182,41 @@ impl Vm {
             PROP_LOC_Y => w.location.y as i32,
             PROP_SIZE_W => w.size.w as i32,
             PROP_SIZE_H => w.size.h as i32,
-            PROP_VISIBLE => if w.flags & FLAG_VISIBLE != 0 { 1 } else { 0 },
-            PROP_ENABLED => if w.flags & FLAG_ENABLED != 0 { 1 } else { 0 },
-            PROP_CLICKABLE => if w.flags & FLAG_CLICKABLE != 0 { 1 } else { 0 },
-            PROP_CHECKED => if w.flags & FLAG_CHECKED != 0 { 1 } else { 0 },
-            PROP_CLIP_CHILDREN => if w.flags & FLAG_CLIP_CHILDREN != 0 { 1 } else { 0 },
+            PROP_VISIBLE => {
+                if w.flags & FLAG_VISIBLE != 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+            PROP_ENABLED => {
+                if w.flags & FLAG_ENABLED != 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+            PROP_CLICKABLE => {
+                if w.flags & FLAG_CLICKABLE != 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+            PROP_CHECKED => {
+                if w.flags & FLAG_CHECKED != 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+            PROP_CLIP_CHILDREN => {
+                if w.flags & FLAG_CLIP_CHILDREN != 0 {
+                    1
+                } else {
+                    0
+                }
+            }
             PROP_BG_COLOR => w.background_color as i32,
             PROP_BORDER_COLOR => w.border_color as i32,
             PROP_KIND => w.kind as i32,
@@ -1914,13 +2276,19 @@ impl Vm {
         match prop_id {
             PROP_LOCATION if count >= 2 => {
                 let w = ctx.tree.get_mut(self.target);
-                w.location = Offset { x: vals[0] as i16, y: vals[1] as i16 };
+                w.location = Offset {
+                    x: vals[0] as i16,
+                    y: vals[1] as i16,
+                };
                 ctx.tree.mark_dirty(self.target);
                 return;
             }
             PROP_SIZE if count >= 2 => {
                 let w = ctx.tree.get_mut(self.target);
-                w.size = Size { w: vals[0] as u16, h: vals[1] as u16 };
+                w.size = Size {
+                    w: vals[0] as u16,
+                    h: vals[1] as u16,
+                };
                 ctx.tree.mark_dirty(self.target);
                 return;
             }
@@ -1931,13 +2299,16 @@ impl Vm {
         if let Some(ext) = ctx.tree.ensure_ext(self.target) {
             match prop_id {
                 PROP_MARGIN if count >= 4 => {
-                    ext.margin = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
+                    ext.margin =
+                        Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
                 }
                 PROP_BORDER_EDGES if count >= 4 => {
-                    ext.border = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
+                    ext.border =
+                        Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
                 }
                 PROP_PADDING if count >= 4 => {
-                    ext.padding = Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
+                    ext.padding =
+                        Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
                 }
                 _ => {}
             }
@@ -1947,7 +2318,9 @@ impl Vm {
     // --- Array operations ---
 
     fn find_array(&self, arr_id: i32) -> Option<usize> {
-        if arr_id < 0 { return None; }
+        if arr_id < 0 {
+            return None;
+        }
         let id = arr_id as u16;
         self.arrays.iter().position(|a| a.id == id)
     }
@@ -2006,7 +2379,10 @@ impl Vm {
     /// widget) to read sample buffers without copying. Returns None when the
     /// id does not name a live array.
     pub fn array_slice(&self, arr_id: u16) -> Option<&[i32]> {
-        self.arrays.iter().find(|a| a.id == arr_id).map(|a| a.data.as_slice())
+        self.arrays
+            .iter()
+            .find(|a| a.id == arr_id)
+            .map(|a| a.data.as_slice())
     }
 
     // --- File ops ---
@@ -2019,11 +2395,16 @@ impl Vm {
             2 => 1,
             _ => return None,
         };
-        if self.open_files[idx].is_some() { Some(idx) } else { None }
+        if self.open_files[idx].is_some() {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     fn file_slot(&self, handle: i32) -> Option<&OpenFile> {
-        self.file_slot_index(handle).map(|i| self.open_files[i].as_ref().unwrap())
+        self.file_slot_index(handle)
+            .map(|i| self.open_files[i].as_ref().unwrap())
     }
 
     fn file_slot_mut(&mut self, handle: i32) -> Option<&mut OpenFile> {
@@ -2099,14 +2480,22 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderM
             return None;
         }
         let flags = u16::from_le_bytes([data[5], data[6]]);
-        let rm = if flags & 0x01 != 0 { RenderMode::Buffered } else { RenderMode::Dirty };
+        let rm = if flags & 0x01 != 0 {
+            RenderMode::Buffered
+        } else {
+            RenderMode::Dirty
+        };
         (IMAGE_HEADER_SIZE_V4, rm, data[7], data[8])
     } else if version >= 3 {
         if data.len() < IMAGE_HEADER_SIZE_V3 {
             return None;
         }
         let flags = u16::from_le_bytes([data[5], data[6]]);
-        let rm = if flags & 0x01 != 0 { RenderMode::Buffered } else { RenderMode::Dirty };
+        let rm = if flags & 0x01 != 0 {
+            RenderMode::Buffered
+        } else {
+            RenderMode::Dirty
+        };
         (IMAGE_HEADER_SIZE_V3, rm, 0u8, 0u8)
     } else {
         (IMAGE_HEADER_SIZE_V2, RenderMode::Dirty, 0u8, 0u8)
@@ -2126,10 +2515,16 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderM
         let kind_byte = data[base + 2];
         // data[base + 3] = pad
         let offset = u32::from_le_bytes([
-            data[base + 4], data[base + 5], data[base + 6], data[base + 7],
+            data[base + 4],
+            data[base + 5],
+            data[base + 6],
+            data[base + 7],
         ]);
         let length = u32::from_le_bytes([
-            data[base + 8], data[base + 9], data[base + 10], data[base + 11],
+            data[base + 8],
+            data[base + 9],
+            data[base + 10],
+            data[base + 11],
         ]);
 
         let kind = FunctionKind::from_u8(kind_byte).unwrap_or(FunctionKind::UserFunction);
@@ -2142,7 +2537,14 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderM
         });
     }
 
-    Some((functions, opcode_start, global_count, render_mode, widget_count, ext_count))
+    Some((
+        functions,
+        opcode_start,
+        global_count,
+        render_mode,
+        widget_count,
+        ext_count,
+    ))
 }
 
 // --- Packed u32 helper ---

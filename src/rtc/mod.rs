@@ -1,7 +1,9 @@
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub mod hw;
 #[cfg(feature = "host")]
 pub mod sim;
+#[cfg(feature = "epaper")]
+pub mod epaper;
 
 /// Date and time.
 #[derive(Clone, Copy)]
@@ -66,13 +68,16 @@ impl<B: RtcBackend> RtcImpl<B> {
     }
 }
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "firmware")]
 pub type Rtc = RtcImpl<hw::At8563>;
 
 #[cfg(feature = "host")]
 pub type Rtc = RtcImpl<sim::SystemRtc>;
 
-#[cfg(not(feature = "host"))]
+#[cfg(feature = "epaper")]
+pub type Rtc = RtcImpl<epaper::EpdRtc>;
+
+#[cfg(feature = "firmware")]
 impl Rtc {
     pub fn init() -> Self {
         Self::with_backend(hw::At8563::init())
@@ -83,5 +88,12 @@ impl Rtc {
 impl Rtc {
     pub fn init() -> Self {
         Self::with_backend(sim::SystemRtc::new())
+    }
+}
+
+#[cfg(feature = "epaper")]
+impl Rtc {
+    pub fn init() -> Self {
+        Self::with_backend(epaper::EpdRtc::new())
     }
 }

@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::vec;
 use std::vec::Vec;
 
-use super::{HEIGHT, LcdBackend, WIDTH};
+use super::{LcdBackend, HEIGHT, WIDTH};
 
 /// Shared 32-bit ARGB framebuffer (0xAARRGGBB). The sim binary owns it too —
 /// it pushes the buffer into minifb each frame.
@@ -112,8 +112,7 @@ impl LcdBackend for SimLcd {
 
     fn draw_pixel(&self, x: u16, y: u16, color: u16) {
         if x < WIDTH && y < HEIGHT {
-            self.fb.borrow_mut()[y as usize * WIDTH as usize + x as usize] =
-                rgb565_to_argb(color);
+            self.fb.borrow_mut()[y as usize * WIDTH as usize + x as usize] = rgb565_to_argb(color);
         }
     }
 }

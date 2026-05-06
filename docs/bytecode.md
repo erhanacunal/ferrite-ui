@@ -207,6 +207,11 @@ Builtins are single-byte opcodes. Operands are passed on the stack unless noted.
 | `0xA4` | `fileSize` | pop handle, push file size |
 | `0xA5` | `fileClose` | pop handle and release file slot |
 | `0xA6` | `arrToStr` | pop length and array id; allocate string from low bytes |
+| `0xA7` | `showModal` | pop `click_fn`, `builder_fn`; suspend until `setDialogResult`; push result |
+| `0xA8` | `setDialogResult` | pop result and record on innermost modal frame |
+| `0xA9` | `sprintf` | `u8 argc`; pop `argc` args then fmt str_id; push formatted str_id |
+
+`sprintf` has an inline `u8 argc` byte (number of format arguments after the format string). Stack layout before execution: `[... fmt, arg0, arg1, ..., argN-1]` (fmt pushed first).
 
 ## Float Opcodes
 
@@ -227,6 +232,20 @@ Float operands and results are `f32` bit patterns stored in `i32` slots.
 | `0xCA` | `fgt` | float greater-than |
 | `0xCB` | `fge` | float greater-or-equal |
 | `0xCC` | `fne` | float inequality |
+
+## Float Math Opcodes
+
+Trig, square root, and rounding. All operate on f32 bit patterns. Integer stack values must be converted to float first (`itof`). The compiler handles auto-promotion automatically when these functions are called from Ferrite programs.
+
+| Opcode | Name | Behavior |
+| --- | --- | --- |
+| `0xCD` | `fsin` | `sin(a)` — input in radians |
+| `0xCE` | `fcos` | `cos(a)` — input in radians |
+| `0xCF` | `fsqrt` | `sqrt(a)` |
+| `0xD0` | `fabs` | `|a|` — absolute value |
+| `0xD1` | `fatan2` | pop `x`, pop `y`; push `atan2(y, x)` in radians |
+| `0xD2` | `ffloor` | round toward −∞ |
+| `0xD3` | `fceil` | round toward +∞ |
 
 ## Widget Properties
 

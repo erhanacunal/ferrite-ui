@@ -20,6 +20,7 @@ const NULL_OFFSET: u16 = 0xFFFF;
 
 #[repr(C, align(4))]
 struct HeapStorage([u8; HEAP_SIZE]);
+#[cfg_attr(feature = "epaper", unsafe(link_section = ".dram2_uninit"))]
 static mut HEAP_MEM: HeapStorage = HeapStorage([0; HEAP_SIZE]);
 
 /// Block header — 4 bytes total (was 8 with usize+ptr on a 32-bit target).
@@ -76,7 +77,14 @@ pub fn init() {
 
 /// Return (total_free_bytes, largest_free_block) for diagnostics.
 pub fn stats() -> (usize, usize) {
+    #[cfg(feature = "epaper")]
+    return (esp_alloc::HEAP.free(), 0);
+
+    #[cfg_attr(feature = "epaper", allow(unreachable_code))]
     unsafe {
+        if !HEAP.initialized {
+            return (0, 0);
+        }
         let mut total = 0usize;
         let mut largest = 0usize;
         let mut off = HEAP.free_list;
@@ -212,5 +220,7 @@ unsafe impl GlobalAlloc for FerriAllocator {
     }
 }
 
+// For the epaper build esp_alloc provides the global allocator (PSRAM-backed).
+#[cfg(not(feature = "epaper"))]
 #[global_allocator]
 static ALLOCATOR: FerriAllocator = FerriAllocator;
