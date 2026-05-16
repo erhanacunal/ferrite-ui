@@ -650,14 +650,23 @@ fn position_cursor(ctx: &mut Ctx, id: widget::WidgetId, touch_x: u16) {
         let text = ctx.strpool.get(text_id);
         let tx = touch_x as i16;
         let mut acc = cx;
-        for (i, &ch) in text.iter().enumerate() {
-            let cw = font.char_width(ch as char) as i16;
-            if tx < acc + cw / 2 {
-                cursor_pos = i as i16;
+        let mut byte_pos = 0;
+        while byte_pos < text.len() {
+            let char_start = byte_pos;
+            if let Some(cp) = font::utf8_next(text, &mut byte_pos) {
+                if cp == 0xFFFF {
+                    continue;
+                }
+                let cw = font.char_width_cp(cp) as i16;
+                if tx < acc + cw / 2 {
+                    cursor_pos = char_start as i16;
+                    break;
+                }
+                acc += cw;
+                cursor_pos = byte_pos as i16;
+            } else {
                 break;
             }
-            acc += cw;
-            cursor_pos = (i + 1) as i16;
         }
     }
 
@@ -878,9 +887,8 @@ fn main() -> ! {
     });
     ctx.fonts.add(Font::from_embedded(
         &embedded_font::GLYPHS,
+        &embedded_font::CODEPOINTS,
         &embedded_font::BITMAP,
-        embedded_font::FIRST,
-        embedded_font::LAST,
         embedded_font::Y_ADVANCE,
     ));
 

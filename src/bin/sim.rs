@@ -71,9 +71,8 @@ fn main() -> ExitCode {
 
     ctx.fonts.add(Font::from_embedded(
         &embedded_font::GLYPHS,
+        &embedded_font::CODEPOINTS,
         &embedded_font::BITMAP,
-        embedded_font::FIRST,
-        embedded_font::LAST,
         embedded_font::Y_ADVANCE,
     ));
 

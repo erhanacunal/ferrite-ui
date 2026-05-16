@@ -468,8 +468,7 @@ def build(project_path: str, output_path: str) -> dict:
 
     resources = []  # (name, kind, data)
 
-    # 1. Fonts — combined resource: header + bitmap data in one RES_FONT
-    #    Flash layout: first(2) + last(2) + y_advance(1) + font_id(1) + glyphs + bitmap
+    # 1. Fonts — sparse binary resource (num_glyphs + y_advance + font_id + codepoints + glyphs + bitmap)
     font_ids_seen = set()
     for font in project.get("fonts", []):
         name = font["name"]
@@ -488,25 +487,21 @@ def build(project_path: str, output_path: str) -> dict:
             sys.exit(1)
         font_ids_seen.add(font_id)
 
-        header_path = project_dir / font["header"]
-        data_path = project_dir / font["data"]
-
-        header_data = bytearray(header_path.read_bytes())
-        bitmap_data = data_path.read_bytes()
-
-        # Inject font_id at byte 5 of header (first[2] + last[2] + y_advance[1] + font_id[1])
-        # If header is only 5 bytes (no padding byte), insert it; otherwise overwrite byte 5
-        if len(header_data) < 5:
-            print(f"Error: font '{name}' header too small ({len(header_data)} bytes)", file=sys.stderr)
+        if "header" in font or "data" in font:
+            print(f"Error: font '{name}' uses old 'header'/'data' keys — re-import with ferrite_font_converter.py",
+                  file=sys.stderr)
             sys.exit(1)
-        if len(header_data) == 5:
-            header_data.insert(5, font_id)
-        else:
-            header_data[5] = font_id
 
-        # Combined resource: header (with font_id) + bitmap data
-        combined = bytes(header_data) + bitmap_data
-        resources.append((name, RES_FONT, combined, 0))
+        font_path = project_dir / font["file"]
+        font_data = bytearray(font_path.read_bytes())
+
+        # Verify minimum length and patch font_id at byte 3
+        if len(font_data) < 4:
+            print(f"Error: font '{name}' binary too small ({len(font_data)} bytes)", file=sys.stderr)
+            sys.exit(1)
+        font_data[3] = font_id
+
+        resources.append((name, RES_FONT, bytes(font_data), 0))
 
     # 2. Images — PNG → FI format (header extended to 9 bytes with image_id)
     image_ids_seen = set()

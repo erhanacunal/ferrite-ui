@@ -773,8 +773,15 @@ fn draw_input_text(ctx: &Ctx, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
         if has_text {
             let text = ctx.strpool.get(ext.text_id);
             let end = cursor_pos.min(text.len());
-            for i in 0..end {
-                cursor_x += font.char_width(text[i] as char) as i16;
+            let mut byte_pos = 0;
+            while byte_pos < end {
+                if let Some(cp) = crate::font::utf8_next(text, &mut byte_pos) {
+                    if cp != 0xFFFF {
+                        cursor_x += font.char_width_cp(cp) as i16;
+                    }
+                } else {
+                    break;
+                }
             }
         }
         // Draw 2px wide cursor line

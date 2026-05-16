@@ -1,16 +1,16 @@
-/// Adafruit GFX compatible bitmap font renderer
+/// Adafruit GFX compatible bitmap font renderer — sparse (UTF-8) variant
 ///
 /// Two sources:
-///   1. Flash: combined resource (header + glyph table + bitmap) via load/load_by_id
-///   2. Embedded: glyph table + bitmap in ROM via from_embedded
+///   1. Flash: combined resource via load/load_by_id
+///   2. Embedded: codepoints + glyph table + bitmap in ROM via from_embedded
 ///
-/// Flash resource layout (combined, single RES_FONT):
-///   [0..2]  first: u16 LE (first character code)
-///   [2..4]  last: u16 LE (last character code)
-///   [4]     y_advance: u8 (line height)
-///   [5]     font_id: u8 (unique ID, 0 = reserved for embedded)
-///   [6..]   glyph table (7 bytes per glyph)
-///   [6+N*7..] bitmap data (1-bit packed, MSB first)
+/// Flash resource layout (sparse format, N = num_glyphs):
+///   [0..2]         num_glyphs: u16 LE
+///   [2]            y_advance: u8
+///   [3]            font_id: u8
+///   [4..4+N*2]     codepoints[] (N × u16 LE, sorted ascending)
+///   [4+N*2..4+N*9] glyphs[] (N × 7 bytes)
+///   [4+N*9..]      bitmap data (1-bit packed, MSB first)
 ///
 /// GfxGlyph (7 bytes, packed):
 ///   bitmapOffset: u16, width: u8, height: u8,
@@ -71,31 +71,38 @@ const BITMAP_BUF_SIZE: usize = 128;
 /// Embedded font ID (reserved, user fonts cannot use this)
 pub const EMBEDDED_FONT_ID: u8 = 0;
 
-/// Glyph storage — either ROM reference (embedded) or heap-allocated (flash-loaded).
-/// Embedded fonts use zero RAM for glyphs — they point directly to ROM.
+/// Glyph + codepoint storage — ROM reference (embedded) or heap-allocated (flash-loaded).
 enum GlyphData {
-    /// Static ROM reference (embedded font). Zero RAM cost.
-    Static(&'static [GfxGlyph]),
-    /// Heap-allocated (flash-loaded font). RAM = glyph_count × 7 bytes.
-    Heap(Vec<GfxGlyph>),
+    Static {
+        glyphs: &'static [GfxGlyph],
+        codepoints: &'static [u16],
+    },
+    Heap {
+        glyphs: Vec<GfxGlyph>,
+        codepoints: Vec<u16>,
+    },
 }
 
 impl GlyphData {
-    fn get(&self, index: usize) -> &GfxGlyph {
+    fn codepoints(&self) -> &[u16] {
         match self {
-            GlyphData::Static(s) => &s[index],
-            GlyphData::Heap(v) => &v[index],
+            GlyphData::Static { codepoints, .. } => codepoints,
+            GlyphData::Heap { codepoints, .. } => codepoints,
+        }
+    }
+
+    fn glyph(&self, index: usize) -> &GfxGlyph {
+        match self {
+            GlyphData::Static { glyphs, .. } => &glyphs[index],
+            GlyphData::Heap { glyphs, .. } => &glyphs[index],
         }
     }
 }
 
-/// Font — glyph data from ROM or heap, bitmap data from flash or ROM.
+/// Font — sparse format, binary search on sorted codepoints[].
 pub struct Font {
     pub font_id: u8,
-    first: u16,
-    last: u16,
     y_advance: u8,
-    glyph_count: u16,
     glyphs: GlyphData,
     /// Absolute flash address of bitmap data
     bitmap_addr: u32,
@@ -108,71 +115,74 @@ unsafe impl Send for Font {}
 unsafe impl Sync for Font {}
 
 impl Font {
-    /// Empty/invalid font sentinel.
     fn empty() -> Self {
         Font {
             font_id: 0xFF,
-            first: 0,
-            last: 0,
             y_advance: 0,
-            glyph_count: 0,
-            glyphs: GlyphData::Heap(Vec::new()),
+            glyphs: GlyphData::Heap {
+                glyphs: Vec::new(),
+                codepoints: Vec::new(),
+            },
             bitmap_addr: 0,
             embedded_bitmap: core::ptr::null(),
         }
     }
 
-    /// Load font from flash by resource name (combined format).
+    /// Load font from flash by resource name.
     pub fn load(fs: &Fs, flash: &Flash, name: &[u8]) -> Option<Self> {
         let entry = fs.find(flash, name)?;
         Self::load_from_entry(flash, &entry)
     }
 
-    /// Load font from a ResourceEntry (combined format: header + glyphs + bitmap).
+    /// Load font from a ResourceEntry (sparse format).
     pub fn load_from_entry(flash: &Flash, entry: &crate::fs::ResourceEntry) -> Option<Self> {
-        if entry.size < 6 {
+        if entry.size < 4 {
             return None;
         }
 
-        let mut hdr = [0u8; 6];
+        let mut hdr = [0u8; 4];
         flash.read(entry.offset, &mut hdr);
 
-        let first = u16::from_le_bytes([hdr[0], hdr[1]]);
-        let last = u16::from_le_bytes([hdr[2], hdr[3]]);
-        let y_advance = hdr[4];
-        let font_id = hdr[5];
+        let num_glyphs = u16::from_le_bytes([hdr[0], hdr[1]]) as usize;
+        let y_advance = hdr[2];
+        let font_id = hdr[3];
 
-        if first > last {
+        let cp_bytes = (num_glyphs * 2) as u32;
+        let gl_bytes = (num_glyphs * 7) as u32;
+
+        if entry.size < 4 + cp_bytes + gl_bytes {
             return None;
         }
-        let glyph_count = last - first + 1;
 
-        let mut glyphs = Vec::with_capacity(glyph_count as usize);
-        let mut g_buf = [0u8; 7];
+        let cp_base = entry.offset + 4;
+        let mut codepoints = Vec::with_capacity(num_glyphs);
+        for i in 0..num_glyphs {
+            let mut buf = [0u8; 2];
+            flash.read(cp_base + (i as u32 * 2), &mut buf);
+            codepoints.push(u16::from_le_bytes(buf));
+        }
 
-        for i in 0..glyph_count as usize {
-            let offset = 6 + (i * 7) as u32;
-            flash.read(entry.offset + offset, &mut g_buf);
-
+        let gl_base = cp_base + cp_bytes;
+        let mut glyphs = Vec::with_capacity(num_glyphs);
+        for i in 0..num_glyphs {
+            let mut g = [0u8; 7];
+            flash.read(gl_base + (i as u32 * 7), &mut g);
             glyphs.push(GfxGlyph {
-                bitmap_offset: u16::from_le_bytes([g_buf[0], g_buf[1]]),
-                width: g_buf[2],
-                height: g_buf[3],
-                x_advance: g_buf[4],
-                x_offset: g_buf[5] as i8,
-                y_offset: g_buf[6] as i8,
+                bitmap_offset: u16::from_le_bytes([g[0], g[1]]),
+                width: g[2],
+                height: g[3],
+                x_advance: g[4],
+                x_offset: g[5] as i8,
+                y_offset: g[6] as i8,
             });
         }
 
-        let bitmap_addr = entry.offset + 6 + glyph_count as u32 * 7;
+        let bitmap_addr = gl_base + gl_bytes;
 
         Some(Font {
             font_id,
-            first,
-            last,
             y_advance,
-            glyph_count,
-            glyphs: GlyphData::Heap(glyphs),
+            glyphs: GlyphData::Heap { glyphs, codepoints },
             bitmap_addr,
             embedded_bitmap: core::ptr::null(),
         })
@@ -187,12 +197,12 @@ impl Font {
         let count = fs.count_by_kind(flash, RES_FONT);
         for i in 0..count {
             if let Some(entry) = fs.find_nth_by_kind(flash, RES_FONT, i) {
-                if entry.size < 6 {
+                if entry.size < 4 {
                     continue;
                 }
-                let mut hdr = [0u8; 6];
+                let mut hdr = [0u8; 4];
                 flash.read(entry.offset, &mut hdr);
-                if hdr[5] == font_id {
+                if hdr[3] == font_id {
                     return Self::load_from_entry(flash, &entry);
                 }
             }
@@ -201,21 +211,17 @@ impl Font {
     }
 
     /// Create an embedded (ROM) font. Always gets font_id = 0.
-    /// Glyphs reference ROM directly — zero RAM cost for glyph data.
+    /// Glyphs and codepoints reference ROM directly — zero RAM cost.
     pub fn from_embedded(
         glyphs: &'static [GfxGlyph],
+        codepoints: &'static [u16],
         bitmap: &'static [u8],
-        first: u16,
-        last: u16,
         y_advance: u8,
     ) -> Self {
         Font {
             font_id: EMBEDDED_FONT_ID,
-            first,
-            last,
             y_advance,
-            glyph_count: glyphs.len() as u16,
-            glyphs: GlyphData::Static(glyphs),
+            glyphs: GlyphData::Static { glyphs, codepoints },
             bitmap_addr: 0,
             embedded_bitmap: bitmap.as_ptr(),
         }
@@ -226,26 +232,41 @@ impl Font {
         self.y_advance
     }
 
-    /// Character width (xAdvance)
-    pub fn char_width(&self, ch: char) -> u8 {
-        let code = ch as u16;
-        if code < self.first || code > self.last {
-            return 0;
+    /// Binary search for glyph by Unicode BMP codepoint.
+    fn find_glyph(&self, cp: u16) -> Option<&GfxGlyph> {
+        match self.glyphs.codepoints().binary_search(&cp) {
+            Ok(idx) => Some(self.glyphs.glyph(idx)),
+            Err(_) => None,
         }
-        let idx = (code - self.first) as usize;
-        self.glyphs.get(idx).x_advance
     }
 
-    /// Calculate string width in pixels.
+    /// Advance width for a BMP codepoint (0 if not in font).
+    pub fn char_width_cp(&self, cp: u16) -> u8 {
+        self.find_glyph(cp).map(|g| g.x_advance).unwrap_or(0)
+    }
+
+    /// Advance width for a char (0 if out of BMP or not in font).
+    pub fn char_width(&self, ch: char) -> u8 {
+        let cp = ch as u32;
+        if cp > 0xFFFF {
+            return 0;
+        }
+        self.char_width_cp(cp as u16)
+    }
+
+    /// Calculate string width in pixels (text is UTF-8 encoded).
     pub fn text_width(&self, text: &[u8]) -> u16 {
         let mut w: u16 = 0;
-        for &ch in text {
-            w += self.char_width(ch as char) as u16;
+        let mut pos = 0;
+        while let Some(cp) = utf8_next(text, &mut pos) {
+            if cp != 0xFFFF {
+                w = w.saturating_add(self.char_width_cp(cp) as u16);
+            }
         }
         w
     }
 
-    /// Draw a single character.
+    /// Draw a single Unicode character.
     pub fn draw_char(
         &self,
         lcd: &Lcd,
@@ -256,13 +277,49 @@ impl Font {
         fg: u16,
         bg: Option<u16>,
     ) -> u8 {
-        let code = ch as u16;
-        if code < self.first || code > self.last {
+        let cp = ch as u32;
+        if cp > 0xFFFF {
             return 0;
         }
+        self.draw_cp(lcd, flash, cp as u16, cx, cy, fg, bg)
+    }
 
-        let idx = (code - self.first) as usize;
-        let glyph = self.glyphs.get(idx);
+    /// Draw a UTF-8 encoded string. Returns the X position after the last glyph.
+    pub fn draw_str(
+        &self,
+        lcd: &Lcd,
+        flash: &Flash,
+        text: &[u8],
+        mut x: i16,
+        y: i16,
+        fg: u16,
+        bg: Option<u16>,
+    ) -> i16 {
+        let mut pos = 0;
+        while let Some(cp) = utf8_next(text, &mut pos) {
+            if cp != 0xFFFF {
+                x += self.draw_cp(lcd, flash, cp, x, y, fg, bg) as i16;
+            }
+        }
+        x
+    }
+
+    // --- Internal: draw one BMP codepoint ---
+
+    fn draw_cp(
+        &self,
+        lcd: &Lcd,
+        flash: &Flash,
+        cp: u16,
+        cx: i16,
+        cy: i16,
+        fg: u16,
+        bg: Option<u16>,
+    ) -> u8 {
+        let glyph = match self.find_glyph(cp) {
+            Some(g) => g,
+            None => return 0,
+        };
 
         if glyph.width == 0 || glyph.height == 0 {
             return glyph.x_advance;
@@ -281,32 +338,27 @@ impl Font {
 
         let total_bits = glyph.width as u32 * glyph.height as u32;
         let total_bytes = (total_bits + 7) / 8;
+        // Copy fields before releasing the borrow via find_glyph
+        let bitmap_offset = glyph.bitmap_offset;
+        let width = glyph.width;
+        let height = glyph.height;
+        let x_advance = glyph.x_advance;
 
         if let Some(bg_color) = bg {
-            self.draw_opaque(lcd, flash, total_bytes, glyph, draw_x, draw_y, fg, bg_color);
+            self.draw_opaque(
+                lcd, flash, total_bytes,
+                bitmap_offset, width, height,
+                draw_x, draw_y, fg, bg_color,
+            );
         } else {
-            self.draw_transparent(lcd, flash, total_bytes, glyph, draw_x, draw_y, fg);
+            self.draw_transparent(
+                lcd, flash, total_bytes,
+                bitmap_offset, width, height,
+                draw_x, draw_y, fg,
+            );
         }
 
-        glyph.x_advance
-    }
-
-    /// Draw a string.
-    pub fn draw_str(
-        &self,
-        lcd: &Lcd,
-        flash: &Flash,
-        text: &[u8],
-        mut x: i16,
-        y: i16,
-        fg: u16,
-        bg: Option<u16>,
-    ) -> i16 {
-        for &ch in text {
-            let advance = self.draw_char(lcd, flash, ch as char, x, y, fg, bg);
-            x += advance as i16;
-        }
-        x
+        x_advance
     }
 
     // --- Bitmap reading (flash or ROM) ---
@@ -332,30 +384,26 @@ impl Font {
         lcd: &Lcd,
         flash: &Flash,
         total_bytes: u32,
-        glyph: &GfxGlyph,
+        bitmap_offset: u16,
+        width: u8,
+        height: u8,
         draw_x: i16,
         draw_y: i16,
         fg: u16,
         bg: u16,
     ) {
-        lcd.begin_pixels(draw_x as u16, draw_y as u16, glyph.width as u16, glyph.height as u16);
+        lcd.begin_pixels(draw_x as u16, draw_y as u16, width as u16, height as u16);
 
-        let total_bits = glyph.width as u32 * glyph.height as u32;
+        let total_bits = width as u32 * height as u32;
         let mut bit_idx: u32 = 0;
         let mut bytes_read: u32 = 0;
 
         while bytes_read < total_bytes {
-            let remaining = total_bytes - bytes_read;
-            let chunk_size = if remaining < BITMAP_BUF_SIZE as u32 {
-                remaining as usize
-            } else {
-                BITMAP_BUF_SIZE
-            };
-
+            let chunk = (total_bytes - bytes_read).min(BITMAP_BUF_SIZE as u32) as usize;
             let mut buf = [0u8; BITMAP_BUF_SIZE];
-            self.read_bitmap(flash, glyph.bitmap_offset, bytes_read, &mut buf[..chunk_size]);
+            self.read_bitmap(flash, bitmap_offset, bytes_read, &mut buf[..chunk]);
 
-            for i in 0..chunk_size {
+            for i in 0..chunk {
                 let byte = buf[i];
                 for bit in (0..8).rev() {
                     if bit_idx >= total_bits {
@@ -370,7 +418,7 @@ impl Font {
                 }
             }
 
-            bytes_read += chunk_size as u32;
+            bytes_read += chunk as u32;
         }
     }
 
@@ -379,28 +427,24 @@ impl Font {
         lcd: &Lcd,
         flash: &Flash,
         total_bytes: u32,
-        glyph: &GfxGlyph,
+        bitmap_offset: u16,
+        width: u8,
+        height: u8,
         draw_x: i16,
         draw_y: i16,
         fg: u16,
     ) {
-        let w = glyph.width as u32;
-        let total_bits = w * glyph.height as u32;
+        let w = width as u32;
+        let total_bits = w * height as u32;
         let mut bit_idx: u32 = 0;
         let mut bytes_read: u32 = 0;
 
         while bytes_read < total_bytes {
-            let remaining = total_bytes - bytes_read;
-            let chunk_size = if remaining < BITMAP_BUF_SIZE as u32 {
-                remaining as usize
-            } else {
-                BITMAP_BUF_SIZE
-            };
-
+            let chunk = (total_bytes - bytes_read).min(BITMAP_BUF_SIZE as u32) as usize;
             let mut buf = [0u8; BITMAP_BUF_SIZE];
-            self.read_bitmap(flash, glyph.bitmap_offset, bytes_read, &mut buf[..chunk_size]);
+            self.read_bitmap(flash, bitmap_offset, bytes_read, &mut buf[..chunk]);
 
-            for i in 0..chunk_size {
+            for i in 0..chunk {
                 let byte = buf[i];
                 for bit in (0..8).rev() {
                     if bit_idx >= total_bits {
@@ -415,9 +459,71 @@ impl Font {
                 }
             }
 
-            bytes_read += chunk_size as u32;
+            bytes_read += chunk as u32;
         }
     }
+}
+
+// ============================================================
+// UTF-8 decoder
+// ============================================================
+
+/// Decode one UTF-8 codepoint from `bytes` starting at `*pos`.
+///
+/// Advances `*pos` past the consumed bytes and returns `Some(codepoint)`.
+/// Returns `Some(0xFFFF)` for invalid sequences (pos advanced past the bad byte).
+/// Returns `None` when `pos >= bytes.len()` (end of input).
+///
+/// Covers U+0000..U+FFFF (BMP). 4-byte sequences (U+10000+) return 0xFFFF.
+pub fn utf8_next(bytes: &[u8], pos: &mut usize) -> Option<u16> {
+    if *pos >= bytes.len() {
+        return None;
+    }
+    let b0 = bytes[*pos];
+    *pos += 1;
+
+    // 1-byte ASCII
+    if b0 & 0x80 == 0 {
+        return Some(b0 as u16);
+    }
+
+    // 2-byte: 110xxxxx 10xxxxxx
+    if b0 & 0xE0 == 0xC0 {
+        if *pos >= bytes.len() || bytes[*pos] & 0xC0 != 0x80 {
+            return Some(0xFFFF);
+        }
+        let b1 = bytes[*pos];
+        *pos += 1;
+        return Some(((b0 as u16 & 0x1F) << 6) | (b1 as u16 & 0x3F));
+    }
+
+    // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
+    if b0 & 0xF0 == 0xE0 {
+        if *pos >= bytes.len() || bytes[*pos] & 0xC0 != 0x80 {
+            return Some(0xFFFF);
+        }
+        let b1 = bytes[*pos];
+        *pos += 1;
+        if *pos >= bytes.len() || bytes[*pos] & 0xC0 != 0x80 {
+            return Some(0xFFFF);
+        }
+        let b2 = bytes[*pos];
+        *pos += 1;
+        return Some(
+            ((b0 as u16 & 0x0F) << 12)
+                | ((b1 as u16 & 0x3F) << 6)
+                | (b2 as u16 & 0x3F),
+        );
+    }
+
+    // 4-byte (out of BMP): consume continuation bytes, return sentinel
+    if b0 & 0xF8 == 0xF0 {
+        while *pos < bytes.len() && bytes[*pos] & 0xC0 == 0x80 {
+            *pos += 1;
+        }
+    }
+
+    Some(0xFFFF)
 }
 
 // ============================================================
@@ -425,16 +531,13 @@ impl Font {
 // ============================================================
 
 /// Application-wide font list. Heap-allocated, grows on demand.
-/// Supports lookup by font_id with lazy loading from flash.
 pub struct FontList {
     fonts: Vec<Font>,
 }
 
 impl FontList {
     pub fn new() -> Self {
-        Self {
-            fonts: Vec::new(),
-        }
+        Self { fonts: Vec::new() }
     }
 
     /// Add a font to the list.
@@ -443,13 +546,12 @@ impl FontList {
         true
     }
 
-    /// Find a loaded font by font_id. Returns None if not loaded.
+    /// Find a loaded font by font_id.
     pub fn find(&self, font_id: u8) -> Option<&Font> {
         self.fonts.iter().find(|f| f.font_id == font_id)
     }
 
-    /// Find a font by font_id. If not already loaded, search flash
-    /// filesystem and load it. Returns true if the font is now available.
+    /// Find a font by font_id. If not already loaded, search flash and load it.
     pub fn find_or_load(&mut self, font_id: u8, fs: &Fs, flash: &Flash) -> bool {
         if self.find(font_id).is_some() {
             return true;

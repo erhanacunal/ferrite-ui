@@ -15,12 +15,12 @@
 
 use esp_hal::peripherals;
 
+use super::LcdBackend;
 use super::display::{self, DrawMode, EpdRect};
 use super::ed047tc1::{self, ED047TC1};
-use super::LcdBackend;
 
 // Re-export geometry for use in epaper_main.rs
-pub use display::{full_screen, EPD_HEIGHT, EPD_WIDTH};
+pub use display::{EPD_HEIGHT, EPD_WIDTH, full_screen};
 
 // ---- Initialisation ----
 
@@ -77,6 +77,11 @@ pub fn init(pins: EpdHwPins) {
 /// `psram_allocator!` has been set up in `init_gpio`.
 pub fn alloc_buffers() {
     display::alloc_and_install();
+}
+
+/// Returns true once the global e-paper framebuffer has been installed.
+pub fn is_ready() -> bool {
+    display::is_installed()
 }
 
 /// Full-screen ghost-image erase followed by a white framebuffer reset.

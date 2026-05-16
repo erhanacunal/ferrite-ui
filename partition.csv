@@ -1,5 +1,14 @@
 # Name,    Type, SubType, Offset,   Size,    Flags
+#
+# The `ferrite` row used subtype 0x40 as a custom marker. espflash 4.x (esp-idf-part)
+# parses CSV with a fixed DataType enum; numeric subtypes like 0x40 are not valid
+# data subtypes there and cause a host-side panic when flashing.
+# Firmware uses partition offset 0x110000 for ferrite_fs (flash/epaper.rs). Flash the
+# FS image produced by ferrite_build.py (NOT ferrite_lang --image bytecode), e.g.:
+#   espflash write-bin --chip esp32s3 --port COMx 0x110000 ferrite_fs.bin
+# Or: .\epaper.ps1 flash COMx -FlashFs
+# Firmware auto-detects compact vs 4KiB-padded blobs at boot.
 nvs,       data, nvs,     0x9000,   0x6000,
 phy_init,  data, phy,     0xF000,   0x1000,
 factory,   app,  factory, 0x10000,  1M,
-ferrite,   data, 0x40,    0x110000, 4M,
+ferrite,   data, undefined, 0x110000, 4M,

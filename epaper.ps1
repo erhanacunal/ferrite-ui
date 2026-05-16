@@ -12,15 +12,26 @@
     Optional COM port for flashing (e.g. COM3).
     Omit to let espflash auto-detect.
 
+.PARAMETER FlashFs
+    After a successful firmware flash, also write .\ferrite_fs.bin to the ferrite
+    partition at 0x110000 (built with tools/ferrite_build.py). Ignored for `build`.
+
 .EXAMPLE
     .\epaper.ps1
     .\epaper.ps1 flash
     .\epaper.ps1 flash COM3
+    .\epaper.ps1 flash COM3 -FlashFs
     .\epaper.ps1 monitor
+
+.NOTES
+    partition.csv must use subtypes that espflash (esp-idf-part) accepts. A `data`
+    row with hex subtype 0x40 can panic the flasher — see comments in partition.csv.
+    `ferrite_fs.bin` must be a ferrite filesystem (ferrite_build.py), not vm bytecode from ferrite_lang.py.
 #>
 param(
     [string] $Action = 'build',
-    [string] $Port   = ''
+    [string] $Port   = '',
+    [switch] $FlashFs
 )
 
 Set-StrictMode -Version Latest
@@ -82,12 +93,27 @@ if ($Action -iin @('flash')) {
         Write-Error "Flash failed."
     }
     Write-Host "Flash complete." -ForegroundColor Green
+
+    if ($FlashFs) {
+        $FsBin = Join-Path $Root "ferrite_fs.bin"
+        if (-not (Test-Path $FsBin)) {
+            Write-Error "-FlashFs was set but ferrite_fs.bin not found. Build one with: python tools/ferrite_build.py <project.json> -o ferrite_fs.bin"
+        }
+        Write-Host ""
+        Write-Host "[3/3] Writing ferrite_fs.bin to flash 0x110000 (ferrite partition)" -ForegroundColor Cyan
+        $wbPort = if ($Port) { @('-p', $Port) } else { @() }
+        espflash write-bin --chip esp32s3 @wbPort "0x110000" $FsBin
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "write-bin ferrite_fs.bin failed."
+        }
+        Write-Host "Filesystem image written." -ForegroundColor Green
+    }
 } elseif ($Action -iin @('monitor')) {
     $portArgs = if ($Port) { @('--port', $Port) } else { @() }
     espflash monitor @portArgs
 } else {
     Write-Host ""
-    Write-Host "To flash:   .\epaper.ps1 flash [COM?]"
+    Write-Host "To flash:   .\epaper.ps1 flash [COM?] [-FlashFs]"
     Write-Host "To monitor: .\epaper.ps1 monitor [COM?]"
 }
 

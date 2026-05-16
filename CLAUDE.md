@@ -166,18 +166,22 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **PENIRQ (PC14):** touch detection via GPIO polling (EXTI interrupt NOT USED — SPI conflict)
 - **RAM cost:** ~18 bytes (8 × WidgetId + count + active)
 
-### Font Renderer (Adafruit GFX compatible)
-- **Format:** Adafruit GFX bitmap font — two separate flash resources:
-  - Header: font meta (first/last/yAdvance) + glyph table (7B/glyph)
-  - Data: 1-bit packed bitmap (MSB first, no row padding)
+### Font Renderer (Adafruit GFX compatible, sparse/UTF-8)
+- **Format:** Sparse font — single combined RES_FONT flash resource:
+  - `[0..2]` num_glyphs u16 LE, `[2]` y_advance u8, `[3]` font_id u8
+  - `[4..4+N*2]` codepoints[] (N × u16 LE, sorted — for binary search)
+  - `[4+N*2..4+N*9]` glyphs[] (N × 7B: bitmapOffset u16, w, h, xAdv, xOff i8, yOff i8)
+  - `[4+N*9..]` bitmap data (1-bit packed, MSB first)
 - **GfxGlyph (7B):** bitmapOffset(u16) + width + height + xAdvance + xOffset(i8) + yOffset(i8)
-- **Loading:** `Font::load(fs, flash, header_name, data_name)` — header fully in RAM, bitmap stays in flash
+- **Glyph lookup:** binary search on sorted codepoints[] — O(log N), supports arbitrary Unicode BMP subsets
+- **Loading:** `Font::load(fs, flash, name)` — codepoints + glyphs in RAM, bitmap stays in flash
 - **Draw modes:**
   - Opaque: `begin_pixels` + stream (fast, fg+bg)
   - Transparent: only fg pixels via `fill_rect(1,1)` (slow, background preserved)
-- **API:** `draw_char()`, `draw_str()`, `char_width()`, `text_width()`, `line_height()`
-- **RAM cost:** ~900 bytes (128 glyphs × 7B + meta) — per font
-- **Max glyphs:** 128 (MAX_GLYPHS), bitmap read in 128B chunks
+- **API:** `draw_char(ch: char)`, `draw_str(text: &[u8])` (UTF-8), `char_width()`, `char_width_cp(u16)`, `text_width()`, `line_height()`
+- **UTF-8:** `font::utf8_next(bytes, pos)` decodes one BMP codepoint; returns `Some(0xFFFF)` for invalid sequences
+- **Tool:** `tools/ferrite_font_converter.py` — TrueType → sparse binary; supports `-r` range spec (e.g. `32-127,0x011E-0x011F`)
+- **RAM cost:** N × 9B (codepoints + glyphs) per font; bitmap read in 128B chunks
 
 ## Project Name
 

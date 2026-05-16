@@ -233,16 +233,15 @@ impl EpdDisplay {
                 row_skip(epd, time_us);
             } else if r == area.y {
                 epd.set_buffer(&row_buf);
-                epd.skipping = 0;
-                epd.output_row(time_us);
+                row_write(epd, time_us);                
             } else if r >= area.y + area.height {
                 row_skip(epd, time_us);
             } else {
-                epd.output_row(time_us);
+                row_write(epd, time_us);
             }
         }
         // Extra output_row after last row — matches reference and C driver.
-        epd.output_row(time_us);
+        row_write(epd, time_us);
         epd.frame_end();
     }
 
@@ -258,7 +257,7 @@ impl EpdDisplay {
     }
 
     pub(crate) fn clear_area(&mut self, area: EpdRect) {
-        self.clear_area_cycles(area, 4, 150);
+        self.clear_area_cycles(area, 4, 50);
     }
 
     // ---- Full flush ----
@@ -270,6 +269,12 @@ impl EpdDisplay {
 
     /// Run the 15-frame waveform to push tainted rows to the panel.
     pub(crate) fn flush(&mut self, mode: DrawMode) {
+        let tainted_count: u16 = (0..EPD_HEIGHT)
+            .filter(|&y| self.is_tainted(y))
+            .count() as u16;
+        crate::usart::dbg(b"EPD flush tainted=");
+        crate::usart::dbg_u16(tainted_count);
+        crate::usart::dbg(b"\r\n");
         self.draw(mode);
         self.tainted_rows.fill(0);
         self.framebuffer.fill(0xFF);
@@ -287,11 +292,13 @@ impl EpdDisplay {
             epd.skipping = 0;
             epd.frame_start();
 
+            let mut active: u16 = 0;
             for y in 0..EPD_HEIGHT {
                 if !self.is_tainted(y) {
-                    row_skip(epd, mode.contrast_cycles()[k]);
+                    epd.skip();
                     continue;
                 }
+                active += 1;
                 let start = y as usize * LINE_BYTES_4BPP;
                 let end = start + LINE_BYTES_4BPP;
                 let row_buf = prepare_dma_buffer(&self.framebuffer[start..end], &lut);
@@ -299,14 +306,30 @@ impl EpdDisplay {
                 epd.skipping = 0;
                 epd.output_row(mode.contrast_cycles()[k]);
             }
+            // Pipeline is one row behind: latch+drive the last active row.
+            if epd.skipping == 0 {
+                row_write(epd, mode.contrast_cycles()[k]);
+            }
             epd.frame_end();
+
+            if k == 0 {
+                crate::usart::dbg(b"  frame0 active=");
+                crate::usart::dbg_u16(active);
+                crate::usart::dbg(b"\r\n");
+            }
         }
+        crate::usart::dbg(b"EPD draw done\r\n");
     }
 }
 
 // ---- Global static ----
 
 static mut DISPLAY: Option<EpdDisplay> = None;
+static mut DISPLAY_INSTALLED: bool = false;
+
+pub(crate) fn is_installed() -> bool {
+    unsafe { core::ptr::read_volatile(&raw const DISPLAY_INSTALLED) }
+}
 
 pub(crate) unsafe fn disp() -> &'static mut EpdDisplay {
     (*(&raw mut DISPLAY)).as_mut().unwrap_unchecked()
@@ -317,6 +340,7 @@ pub(crate) unsafe fn disp() -> &'static mut EpdDisplay {
 pub fn alloc_and_install() {
     unsafe {
         DISPLAY = Some(EpdDisplay::new());
+        core::ptr::write_volatile(&raw mut DISPLAY_INSTALLED, true);
     }
 }
 
@@ -345,6 +369,11 @@ fn row_skip(epd: &mut ed047tc1::ED047TC1, time_us: u16) {
         }
     }
     epd.skipping += 1;
+}
+
+fn row_write(epd: &mut ed047tc1::ED047TC1, time_us: u16) { 
+    epd.skipping = 0;
+    epd.output_row(time_us);
 }
 
 // ---- Algorithmic helpers ----

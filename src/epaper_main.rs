@@ -175,6 +175,117 @@ unsafe fn esp_restart() -> ! {
     loop {}
 }
 
+// === Error display ===
+
+/// Draw error box on screen and send error via USART.
+fn show_error(
+    lcd: &mut Lcd,
+    font: &Font,
+    flash: &Flash,
+    usart: &usart::Usart,
+    code: u8,
+    vm_pc: Option<u16>,
+) {
+    lcd.begin_frame();
+    lcd.fill_rect(0, 0, lcd::WIDTH, lcd::HEIGHT, COLOR_WHITE);
+
+    let bw: u16 = 460;
+    let bh: u16 = 210;
+    let bx: u16 = (lcd::WIDTH - bw) / 2;
+    let by: u16 = (lcd::HEIGHT - bh) / 2;
+
+    lcd.draw_rect(bx, by, bw, bh, COLOR_RED);
+    lcd.fill_rect(bx + 2, by + 2, bw - 4, bh - 4, COLOR_WHITE);
+
+    let title = b"ERROR";
+    let tw = font.text_width(title);
+    let tx = bx as i16 + (bw as i16 - tw as i16) / 2;
+    let ty = by as i16 + 34;
+    font.draw_str(lcd, flash, title, tx, ty, COLOR_RED, Some(COLOR_WHITE));
+
+    let mut code_line = [0u8; 16];
+    let code_len = format_error_code(code, &mut code_line);
+    let cw = font.text_width(&code_line[..code_len]);
+    let cx = bx as i16 + (bw as i16 - cw as i16) / 2;
+    font.draw_str(
+        lcd,
+        flash,
+        &code_line[..code_len],
+        cx,
+        ty + 30,
+        COLOR_BLACK,
+        Some(COLOR_WHITE),
+    );
+
+    let desc = error_description(code);
+    let dw = font.text_width(desc);
+    let dx = bx as i16 + (bw as i16 - dw as i16) / 2;
+    font.draw_str(
+        lcd,
+        flash,
+        desc,
+        dx,
+        ty + 60,
+        COLOR_BLACK,
+        Some(COLOR_WHITE),
+    );
+
+    if let Some(pc) = vm_pc {
+        let mut pc_buf = [0u8; 12];
+        let pc_len = format_hex_u16(b"PC: 0x", pc, &mut pc_buf);
+        let pw = font.text_width(&pc_buf[..pc_len]);
+        let px = bx as i16 + (bw as i16 - pw as i16) / 2;
+        font.draw_str(
+            lcd,
+            flash,
+            &pc_buf[..pc_len],
+            px,
+            ty + 90,
+            COLOR_BLACK,
+            Some(COLOR_WHITE),
+        );
+    }
+
+    lcd.end_frame();
+    lcd.flush_dirty();
+
+    protocol::send_error(usart, code);
+}
+
+fn format_hex_u16(prefix: &[u8], val: u16, buf: &mut [u8; 12]) -> usize {
+    let plen = prefix.len().min(6);
+    buf[..plen].copy_from_slice(&prefix[..plen]);
+    let hex = b"0123456789ABCDEF";
+    buf[plen] = hex[((val >> 12) & 0xF) as usize];
+    buf[plen + 1] = hex[((val >> 8) & 0xF) as usize];
+    buf[plen + 2] = hex[((val >> 4) & 0xF) as usize];
+    buf[plen + 3] = hex[(val & 0xF) as usize];
+    plen + 4
+}
+
+fn format_error_code(code: u8, buf: &mut [u8; 16]) -> usize {
+    let prefix = b"Code: ";
+    buf[..6].copy_from_slice(prefix);
+    if code >= 10 {
+        buf[6] = b'0' + code / 10;
+        buf[7] = b'0' + code % 10;
+        8
+    } else {
+        buf[6] = b'0' + code;
+        7
+    }
+}
+
+fn error_description(code: u8) -> &'static [u8] {
+    match code {
+        2 => b"main program not found",
+        5 => b"no file system in flash",
+        6 => b"program execution error",
+        7 => b"insufficient memory",
+        _ => b"error",
+    }
+}
+
 // --- Panic handler ---
 
 #[panic_handler]
@@ -187,8 +298,128 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         usart::dbg_u16(loc.line() as u16);
     }
     usart::dbg(b"\r\n");
-    usart::dbg(b"Message: ");
+
+    if lcd::epaper::is_ready() {
+        let lcd = Lcd::new();
+        let font = Font::from_embedded(
+            &embedded_font::GLYPHS,
+            &embedded_font::CODEPOINTS,
+            &embedded_font::BITMAP,
+            embedded_font::Y_ADVANCE,
+        );
+        let flash = Flash::new();
+
+        lcd.fill_rect(0, 0, lcd::WIDTH, lcd::HEIGHT, COLOR_WHITE);
+
+        let bw: u16 = 520;
+        let bh: u16 = 230;
+        let bx: u16 = (lcd::WIDTH - bw) / 2;
+        let by: u16 = (lcd::HEIGHT - bh) / 2;
+
+        lcd.draw_rect(bx, by, bw, bh, COLOR_RED);
+        lcd.fill_rect(bx + 2, by + 2, bw - 4, bh - 4, COLOR_WHITE);
+
+        let title = b"PANIC";
+        let tw = font.text_width(title);
+        let tx = bx as i16 + (bw as i16 - tw as i16) / 2;
+        font.draw_str(
+            &lcd,
+            &flash,
+            title,
+            tx,
+            by as i16 + 42,
+            COLOR_RED,
+            Some(COLOR_WHITE),
+        );
+
+        if let Some(loc) = info.location() {
+            let file_bytes = loc.file().as_bytes();
+            let mut name_start = 0usize;
+            for i in 0..file_bytes.len() {
+                if file_bytes[i] == b'/' || file_bytes[i] == b'\\' {
+                    name_start = i + 1;
+                }
+            }
+            let short_name = &file_bytes[name_start..];
+
+            let mut loc_buf = [0u8; 64];
+            let mut pos = 0usize;
+            let copy_len = short_name.len().min(48);
+            loc_buf[..copy_len].copy_from_slice(&short_name[..copy_len]);
+            pos += copy_len;
+            loc_buf[pos] = b':';
+            pos += 1;
+
+            let mut line_buf = [0u8; 5];
+            let line_len = format_u16(loc.line() as u16, &mut line_buf);
+            loc_buf[pos..pos + line_len].copy_from_slice(&line_buf[..line_len]);
+            pos += line_len;
+
+            let loc_line = &loc_buf[..pos];
+            let lw = font.text_width(loc_line);
+            let lx = bx as i16 + (bw as i16 - lw as i16) / 2;
+            font.draw_str(
+                &lcd,
+                &flash,
+                loc_line,
+                lx,
+                by as i16 + 84,
+                COLOR_BLACK,
+                Some(COLOR_WHITE),
+            );
+        }
+
+        let msg = b"Device halted";
+        let mw = font.text_width(msg);
+        let mx = bx as i16 + (bw as i16 - mw as i16) / 2;
+        font.draw_str(
+            &lcd,
+            &flash,
+            msg,
+            mx,
+            by as i16 + 138,
+            COLOR_BLACK,
+            Some(COLOR_WHITE),
+        );
+
+        let hint = b"Reset to recover";
+        let hw = font.text_width(hint);
+        let hx = bx as i16 + (bw as i16 - hw as i16) / 2;
+        font.draw_str(
+            &lcd,
+            &flash,
+            hint,
+            hx,
+            by as i16 + 168,
+            COLOR_BLACK,
+            Some(COLOR_WHITE),
+        );
+
+        lcd.flush_dirty();
+    }
+
     loop {}
+}
+
+fn format_u16(val: u16, buf: &mut [u8; 5]) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+
+    let mut n = val;
+    let mut pos = buf.len();
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+
+    let len = buf.len() - pos;
+    for i in 0..len {
+        buf[i] = buf[pos + i];
+    }
+    len
 }
 
 // === Entry point ===
@@ -238,15 +469,18 @@ fn main() -> ! {
         backlight: backlight::Backlight::init(),
         cursor_visible: false,
     });
+    let usart = usart::Usart::init();
 
     // Embedded font (FreeMono 9pt, ROM-resident — never touches flash).
     ctx.fonts.add(Font::from_embedded(
         &embedded_font::GLYPHS,
+        &embedded_font::CODEPOINTS,
         &embedded_font::BITMAP,
-        embedded_font::FIRST,
-        embedded_font::LAST,
         embedded_font::Y_ADVANCE,
     ));
+
+    // Map logical FS addresses into ferrite partition (compact vs padded `ferrite_fs.bin`).
+    flash::epaper::probe_ferrite_fs_preamble();
 
     // Mount FS from XIP-mapped internal flash.
     match fs::Fs::mount(&ctx.flash) {
@@ -331,44 +565,62 @@ fn main() -> ! {
     // Initial full render + EPD flush.
     // Always drive the EPD so hardware can be verified even when the FS is absent.
     if error_code != 0 {
-        usart::dbg(b"\r\nBOOT ERROR: ");
-        usart::dbg_u16(error_code as u16);
-        usart::dbg(b"\r\n");
+        show_error(
+            &mut ctx.lcd,
+            ctx.fonts.embedded(),
+            &ctx.flash,
+            &usart,
+            error_code,
+            None,
+        );
+    } else if vm.render_mode != RenderMode::EPaper {
+        render::render_all(&mut ctx, &vm);
+        ctx.lcd.flush_dirty();
     }
-    render::render_all(&mut ctx, &vm);
-    ctx.lcd.flush_dirty();
 
     usart::dbg(b"EPD flush done\r\n");
 
     let mut touch = Touch::init();
     let mut protocol = Protocol::new();
-    let usart = usart::Usart::init();
 
     // ===================== MAIN LOOP =====================
     loop {
         // --- Modal resume ---
-        vm.try_resume_modal(&mut ctx);
+        if error_code == 0 {
+            vm.try_resume_modal(&mut ctx);
+        }
 
         // --- VM step ---
-        match vm.state {
-            VmState::Running | VmState::Yielded => {
-                vm.state = VmState::Running;
-                vm.step(&mut ctx);
-
-                while vm.is_critical() && vm.state == VmState::Running {
-                    vm.step(&mut ctx);
-                }
-
-                if vm.state == VmState::Error {
-                    usart::dbg(b"\r\nVM ERROR\r\n");
-                }
-            }
-            VmState::Waiting => {
-                if systick::millis().wrapping_sub(vm.wait_until) < 0x8000_0000 {
+        if error_code == 0 {
+            match vm.state {
+                VmState::Running | VmState::Yielded => {
                     vm.state = VmState::Running;
+                    vm.step(&mut ctx);
+
+                    while vm.is_critical() && vm.state == VmState::Running {
+                        vm.step(&mut ctx);
+                    }
+
+                    if vm.state == VmState::Error {
+                        usart::dbg(b"\r\nVM ERROR\r\n");
+                        error_code = ERR_PROGRAM_ERROR;
+                        show_error(
+                            &mut ctx.lcd,
+                            ctx.fonts.embedded(),
+                            &ctx.flash,
+                            &usart,
+                            error_code,
+                            Some(vm.pc()),
+                        );
+                    }
                 }
+                VmState::Waiting => {
+                    if systick::millis().wrapping_sub(vm.wait_until) < 0x8000_0000 {
+                        vm.state = VmState::Running;
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
 
         // --- USART protocol ---
@@ -442,17 +694,37 @@ fn main() -> ! {
                         }
                     }
 
-                    render::render_all(&mut ctx, &vm);
-                    ctx.lcd.flush_dirty();
+                    if error_code == 0 && vm.render_mode != RenderMode::EPaper {
+                        render::render_all(&mut ctx, &vm);
+                        ctx.lcd.flush_dirty();
+                    } else if error_code != 0 {
+                        show_error(
+                            &mut ctx.lcd,
+                            ctx.fonts.embedded(),
+                            &ctx.flash,
+                            &usart,
+                            error_code,
+                            None,
+                        );
+                    }
                 }
 
                 RxEvent::ProgramTooLarge => {
-                    protocol::send_error(&usart, ERR_INSUFFICIENT_MEMORY);
+                    error_code = ERR_INSUFFICIENT_MEMORY;
+                    show_error(
+                        &mut ctx.lcd,
+                        ctx.fonts.embedded(),
+                        &ctx.flash,
+                        &usart,
+                        ERR_INSUFFICIENT_MEMORY,
+                        None,
+                    );
                 }
 
                 RxEvent::FsReady => {
                     protocol.free_program();
                     protocol.alloc_sector_buf();
+                    error_code = 0;
                     protocol::send_pong(&usart);
                 }
 
@@ -471,39 +743,41 @@ fn main() -> ! {
         }
 
         // --- Button / touch poll ---
-        if let Some(event) = touch.poll() {
-            use touch::TouchEventKind;
-            match event.kind {
-                TouchEventKind::Press => {
-                    let hit = touch::hit_test(&mut ctx.tree, event.x, event.y);
-                    if hit.is_some() {
-                        // Mark pressed state.
-                        let flags = ctx.tree.get(hit).flags;
-                        ctx.tree.get_mut(hit).flags = flags | widget::FLAG_PRESSED;
-                        ctx.tree.mark_dirty(hit);
+        if error_code == 0 {
+            if let Some(event) = touch.poll() {
+                use touch::TouchEventKind;
+                match event.kind {
+                    TouchEventKind::Press => {
+                        let hit = touch::hit_test(&mut ctx.tree, event.x, event.y);
+                        if hit.is_some() {
+                            // Mark pressed state.
+                            let flags = ctx.tree.get(hit).flags;
+                            ctx.tree.get_mut(hit).flags = flags | widget::FLAG_PRESSED;
+                            ctx.tree.mark_dirty(hit);
+                        }
                     }
-                }
-                TouchEventKind::Release => {
-                    // Find the widget at last known position and fire on_click.
-                    let hit = touch::hit_test(&mut ctx.tree, event.x, event.y);
-                    if hit.is_some() {
-                        let flags = ctx.tree.get(hit).flags;
-                        ctx.tree.get_mut(hit).flags = flags & !widget::FLAG_PRESSED;
-                        ctx.tree.mark_dirty(hit);
+                    TouchEventKind::Release => {
+                        // Find the widget at last known position and fire on_click.
+                        let hit = touch::hit_test(&mut ctx.tree, event.x, event.y);
+                        if hit.is_some() {
+                            let flags = ctx.tree.get(hit).flags;
+                            ctx.tree.get_mut(hit).flags = flags & !widget::FLAG_PRESSED;
+                            ctx.tree.mark_dirty(hit);
 
-                        if vm.has_code() {
-                            if let Some(entry) = vm.find_func(ctx.tree.on_click(hit)) {
-                                vm.enqueue_callback(entry.offset as u16, &[hit.0 as i32]);
+                            if vm.has_code() {
+                                if let Some(entry) = vm.find_func(ctx.tree.on_click(hit)) {
+                                    vm.enqueue_callback(entry.offset as u16, &[hit.0 as i32]);
+                                }
                             }
                         }
                     }
+                    TouchEventKind::Hold => {}
                 }
-                TouchEventKind::Hold => {}
             }
         }
 
         // --- Paint callbacks ---
-        if vm.has_code() {
+        if error_code == 0 && vm.has_code() {
             let dfs = ctx.tree.dfs_order();
             let mut paint_count = 0usize;
             let mut paint_ids = [widget::WidgetId::NONE; 8];
@@ -527,28 +801,30 @@ fn main() -> ! {
         }
 
         // --- Render ---
-        match vm.render_mode {
-            RenderMode::Buffered => {
-                if render::buffered_has_dirty(&mut ctx) {
-                    ctx.lcd.begin_frame();
-                    render::render_buffered_content(&mut ctx, &vm);
-                    ctx.lcd.end_frame();
+        if error_code == 0 {
+            match vm.render_mode {
+                RenderMode::Buffered => {
+                    if render::buffered_has_dirty(&mut ctx) {
+                        ctx.lcd.begin_frame();
+                        render::render_buffered_content(&mut ctx, &vm);
+                        ctx.lcd.end_frame();
+                        ctx.lcd.flush_dirty();
+                    }
+                }
+                RenderMode::Dirty => {
+                    render::render_dirty(&mut ctx, &vm);
                     ctx.lcd.flush_dirty();
                 }
-            }
-            RenderMode::Dirty => {
-                render::render_dirty(&mut ctx, &vm);
-                ctx.lcd.flush_dirty();
-            }
-            RenderMode::EPaper => {
-                // EPD updates are driven exclusively by OP_W_RENDER (render() in
-                // Ferrite code). Do nothing here to avoid premature dirty-flag
-                // clearing and spurious ghost-only flushes.
+                RenderMode::EPaper => {
+                    // EPD updates are driven exclusively by OP_W_RENDER (render() in
+                    // Ferrite code). Do nothing here to avoid premature dirty-flag
+                    // clearing and spurious ghost-only flushes.
+                }
             }
         }
 
         // --- Drain callback queue ---
-        if vm.has_pending_callbacks() {
+        if error_code == 0 && vm.has_pending_callbacks() {
             vm.drain_callbacks(&mut ctx);
             match vm.render_mode {
                 RenderMode::Buffered => {

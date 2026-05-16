@@ -26,14 +26,16 @@ try:
         QSpinBox, QLineEdit, QComboBox, QCheckBox, QPushButton,
         QLabel, QSplitter, QToolBar, QStatusBar, QGroupBox,
         QFileDialog, QColorDialog, QMessageBox, QDialog, QTextEdit,
-        QDialogButtonBox, QTabWidget, QPlainTextEdit, QStyle,
+        QDialogButtonBox, QTabWidget, QPlainTextEdit, QStyle, QDockWidget,
+        QProgressDialog,
     )
-    from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QSettings, QRegularExpression
+    from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QSettings, QRegularExpression, QBuffer
     from PySide6.QtGui import (
-        QColor, QPainter, QPen, QBrush, QFont, QAction,
+        QColor, QPainter, QPen, QBrush, QFont, QAction, QIcon,
         QPainterPath, QKeySequence, QSyntaxHighlighter, QTextCharFormat,
-        QFontDatabase,
+        QFontDatabase, QImage,
     )
+    from PySide6.QtWidgets import QListWidget, QListWidgetItem
 except ImportError:
     print("PySide6 is required: pip install PySide6")
     sys.exit(1)
@@ -44,20 +46,93 @@ except ImportError:
     qta = None
 
 
-def designer_icon(qta_name, fallback=None):
-    """Return a QIcon from qtawesome, falling back to Qt's built-in icons."""
-    if qta is not None and qta_name:
+
+# Designer UI icons live in tools/images/ (in-repo, relative to this script)
+_DESIGNER_ICONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
+
+# SVG icon browser folder (user-configurable, for importing icons into ferrite projects)
+SVG_ICON_FOLDER_KEY = "svg_icon_folder"
+SVG_ICON_FOLDER_DEFAULT = r"E:\ico\images"
+
+# Maps icon names (qtawesome or logical) to filename stems in _DESIGNER_ICONS_DIR
+_ICON_MAP = {
+    # File / project
+    "fa5s.file":                "NewDocument",
+    "fa5s.folder-open":         "OpenFolder",
+    "fa5s.save":                "Save",
+    "fa5s.file-export":         "Export",
+    # Build / deploy
+    "fa5s.hammer":              "BuildDefinition",
+    "fa5s.upload":              "Upload",
+    "fa5s.cloud-upload-alt":    "CloudUpload",
+    "fa5s.sync":                "Refresh",
+    "fa5s.play":                "Run",
+    # Edit
+    "fa5s.trash":               "Delete",
+    "fa5s.copy":                "Copy",
+    "fa5s.paste":               "Paste",
+    "fa5s.clone":               "Duplicate",
+    "fa5s.arrow-up":            "BringToFront",
+    "fa5s.arrow-down":          "SendBackward",
+    "fa5s.th":                  "SnapToGrid",
+    # Align (used in align-action tuples)
+    "fa5s.align-left":          "AlignLeft",
+    "fa5s.align-right":         "AlignRight",
+    "fa5s.align-top":           "AlignTop",
+    "fa5s.align-bottom":        "AlignBottom",
+    "fa5s.align-center":        "AlignCenter",
+    "fa5s.center-h":            "CenterHorizontally",
+    "fa5s.center-v":            "CenterVertically",
+    # Code / resources
+    "fa5s.code":                "Code",
+    "fa5s.file-code":           "Code",
+    "fa5s.font":                "Font",
+    "fa5s.image":               "Image",
+    "fa5s.icons":               "ImageButton",
+    "fa5s.undo":                "Refresh",
+    # Comms / device
+    "fa5s.satellite-dish":      "Connect",
+    "fa5s.power-off":           "Restart",
+    "fa5s.memory":              "Memory",
+    "fa5s.microchip":           "Processor",
+    "fa5s.expand-arrows-alt":   "FitToScreen",
+    # Close / exit
+    "fa5s.times":               "Close",
+    "exit":                     "Exit",
+    # Widget kinds
+    "fa5s.square":              "Panel",
+    "fa5s.hand-pointer":        "Button",
+    "fa5s.tasks":               "ProgressBar",
+    "fa5s.sliders-h":           "Slider",
+    "fa5s.check-square":        "CheckBoxChecked",
+    "fa5s.dot-circle":          "RadioButton",
+    "fa5s.caret-square-down":   "ComboBox",
+}
+
+def designer_icon(name, fallback=None):
+    """Return a QIcon: SVG collection first, then qtawesome, then Qt built-in."""
+    # 1. SVG collection via _ICON_MAP (tools/images/ inside repo)
+    stem = _ICON_MAP.get(name)
+    if stem:
+        path = os.path.join(_DESIGNER_ICONS_DIR, stem + ".svg")
+        if os.path.isfile(path):
+            icon = QIcon(path)
+            if not icon.isNull():
+                return icon
+    # 2. qtawesome (legacy / unmapped names)
+    if qta is not None and name:
         try:
-            return qta.icon(qta_name)
+            return qta.icon(name)
         except Exception:
             pass
+    # 3. Qt standard icon
     if fallback is not None:
         return QApplication.style().standardIcon(fallback)
     return None
 
 
-def set_icon(widget, qta_name, fallback=None):
-    icon = designer_icon(qta_name, fallback)
+def set_icon(widget, name, fallback=None):
+    icon = designer_icon(name, fallback)
     if icon is not None:
         widget.setIcon(icon)
 
@@ -127,6 +202,17 @@ KIND_PREFIXES = {
     KIND_DROPDOWN: "dropdown",
 }
 
+KIND_ICON_NAMES = {
+    KIND_BASE:     "fa5s.square",
+    KIND_LABEL:    "fa5s.font",
+    KIND_BUTTON:   "fa5s.hand-pointer",
+    KIND_PROGRESS: "fa5s.tasks",
+    KIND_SLIDER:   "fa5s.sliders-h",
+    KIND_CHECKBOX: "fa5s.check-square",
+    KIND_RADIO:    "fa5s.dot-circle",
+    KIND_DROPDOWN: "fa5s.caret-square-down",
+}
+
 
 def kind_name(kind):
     if kind in KIND_VALUES:
@@ -136,6 +222,7 @@ def kind_name(kind):
 HANDLE_SIZE = 8
 CANVAS_MARGIN = 40
 GRID_SIZE = 10
+GUIDE_SNAP_DIST = 6
 
 
 # ============================================================
@@ -181,41 +268,133 @@ import struct as _struct
 from PySide6.QtGui import QImage, QPixmap
 
 
+def _is_sparse_font(data):
+    """Return True if data looks like a new sparse font binary (not old range format).
+
+    Old format: bytes 0-1 = first, bytes 2-3 = last (both small codepoints like 0x0020/0x007E).
+    New format: bytes 0-1 = num_glyphs (e.g. 95 for ASCII), byte 2 = y_advance, byte 3 = font_id.
+    Heuristic: if byte 3 (font_id candidate) <= 254 AND the codepoints section is consistent
+    with a sparse layout, treat as new format.  The simplest check: new format has
+    num_glyphs u16 at [0], then at [4] the first codepoint — which should equal the first
+    char in the set.  For old format bytes [2..4] = last u16, which would be e.g. 0x007E.
+    Distinguish: in old format data[4] is y_advance (typically 10-30), in new format data[4]
+    is the low byte of the first codepoint (0x20 for space = 32).  Use a round-trip check:
+    parse as new, verify the first codepoint matches.
+    """
+    if len(data) < 4:
+        return False
+    n = _struct.unpack_from("<H", data, 0)[0]
+    if n == 0 or n > 0x3FFF:
+        return False
+    cp_end = 4 + n * 2
+    glyph_end = cp_end + n * 7
+    if len(data) < glyph_end:
+        return False
+    # Verify codepoints are sorted ascending
+    prev = -1
+    for i in range(min(n, 4)):
+        cp = _struct.unpack_from("<H", data, 4 + i * 2)[0]
+        if cp <= prev:
+            return False
+        prev = cp
+    return True
+
+
+def _old_range_font_to_sparse(data):
+    """Convert old range-based font binary to new sparse format.
+
+    Old layout: first(u16) + last(u16) + y_advance(u8) + font_id(u8) + glyphs(N*7) + bitmap
+    New layout: num_glyphs(u16) + y_advance(u8) + font_id(u8) + codepoints(N*u16) + glyphs(N*7) + bitmap
+    """
+    if len(data) < 6:
+        return None
+    first, last = _struct.unpack_from("<HH", data, 0)
+    y_advance = data[4]
+    font_id = data[5]
+    n = last - first + 1
+    header_size = 6 + n * 7
+    if len(data) < header_size or n <= 0 or n > 0x3FFF:
+        return None
+    glyphs_raw = data[6:header_size]
+    bitmap = data[header_size:]
+    out = bytearray()
+    out.extend(_struct.pack("<HBB", n, y_advance, font_id))
+    for cp in range(first, last + 1):
+        out.extend(_struct.pack("<H", cp))
+    out.extend(glyphs_raw)
+    out.extend(bitmap)
+    return bytes(out)
+
+
 class GfxFontPreview:
-    """Parses Adafruit GFX binary font data for QPainter rendering."""
+    """Parses Ferrite sparse binary font data for QPainter rendering."""
 
     def __init__(self, binary):
-        if len(binary) < 6:
+        if len(binary) < 4:
             raise ValueError("font binary too short")
-        self.first, self.last = _struct.unpack_from("<HH", binary, 0)
-        self.y_advance = binary[4]
-        # font_id at byte 5 — not needed for rendering
-        glyph_count = self.last - self.first + 1
+        n = _struct.unpack_from("<H", binary, 0)[0]
+        self.y_advance = binary[2]
+        # font_id at byte 3 — not needed for rendering
+        cp_end = 4 + n * 2
+        glyph_end = cp_end + n * 7
+        if len(binary) < glyph_end:
+            raise ValueError("font binary truncated")
+        self.codepoints = [_struct.unpack_from("<H", binary, 4 + i * 2)[0] for i in range(n)]
         self.glyphs = []  # (bitmap_offset, w, h, x_advance, x_offset, y_offset)
-        offset = 6
-        for _ in range(glyph_count):
-            if offset + 7 > len(binary):
-                break
-            bm_off = _struct.unpack_from("<H", binary, offset)[0]
-            w = binary[offset + 2]
-            h = binary[offset + 3]
-            x_adv = binary[offset + 4]
-            x_off = binary[offset + 5] if binary[offset + 5] < 128 else binary[offset + 5] - 256
-            y_off = binary[offset + 6] if binary[offset + 6] < 128 else binary[offset + 6] - 256
+        for i in range(n):
+            off = cp_end + i * 7
+            bm_off = _struct.unpack_from("<H", binary, off)[0]
+            w = binary[off + 2]
+            h = binary[off + 3]
+            x_adv = binary[off + 4]
+            x_off = binary[off + 5] if binary[off + 5] < 128 else binary[off + 5] - 256
+            y_off = binary[off + 6] if binary[off + 6] < 128 else binary[off + 6] - 256
             self.glyphs.append((bm_off, w, h, x_adv, x_off, y_off))
-            offset += 7
-        self.bitmap = binary[offset:]
+        self.bitmap = binary[glyph_end:]
+
+    def _find(self, cp):
+        """Binary search for codepoint cp; returns glyph index or -1."""
+        lo, hi = 0, len(self.codepoints) - 1
+        while lo <= hi:
+            mid = (lo + hi) >> 1
+            c = self.codepoints[mid]
+            if c == cp:
+                return mid
+            elif c < cp:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return -1
 
     def text_width(self, text):
         w = 0
         for ch in text:
-            idx = ord(ch) - self.first
-            if 0 <= idx < len(self.glyphs):
+            idx = self._find(ord(ch))
+            if idx >= 0:
                 w += self.glyphs[idx][3]  # x_advance
         return w
 
     def line_height(self):
         return self.y_advance
+
+    def text_bounds(self, text):
+        """Return (ascent, descent) in pixels for the given string.
+
+        ascent  — pixels above baseline (positive)
+        descent — pixels below baseline (positive)
+        """
+        ascent = 0
+        descent = 0
+        for ch in text:
+            idx = self._find(ord(ch))
+            if idx < 0:
+                continue
+            _, gw, gh, _, _, y_off = self.glyphs[idx]
+            if gw == 0 or gh == 0:
+                continue
+            ascent = max(ascent, -y_off)           # y_off is negative above baseline
+            descent = max(descent, y_off + gh)     # positive if below baseline
+        return ascent, descent
 
     def draw_text(self, painter, x, y, text, color):
         """Draw text at (x, y=baseline) using 1-bit glyph bitmaps."""
@@ -223,8 +402,8 @@ class GfxFontPreview:
         painter.setPen(Qt.NoPen)
         brush = QBrush(color)
         for ch in text:
-            idx = ord(ch) - self.first
-            if idx < 0 or idx >= len(self.glyphs):
+            idx = self._find(ord(ch))
+            if idx < 0:
                 continue
             bm_off, gw, gh, x_adv, x_off, y_off = self.glyphs[idx]
             if gw == 0 or gh == 0:
@@ -272,18 +451,12 @@ class ResourceCache:
         self._check_gen()
         if font_id in self._fonts:
             return self._fonts[font_id]
-        # Find font resource
         for fres in self.model.fonts:
             if fres.get("font_id") != font_id:
                 continue
             try:
-                if "combined_b64" in fres:
-                    data = base64.b64decode(fres["combined_b64"])
-                elif "header_b64" in fres and "data_b64" in fres:
-                    data = base64.b64decode(fres["header_b64"]) + base64.b64decode(fres["data_b64"])
-                else:
-                    data = b""
-                if len(data) >= 6:
+                data = base64.b64decode(fres.get("combined_b64", ""))
+                if len(data) >= 4:
                     font = GfxFontPreview(data)
                     self._fonts[font_id] = font
                     return font
@@ -434,11 +607,14 @@ class DesignerModel(QWidget):
         self._counter = 0
         self._path = None
         self.snap_to_grid = False
+        self.selection = set()   # all currently selected WidgetNodes
+        self.clipboard = None    # dict from WidgetNode.to_dict()
 
         # Project resources — all binary data embedded as base64 in .fui
         self.fonts = []     # [{"name": str, "font_id": int, "header_b64": str, "data_b64": str}]
         self.images = []    # [{"name": str, "image_id": int, "source_name": str, "mode": "auto", "max_colors": 256, "data_b64": str}]
         self.programs = []  # [{"name": str, "exec_mode": "ram"|"flash", "source_b64": str}]
+        self.files = []     # [{"name": str, "source_name": str, "data_b64": str}]
         self._res_gen = 0   # bumped when fonts/images change, for cache invalidation
         self.include_dirs = []  # extra include dirs for compilation
         self.exec_mode = "flash"  # default exec_mode for the main program
@@ -552,9 +728,71 @@ class DesignerModel(QWidget):
         new_parent.children.append(node)
         self.tree_changed.emit()
 
+    def bring_to_front(self, node):
+        if node is self.root or node.parent is None:
+            return
+        siblings = node.parent.children
+        if siblings[-1] is node:
+            return
+        siblings.remove(node)
+        siblings.append(node)
+        self.tree_changed.emit()
+
+    def send_to_back(self, node):
+        if node is self.root or node.parent is None:
+            return
+        siblings = node.parent.children
+        if siblings[0] is node:
+            return
+        siblings.remove(node)
+        siblings.insert(0, node)
+        self.tree_changed.emit()
+
     def select(self, node):
         self.selected = node
+        self.selection = {node} if node else set()
         self.selection_changed.emit()
+
+    def select_toggle(self, node):
+        """Ctrl+click: add/remove node from multi-selection."""
+        if node in self.selection:
+            self.selection.discard(node)
+            if node is self.selected:
+                self.selected = next(iter(self.selection), None)
+        else:
+            self.selection.add(node)
+            self.selected = node
+        self.selection_changed.emit()
+
+    def copy_selected(self):
+        if self.selected and self.selected is not self.root:
+            self.clipboard = self.selected.to_dict()
+
+    def paste_widget(self):
+        if not self.clipboard:
+            return None
+        parent = (self.selected.parent if self.selected and self.selected is not self.root
+                  else self.root)
+        if parent is None:
+            parent = self.root
+        d = dict(self.clipboard)
+        d["loc_x"] = d.get("loc_x", 0) + 10
+        d["loc_y"] = d.get("loc_y", 0) + 10
+        base = self.clipboard.get("name", "widget")
+        name = base + "_copy"
+        n = 1
+        while any(w.name == name for w in self.widgets):
+            name = f"{base}_copy{n}"
+            n += 1
+        d["name"] = name
+        node = WidgetNode.from_dict(d)
+        node.parent = parent
+        parent.children.append(node)
+        self._counter += 1
+        self.widgets.append(node)
+        self.tree_changed.emit()
+        self.select(node)
+        return node
 
     def notify_changed(self):
         self.changed.emit()
@@ -594,6 +832,7 @@ class DesignerModel(QWidget):
         self.fonts = []
         self.images = []
         self.programs = []
+        self.files = []
         self.include_dirs = []
         self.exec_mode = "flash"
         self.render_mode = spec["render_mode"]
@@ -613,6 +852,7 @@ class DesignerModel(QWidget):
             "fonts": self.fonts[:],
             "images": self.images[:],
             "programs": self.programs[:],
+            "files": self.files[:],
             "include_dirs": self.include_dirs[:],
             "exec_mode": self.exec_mode,
             "render_mode": self.render_mode,
@@ -656,22 +896,41 @@ class DesignerModel(QWidget):
         else:
             self.main_fl = DEFAULT_MAIN_FL
 
-        # Resources — migrate old path-based format to embedded
+        # Resources — migrate old path-based / old range-based formats to embedded sparse
         self.fonts = []
         for f_entry in data.get("fonts", []):
-            if "header_b64" in f_entry or "combined_b64" in f_entry:
-                self.fonts.append(f_entry)
+            if "combined_b64" in f_entry:
+                combined = base64.b64decode(f_entry["combined_b64"])
+                # If old range-based format (starts with first/last u16 pair, 6-byte header)
+                if len(combined) >= 6 and not _is_sparse_font(combined):
+                    combined = _old_range_font_to_sparse(combined) or combined
+                self.fonts.append({
+                    "name": f_entry["name"], "font_id": f_entry["font_id"],
+                    "combined_b64": base64.b64encode(combined).decode("ascii"),
+                })
+            elif "header_b64" in f_entry and "data_b64" in f_entry:
+                # Old split format: header (first+last+y_adv+font_id+glyphs) + bitmap
+                combined = (base64.b64decode(f_entry["header_b64"])
+                            + base64.b64decode(f_entry["data_b64"]))
+                if _is_sparse_font(combined):
+                    converted = combined
+                else:
+                    converted = _old_range_font_to_sparse(combined) or combined
+                self.fonts.append({
+                    "name": f_entry["name"], "font_id": f_entry["font_id"],
+                    "combined_b64": base64.b64encode(converted).decode("ascii"),
+                })
             elif "header" in f_entry:
                 # Old format: read files from disk and embed
                 proj_dir = os.path.dirname(os.path.abspath(path))
                 try:
                     h_path = os.path.join(proj_dir, f_entry["header"])
                     d_path = os.path.join(proj_dir, f_entry["data"])
-                    h_b64 = base64.b64encode(open(h_path, "rb").read()).decode("ascii")
-                    d_b64 = base64.b64encode(open(d_path, "rb").read()).decode("ascii")
+                    combined = open(h_path, "rb").read() + open(d_path, "rb").read()
+                    converted = _old_range_font_to_sparse(combined) or combined
                     self.fonts.append({
                         "name": f_entry["name"], "font_id": f_entry["font_id"],
-                        "header_b64": h_b64, "data_b64": d_b64,
+                        "combined_b64": base64.b64encode(converted).decode("ascii"),
                     })
                 except Exception:
                     pass  # skip unreadable fonts
@@ -712,6 +971,23 @@ class DesignerModel(QWidget):
                 except Exception:
                     pass
 
+        self.files = []
+        for fi_entry in data.get("files", []):
+            if "data_b64" in fi_entry:
+                self.files.append(fi_entry)
+            elif "source" in fi_entry:
+                proj_dir = os.path.dirname(os.path.abspath(path))
+                try:
+                    s_path = os.path.join(proj_dir, fi_entry["source"])
+                    s_b64 = base64.b64encode(open(s_path, "rb").read()).decode("ascii")
+                    self.files.append({
+                        "name": fi_entry["name"],
+                        "source_name": os.path.basename(fi_entry["source"]),
+                        "data_b64": s_b64,
+                    })
+                except Exception:
+                    pass
+
         self.include_dirs = data.get("include_dirs", [])
         self.exec_mode = data.get("exec_mode", "flash")
         self.render_mode = render_mode
@@ -744,35 +1020,16 @@ class DesignerModel(QWidget):
         with open(os.path.join(build_dir, "main.fl"), "w", encoding="utf-8") as f:
             f.write(self.main_fl)
 
-        # Fonts — extract to header + data binaries for ferrite_build.py
+        # Fonts — extract as single sparse binary for ferrite_build.py
         font_entries = []
         for font in self.fonts:
-            import struct as st
             name = font["name"]
-            header_file = f"{name}_header.bin"
-            data_file = f"{name}_data.bin"
-
-            if "combined_b64" in font:
-                # Combined binary from .h conversion: split into header + bitmap
-                combined = base64.b64decode(font["combined_b64"])
-                first = int.from_bytes(combined[0:2], 'little')
-                last = int.from_bytes(combined[2:4], 'little')
-                glyph_count = last - first + 1
-                split_at = 6 + glyph_count * 7
-                with open(os.path.join(build_dir, header_file), "wb") as f:
-                    f.write(combined[:split_at])
-                with open(os.path.join(build_dir, data_file), "wb") as f:
-                    f.write(combined[split_at:])
-            else:
-                # Separate header + data binaries
-                with open(os.path.join(build_dir, header_file), "wb") as f:
-                    f.write(base64.b64decode(font["header_b64"]))
-                with open(os.path.join(build_dir, data_file), "wb") as f:
-                    f.write(base64.b64decode(font["data_b64"]))
-
+            font_file = f"{name}.bin"
+            with open(os.path.join(build_dir, font_file), "wb") as f:
+                f.write(base64.b64decode(font["combined_b64"]))
             font_entries.append({
                 "name": name, "font_id": font["font_id"],
-                "header": header_file, "data": data_file,
+                "file": font_file,
             })
 
         # Images — extract source files
@@ -801,6 +1058,14 @@ class DesignerModel(QWidget):
                 "exec_mode": prog.get("exec_mode", "ram"),
             })
 
+        # Files — extract raw user data
+        file_entries = []
+        for fi in self.files:
+            src_name = fi.get("source_name", fi["name"])
+            with open(os.path.join(build_dir, src_name), "wb") as f:
+                f.write(base64.b64decode(fi["data_b64"]))
+            file_entries.append({"name": fi["name"], "source": src_name})
+
         # project.json
         dirs = list(self.include_dirs)
         if "." not in dirs:
@@ -816,6 +1081,7 @@ class DesignerModel(QWidget):
             "programs": [
                 {"name": "main", "source": "main.fl", "exec_mode": self.exec_mode}
             ] + prog_entries,
+            "files": file_entries,
         }
         json_path = os.path.join(build_dir, "project.json")
         with open(json_path, "w", encoding="utf-8") as f:
@@ -838,6 +1104,7 @@ class WidgetItem(QGraphicsItem):
         self._dragging = False
         self._drag_start = None
         self._orig_loc = (0, 0)
+        self._drag_orig_all = {}
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
 
@@ -965,7 +1232,6 @@ class WidgetItem(QGraphicsItem):
             if gfx_font:
                 # Render with actual Adafruit GFX bitmap font
                 tw = gfx_font.text_width(node.text)
-                lh = gfx_font.line_height()
                 content_w = w - pad_l - pad_r - 4
                 content_h = h - pad_t - pad_b
                 # Horizontal alignment
@@ -975,8 +1241,12 @@ class WidgetItem(QGraphicsItem):
                     tx = pad_l + 2 + content_w - tw
                 else:
                     tx = pad_l + 2
-                # Vertical center — y is baseline
-                ty = pad_t + (content_h + lh) // 2 - 2
+                # Vertical center — ty is the baseline Y.
+                # Center on the actual visual bounds (ascent above + descent below baseline).
+                ascent, descent = gfx_font.text_bounds(node.text)
+                if ascent + descent == 0:
+                    ascent, descent = gfx_font.line_height(), 0
+                ty = pad_t + (content_h + ascent - descent) // 2
                 painter.save()
                 painter.setClipRect(QRectF(pad_l, pad_t, w - pad_l - pad_r, content_h))
                 gfx_font.draw_text(painter, int(tx), int(ty), node.text, text_color)
@@ -1001,6 +1271,10 @@ class WidgetItem(QGraphicsItem):
             painter.setPen(QPen(QColor(0, 150, 255), 2, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(QRectF(0, 0, w, h))
+        elif node in self.model.selection:
+            painter.setPen(QPen(QColor(0, 150, 255), 1, Qt.DotLine))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(QRectF(0, 0, w, h))
 
         # Dim if not visible
         if not node.visible:
@@ -1008,25 +1282,45 @@ class WidgetItem(QGraphicsItem):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.model.select(self.node)
-            if self.node is not self.model.root:
-                self._dragging = True
-                self._drag_start = event.scenePos()
-                self._orig_loc = (self.node.loc_x, self.node.loc_y)
+            if event.modifiers() & Qt.ControlModifier:
+                self.model.select_toggle(self.node)
+            else:
+                if self.node not in self.model.selection:
+                    self.model.select(self.node)
+                else:
+                    self.model.selected = self.node
+                    self.model.selection_changed.emit()
+                if self.node is not self.model.root:
+                    self._dragging = True
+                    self._drag_start = event.scenePos()
+                    self._orig_loc = (self.node.loc_x, self.node.loc_y)
+                    self._drag_orig_all = {
+                        n: (n.loc_x, n.loc_y)
+                        for n in self.model.selection
+                        if n is not self.model.root
+                    }
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._dragging:
             delta = event.scenePos() - self._drag_start
-            new_x = self._orig_loc[0] + int(delta.x())
-            new_y = self._orig_loc[1] + int(delta.y())
-            self.node.loc_x = self.model.snap(new_x)
-            self.node.loc_y = self.model.snap(new_y)
+            dx, dy = int(delta.x()), int(delta.y())
+            if len(self._drag_orig_all) > 1:
+                for n, (ox, oy) in self._drag_orig_all.items():
+                    n.loc_x = self.model.snap(ox + dx)
+                    n.loc_y = self.model.snap(oy + dy)
+            else:
+                self.node.loc_x = self.model.snap(self._orig_loc[0] + dx)
+                self.node.loc_y = self.model.snap(self._orig_loc[1] + dy)
             self.model.notify_changed()
+            if self.scene():
+                self.scene().update_guides(self.node)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         self._dragging = False
+        if self.scene():
+            self.scene().clear_guides()
         super().mouseReleaseEvent(event)
 
 
@@ -1096,6 +1390,10 @@ class DesignerScene(QGraphicsScene):
         self.res_cache = ResourceCache(model)
         self.items_map = {}
         self.handles = []
+        self._h_guides = []  # y-coordinates of horizontal guide lines
+        self._v_guides = []  # x-coordinates of vertical guide lines
+        self._rb_origin = None   # QPointF where rubber-band drag started
+        self._rb_rect = None     # QRectF of current rubber-band, or None
         self._update_scene_rect()
         model.tree_changed.connect(self.rebuild)
         model.changed.connect(self.refresh)
@@ -1113,6 +1411,67 @@ class DesignerScene(QGraphicsScene):
         # Screen boundary
         painter.setPen(QPen(QColor(100, 100, 100), 1))
         painter.drawRect(QRectF(-1, -1, self.model.screen_w + 2, self.model.screen_h + 2))
+
+    def drawForeground(self, painter, rect):
+        # Smart guide lines
+        if self._h_guides or self._v_guides:
+            pen = QPen(QColor(0, 210, 255), 0)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            for y in self._h_guides:
+                painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            for x in self._v_guides:
+                painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+
+        # Rubber-band selection rectangle
+        if self._rb_rect and self._rb_rect.width() > 2 and self._rb_rect.height() > 2:
+            painter.save()
+            painter.setPen(QPen(QColor(0, 150, 255), 0, Qt.DashLine))
+            painter.setBrush(QBrush(QColor(0, 120, 255, 40)))
+            painter.drawRect(self._rb_rect)
+            painter.restore()
+
+    def update_guides(self, drag_node):
+        """Compute snap-assist guide lines while dragging drag_node."""
+        ax, ay = drag_node.abs_pos()
+        w, h = drag_node.size_w, drag_node.size_h
+        cx, cy = ax + w / 2, ay + h / 2
+        rx, by = ax + w, ay + h
+
+        drag_h = [ay, cy, by]
+        drag_v = [ax, cx, rx]
+
+        sw, sh = self.model.screen_w, self.model.screen_h
+        src_h = [0, sh / 2, sh]
+        src_v = [0, sw / 2, sw]
+        for node in self.model.widgets:
+            if node is drag_node or node is self.model.root:
+                continue
+            nx, ny = node.abs_pos()
+            nw, nh = node.size_w, node.size_h
+            src_h.extend([ny, ny + nh / 2, ny + nh])
+            src_v.extend([nx, nx + nw / 2, nx + nw])
+
+        self._h_guides = []
+        self._v_guides = []
+        for dy in drag_h:
+            for sy in src_h:
+                if abs(dy - sy) <= GUIDE_SNAP_DIST:
+                    if sy not in self._h_guides:
+                        self._h_guides.append(sy)
+                    break
+        for dx in drag_v:
+            for sx in src_v:
+                if abs(dx - sx) <= GUIDE_SNAP_DIST:
+                    if sx not in self._v_guides:
+                        self._v_guides.append(sx)
+                    break
+        self.update()
+
+    def clear_guides(self):
+        self._h_guides = []
+        self._v_guides = []
+        self.update()
 
     def rebuild(self):
         self._update_scene_rect()
@@ -1174,11 +1533,63 @@ class DesignerScene(QGraphicsScene):
             self.removeItem(h)
         self.handles.clear()
 
+    def _hit_item(self, scene_pos):
+        xform = self.views()[0].transform() if self.views() else __import__('PySide6.QtGui', fromlist=['QTransform']).QTransform()
+        return self.itemAt(scene_pos, xform)
+
     def mousePressEvent(self, event):
-        item = self.itemAt(event.scenePos(), self.views()[0].transform() if self.views() else __import__('PySide6.QtGui', fromlist=['QTransform']).QTransform())
-        if item is None:
-            self.model.select(None)
+        if event.button() == Qt.LeftButton:
+            item = self._hit_item(event.scenePos())
+            is_background = item is None or (
+                isinstance(item, WidgetItem) and item.node is self.model.root)
+            if is_background:
+                # Start rubber-band selection on empty canvas / root background
+                if not (event.modifiers() & Qt.ControlModifier):
+                    self.model.select(None)
+                self._rb_origin = event.scenePos()
+                self._rb_rect = QRectF(self._rb_origin, self._rb_origin)
+                event.accept()
+                return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._rb_origin is not None:
+            pos = event.scenePos()
+            self._rb_rect = QRectF(self._rb_origin, pos).normalized()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._rb_origin is not None:
+            rb = self._rb_rect
+            self._rb_origin = None
+            self._rb_rect = None
+            self.update()
+
+            if rb and (rb.width() > 4 or rb.height() > 4):
+                add = bool(event.modifiers() & Qt.ControlModifier)
+                if not add:
+                    self.model.selection = set()
+                last = None
+                for node in self.model.widgets:
+                    if node is self.model.root:
+                        continue
+                    ax, ay = node.abs_pos()
+                    node_rect = QRectF(ax, ay, node.size_w, node.size_h)
+                    if rb.intersects(node_rect):
+                        self.model.selection.add(node)
+                        last = node
+                if last is not None:
+                    self.model.selected = last
+                elif not add:
+                    self.model.selected = None
+                self.model.selection_changed.emit()
+
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class CanvasView(QGraphicsView):
@@ -1228,11 +1639,14 @@ class TreePanel(QTreeWidget):
         node_items = {}
 
         def add_node(node, parent_item=None):
-            text = f"{node.name} ({kind_name(node.kind)}, {node.size_w}x{node.size_h})"
             if parent_item is None:
-                item = QTreeWidgetItem(self, [text])
+                item = QTreeWidgetItem(self, [node.name])
             else:
-                item = QTreeWidgetItem(parent_item, [text])
+                item = QTreeWidgetItem(parent_item, [node.name])
+            icon = designer_icon(KIND_ICON_NAMES.get(node.kind, ""))
+            if icon:
+                item.setIcon(0, icon)
+            item.setToolTip(0, f"{kind_name(node.kind)}  {node.size_w}×{node.size_h}")
             item.setData(0, Qt.UserRole, node)
             item.setExpanded(True)
             node_items[node] = item
@@ -1726,6 +2140,265 @@ class PropertyEditor(QScrollArea):
 
 
 # ============================================================
+# Add-font dialog
+# ============================================================
+
+class AddFontDialog(QDialog):
+    """Dialog to generate one or more sparse font binaries from a TrueType file."""
+
+    DEFAULT_RANGES = "32-126"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Font from TrueType")
+        self.setMinimumWidth(500)
+        layout = QFormLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        # Font file row
+        file_row = QWidget()
+        fl = QHBoxLayout(file_row)
+        fl.setContentsMargins(0, 0, 0, 0)
+        fl.setSpacing(4)
+        self._file_edit = QLineEdit()
+        self._file_edit.setPlaceholderText("path/to/font.ttf")
+        browse_btn = QPushButton("Browse…")
+        set_icon(browse_btn, "fa5s.folder-open", QStyle.SP_DialogOpenButton)
+        browse_btn.clicked.connect(self._browse)
+        fl.addWidget(self._file_edit, 1)
+        fl.addWidget(browse_btn)
+        layout.addRow("Font file:", file_row)
+
+        # Sizes
+        self._sizes_edit = QLineEdit()
+        self._sizes_edit.setPlaceholderText("e.g. 18,20,24,72")
+        self._sizes_edit.setText("18,20,24")
+        layout.addRow("Sizes (pt):", self._sizes_edit)
+
+        # Codepoint ranges
+        self._ranges_edit = QLineEdit()
+        self._ranges_edit.setPlaceholderText(
+            "e.g. 32-127,0xC7,0xD6,0x011E-0x011F")
+        self._ranges_edit.setText(self.DEFAULT_RANGES)
+        layout.addRow("Codepoint ranges:", self._ranges_edit)
+
+        hint = QLabel(
+            "Sizes: comma-separated point sizes (each becomes a separate font entry).\n"
+            "Ranges: decimal, hex (0x011E), or char ('A'), dash for inclusive ranges.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addRow("", hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Generate & Add")
+        btns.accepted.connect(self._validate_and_accept)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select TrueType Font", "",
+            "TrueType Fonts (*.ttf *.TTF *.otf *.OTF);;All Files (*)")
+        if path:
+            self._file_edit.setText(path)
+
+    def _validate_and_accept(self):
+        if not self._file_edit.text().strip():
+            QMessageBox.warning(self, "Missing file", "Please select a .ttf font file.")
+            return
+        if not os.path.isfile(self._file_edit.text().strip()):
+            QMessageBox.warning(self, "File not found",
+                                f"File not found:\n{self._file_edit.text().strip()}")
+            return
+        try:
+            sizes = self._parse_sizes()
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid sizes", str(e))
+            return
+        if not sizes:
+            QMessageBox.warning(self, "No sizes", "Enter at least one point size.")
+            return
+        try:
+            self._parse_ranges()
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid ranges", str(e))
+            return
+        self.accept()
+
+    def _parse_sizes(self):
+        sizes = []
+        for tok in self._sizes_edit.text().split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                v = int(tok)
+            except ValueError:
+                raise ValueError(f"Not a valid integer: {tok!r}")
+            if v < 4 or v > 256:
+                raise ValueError(f"Size {v} is out of range (4–256).")
+            sizes.append(v)
+        return sizes
+
+    def _parse_ranges(self):
+        # Import lazily — only needed here and in the conversion step.
+        tools_dir = os.path.dirname(os.path.abspath(__file__))
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        from ferrite_font_converter import parse_ranges
+        return parse_ranges(self._ranges_edit.text().strip() or self.DEFAULT_RANGES)
+
+    # Public accessors used by ResourcePanel after accept()
+
+    def font_file(self):
+        return self._file_edit.text().strip()
+
+    def sizes(self):
+        return self._parse_sizes()
+
+    def ranges_spec(self):
+        return self._ranges_edit.text().strip() or self.DEFAULT_RANGES
+
+
+# ============================================================
+# Resource panel
+# ============================================================
+
+# ============================================================
+# SVG icon picker dialog
+# ============================================================
+
+class SvgIconPickerDialog(QDialog):
+    """Browse a folder of SVG icons, filter by name, preview thumbnails."""
+
+    _MAX_VISIBLE = 300
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Browse SVG Icons")
+        self.resize(760, 540)
+        self._folder = QSettings().value(SVG_ICON_FOLDER_KEY, SVG_ICON_FOLDER_DEFAULT)
+        self._all_items = []   # list of (display_name, full_path)
+        self._build_ui()
+        self._scan_folder()
+
+    def _build_ui(self):
+        vbox = QVBoxLayout(self)
+
+        # Folder row
+        fr = QHBoxLayout()
+        fr.addWidget(QLabel("Folder:"))
+        self._folder_edit = QLineEdit(self._folder)
+        self._folder_edit.setReadOnly(True)
+        browse_btn = QPushButton("…")
+        browse_btn.setFixedWidth(32)
+        browse_btn.clicked.connect(self._browse_folder)
+        fr.addWidget(self._folder_edit)
+        fr.addWidget(browse_btn)
+        vbox.addLayout(fr)
+
+        # Search + size row
+        sr = QHBoxLayout()
+        sr.addWidget(QLabel("Search:"))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("type to filter…")
+        self._search.setClearButtonEnabled(True)
+        self._search.textChanged.connect(self._apply_filter)
+        sr.addWidget(self._search)
+        sr.addWidget(QLabel("Size:"))
+        self._size_combo = QComboBox()
+        for px in (16, 24, 32, 48, 64):
+            self._size_combo.addItem(f"{px}px", px)
+        self._size_combo.setCurrentIndex(2)  # default 32 px
+        sr.addWidget(self._size_combo)
+        vbox.addLayout(sr)
+
+        self._count_lbl = QLabel()
+        vbox.addWidget(self._count_lbl)
+
+        # Icon grid
+        self._grid = QListWidget()
+        self._grid.setViewMode(QListWidget.IconMode)
+        self._grid.setIconSize(QSize(48, 48))
+        self._grid.setResizeMode(QListWidget.Adjust)
+        self._grid.setWordWrap(True)
+        self._grid.setSpacing(4)
+        self._grid.setUniformItemSizes(True)
+        self._grid.itemDoubleClicked.connect(self.accept)
+        vbox.addWidget(self._grid)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        vbox.addWidget(btns)
+
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "SVG Icon Folder", self._folder)
+        if folder:
+            self._folder = folder
+            self._folder_edit.setText(folder)
+            QSettings().setValue(SVG_ICON_FOLDER_KEY, folder)
+            self._scan_folder()
+
+    def _scan_folder(self):
+        self._all_items = []
+        if os.path.isdir(self._folder):
+            for fn in sorted(os.listdir(self._folder)):
+                if fn.lower().endswith(".svg"):
+                    self._all_items.append((os.path.splitext(fn)[0],
+                                            os.path.join(self._folder, fn)))
+        self._apply_filter(self._search.text())
+
+    def _apply_filter(self, query):
+        q = query.strip().lower()
+        if q:
+            words = q.split()
+            filtered = [(d, p) for d, p in self._all_items
+                        if all(w in d.lower() for w in words)]
+        else:
+            filtered = self._all_items
+
+        total = len(filtered)
+        capped = filtered[:self._MAX_VISIBLE]
+        suffix = f"  (showing first {self._MAX_VISIBLE})" if total > self._MAX_VISIBLE else ""
+        self._count_lbl.setText(f"{total} icons{suffix}")
+
+        self._grid.clear()
+        for display, path in capped:
+            item = QListWidgetItem(display)
+            item.setData(Qt.UserRole, path)
+            item.setIcon(QIcon(path))   # Qt renders SVG lazily via QtSvg
+            item.setSizeHint(QSize(84, 72))
+            self._grid.addItem(item)
+
+    def selected_path(self):
+        item = self._grid.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def selected_size(self):
+        return self._size_combo.currentData()
+
+    @staticmethod
+    def render_svg_to_png(path, size):
+        """Render an SVG file to PNG bytes at *size* × *size* pixels."""
+        try:
+            from PySide6.QtSvg import QSvgRenderer
+        except ImportError:
+            raise RuntimeError("PySide6.QtSvg is required: pip install PySide6")
+        renderer = QSvgRenderer(path)
+        img = QImage(size, size, QImage.Format_ARGB32)
+        img.fill(0)  # transparent
+        painter = QPainter(img)
+        renderer.render(painter)
+        painter.end()
+        buf = QBuffer()
+        buf.open(QBuffer.WriteOnly)
+        img.save(buf, "PNG")
+        return bytes(buf.data())
+
+
+# ============================================================
 # Resource panel
 # ============================================================
 
@@ -1769,10 +2442,14 @@ class ResourcePanel(QWidget):
         add_img_btn = QPushButton("+ Image")
         set_icon(add_img_btn, "fa5s.image", QStyle.SP_FileIcon)
         add_img_btn.clicked.connect(self._add_image)
+        svg_btn = QPushButton("Browse Icons…")
+        set_icon(svg_btn, "fa5s.icons", QStyle.SP_FileDialogListView)
+        svg_btn.clicked.connect(self._add_image_from_svg)
         rm_img_btn = QPushButton("- Image")
         set_icon(rm_img_btn, "fa5s.trash", QStyle.SP_TrashIcon)
         rm_img_btn.clicked.connect(self._rm_image)
         ib.addWidget(add_img_btn)
+        ib.addWidget(svg_btn)
         ib.addWidget(rm_img_btn)
         ib.addStretch()
         layout.addLayout(ib)
@@ -1795,6 +2472,25 @@ class ResourcePanel(QWidget):
         pb.addWidget(rm_prog_btn)
         pb.addStretch()
         layout.addLayout(pb)
+
+        # Arbitrary files
+        layout.addWidget(QLabel("Files"))
+        self.file_list = QTreeWidget()
+        self.file_list.setHeaderLabels(["Name", "Source", "Size"])
+        self.file_list.setMaximumHeight(80)
+        self.file_list.setRootIsDecorated(False)
+        layout.addWidget(self.file_list)
+        fib = QHBoxLayout()
+        add_file_btn = QPushButton("+ File")
+        set_icon(add_file_btn, "fa5s.file", QStyle.SP_FileIcon)
+        add_file_btn.clicked.connect(self._add_file)
+        rm_file_btn = QPushButton("- File")
+        set_icon(rm_file_btn, "fa5s.trash", QStyle.SP_TrashIcon)
+        rm_file_btn.clicked.connect(self._rm_file)
+        fib.addWidget(add_file_btn)
+        fib.addWidget(rm_file_btn)
+        fib.addStretch()
+        layout.addLayout(fib)
 
         # Include dirs
         layout.addWidget(QLabel("Include Dirs (comma-separated)"))
@@ -1826,15 +2522,10 @@ class ResourcePanel(QWidget):
     def refresh(self):
         self.font_list.clear()
         for f in self.model.fonts:
-            if "combined_b64" in f:
-                size = len(base64.b64decode(f["combined_b64"]))
-                src = ".h"
-            else:
-                size = len(base64.b64decode(f.get("header_b64", ""))) + len(base64.b64decode(f.get("data_b64", "")))
-                src = ".bin"
+            size = len(base64.b64decode(f.get("combined_b64", "")))
             QTreeWidgetItem(self.font_list, [
                 f.get("name", ""), str(f.get("font_id", "")),
-                f"{size} B ({src})"])
+                f"{size} B"])
         self.image_list.clear()
         for img in self.model.images:
             size = len(base64.b64decode(img.get("data_b64", "")))
@@ -1846,6 +2537,12 @@ class ResourcePanel(QWidget):
             QTreeWidgetItem(self.prog_list, [
                 p.get("name", ""), p.get("exec_mode", "ram"),
                 f"{len(base64.b64decode(p.get('source_b64', '')))} bytes"])
+        self.file_list.clear()
+        for fi in self.model.files:
+            size = len(base64.b64decode(fi.get("data_b64", "")))
+            QTreeWidgetItem(self.file_list, [
+                fi.get("name", ""), fi.get("source_name", ""),
+                f"{size} B"])
         self.include_edit.setText(", ".join(self.model.include_dirs))
         idx = self.exec_combo.findText(self.model.exec_mode)
         if idx >= 0:
@@ -1855,53 +2552,90 @@ class ResourcePanel(QWidget):
             self.render_combo.setCurrentIndex(idx)
 
     def _add_font(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Font File (.h or .bin)",  "",
-            "Adafruit GFX Header (*.h);;Binary header+data (*.bin);;All (*)")
-        if not path:
+        dlg = AddFontDialog(self)
+        if dlg.exec() != QDialog.Accepted:
             return
 
-        name = os.path.splitext(os.path.basename(path))[0]
-        used_ids = {f.get("font_id", 0) for f in self.model.fonts}
-        fid = 1
-        while fid in used_ids:
-            fid += 1
+        # Lazy-import converter (requires freetype-py)
+        try:
+            import io as _io
+            tools_dir = os.path.dirname(os.path.abspath(__file__))
+            if tools_dir not in sys.path:
+                sys.path.insert(0, tools_dir)
+            from ferrite_font_converter import rasterize, write_resource, parse_ranges
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "Missing dependency",
+                "ferrite_font_converter requires freetype-py.\n\n"
+                "Install it with:\n    pip install freetype-py\n\n"
+                f"Detail: {e}")
+            return
 
-        if path.lower().endswith(".h"):
-            # Auto-convert Adafruit GFX .h → combined binary
+        font_path = dlg.font_file()
+        sizes = dlg.sizes()
+        ranges_spec = dlg.ranges_spec()
+        basename = (os.path.splitext(os.path.basename(font_path))[0]
+                    .lower().replace(" ", "_"))
+
+        try:
+            codes = parse_ranges(ranges_spec)
+        except ValueError as e:
+            QMessageBox.critical(self, "Invalid ranges", str(e))
+            return
+
+        used_ids = {f.get("font_id", 0) for f in self.model.fonts}
+        next_id = max(used_ids, default=0) + 1
+
+        progress = QProgressDialog("Generating fonts…", "Cancel", 0, len(sizes), self)
+        progress.setWindowTitle("Add Font")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        added = []
+        errors = []
+
+        for i, size in enumerate(sizes):
+            if progress.wasCanceled():
+                break
+            progress.setValue(i)
+            progress.setLabelText(
+                f"Rendering {basename} {size} pt  ({i + 1}/{len(sizes)})…")
+            QApplication.processEvents()
+
+            while next_id in used_ids:
+                next_id += 1
+
+            name = f"{basename}_{size}"
+            if any(f["name"] == name for f in self.model.fonts):
+                errors.append(f"{name}: already exists, skipped")
+                continue
+
             try:
-                combined = gfx_header_to_bin(path, fid)
-                # Split into header (first 6 bytes) and rest (glyphs + bitmap)
-                # But for our combined format, header_b64 = first 6 bytes + glyphs, data_b64 = bitmap
-                # Actually, ferrite_build.py expects header (first+last+yAdvance + glyphs) and data (bitmap) separately
-                # Then it injects font_id at byte 5 and concatenates them
-                # Simpler: store as combined, extract_to_dir writes the combined binary
-                header_b64 = base64.b64encode(combined).decode("ascii")
+                bitmap, table, y_advance = rasterize(font_path, size, codes)
+                buf = _io.BytesIO()
+                write_resource(bitmap, table, y_advance, next_id, buf)
                 self.model.fonts.append({
-                    "name": name, "font_id": fid,
-                    "combined_b64": header_b64,
+                    "name": name,
+                    "font_id": next_id,
+                    "combined_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
                 })
-                self.model._res_gen += 1
-                self.refresh()
-                self.model.notify_changed()
+                used_ids.add(next_id)
+                next_id += 1
+                added.append(name)
             except Exception as e:
-                QMessageBox.critical(self, "Font Conversion Error",
-                                     f"Failed to parse {os.path.basename(path)}:\n\n{e}")
-        else:
-            # Binary: ask for header + data pair
-            header_b64 = base64.b64encode(open(path, "rb").read()).decode("ascii")
-            data, _ = QFileDialog.getOpenFileName(
-                self, "Font Bitmap (.bin)", os.path.dirname(path), "Binary (*.bin)")
-            if not data:
-                return
-            data_b64 = base64.b64encode(open(data, "rb").read()).decode("ascii")
-            self.model.fonts.append({
-                "name": name, "font_id": fid,
-                "header_b64": header_b64, "data_b64": data_b64,
-            })
+                errors.append(f"{name}: {e}")
+
+        progress.setValue(len(sizes))
+
+        if added:
             self.model._res_gen += 1
             self.refresh()
             self.model.notify_changed()
+
+        if errors:
+            QMessageBox.warning(
+                self, "Font generation",
+                f"Added {len(added)} font(s).\n\nIssues:\n" + "\n".join(errors))
 
     def _rm_font(self):
         idx = self.font_list.indexOfTopLevelItem(self.font_list.currentItem())
@@ -1931,6 +2665,34 @@ class ResourcePanel(QWidget):
         self.refresh()
         self.model.notify_changed()
 
+    def _add_image_from_svg(self):
+        dlg = SvgIconPickerDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        path = dlg.selected_path()
+        if not path:
+            return
+        size = dlg.selected_size()
+        try:
+            png_bytes = SvgIconPickerDialog.render_svg_to_png(path, size)
+        except Exception as e:
+            QMessageBox.warning(self, "SVG Error", f"Could not render SVG:\n{e}")
+            return
+        name = os.path.splitext(os.path.basename(path))[0][:15]
+        used_ids = {img.get("image_id", 0) for img in self.model.images}
+        iid = 1
+        while iid in used_ids:
+            iid += 1
+        self.model.images.append({
+            "name": name, "image_id": iid,
+            "source_name": os.path.basename(path),
+            "mode": "auto", "max_colors": device_spec(self.model.device_id)["image_max_colors"],
+            "data_b64": base64.b64encode(png_bytes).decode("ascii"),
+        })
+        self.model._res_gen += 1
+        self.refresh()
+        self.model.notify_changed()
+
     def _rm_image(self):
         idx = self.image_list.indexOfTopLevelItem(self.image_list.currentItem())
         if idx >= 0 and idx < len(self.model.images):
@@ -1953,6 +2715,32 @@ class ResourcePanel(QWidget):
         if idx >= 0 and idx < len(self.model.programs):
             self.model.programs.pop(idx)
             self.refresh()
+
+    def _add_file(self):
+        source, _ = QFileDialog.getOpenFileName(self, "Add File", "", "All Files (*)")
+        if not source:
+            return
+        src_name = os.path.basename(source)
+        # Strip extension for the resource name, max 15 chars
+        name = os.path.splitext(src_name)[0][:15]
+        # Ensure unique name
+        existing = {fi["name"] for fi in self.model.files}
+        base = name
+        n = 1
+        while name in existing:
+            name = f"{base[:13]}_{n}"
+            n += 1
+        data_b64 = base64.b64encode(open(source, "rb").read()).decode("ascii")
+        self.model.files.append({"name": name, "source_name": src_name, "data_b64": data_b64})
+        self.refresh()
+        self.model.notify_changed()
+
+    def _rm_file(self):
+        idx = self.file_list.indexOfTopLevelItem(self.file_list.currentItem())
+        if 0 <= idx < len(self.model.files):
+            self.model.files.pop(idx)
+            self.refresh()
+            self.model.notify_changed()
 
     def _update_includes(self):
         text = self.include_edit.text().strip()
@@ -2089,15 +2877,15 @@ def generate_fl(model):
 # ============================================================
 
 def gfx_header_to_bin(h_path, font_id=0):
-    """Parse an Adafruit GFX C header (.h) and produce the combined flash binary.
+    """Parse an Adafruit GFX C header (.h) and produce a sparse flash binary.
 
-    Flash binary format:
-      [0..2]  first: u16 LE
-      [2..4]  last: u16 LE
-      [4]     y_advance: u8
-      [5]     font_id: u8
-      [6..]   glyph table (7 bytes per glyph: bitmapOffset u16LE, w, h, xAdv, xOff i8, yOff i8)
-      [6+N*7..] bitmap data (1-bit packed, MSB first)
+    New sparse flash binary format:
+      [0..2]         num_glyphs: u16 LE
+      [2]            y_advance: u8
+      [3]            font_id: u8
+      [4..4+N*2]     codepoints: N x u16 LE, sorted ascending (range first..last)
+      [4+N*2..4+N*9] glyphs: N x 7 bytes
+      [4+N*9..]      bitmap data (1-bit packed, MSB first)
     """
     import re
     import struct
@@ -2112,14 +2900,14 @@ def gfx_header_to_bin(h_path, font_id=0):
         raise ValueError("Bitmap array not found (expected: const uint8_t ...Bitmaps[] = {...})")
     bitmap_bytes = bytes(int(x.strip(), 0) for x in bm.group(1).split(",") if x.strip())
 
-    # Glyph array — strip C comments before parsing to avoid ' in comments breaking the regex
+    # Glyph array — strip C comments before parsing
     gm = re.search(
         r"const\s+GFXglyph\s+\w+Glyphs\[\]\s+(?:PROGMEM\s*)?=\s*\{(.+?)\};",
         src, re.DOTALL)
     if not gm:
         raise ValueError("Glyph array not found (expected: const GFXglyph ...Glyphs[] = {...})")
 
-    glyph_text = re.sub(r"//[^\n]*", "", gm.group(1))  # strip line comments
+    glyph_text = re.sub(r"//[^\n]*", "", gm.group(1))
     glyphs = []
     for m in re.finditer(r"\{([^}]+)\}", glyph_text):
         vals = [v.strip() for v in m.group(1).split(",") if v.strip()]
@@ -2138,15 +2926,14 @@ def gfx_header_to_bin(h_path, font_id=0):
 
     glyph_count = last - first + 1
     if len(glyphs) < glyph_count:
-        raise ValueError(f"Expected {glyph_count} glyphs (first=0x{first:02X}, last=0x{last:02X}), found {len(glyphs)}")
+        raise ValueError(
+            f"Expected {glyph_count} glyphs (first=0x{first:02X}, last=0x{last:02X}), found {len(glyphs)}")
 
-    # Build binary
+    # Build new sparse binary
     out = bytearray()
-    out.extend(struct.pack("<HH", first, last))  # first, last (u16 LE)
-    out.append(y_advance)                          # y_advance (u8)
-    out.append(font_id & 0xFF)                     # font_id (u8)
-
-    # Glyph table
+    out.extend(struct.pack("<HBB", glyph_count, y_advance, font_id & 0xFF))
+    for cp in range(first, last + 1):
+        out.extend(struct.pack("<H", cp))
     for g in glyphs[:glyph_count]:
         offset, w, h, x_adv, x_off, y_off = g
         out.extend(struct.pack("<H", offset & 0xFFFF))
@@ -2155,8 +2942,6 @@ def gfx_header_to_bin(h_path, font_id=0):
         out.append(x_adv & 0xFF)
         out.append(x_off & 0xFF)  # i8 as u8
         out.append(y_off & 0xFF)  # i8 as u8
-
-    # Bitmap data
     out.extend(bitmap_bytes)
 
     return bytes(out)
@@ -2904,34 +3689,49 @@ class DesignerWindow(QMainWindow):
         self.resources = ResourcePanel(self.model)
         self.code_editor = CodeEditorPanel(self.model)
 
-        # Layout: left panel (tree + props) | center tabs (Design/Code) | right (resources)
-        left_splitter = QSplitter(Qt.Vertical)
-        left_splitter.addWidget(self.tree)
-        left_splitter.addWidget(self.props)
-        left_splitter.setStretchFactor(0, 1)
-        left_splitter.setStretchFactor(1, 2)
-
         self.center_tabs = QTabWidget()
         self.center_tabs.addTab(self.canvas, "Design")
         self.center_tabs.addTab(self.code_editor, "Code (main.fl)")
         self.center_tabs.currentChanged.connect(self._on_tab_changed)
+        self.setCentralWidget(self.center_tabs)
 
-        right_splitter = QSplitter(Qt.Vertical)
-        right_splitter.addWidget(self.resources)
+        self.setDockOptions(
+            QMainWindow.DockOption.AnimatedDocks |
+            QMainWindow.DockOption.AllowNestedDocks |
+            QMainWindow.DockOption.AllowTabbedDocks
+        )
 
-        main_splitter = QSplitter(Qt.Horizontal)
-        main_splitter.addWidget(left_splitter)
-        main_splitter.addWidget(self.center_tabs)
-        main_splitter.addWidget(right_splitter)
-        main_splitter.setStretchFactor(0, 0)
-        main_splitter.setStretchFactor(1, 1)
-        main_splitter.setStretchFactor(2, 0)
-        main_splitter.setSizes([300, 680, 280])
-        self.setCentralWidget(main_splitter)
+        self._dock_tree = QDockWidget("Widget Tree", self)
+        self._dock_tree.setObjectName("dock_tree")
+        self._dock_tree.setWidget(self.tree)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self._dock_tree)
+
+        self._dock_props = QDockWidget("Properties", self)
+        self._dock_props.setObjectName("dock_props")
+        self._dock_props.setWidget(self.props)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self._dock_props)
+        self.splitDockWidget(self._dock_tree, self._dock_props, Qt.Vertical)
+
+        self._dock_resources = QDockWidget("Resources", self)
+        self._dock_resources.setObjectName("dock_resources")
+        self._dock_resources.setWidget(self.resources)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._dock_resources)
+
+        self.resizeDocks(
+            [self._dock_tree, self._dock_props], [220, 380], Qt.Vertical
+        )
+        self.resizeDocks([self._dock_tree], [260], Qt.Horizontal)
+        self.resizeDocks([self._dock_resources], [260], Qt.Horizontal)
 
         self._build_toolbar()
         self._build_menu()
         self.statusBar().showMessage(self._device_status())
+
+        s = self._settings()
+        if s.value("geometry"):
+            self.restoreGeometry(s.value("geometry"))
+        if s.value("windowState"):
+            self.restoreState(s.value("windowState"))
 
     def _device_status(self):
         spec = device_spec(self.model.device_id)
@@ -2957,20 +3757,11 @@ class DesignerWindow(QMainWindow):
 
     def _build_toolbar(self):
         tb = self.addToolBar("Widgets")
+        tb.setObjectName("tb_widgets")
         tb.setMovable(False)
-        kind_icons = {
-            KIND_BASE: "fa5s.square",
-            KIND_LABEL: "fa5s.font",
-            KIND_BUTTON: "fa5s.hand-pointer",
-            KIND_PROGRESS: "fa5s.tasks",
-            KIND_SLIDER: "fa5s.sliders-h",
-            KIND_CHECKBOX: "fa5s.check-square",
-            KIND_RADIO: "fa5s.dot-circle",
-            KIND_DROPDOWN: "fa5s.caret-square-down",
-        }
         for idx, kind in enumerate(KIND_VALUES):
             act = QAction(f"+ {KIND_NAMES[idx]}", self)
-            set_icon(act, kind_icons.get(kind), QStyle.SP_FileIcon)
+            set_icon(act, KIND_ICON_NAMES.get(kind), QStyle.SP_FileIcon)
             act.triggered.connect(lambda checked, k=kind: self.model.add_widget(k))
             tb.addAction(act)
         tb.addSeparator()
@@ -2979,6 +3770,16 @@ class DesignerWindow(QMainWindow):
         del_act.setToolTip("Delete selected widget (Del)")
         del_act.triggered.connect(self._delete_selected)
         tb.addAction(del_act)
+        front_act = QAction("Bring to Front", self)
+        set_icon(front_act, "fa5s.arrow-up", QStyle.SP_ArrowUp)
+        front_act.setToolTip("Bring selected widget to front (])")
+        front_act.triggered.connect(self._bring_to_front)
+        tb.addAction(front_act)
+        back_act = QAction("Send to Back", self)
+        set_icon(back_act, "fa5s.arrow-down", QStyle.SP_ArrowDown)
+        back_act.setToolTip("Send selected widget to back ([)")
+        back_act.triggered.connect(self._send_to_back)
+        tb.addAction(back_act)
         tb.addSeparator()
         snap_act = QAction("Snap Grid", self)
         set_icon(snap_act, "fa5s.th", QStyle.SP_FileDialogDetailedView)
@@ -3007,6 +3808,7 @@ class DesignerWindow(QMainWindow):
         tb.addSeparator()
         tb.addWidget(QLabel(" Port: "))
         self.port_combo = QComboBox()
+        self.port_combo.setObjectName("port_combo_main")
         self.port_combo.setEditable(True)
         self.port_combo.setMinimumWidth(100)
         tb.addWidget(self.port_combo)
@@ -3015,6 +3817,62 @@ class DesignerWindow(QMainWindow):
         refresh_act.triggered.connect(self._refresh_ports)
         tb.addAction(refresh_act)
         self._refresh_ports()
+
+        # Second toolbar: clipboard + align + size
+        tb2 = self.addToolBar("Align")
+        tb2.setObjectName("tb_align")
+        tb2.setMovable(False)
+
+        copy_act = QAction("Copy", self)
+        set_icon(copy_act, "fa5s.copy", QStyle.SP_FileIcon)
+        copy_act.setToolTip("Copy selected widget (Ctrl+C)")
+        copy_act.setShortcut(QKeySequence("Ctrl+C"))
+        copy_act.triggered.connect(self._copy_widget)
+        tb2.addAction(copy_act)
+
+        paste_act = QAction("Paste", self)
+        set_icon(paste_act, "fa5s.paste", QStyle.SP_FileIcon)
+        paste_act.setToolTip("Paste widget (Ctrl+V)")
+        paste_act.setShortcut(QKeySequence("Ctrl+V"))
+        paste_act.triggered.connect(self._paste_widget)
+        tb2.addAction(paste_act)
+
+        dup_act = QAction("Duplicate", self)
+        set_icon(dup_act, "fa5s.clone", QStyle.SP_FileIcon)
+        dup_act.setToolTip("Duplicate selected widget (Ctrl+D)")
+        dup_act.setShortcut(QKeySequence("Ctrl+D"))
+        dup_act.triggered.connect(self._duplicate_widget)
+        tb2.addAction(dup_act)
+
+        tb2.addSeparator()
+        tb2.addWidget(QLabel(" Align: "))
+
+        for label, tip, slot, icon in (
+            ("⇐L", "Align left edges",        self._align_left,     "fa5s.align-left"),
+            ("⇒R", "Align right edges",        self._align_right,    "fa5s.align-right"),
+            ("⇑T", "Align top edges",          self._align_top,      "fa5s.align-top"),
+            ("⇓B", "Align bottom edges",       self._align_bottom,   "fa5s.align-bottom"),
+            ("⇔H", "Center horizontally",      self._center_h,       "fa5s.center-h"),
+            ("⇕V", "Center vertically",        self._center_v,       "fa5s.center-v"),
+        ):
+            act = QAction(label, self)
+            act.setToolTip(tip)
+            act.triggered.connect(slot)
+            set_icon(act, icon)
+            tb2.addAction(act)
+
+        tb2.addSeparator()
+        tb2.addWidget(QLabel(" Size: "))
+
+        sw_act = QAction("=W", self)
+        sw_act.setToolTip("Make same width as primary selection")
+        sw_act.triggered.connect(self._same_width)
+        tb2.addAction(sw_act)
+
+        sh_act = QAction("=H", self)
+        sh_act.setToolTip("Make same height as primary selection")
+        sh_act.triggered.connect(self._same_height)
+        tb2.addAction(sh_act)
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -3060,11 +3918,46 @@ class DesignerWindow(QMainWindow):
         set_icon(del_act, "fa5s.trash", QStyle.SP_TrashIcon)
         del_act.setShortcut(QKeySequence.Delete)
         del_act.triggered.connect(self._delete_selected)
+        edit_menu.addSeparator()
+        copy_act2 = edit_menu.addAction("&Copy")
+        set_icon(copy_act2, "fa5s.copy", QStyle.SP_FileIcon)
+        copy_act2.setShortcut(QKeySequence("Ctrl+C"))
+        copy_act2.triggered.connect(self._copy_widget)
+        paste_act2 = edit_menu.addAction("&Paste")
+        set_icon(paste_act2, "fa5s.paste", QStyle.SP_FileIcon)
+        paste_act2.setShortcut(QKeySequence("Ctrl+V"))
+        paste_act2.triggered.connect(self._paste_widget)
+        dup_act2 = edit_menu.addAction("D&uplicate")
+        set_icon(dup_act2, "fa5s.clone", QStyle.SP_FileIcon)
+        dup_act2.setShortcut(QKeySequence("Ctrl+D"))
+        dup_act2.triggered.connect(self._duplicate_widget)
+        edit_menu.addSeparator()
+        front_act2 = edit_menu.addAction("Bring to &Front")
+        set_icon(front_act2, "fa5s.arrow-up", QStyle.SP_ArrowUp)
+        front_act2.setShortcut(QKeySequence("]"))
+        front_act2.triggered.connect(self._bring_to_front)
+        back_act2 = edit_menu.addAction("Send to &Back")
+        set_icon(back_act2, "fa5s.arrow-down", QStyle.SP_ArrowDown)
+        back_act2.setShortcut(QKeySequence("["))
+        back_act2.triggered.connect(self._send_to_back)
+        edit_menu.addSeparator()
+        align_menu = edit_menu.addMenu("&Align")
+        for label, slot in (
+            ("Align &Left",             self._align_left),
+            ("Align &Right",            self._align_right),
+            ("Align &Top",              self._align_top),
+            ("Align &Bottom",           self._align_bottom),
+            ("Center &Horizontally",    self._center_h),
+            ("Center &Vertically",      self._center_v),
+        ):
+            align_menu.addAction(label).triggered.connect(slot)
+        size_menu = edit_menu.addMenu("&Size")
+        size_menu.addAction("Same &Width").triggered.connect(self._same_width)
+        size_menu.addAction("Same &Height").triggered.connect(self._same_height)
 
         device_menu = mb.addMenu("&Device")
         device_act = device_menu.addAction("&Device Manager...")
         set_icon(device_act, "fa5s.microchip", QStyle.SP_ComputerIcon)
-        device_act.setShortcut(QKeySequence("Ctrl+D"))
         device_act.triggered.connect(self._show_device)
         device_menu.addSeparator()
         build_upload_act = device_menu.addAction("Build && &Upload")
@@ -3078,6 +3971,16 @@ class DesignerWindow(QMainWindow):
         fit_act.setShortcut(QKeySequence("Ctrl+0"))
         fit_act.triggered.connect(lambda: self.canvas.fitInView(
             self.scene.sceneRect(), Qt.KeepAspectRatio))
+        view_menu.addSeparator()
+        view_menu.addAction(self._dock_tree.toggleViewAction())
+        view_menu.addAction(self._dock_props.toggleViewAction())
+        view_menu.addAction(self._dock_resources.toggleViewAction())
+
+    def closeEvent(self, event):
+        s = self._settings()
+        s.setValue("geometry", self.saveGeometry())
+        s.setValue("windowState", self.saveState())
+        super().closeEvent(event)
 
     def _on_tab_changed(self, index):
         if index == 1:  # Code tab — show main.fl from model
@@ -3146,6 +4049,156 @@ class DesignerWindow(QMainWindow):
     def _delete_selected(self):
         if self.model.selected and self.model.selected is not self.model.root:
             self.model.remove_widget(self.model.selected)
+
+    def _bring_to_front(self):
+        if self.model.selected:
+            self.model.bring_to_front(self.model.selected)
+
+    def _send_to_back(self):
+        if self.model.selected:
+            self.model.send_to_back(self.model.selected)
+
+    # --- Copy / Paste / Duplicate ---
+
+    def _copy_widget(self):
+        self.model.copy_selected()
+        if self.model.clipboard:
+            self.statusBar().showMessage("Copied", 2000)
+
+    def _paste_widget(self):
+        node = self.model.paste_widget()
+        if node:
+            self.statusBar().showMessage(f"Pasted as '{node.name}'", 2000)
+
+    def _duplicate_widget(self):
+        to_dup = [n for n in self.model.selection if n is not self.model.root]
+        if not to_dup and self.model.selected and self.model.selected is not self.model.root:
+            to_dup = [self.model.selected]
+        if not to_dup:
+            return
+        new_nodes = []
+        for node in to_dup:
+            d = dict(node.to_dict())
+            d["loc_x"] = d.get("loc_x", 0) + 10
+            d["loc_y"] = d.get("loc_y", 0) + 10
+            base = node.name
+            dup_name = base + "_copy"
+            n_sfx = 1
+            while any(w.name == dup_name for w in self.model.widgets):
+                dup_name = f"{base}_copy{n_sfx}"
+                n_sfx += 1
+            d["name"] = dup_name
+            new_node = WidgetNode.from_dict(d)
+            parent = node.parent if node.parent else self.model.root
+            new_node.parent = parent
+            parent.children.append(new_node)
+            self.model._counter += 1
+            self.model.widgets.append(new_node)
+            new_nodes.append(new_node)
+        if new_nodes:
+            self.model.selection = set(new_nodes)
+            self.model.selected = new_nodes[-1]
+            self.model.tree_changed.emit()
+            self.model.selection_changed.emit()
+            self.statusBar().showMessage(f"Duplicated {len(new_nodes)} widget(s)", 2000)
+
+    # --- Alignment helpers ---
+
+    def _selection_secondary(self):
+        """Return the set of selected widgets that are NOT the primary anchor."""
+        anchor = self.model.selected
+        if not anchor or anchor is self.model.root:
+            return set()
+        others = self.model.selection - {anchor}
+        return {n for n in others if n is not self.model.root}
+
+    def _parent_content_origin(self, node):
+        """Return (px, py) of the content area origin of node's parent in scene coords."""
+        p = node.parent
+        if p is None:
+            return 0, 0
+        px, py = p.abs_pos()
+        return px + p.border[3] + p.padding[3], py + p.border[0] + p.padding[0]
+
+    def _align_left(self):
+        anchor = self.model.selected
+        if not anchor or anchor is self.model.root:
+            return
+        ax, _ = anchor.abs_pos()
+        for node in self._selection_secondary():
+            pcx, _ = self._parent_content_origin(node)
+            node.loc_x = ax - pcx
+        self.model.notify_changed()
+
+    def _align_right(self):
+        anchor = self.model.selected
+        if not anchor or anchor is self.model.root:
+            return
+        ax, _ = anchor.abs_pos()
+        right = ax + anchor.size_w
+        for node in self._selection_secondary():
+            pcx, _ = self._parent_content_origin(node)
+            node.loc_x = right - node.size_w - pcx
+        self.model.notify_changed()
+
+    def _align_top(self):
+        anchor = self.model.selected
+        if not anchor or anchor is self.model.root:
+            return
+        _, ay = anchor.abs_pos()
+        for node in self._selection_secondary():
+            _, pcy = self._parent_content_origin(node)
+            node.loc_y = ay - pcy
+        self.model.notify_changed()
+
+    def _align_bottom(self):
+        anchor = self.model.selected
+        if not anchor or anchor is self.model.root:
+            return
+        _, ay = anchor.abs_pos()
+        bottom = ay + anchor.size_h
+        for node in self._selection_secondary():
+            _, pcy = self._parent_content_origin(node)
+            node.loc_y = bottom - node.size_h - pcy
+        self.model.notify_changed()
+
+    def _center_h(self):
+        anchor = self.model.selected
+        if not anchor or anchor is self.model.root:
+            return
+        ax, _ = anchor.abs_pos()
+        cx = ax + anchor.size_w / 2
+        for node in self._selection_secondary():
+            pcx, _ = self._parent_content_origin(node)
+            node.loc_x = int(cx - node.size_w / 2 - pcx)
+        self.model.notify_changed()
+
+    def _center_v(self):
+        anchor = self.model.selected
+        if not anchor or anchor is self.model.root:
+            return
+        _, ay = anchor.abs_pos()
+        cy = ay + anchor.size_h / 2
+        for node in self._selection_secondary():
+            _, pcy = self._parent_content_origin(node)
+            node.loc_y = int(cy - node.size_h / 2 - pcy)
+        self.model.notify_changed()
+
+    def _same_width(self):
+        anchor = self.model.selected
+        if not anchor or anchor is self.model.root:
+            return
+        for node in self._selection_secondary():
+            node.size_w = anchor.size_w
+        self.model.notify_changed()
+
+    def _same_height(self):
+        anchor = self.model.selected
+        if not anchor or anchor is self.model.root:
+            return
+        for node in self._selection_secondary():
+            node.size_h = anchor.size_h
+        self.model.notify_changed()
 
     def _show_code(self):
         designer_code = generate_designer_fl(self.model)
@@ -3411,28 +4464,104 @@ class DesignerWindow(QMainWindow):
 # Entry point
 # ============================================================
 
-def main():
-    app = QApplication(sys.argv)
+def _apply_fusion_palette(app):
     app.setStyle("Fusion")
+    pal = app.palette()
 
-    window = DesignerWindow()
+    # Base surfaces
+    pal.setColor(pal.ColorRole.Window,          QColor(245, 246, 250))
+    pal.setColor(pal.ColorRole.WindowText,      QColor( 30,  30,  40))
+    pal.setColor(pal.ColorRole.Base,            QColor(255, 255, 255))
+    pal.setColor(pal.ColorRole.AlternateBase,   QColor(235, 237, 245))
+    pal.setColor(pal.ColorRole.ToolTipBase,     QColor(255, 255, 220))
+    pal.setColor(pal.ColorRole.ToolTipText,     QColor( 30,  30,  40))
+    pal.setColor(pal.ColorRole.PlaceholderText, QColor(160, 160, 180))
+    pal.setColor(pal.ColorRole.Text,            QColor( 30,  30,  40))
+    pal.setColor(pal.ColorRole.BrightText,      QColor(255, 255, 255))
 
-    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+    # Buttons
+    pal.setColor(pal.ColorRole.Button,          QColor(225, 228, 240))
+    pal.setColor(pal.ColorRole.ButtonText,      QColor( 30,  30,  40))
+
+    # Accent / highlight — steel blue
+    pal.setColor(pal.ColorRole.Highlight,       QColor( 66, 133, 244))
+    pal.setColor(pal.ColorRole.HighlightedText, QColor(255, 255, 255))
+
+    # Links
+    pal.setColor(pal.ColorRole.Link,            QColor( 66, 133, 244))
+    pal.setColor(pal.ColorRole.LinkVisited,     QColor(138,  43, 226))
+
+    # Mid-tones used by Fusion for borders / shadow
+    pal.setColor(pal.ColorRole.Light,           QColor(255, 255, 255))
+    pal.setColor(pal.ColorRole.Midlight,        QColor(210, 213, 225))
+    pal.setColor(pal.ColorRole.Mid,             QColor(180, 184, 200))
+    pal.setColor(pal.ColorRole.Dark,            QColor(140, 144, 160))
+    pal.setColor(pal.ColorRole.Shadow,          QColor( 80,  84, 100))
+
+    app.setPalette(pal)
+
+
+def main():
+    import traceback
+    import logging
+
+    log_path = os.path.join(tempfile.gettempdir(), "ferrite_designer.log")
+    logging.basicConfig(
+        filename=log_path,
+        level=logging.ERROR,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    app = QApplication(sys.argv)
+    _apply_fusion_palette(app)
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        logging.error("Unhandled exception:\n%s", msg)
         try:
-            window.model.load_from_file(sys.argv[1])
-            window._set_window_title(sys.argv[1])
-            window._add_recent(sys.argv[1])
-            window.resources.refresh()
-        except Exception as e:
-            QMessageBox.critical(window, "Error", f"Failed to open: {e}")
-    else:
-        dlg = DeviceChoiceDialog(window)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        window._apply_new_device(dlg.selected_device())
+            QMessageBox.critical(
+                None, "Unexpected Error",
+                f"An unexpected error occurred and was logged.\n\n"
+                f"{exc_type.__name__}: {exc_value}\n\n"
+                f"Log: {log_path}",
+            )
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
 
-    window.show()
-    sys.exit(app.exec())
+    sys.excepthook = _excepthook
+
+    try:
+        window = DesignerWindow()
+
+        if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+            try:
+                window.model.load_from_file(sys.argv[1])
+                window._set_window_title(sys.argv[1])
+                window._add_recent(sys.argv[1])
+                window.resources.refresh()
+            except Exception as e:
+                QMessageBox.critical(window, "Error", f"Failed to open: {e}")
+        else:
+            dlg = DeviceChoiceDialog(window)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            window._apply_new_device(dlg.selected_device())
+
+        window.show()
+        sys.exit(app.exec())
+
+    except Exception:
+        msg = traceback.format_exc()
+        logging.error("Fatal startup error:\n%s", msg)
+        try:
+            QMessageBox.critical(
+                None, "Fatal Error",
+                f"Ferrite Designer failed to start.\n\n{msg}\n\nLog: {log_path}",
+            )
+        except Exception:
+            print(f"FATAL ERROR:\n{msg}", file=sys.stderr)
+        raise
 
 
 if __name__ == "__main__":
