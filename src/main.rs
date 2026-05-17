@@ -1168,6 +1168,12 @@ fn main() -> ! {
                     protocol::send_stackinfo(&usart, used, free);
                 }
 
+                RxEvent::SetDateTime => {
+                    let dt = protocol.datetime();
+                    rtc::Rtc::init().set_time(&dt);
+                    protocol::send_pong(&usart);
+                }
+
                 RxEvent::TouchCalibrate => {
                     let cal = touch::run_calibration(&mut touch, &ctx.lcd);
                     cfg.write(&ctx.flash, config::KEY_TOUCH_CAL, &cal.to_bytes());

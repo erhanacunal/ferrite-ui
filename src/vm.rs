@@ -15,6 +15,7 @@ use crate::proto::{
 };
 use crate::render;
 use crate::strpool;
+use crate::strpool::StringPool;
 use crate::systick;
 use crate::types::{Edges, Offset, Size};
 use crate::widget::{
@@ -240,6 +241,8 @@ const OP_W_ALLOC: u8 = 0x1A;
 const OP_ARR_FREE: u8 = 0x1B;
 const OP_W_ALLTAR: u8 = 0x1C; // alloc + target + store (combined)
 const OP_FRAME: u8 = 0x1D; // + u8 local_count (function prologue)
+const OP_SHL: u8 = 0x1E; // a b → a << (b & 31), logical left shift
+const OP_SHR: u8 = 0x1F; // a b → a >> (b & 31), arithmetic right shift (sign-preserving)
 
 // Specialized short forms (1 byte, no args)
 const OP_PUSH_0: u8 = 0x20;
@@ -318,6 +321,8 @@ const OP_FILE_OPEN: u8 = 0xA2; // pop str_id (name) → push handle (1|2|0xFF)
 const OP_FILE_READ: u8 = 0xA3; // pop handle → push byte (0..255) or -1 on EOF
 const OP_FILE_SIZE: u8 = 0xA4; // pop handle → push size
 const OP_FILE_CLOSE: u8 = 0xA5; // pop handle, release slot
+const OP_FILE_SEEK: u8 = 0xAA; // pop handle, pop pos → seek to byte position (clamped to [0, size])
+const OP_SYSCALL: u8 = 0xAB; // + u8 syscall_id + u8 argc — pop argc args → call handler, push i32 result
 const OP_ARR_TO_STR: u8 = 0xA6; // pop len, pop arr_id → alloc string from low bytes of arr elements (len<0 = full array)
 const OP_SHOW_MODAL: u8 = 0xA7; // pop click_fn, pop builder_fn → suspend until setDialogResult, push result on resume
 const OP_SET_DIALOG_RESULT: u8 = 0xA8; // pop result → record on top modal frame; void return
@@ -374,6 +379,7 @@ pub enum VmMode {
 // --- VM ---
 
 const STACK_SIZE: usize = 16;
+const MAX_SYSCALL_ARGS: usize = 16;
 /// Variable entry — sparse mapping from slot ID to value.
 struct VmVar {
     id: u16,
@@ -533,6 +539,8 @@ pub struct Vm {
     open_files: [Option<OpenFile>; 2],
     // Open modal dialogs (innermost = last). Empty when no dialog is showing.
     modal_stack: Vec<ModalFrame>,
+    // Device-specific syscall handler. Called by OP_SYSCALL; returns None → VM Error.
+    pub syscall_fn: Option<fn(id: u8, args: &[i32], strpool: &StringPool) -> Option<i32>>,
 }
 
 impl Vm {
@@ -575,6 +583,7 @@ impl Vm {
             ext_count: 0,
             open_files: [None, None],
             modal_stack: Vec::new(),
+            syscall_fn: None,
         }
     }
 
@@ -1179,6 +1188,16 @@ impl Vm {
                 let b = self.pop();
                 let a = self.pop();
                 self.push(a | b);
+            }
+            OP_SHL => {
+                let b = self.pop() as u32 & 31;
+                let a = self.pop();
+                self.push(a << b);
+            }
+            OP_SHR => {
+                let b = self.pop() as u32 & 31;
+                let a = self.pop();
+                self.push(a >> b);
             }
             OP_NOT => {
                 let a = self.pop();
@@ -1863,6 +1882,14 @@ impl Vm {
                     None => self.state = VmState::Error,
                 }
             }
+            OP_FILE_SEEK => {
+                let pos = self.pop();
+                let handle = self.pop();
+                match self.file_slot_mut(handle) {
+                    Some(f) => f.pos = (pos.max(0) as u32).min(f.size),
+                    None => self.state = VmState::Error,
+                }
+            }
             OP_SHOW_MODAL => {
                 self.handle_show_modal(ctx);
             }
@@ -1920,6 +1947,23 @@ impl Vm {
                 };
                 match strpool::sprintf(&mut ctx.strpool, &fmt_buf[..fmt_len], &args[..actual]) {
                     Some(id) => self.push(id as i32),
+                    None => self.state = VmState::Error,
+                }
+            }
+
+            OP_SYSCALL => {
+                let syscall_id = self.read_u8();
+                let argc = self.read_u8() as usize;
+                let actual = argc.min(MAX_SYSCALL_ARGS);
+                let mut args = [0i32; MAX_SYSCALL_ARGS];
+                for i in (0..actual).rev() {
+                    args[i] = self.pop();
+                }
+                match self.syscall_fn {
+                    Some(f) => match f(syscall_id, &args[..actual], &ctx.strpool) {
+                        Some(v) => self.push(v),
+                        None => self.state = VmState::Error,
+                    },
                     None => self.state = VmState::Error,
                 }
             }

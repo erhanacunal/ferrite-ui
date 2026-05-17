@@ -205,6 +205,17 @@ if (temp < 10) { /* cold */ }     // 10 auto-promoted, uses FLT
 | `!`  | Logical NOT |
 | `&` | Bitwise AND (int only) |
 | `\|` | Bitwise OR (int only) |
+| `<<` | Left shift (int only) |
+| `>>` | Arithmetic right shift, sign-preserving (int only) |
+
+Shift operators follow C precedence: lower than `+`/`-`, higher than `<`/`>`. The shift amount is masked to `[0, 31]`.
+
+```c
+var flags = 0;
+flags = flags | (1 << 4);   // set bit 4
+var bit4 = (flags >> 4) & 1; // extract bit 4
+var sign = -8 >> 1;          // -4  (arithmetic: sign bit preserved)
+```
 
 ### Compound Assignment
 
@@ -1111,7 +1122,7 @@ Names are limited to **15 ASCII characters**. Source paths are relative to the p
 - Files are **read-only** (flash-backed).
 - At most **2 files open simultaneously** — handle values are `1` and `2`.
 - `fileRead` returns **one byte per call**. Heavy reads are slow; buffer into your own array if you need to process large data repeatedly.
-- Passing an **invalid handle** (`0xFF`, a closed slot, or a value other than 1/2) to `fileRead` / `fileSize` / `fileClose` puts the VM into the **Error** state. Programs must check the return of `fileOpen` before using the handle.
+- Passing an **invalid handle** (`0xFF`, a closed slot, or a value other than 1/2) to `fileRead` / `fileSize` / `fileSeek` / `fileClose` puts the VM into the **Error** state. Programs must check the return of `fileOpen` before using the handle.
 
 ### fileOpen(name) → handle
 
@@ -1152,6 +1163,17 @@ Returns the total size of the open file in bytes. Does not change the read posit
 ```c
 var total = fileSize(h);
 ```
+
+### fileSeek(handle, pos)
+
+Sets the read position to `pos` bytes from the start of the file. The position is clamped to `[0, fileSize(handle)]` — seeking past the end lands exactly at EOF, and a negative `pos` is treated as `0`. Does not return a value.
+
+```c
+fileSeek(h, 0);   // rewind to start
+fileSeek(h, 16);  // skip first 16-byte header
+```
+
+Seeking to the end and calling `fileRead` immediately returns `-1` (EOF). There is no seek-from-end or seek-from-current — `pos` is always an absolute byte offset.
 
 ### fileClose(handle)
 
@@ -1401,6 +1423,88 @@ sendUsart(buf);
 
 var msg = str("hello");
 sendUsart(msg);
+```
+
+## Syscall Interface
+
+Device-specific operations are exposed through `syscall()`. The VM dispatches to a handler registered by the host firmware — the VM itself stays device-agnostic.
+
+```c
+var result = syscall(id, arg0, arg1, ...);
+```
+
+The first argument is the syscall **ID** — it must be a compile-time integer literal or a named `const`. Arguments after the ID are runtime values (int, float bits, or str_ids). The call always pushes one `i32` result. If the handler signals an error (by returning `None` internally), the VM enters the **Error** state.
+
+### Using the e-paper device library
+
+Include `lib/epaper.fl` to get the predefined constants:
+
+```c
+#include "epaper.fl"
+
+fn setup() {
+    var ssid = str("MyNetwork");
+    var pass = str("secret123");
+    var rc = syscall(SYS_WIFI_CONNECT, ssid, pass);
+    strClear();
+    if (rc != 0) {
+        // connection failed
+    }
+    return 0;
+}
+
+fn loop() {
+    var status = syscall(SYS_WIFI_STATUS);
+    if (status == 2) {
+        // connected — do work
+    }
+    delay(1000);
+}
+```
+
+### Syscall ID ranges (epaper device)
+
+| Range | Category |
+|-------|----------|
+| `0x00–0x0F` | System |
+| `0x10–0x1F` | WiFi |
+| `0x20–0x2F` | Bluetooth |
+
+| ID | Name | Arguments | Returns |
+|----|------|-----------|---------|
+| `0x00` | `SYS_UPTIME` | — | milliseconds |
+| `0x01` | `SYS_REBOOT` | — | does not return |
+| `0x10` | `SYS_WIFI_CONNECT` | `ssid: str_id, pass: str_id` | `0`=ok, `-1`=error |
+| `0x11` | `SYS_WIFI_DISCONNECT` | — | `0` |
+| `0x12` | `SYS_WIFI_STATUS` | — | `0`=idle, `1`=connecting, `2`=connected, `3`=failed |
+| `0x13` | `SYS_WIFI_RSSI` | — | RSSI in dBm, or `0` if not connected |
+| `0x14` | `SYS_WIFI_IP` | — | IPv4 as `u32` big-endian |
+| `0x20` | `SYS_BT_START` | `name: str_id` | `0`=ok, `-1`=error |
+| `0x21` | `SYS_BT_STOP` | — | `0` |
+| `0x22` | `SYS_BT_STATUS` | — | `0`=off, `1`=advertising, `2`=connected |
+| `0x23` | `SYS_BT_SEND` | `data: str_id` | bytes sent, or `-1` on error |
+
+### Adding new syscalls
+
+Define new IDs in your own include file — no VM changes needed:
+
+```c
+// mydevice.fl
+const SYS_READ_SENSOR = 0x30;  // () → sensor reading as i32
+const SYS_SET_GPIO    = 0x31;  // (pin: int, level: int) → 0
+
+var temp = syscall(SYS_READ_SENSOR);
+syscall(SYS_SET_GPIO, 5, 1);
+```
+
+The host registers the handler once before running the VM:
+
+```rust
+vm.syscall_fn = Some(|id, args, strpool| match id {
+    0x30 => Some(read_sensor()),
+    0x31 => { set_gpio(args[0] as u8, args[1] != 0); Some(0) }
+    _    => None,  // unknown id → VM Error
+});
 ```
 
 ## VM Image Format

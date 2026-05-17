@@ -12,6 +12,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec;
 
+use crate::systick::delay_ms;
+
 use super::ed047tc1;
 
 // ---- Geometry ----
@@ -95,6 +97,22 @@ impl EpdDisplay {
             framebuffer: vec![0xFFu8; FRAMEBUFFER_SIZE].into_boxed_slice(),
             tainted_rows: [0u8; TAINTED_SIZE],
         }
+    }
+
+    /// Performs the screen repair routine as described here
+    /// https://github.com/Xinyuan-LilyGO/LilyGo-EPD47/blob/master/examples/screen_repair/screen_repair.ino
+    pub fn repair(&mut self) {
+        self.clear_area(full_screen());
+        for _ in 0..20 {
+            self.push_pixels(full_screen(), 50, false);
+            delay_ms(500);
+        }
+        self.clear_area(full_screen());
+        for _ in 0..40 {
+            self.push_pixels(full_screen(), 50, true);
+            delay_ms(500);
+        }
+        self.clear_area(full_screen());
     }
 
     // ---- Pixel write ----
@@ -233,7 +251,7 @@ impl EpdDisplay {
                 row_skip(epd, time_us);
             } else if r == area.y {
                 epd.set_buffer(&row_buf);
-                row_write(epd, time_us);                
+                row_write(epd, time_us);
             } else if r >= area.y + area.height {
                 row_skip(epd, time_us);
             } else {
@@ -269,12 +287,7 @@ impl EpdDisplay {
 
     /// Run the 15-frame waveform to push tainted rows to the panel.
     pub(crate) fn flush(&mut self, mode: DrawMode) {
-        let tainted_count: u16 = (0..EPD_HEIGHT)
-            .filter(|&y| self.is_tainted(y))
-            .count() as u16;
-        crate::usart::dbg(b"EPD flush tainted=");
-        crate::usart::dbg_u16(tainted_count);
-        crate::usart::dbg(b"\r\n");
+        //let tainted_count: u16 = (0..EPD_HEIGHT).filter(|&y| self.is_tainted(y)).count() as u16;        
         self.draw(mode);
         self.tainted_rows.fill(0);
         self.framebuffer.fill(0xFF);
@@ -292,13 +305,13 @@ impl EpdDisplay {
             epd.skipping = 0;
             epd.frame_start();
 
-            let mut active: u16 = 0;
+            //let mut active: u16 = 0;
             for y in 0..EPD_HEIGHT {
                 if !self.is_tainted(y) {
                     epd.skip();
                     continue;
                 }
-                active += 1;
+                //active += 1;
                 let start = y as usize * LINE_BYTES_4BPP;
                 let end = start + LINE_BYTES_4BPP;
                 let row_buf = prepare_dma_buffer(&self.framebuffer[start..end], &lut);
@@ -311,14 +324,7 @@ impl EpdDisplay {
                 row_write(epd, mode.contrast_cycles()[k]);
             }
             epd.frame_end();
-
-            if k == 0 {
-                crate::usart::dbg(b"  frame0 active=");
-                crate::usart::dbg_u16(active);
-                crate::usart::dbg(b"\r\n");
-            }
         }
-        crate::usart::dbg(b"EPD draw done\r\n");
     }
 }
 
@@ -371,7 +377,7 @@ fn row_skip(epd: &mut ed047tc1::ED047TC1, time_us: u16) {
     epd.skipping += 1;
 }
 
-fn row_write(epd: &mut ed047tc1::ED047TC1, time_us: u16) { 
+fn row_write(epd: &mut ed047tc1::ED047TC1, time_us: u16) {
     epd.skipping = 0;
     epd.output_row(time_us);
 }

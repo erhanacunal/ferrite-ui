@@ -106,6 +106,8 @@ Older images are still parsed:
 | `0x37` | `JNZ` | `u16 target` | pop condition; jump if nonzero |
 | `0x38` | `CALL` | `u16 target` | call function at target |
 | `0x1D` | `FRAME` | `u8 local_count` | function prologue; reserves locals |
+| `0x1E` | `SHL` | - | `a b -> a << (b & 31)`, logical left shift |
+| `0x1F` | `SHR` | - | `a b -> a >> (b & 31)`, arithmetic right shift (sign-preserving) |
 | `0x9F` | `critical` | - | run without cooperative yielding until next explicit yield |
 
 ### Constants And Variables
@@ -206,10 +208,12 @@ Builtins are single-byte opcodes. Operands are passed on the stack unless noted.
 | `0xA3` | `fileRead` | pop handle, push byte `0..255` or `-1` on EOF |
 | `0xA4` | `fileSize` | pop handle, push file size |
 | `0xA5` | `fileClose` | pop handle and release file slot |
+| `0xAA` | `fileSeek` | pop pos, pop handle; set read position (clamped to `[0, size]`) |
 | `0xA6` | `arrToStr` | pop length and array id; allocate string from low bytes |
 | `0xA7` | `showModal` | pop `click_fn`, `builder_fn`; suspend until `setDialogResult`; push result |
 | `0xA8` | `setDialogResult` | pop result and record on innermost modal frame |
 | `0xA9` | `sprintf` | `u8 argc`; pop `argc` args then fmt str_id; push formatted str_id |
+| `0xAB` | `syscall` | `u8 syscall_id, u8 argc`; pop `argc` args; call host handler; push i32 result |
 
 `sprintf` has an inline `u8 argc` byte (number of format arguments after the format string). Stack layout before execution: `[... fmt, arg0, arg1, ..., argN-1]` (fmt pushed first).
 

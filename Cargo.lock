@@ -765,6 +765,7 @@ dependencies = [
  "esp-storage",
  "libm",
  "minifb",
+ "nb 1.1.0",
  "xtensa-lx",
 ]
 

@@ -238,7 +238,8 @@ def tokenize(source):
         # Two-char operators
         two = source[i:i + 2] if i + 1 < n else ''
         if two in ('==', '!=', '<=', '>=', '&&', '||',
-                    '++', '--', '+=', '-=', '*=', '/=', '%='):
+                    '++', '--', '+=', '-=', '*=', '/=', '%=',
+                    '<<', '>>'):
             tokens.append(Token(two, two, line))
             i += 2
             continue
@@ -561,16 +562,18 @@ class Parser:
         return FnDef(name, params, body, line, param_types)
 
     def _parse_type_annotation(self):
-        """Parse optional ': float' type annotation. Returns 'int' or 'float'."""
+        """Parse optional ': int|float|widget' type annotation."""
         if self._match(':'):
             tok = self._expect('IDENT')
             if tok.value == 'float':
                 return 'float'
             elif tok.value == 'int':
                 return 'int'
+            elif tok.value == 'widget':
+                return 'widget'
             else:
                 raise CompileError(
-                    f"unknown type '{tok.value}' (expected 'int' or 'float')",
+                    f"unknown type '{tok.value}' (expected 'int', 'float', or 'widget')",
                     tok.line)
         return 'int'
 
@@ -780,8 +783,16 @@ class Parser:
         return left
 
     def _comparison_expr(self):
-        left = self._add_expr()
+        left = self._shift_expr()
         while self._check('<', '<=', '>', '>='):
+            op = self._advance().value
+            right = self._shift_expr()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _shift_expr(self):
+        left = self._add_expr()
+        while self._check('<<', '>>'):
             op = self._advance().value
             right = self._add_expr()
             left = BinOp(op, left, right, left.line)
@@ -935,8 +946,12 @@ NO_VALUE_BUILTINS = {
     'sendUsart',
     'rtcWrite',
     'fileClose',
+    'fileSeek',
     'setDialogResult',
 }
+
+# Builtins whose return value is an array ID (so the variable must be in array_vars)
+_ARRAY_RETURNING_BUILTINS = {'rtcRead'}
 
 
 class CodeGen:
@@ -1472,6 +1487,7 @@ class CodeGen:
         'alloc', 'get', 'str', 'itos', 'ftos', 'concat', 'sprintf',
         'parseInt', 'strLen', 'millis', 'brightness',
         'arrFree', 'strFree', 'strClear',
+        'syscall',
     }
 
     def _infer_type(self, node):
@@ -1561,7 +1577,12 @@ class CodeGen:
         param_slots = []
         for i, p in enumerate(fn.params):
             slot = self._alloc_var(p, getattr(fn, 'line', 0))
-            self.var_types[p] = param_types[i] if i < len(param_types) else self.T_INT
+            pt = param_types[i] if i < len(param_types) else self.T_INT
+            if pt == 'widget':
+                self.var_types[p] = self.T_INT   # widget IDs are ints at runtime
+                self.widget_ids[p] = -1          # mark as widget variable
+            else:
+                self.var_types[p] = pt
             param_slots.append(slot)
         for slot in reversed(param_slots):
             self.asm.store(slot)
@@ -1685,6 +1706,8 @@ class CodeGen:
                     self._last_alltar_var = node.name
                     self._current_target = node.name
                     return
+                if isinstance(node.init, CallExpr) and node.init.name in _ARRAY_RETURNING_BUILTINS:
+                    self.array_vars.add(node.name)
                 self._gen_expr(node.init)
             else:
                 self.var_types[node.name] = self.T_INT
@@ -1744,6 +1767,23 @@ class CodeGen:
             return (1 if init.value else 0, CodeGen.T_INT)
         return None
 
+    def _resolve_syscall_id(self, node, line):
+        """Resolve the first syscall() argument to a compile-time u8 integer.
+        Accepts integer literals and named integer consts only."""
+        if isinstance(node, NumLit):
+            val = node.value
+        elif isinstance(node, VarRef) and node.name in self.const_values:
+            val, vtype = self.const_values[node.name]
+            if vtype != self.T_INT:
+                raise CompileError("syscall id must be an integer constant", line)
+            val = int(val)
+        else:
+            raise CompileError(
+                "syscall id must be a compile-time integer constant or named const", line)
+        if not (0 <= val <= 255):
+            raise CompileError(f"syscall id {val} is out of range (0-255)", line)
+        return val
+
     def _gen_assign(self, node):
         self._check_const(node.name, node.line)
         if node.index is not None:
@@ -1755,7 +1795,7 @@ class CodeGen:
             self.asm.arr_store()
         else:
             # Track array-returning builtins
-            if isinstance(node.value, CallExpr) and node.value.name == 'rtcRead':
+            if isinstance(node.value, CallExpr) and node.value.name in _ARRAY_RETURNING_BUILTINS:
                 self.array_vars.add(node.name)
             # Track widget ID reassignment: lbl = alloc()
             if isinstance(node.value, CallExpr) and node.value.name == 'alloc':
@@ -1878,7 +1918,9 @@ class CodeGen:
     # --- Expressions ---
 
     def _gen_expr(self, node):
-        if isinstance(node, NumLit):
+        if isinstance(node, StrLit):
+            self.asm.str_alloc(node.value)
+        elif isinstance(node, NumLit):
             self.asm.push(node.value)
         elif isinstance(node, FloatLit):
             self.asm.push(float_bits(node.value))
@@ -1930,6 +1972,7 @@ class CodeGen:
         '+': 'add', '-': 'sub', '*': 'mul', '/': 'div', '%': 'modulo',
         '==': 'eq', '!=': 'ne', '<': 'lt', '<=': 'le', '>': 'gt', '>=': 'ge',
         '&': 'and_', '|': 'or_',
+        '<<': 'shl', '>>': 'shr',
     }
     _FLOAT_ARITH = {
         '+': 'fadd', '-': 'fsub', '*': 'fmul', '/': 'fdiv',
@@ -1957,8 +2000,8 @@ class CodeGen:
             self.asm.patch(patch)
             return
 
-        # Bitwise — always int, no float promotion
-        if node.op in ('&', '|'):
+        # Bitwise/shift — always int, no float promotion
+        if node.op in ('&', '|', '<<', '>>'):
             self._gen_expr(node.left)
             self._gen_expr(node.right)
             getattr(self.asm, self._INT_OPS[node.op])()
@@ -2645,6 +2688,33 @@ class CodeGen:
                 raise CompileError("fileClose() takes 1 argument: handle", node.line)
             self._gen_expr(node.args[0])
             self.asm.builtin(Builtin.FILE_CLOSE)
+            return
+
+        if name == 'fileSeek':
+            # fileSeek(handle, pos) — seek to byte position within file.
+            # pos is clamped to [0, size]; negative pos → 0.
+            # Passing 0xFF or an unopened handle → VM error.
+            if len(node.args) != 2:
+                raise CompileError("fileSeek() takes 2 arguments: handle, pos", node.line)
+            self._gen_expr(node.args[0])
+            self._gen_expr(node.args[1])
+            self.asm.builtin(Builtin.FILE_SEEK)
+            return
+
+        if name == 'syscall':
+            # syscall(id, arg0, arg1, ...) → i32
+            # id must be a compile-time integer literal or named const (0-255).
+            # Args are passed as i32 stack values; str_ids and arr_ids are valid.
+            # Returns None from handler → VM Error state.
+            if len(node.args) < 1:
+                raise CompileError("syscall() requires at least 1 argument: id", node.line)
+            syscall_id = self._resolve_syscall_id(node.args[0], node.line)
+            runtime_args = node.args[1:]
+            if len(runtime_args) > 16:
+                raise CompileError("syscall() supports at most 16 arguments", node.line)
+            for arg in runtime_args:
+                self._gen_expr(arg)
+            self.asm.syscall(syscall_id, len(runtime_args))
             return
 
         if name == 'showModal':

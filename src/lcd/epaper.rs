@@ -66,11 +66,9 @@ pub fn init(pins: EpdHwPins) {
         pins.rmt,
     );
     ed047tc1::install(epd);
-    crate::usart::dbg(b"  power_on\r\n");
     unsafe {
         ed047tc1::ctrl().power_on();
     }
-    crate::usart::dbg(b"  power_on ok\r\n");
 }
 
 /// Allocate the PSRAM-backed framebuffer. Must be called after
@@ -88,6 +86,24 @@ pub fn is_ready() -> bool {
 pub fn clear() {
     unsafe {
         display::disp().clear_area(full_screen());
+    }
+}
+
+pub fn repair_screen() {
+    unsafe {
+        display::disp().repair();
+    }
+}
+
+pub fn power_off() {
+    unsafe {
+        ed047tc1::ctrl().power_off();
+    }
+}
+
+pub fn power_on() {
+    unsafe {
+        ed047tc1::ctrl().power_on();
     }
 }
 

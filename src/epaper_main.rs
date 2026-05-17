@@ -34,6 +34,7 @@ use esp_hal::{
 // --- Module tree (mirrors src/main.rs; paths resolve relative to src/) ---
 
 mod backlight;
+mod battery;
 mod clip;
 mod config;
 mod ctx;
@@ -79,7 +80,28 @@ const ERR_PROGRAM_ERROR: u8 = 6;
 const ERR_PROGRAM_NOT_FOUND: u8 = 2;
 const ERR_INSUFFICIENT_MEMORY: u8 = 7;
 
-const MAX_CODE_SIZE: usize = 4096;
+const MAX_CODE_SIZE: usize = 50 * 1024; // sanity check to avoid OOM when loading malformed program
+
+// --- System (0x00–0x0F) ---
+const SYS_UPTIME: u8 = 0x00; // () → milliseconds as i32 (same as millis())
+const SYS_REBOOT: u8 = 0x01; // () → does not return
+const SYS_REPAIR_SCREEN: u8 = 0x02; // () → 0=ok, -1=error
+const SYS_EPD_POWER_OFF: u8 = 0x03; // () → 0
+const SYS_EPD_POWER_ON: u8 = 0x04; // () → 0
+const SYS_BATTERY_VOLTAGE: u8 = 0x05; // () → battery voltage in millivolts (e.g. 3750 = 3.75 V)
+
+// --- WiFi (0x10–0x1F) ---
+const SYS_WIFI_CONNECT: u8 = 0x10; // (ssid: str_id, pass: str_id) → 0=ok, -1=error
+const SYS_WIFI_DISCONNECT: u8 = 0x11; // () → 0
+const SYS_WIFI_STATUS: u8 = 0x12; // () → 0=idle, 1=connecting, 2=connected, 3=failed
+const SYS_WIFI_RSSI: u8 = 0x13; // () → RSSI in dBm (negative i32), or 0 if not connected
+const SYS_WIFI_IP: u8 = 0x14; // () → IPv4 as u32 big-endian (0 if not connected)
+
+// --- Bluetooth (0x20–0x2F) ---
+const SYS_BT_START: u8 = 0x20; // (name: str_id) → 0=ok, -1=error
+const SYS_BT_STOP: u8 = 0x21; // () → 0
+const SYS_BT_STATUS: u8 = 0x22; // () → 0=off, 1=advertising, 2=connected
+const SYS_BT_SEND: u8 = 0x23; // (data: str_id) → bytes_sent, or -1 on error
 
 // --- GPIO pin ownership ---
 
@@ -89,6 +111,7 @@ struct EpaperPins {
     _sd_miso: Input<'static>,
     _sd_cs: Output<'static>,
     _button_1: Input<'static>,
+    // GPIO14 and ADC2 are consumed by battery::init() — not stored here.
 }
 
 fn init_gpio(peripherals: Peripherals) -> EpaperPins {
@@ -104,7 +127,6 @@ fn init_gpio(peripherals: Peripherals) -> EpaperPins {
     let input_pu = InputConfig::default().with_pull(Pull::Up);
 
     // Initialise ED047TC1: I8080, RMT, and config shift-register in one call.
-    usart::dbg(b"  epd hw init\r\n");
     lcd::epaper::init(lcd::epaper::EpdHwPins {
         cfg_data: peripherals.GPIO13,
         cfg_clk: peripherals.GPIO12,
@@ -123,38 +145,11 @@ fn init_gpio(peripherals: Peripherals) -> EpaperPins {
         lcd_cam: peripherals.LCD_CAM,
         rmt: peripherals.RMT,
     });
-    usart::dbg(b"  epd hw ok\r\n");
     // System timer (SYSTIMER UNIT0, 16 MHz).
     systick::init(peripherals.SYSTIMER);
     rtc::epaper::init(peripherals.I2C0, peripherals.GPIO17, peripherals.GPIO18);
-    let rtc_instance = crate::rtc::Rtc::init();
-    let now = crate::rtc::DateTime {
-        year: 26,
-        month: 5,
-        day: 6,
-        weekday: 0,
-        hour: 12,
-        minute: 8,
-        second: 0,
-    };
-    rtc_instance.set_time(&now);
-    let check = rtc_instance.read_time();
-    usart::dbg(b"  rtc time: ");
-    usart::dbg_u16(check.year as u16);
-    usart::dbg(b".");
-    usart::dbg_u16(check.month as u16);
-    usart::dbg(b".");
-    usart::dbg_u16(check.day as u16);
-    usart::dbg(b" ");
-    usart::dbg_u16(check.hour as u16);
-    usart::dbg(b":");
-    usart::dbg_u16(check.minute as u16);
-    usart::dbg(b":");
-    usart::dbg_u16(check.second as u16);
-    usart::dbg(b"\r\n");
-    if check.year != now.year || check.month != now.month || check.day != now.day {
-        rtc_instance.set_time(&now);
-    }
+    crate::rtc::Rtc::init();
+    battery::init(peripherals.GPIO14, peripherals.ADC2);
     EpaperPins {
         _sd_sclk: Output::new(peripherals.GPIO11, Level::Low, output),
         _sd_mosi: Output::new(peripherals.GPIO15, Level::Low, output),
@@ -290,15 +285,6 @@ fn error_description(code: u8) -> &'static [u8] {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    usart::dbg(b"\r\nPANIC");
-    if let Some(loc) = info.location() {
-        usart::dbg(b" at ");
-        usart::dbg(loc.file().as_bytes());
-        usart::dbg(b":");
-        usart::dbg_u16(loc.line() as u16);
-    }
-    usart::dbg(b"\r\n");
-
     if lcd::epaper::is_ready() {
         let lcd = Lcd::new();
         let font = Font::from_embedded(
@@ -433,29 +419,21 @@ fn main() -> ! {
 
     // Early UART banner — confirms the binary is executing before any heap/FS ops.
     // UART0 is already configured at 115200 baud by the ROM bootloader.
-    usart::dbg(b"\r\nferrite-ui booting\r\n");
 
     // 64 KB DRAM heap for small allocations (Vec metadata, Box, etc.).
     // PSRAM (8 MB) is added inside init_gpio() via psram_allocator! before
     // any large allocation (FRAMEBUFFER, LUT) is accessed.
-    usart::dbg(b"[1] heap alloc\r\n");
     esp_alloc::heap_allocator!(size: 64 * 1024);
 
     // Configure GPIO pins; PSRAM heap and I8080/RMT are set up inside.
-    usart::dbg(b"[2] init_gpio\r\n");
     let _pins = init_gpio(peripherals);
-    usart::dbg(b"[2] done\r\n");
 
     // Allocate framebuffer (259 KB) and LUT (64 KB) from the PSRAM heap.
     // Must happen after init_gpio() so psram_allocator! has already run.
-    usart::dbg(b"[3] alloc_buffers\r\n");
     lcd::epaper::alloc_buffers();
-    usart::dbg(b"[3] done\r\n");
 
     // Clear any ghost image from the previous session before first content draw.
-    usart::dbg(b"[4] epd clear\r\n");
     lcd::epaper::clear();
-    usart::dbg(b"[4] done\r\n");
 
     // Build context on the heap to avoid blowing the stack.
     let mut ctx = Box::new(Ctx {
@@ -502,6 +480,31 @@ fn main() -> ! {
 
     let mut vm = Box::new(Vm::new());
     let mut error_code: u8 = 0;
+
+    vm.syscall_fn = Some(|id, args, strpool| match id {
+        SYS_UPTIME => Some(systick::millis() as i32),
+        SYS_REBOOT => {
+            unsafe {
+                esp_restart();
+            }
+            Some(0) // not reached
+        }
+        SYS_REPAIR_SCREEN => {
+            lcd::epaper::repair_screen();
+            Some(0)
+        }
+        SYS_EPD_POWER_OFF => {
+            lcd::epaper::power_off();
+            Some(0)
+        }
+        SYS_EPD_POWER_ON => {
+            lcd::epaper::power_on();
+            Some(0)
+        }
+        SYS_BATTERY_VOLTAGE => battery::read_mv().or(Some(-1)),
+
+        _ => None, // unknown id → VM Error
+    });
 
     // Load main program from FS.
     if let Some(ref fs) = ctx.fs {
@@ -578,8 +581,6 @@ fn main() -> ! {
         ctx.lcd.flush_dirty();
     }
 
-    usart::dbg(b"EPD flush done\r\n");
-
     let mut touch = Touch::init();
     let mut protocol = Protocol::new();
 
@@ -602,7 +603,6 @@ fn main() -> ! {
                     }
 
                     if vm.state == VmState::Error {
-                        usart::dbg(b"\r\nVM ERROR\r\n");
                         error_code = ERR_PROGRAM_ERROR;
                         show_error(
                             &mut ctx.lcd,
@@ -736,6 +736,12 @@ fn main() -> ! {
                     protocol::send_pong(&usart);
                     delay_ms(50);
                     unsafe { esp_restart() };
+                }
+
+                RxEvent::SetDateTime => {
+                    let dt = protocol.datetime();
+                    rtc::Rtc::init().set_time(&dt);
+                    protocol::send_pong(&usart);
                 }
 
                 _ => {}

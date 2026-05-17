@@ -1,0 +1,63 @@
+// epaper.fl — Syscall constants for the ESP32-S3 e-paper device
+// Usage: #include "epaper.fl"
+//
+// Syscall convention:
+//   syscall(SYS_xxx, arg0, arg1, ...) → i32
+//   String arguments are str_ids (from str(), arrToStr(), sprintf(), etc.)
+//   Return value 0 = success unless noted otherwise.
+//   Handler returning None → VM enters Error state.
+
+// --- System (0x00–0x0F) ---
+const SYS_UPTIME        = 0x00; // () → milliseconds as i32 (same as millis())
+const SYS_REBOOT        = 0x01; // () → does not return
+const SYS_REPAIR_SCREEN = 0x02; // () → 0
+const SYS_EPD_POWER_OFF     = 0x03; // () → 0
+const SYS_EPD_POWER_ON      = 0x04; // () → 0
+const SYS_BATTERY_VOLTAGE   = 0x05; // () → battery voltage in millivolts (e.g. 3750 = 3.75 V), or -1 on error
+
+// --- WiFi (0x10–0x1F) ---
+const SYS_WIFI_CONNECT    = 0x10; // (ssid: str_id, pass: str_id) → 0=ok, -1=error
+const SYS_WIFI_DISCONNECT = 0x11; // () → 0
+const SYS_WIFI_STATUS     = 0x12; // () → 0=idle, 1=connecting, 2=connected, 3=failed
+const SYS_WIFI_RSSI       = 0x13; // () → RSSI in dBm (negative i32), or 0 if not connected
+const SYS_WIFI_IP         = 0x14; // () → IPv4 as u32 big-endian (0 if not connected)
+
+// --- Bluetooth (0x20–0x2F) ---
+const SYS_BT_START        = 0x20; // (name: str_id) → 0=ok, -1=error
+const SYS_BT_STOP         = 0x21; // () → 0
+const SYS_BT_STATUS       = 0x22; // () → 0=off, 1=advertising, 2=connected
+const SYS_BT_SEND         = 0x23; // (data: str_id) → bytes_sent, or -1 on error
+
+
+fn epd_repair_screen() {
+    syscall(SYS_REPAIR_SCREEN);
+}
+
+fn epd_power_off() {
+    syscall(SYS_EPD_POWER_OFF);
+}
+
+fn epd_power_on() {
+    syscall(SYS_EPD_POWER_ON);
+}
+
+// Returns battery voltage in millivolts (e.g. 3750 = 3.75 V), or -1 on error.
+fn battery_voltage_mv() {
+    return syscall(SYS_BATTERY_VOLTAGE);
+}
+
+// Returns battery percentage 0-100 based on a simple 3.0–4.2 V LiPo curve.
+// Returns -1 if the voltage reading failed.
+fn battery_percent() {
+    var mv = syscall(SYS_BATTERY_VOLTAGE);
+    if (mv < 0) {
+        return -1;
+    }
+    if (mv >= 4200) {
+        return 100;
+    }
+    if (mv <= 3000) {
+        return 0;
+    }
+    return (mv - 3000) / 12;
+}

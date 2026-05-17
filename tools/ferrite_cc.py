@@ -59,6 +59,8 @@ class Op:
     ARR_FREE   = 0x1B
     W_ALLTAR   = 0x1C  # + u8 var_slot (alloc + store + target)
     FRAME      = 0x1D  # + u8 local_count (function prologue)
+    SHL        = 0x1E  # a b → a << (b & 31), logical left shift
+    SHR        = 0x1F  # a b → a >> (b & 31), arithmetic right shift
 
     # Specialized short forms (1 byte, no args)
     PUSH_0     = 0x20
@@ -146,6 +148,9 @@ class Op:
     # String formatting
     SPRINTF = 0xA9  # + u8 argc (number of format args after the fmt string)
 
+    # Device syscall
+    SYSCALL = 0xAB  # + u8 syscall_id + u8 argc — pop argc args, push i32 result
+
     # Float math (trig / sqrt / rounding)
     FSIN   = 0xCD
     FCOS   = 0xCE
@@ -200,6 +205,8 @@ class Builtin:
     ARR_TO_STR = 38 # (arr_id, len) → str_id  (len<0 = full array; bytes are low byte of each element)
     SHOW_MODAL = 39 # (builder_fn, overlay_click_fn) → result; suspends VM until setDialogResult
     SET_DIALOG_RESULT = 40 # (result) → void; latches result on innermost modal frame
+    # index 41 = 0xA9 is SPRINTF (emitted directly via str_sprintf, not via asm.builtin)
+    FILE_SEEK = 42  # (handle, pos) → void; seek to byte position (clamped to [0, size])
 
 
 class Prop:
@@ -446,6 +453,12 @@ class Asm:
 
     def or_(self):
         self._emit(Op.OR)
+
+    def shl(self):
+        self._emit(Op.SHL)
+
+    def shr(self):
+        self._emit(Op.SHR)
 
     def not_(self):
         self._emit(Op.NOT)
@@ -836,6 +849,12 @@ class Asm:
         self._emit(Op.SPRINTF)
         self._emit_u8(argc)
 
+    def syscall(self, syscall_id, argc):
+        """syscall(id, arg0..argN) → i32. id is a compile-time u8 syscall number."""
+        self._emit(Op.SYSCALL)
+        self._emit_u8(syscall_id)
+        self._emit_u8(argc)
+
     def str_concat(self):
         """Pop [str_b, str_a], push concatenated str_id."""
         self._emit(Op.CONCAT)
@@ -931,6 +950,7 @@ OP_NAMES = {
     0x14: 'YIELD', 0x15: 'W_DIRTY', 0x16: 'W_RENDER',
     0x17: 'ARR_LOAD', 0x18: 'ARR_STORE', 0x19: 'ARR_LEN',
     0x1A: 'W_ALLOC', 0x1B: 'arrFree', 0x1C: 'W_ALLTAR', 0x1D: 'FRAME',
+    0x1E: 'shl', 0x1F: 'shr',
 
     0x20: 'PUSH_0', 0x21: 'PUSH_1', 0x22: 'PUSH_2', 0x23: 'PUSH_M1',
     0x24: 'LOAD L0', 0x25: 'LOAD L1', 0x26: 'LOAD L2', 0x27: 'LOAD L3', 0x28: 'LOAD L4',
@@ -958,6 +978,8 @@ OP_NAMES = {
     0x9D: 'fpgaCmd', 0x9E: 'fpgaData', 0x9F: 'critical',
     0xA0: 'setBrightness', 0xA1: 'brightness',
     0xA2: 'fileOpen', 0xA3: 'fileRead', 0xA4: 'fileSize', 0xA5: 'fileClose',
+    0xAA: 'fileSeek',
+    0xAB: 'syscall',
     0xA6: 'arrToStr',
     0xA7: 'showModal', 0xA8: 'setDialogResult', 0xA9: 'sprintf',
 
@@ -992,6 +1014,7 @@ PROP_NAMES = {
 # Set of no-arg opcodes for disassembler
 _NO_ARG_OPS = (
     set(range(0x00, 0x1C)) |           # 0x00-0x1B
+    {0x1E, 0x1F} |                     # SHL, SHR
     set(range(0x20, 0x2E)) |           # 0x20-0x2D
     {0x42, 0x43} |                     # W_TARGET_S, W_PARENT_S
     {op for op in range(0x80, 0xA9)    # 0x80-0xA8 except 0x86, 0x88
@@ -1172,6 +1195,12 @@ def disassemble(data, labels=None, symbols=None):
         elif op == Op.SPRINTF:
             argc = data[pos]; pos += 1
             lines.append(f'{addr:04X}: sprintf argc={argc}')
+
+        # SYSCALL: u8 syscall_id + u8 argc
+        elif op == Op.SYSCALL:
+            syscall_id = data[pos]; pos += 1
+            argc = data[pos]; pos += 1
+            lines.append(f'{addr:04X}: syscall id=0x{syscall_id:02X} argc={argc}')
 
         # DRAW_TEXT_LIT, STR_LIT: u8 len + text
         elif op in (Op.DRAW_TEXT_LIT, Op.STR_LIT):

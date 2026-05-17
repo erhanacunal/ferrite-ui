@@ -30,7 +30,7 @@
 #>
 param(
     [string] $Action = 'build',
-    [string] $Port   = '',
+    [string] $Port = '',
     [switch] $FlashFs
 )
 
@@ -42,14 +42,15 @@ $Root = $PSScriptRoot
 Set-Location $Root
 
 $Target = 'xtensa-esp32s3-none-elf'
-$Elf    = "target\$Target\release\epaper"
+$Elf = "target\$Target\release\epaper"
 $PartitionTable = "partition.csv"
 
 # ── ESP environment ──────────────────────────────────────────────────────────
 $ExportEsp = "$env:USERPROFILE\export-esp.ps1"
 if (Test-Path $ExportEsp) {
     . $ExportEsp
-} else {
+}
+else {
     Write-Warning "export-esp.ps1 not found at $ExportEsp"
     Write-Warning "Run 'espup install' and retry, or source the file manually."
 }
@@ -108,10 +109,26 @@ if ($Action -iin @('flash')) {
         }
         Write-Host "Filesystem image written." -ForegroundColor Green
     }
-} elseif ($Action -iin @('monitor')) {
+}
+elseif ($Action -iin @('monitor')) {
     $portArgs = if ($Port) { @('--port', $Port) } else { @() }
     espflash monitor @portArgs
-} else {
+}
+elseif ($Action -iin @('flashfs')) {
+    $FsBin = Join-Path $Root "ferrite_fs.bin"
+    if (-not (Test-Path $FsBin)) {
+        Write-Error "-FlashFs was set but ferrite_fs.bin not found. Build one with: python tools/ferrite_build.py <project.json> -o ferrite_fs.bin"
+    }
+    Write-Host ""
+    Write-Host "[3/3] Writing ferrite_fs.bin to flash 0x110000 (ferrite partition)" -ForegroundColor Cyan
+    $wbPort = if ($Port) { @('-p', $Port) } else { @() }
+    espflash write-bin --chip esp32s3 @wbPort "0x110000" $FsBin
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "write-bin ferrite_fs.bin failed."
+    }
+    Write-Host "Filesystem image written." -ForegroundColor Green
+}
+else {
     Write-Host ""
     Write-Host "To flash:   .\epaper.ps1 flash [COM?] [-FlashFs]"
     Write-Host "To monitor: .\epaper.ps1 monitor [COM?]"

@@ -18,6 +18,7 @@
 ///   Field 7, Varint  = MemInfo (query free heap memory)
 ///   Field 8, Varint  = TouchCalibrate (start 3-point touch calibration)
 ///   Field 9, Varint  = StackInfo (query current stack usage)
+///   Field 10, Payload = SetDateTime (7B: year(0-99) + month + day + weekday + hour + minute + second)
 
 extern crate alloc;
 
@@ -182,6 +183,8 @@ pub enum RxEvent {
     TouchCalibrate,
     /// Stack usage query — respond with current stack used/free
     StackInfo,
+    /// Set RTC date and time — respond with pong
+    SetDateTime,
     /// Program too large — exceeds MAX_PROGRAM_SIZE (2KB)
     ProgramTooLarge,
 }
@@ -196,6 +199,8 @@ pub struct Protocol {
     fs_writer: FsWriter,
     user_msg_buf: [u8; MAX_USER_MSG],
     user_msg_len: u8,
+    datetime_buf: [u8; 7],
+    datetime_pos: u8,
 }
 
 impl Protocol {
@@ -206,6 +211,8 @@ impl Protocol {
             fs_writer: FsWriter::new(),
             user_msg_buf: [0; MAX_USER_MSG],
             user_msg_len: 0,
+            datetime_buf: [0; 7],
+            datetime_pos: 0,
         }
     }
 
@@ -229,6 +236,19 @@ impl Protocol {
     /// Return user message data (valid after UserMessage event).
     pub fn user_message(&self) -> &[u8] {
         &self.user_msg_buf[..self.user_msg_len as usize]
+    }
+
+    /// Return parsed DateTime (valid after SetDateTime event).
+    pub fn datetime(&self) -> crate::rtc::DateTime {
+        crate::rtc::DateTime {
+            year:    self.datetime_buf[0],
+            month:   self.datetime_buf[1],
+            day:     self.datetime_buf[2],
+            weekday: self.datetime_buf[3],
+            hour:    self.datetime_buf[4],
+            minute:  self.datetime_buf[5],
+            second:  self.datetime_buf[6],
+        }
     }
 
     /// Process a single received byte. Returns an event if a complete message was received.
@@ -282,6 +302,15 @@ impl Protocol {
                                 self.user_msg_len = 0;
                                 self.state = RxState::Length {
                                     field: 6,
+                                    value: 0,
+                                    shift: 0,
+                                };
+                            }
+                            10 => {
+                                // SetDateTime — read length, then 7 bytes
+                                self.datetime_pos = 0;
+                                self.state = RxState::Length {
+                                    field: 10,
                                     value: 0,
                                     shift: 0,
                                 };
@@ -381,6 +410,13 @@ impl Protocol {
                             self.user_msg_len += 1;
                         }
                     }
+                    10 => {
+                        // DateTime bytes: year, month, day, weekday, hour, minute, second
+                        if (self.datetime_pos as usize) < 7 {
+                            self.datetime_buf[self.datetime_pos as usize] = byte;
+                            self.datetime_pos += 1;
+                        }
+                    }
                     _ => {}
                 }
 
@@ -410,6 +446,7 @@ impl Protocol {
                                 RxEvent::FsChunkDone
                             }
                         }
+                        10 => RxEvent::SetDateTime,
                         _ => RxEvent::None,
                     }
                 } else {

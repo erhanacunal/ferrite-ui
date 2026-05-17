@@ -144,8 +144,9 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - `fileOpen(name)` → handle `1` or `2`, or `0xFF` on error. **Caller MUST check.**
   - `fileRead(handle)` → byte `0..255`, or `-1` on EOF.
   - `fileSize(handle)` → total size in bytes.
+  - `fileSeek(handle, pos)` — seek to byte position (clamped to `[0, size]`; negative → 0).
   - `fileClose(handle)` — release slot.
-- **Error handling:** passing `0xFF` (or any unopened handle) to `fileRead`/`fileSize`/`fileClose` → VM enters `Error` state. Programs must guard calls.
+- **Error handling:** passing `0xFF` (or any unopened handle) to `fileRead`/`fileSize`/`fileSeek`/`fileClose` → VM enters `Error` state. Programs must guard calls.
 - **Typical loop:**
   ```
   var h = fileOpen("cfg");

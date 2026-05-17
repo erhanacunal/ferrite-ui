@@ -2,7 +2,7 @@
 """ferrite-cli — Host-side tool for communicating with ferrite-ui devices.
 
 Implements the USART protobuf protocol (see protocol.rs).
-Commands: ping, restart, meminfo, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate
+Commands: ping, restart, meminfo, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime
 
 Usage:
     python ferrite_cli.py -p COM3 ping
@@ -13,6 +13,8 @@ Usage:
     python ferrite_cli.py -p COM3 writefs flash.bin
     python ferrite_cli.py -p COM3 send 0x01 0x02 0x03
     python ferrite_cli.py -p COM3 send "hello world"
+    python ferrite_cli.py -p COM3 settime                  (use current system time)
+    python ferrite_cli.py -p COM3 settime "2025-05-17 14:30:00"
 """
 
 import argparse
@@ -33,6 +35,7 @@ TAG_USERMSG    = (6 << 3) | 2   # 0x32, payload (user message data, max 64 bytes
 TAG_MEMINFO    = (7 << 3) | 0   # 0x38, varint
 TAG_TOUCHCAL   = (8 << 3) | 0   # 0x40, varint (start touch calibration)
 TAG_STACKINFO  = (9 << 3) | 0   # 0x48, varint (query stack usage)
+TAG_SETDATETIME = (10 << 3) | 2  # 0x52, payload (7B: year/month/day/weekday/hour/min/sec)
 
 CHUNK_SIZE = 4096  # Must match device sector buffer size
 
@@ -472,6 +475,40 @@ def cmd_calibrate(ser: serial.Serial) -> bool:
         return False
 
 
+def cmd_settime(ser: serial.Serial, dt_str: str | None) -> bool:
+    """Set device RTC. Payload: year(0-99) month day weekday hour minute second."""
+    from datetime import datetime as dt_cls
+
+    if dt_str is None:
+        now = dt_cls.now()
+    else:
+        try:
+            now = dt_cls.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            print(f"invalid format (expected YYYY-MM-DD HH:MM:SS): {dt_str}", file=sys.stderr)
+            return False
+
+    year = now.year - 2000          # AT8563T stores 0-99 offset from 2000
+    weekday = (now.weekday() + 1) % 7  # Python 0=Mon → RTC 0=Sun
+
+    payload = bytes([year, now.month, now.day, weekday, now.hour, now.minute, now.second])
+    ser.write(build_payload_msg(TAG_SETDATETIME, payload))
+    ser.flush()
+
+    resp_type, resp_val = read_response(ser)
+    if resp_type == "pong":
+        day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        print(f"time set: {now.strftime('%Y-%m-%d %H:%M:%S')} ({day_names[weekday]})")
+        return True
+    elif resp_type == "error":
+        desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
+        print(f"error: code {resp_val} — {desc}", file=sys.stderr)
+        return False
+    else:
+        print("no response (timeout)", file=sys.stderr)
+        return False
+
+
 # --- Main ---
 
 
@@ -503,6 +540,11 @@ def main():
     sub.add_parser("calibrate", help="Start 3-point touch calibration")
     sub.add_parser("stackinfo", help="Query current stack usage")
 
+    p_settime = sub.add_parser("settime", help="Set device RTC date and time")
+    p_settime.add_argument("datetime", nargs="?", default=None,
+                           metavar="YYYY-MM-DD HH:MM:SS",
+                           help="Date/time string (default: current system time)")
+
     args = parser.parse_args()
 
     try:
@@ -528,6 +570,8 @@ def main():
             ok = cmd_calibrate(ser)
         elif args.command == "stackinfo":
             ok = cmd_stackinfo(ser)
+        elif args.command == "settime":
+            ok = cmd_settime(ser, args.datetime)
         else:
             ok = False
 

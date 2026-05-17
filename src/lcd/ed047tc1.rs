@@ -15,16 +15,16 @@
 #![cfg(feature = "epaper")]
 
 use esp_hal::{
+    Blocking,
     dma::DmaTxBuf,
     gpio::{Level, Output, OutputConfig},
     lcd_cam::{
-        lcd::i8080::{self, Command, I8080},
         LcdCam,
+        lcd::i8080::{self, Command, I8080},
     },
     peripherals,
     rmt::PulseCode,
     time::Rate,
-    Blocking,
 };
 
 use crate::lcd::rmt;
@@ -161,7 +161,6 @@ impl ED047TC1 {
         // Config shift register
         let mut cfg_writer = ConfigWriter::new(cfg_data, cfg_clk, cfg_str);
         cfg_writer.write();
-        crate::usart::dbg(b"  cfg ok\r\n");
 
         // I8080 — scrambled GPIO→bit mapping to match PCB layout.
         // Compensated by line_buffer_reorder() before every DMA transfer.
@@ -174,7 +173,7 @@ impl ED047TC1 {
             .with_cd_cmd_edge(true)
             .with_cd_dummy_edge(false)
             .with_cd_data_edge(false);
-        crate::usart::dbg(b"  i8080 init\r\n");
+
         let i8080 = I8080::new(lcd.lcd, dma_ch, i8080_cfg)
             .expect("I8080 init failed")
             .with_dc(lcd_dc)
@@ -187,12 +186,9 @@ impl ED047TC1 {
             .with_data5(data3) // I8080 bit5 ← GPIO3 (EPD D3)
             .with_data6(data0) // I8080 bit6 ← GPIO8 (EPD D0)
             .with_data7(data1); // I8080 bit7 ← GPIO1 (EPD D1)
-        crate::usart::dbg(b"  i8080 ok\r\n");
 
         // DMA TX buffer (248 bytes: 240 pixel + 8 trailing zeros)
-        crate::usart::dbg(b"  dma buf\r\n");
         let dma_buf = esp_hal::dma_tx_buffer!(DMA_BUFFER_SIZE).expect("DMA buffer init failed");
-        crate::usart::dbg(b"  dma ok\r\n");
 
         Self {
             i8080: Some(i8080),
