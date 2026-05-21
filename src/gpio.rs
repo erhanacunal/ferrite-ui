@@ -11,6 +11,12 @@ const GPIOB_BASE: u32 = 0x4001_0C00;
 
 const GPIO_BOP_OFFSET: u32 = 0x10;
 const GPIO_BC_OFFSET: u32 = 0x14;
+const GPIO_ISTAT_OFFSET: u32 = 0x08;
+const GPIO_CTL0_OFFSET: u32 = 0x00;
+const GPIO_CTL1_OFFSET: u32 = 0x04;
+
+const GPIOB_OUTPUT_PP_50MHZ: u32 = 0x3333_3333;
+const GPIOB_INPUT_FLOATING: u32 = 0x4444_4444;
 
 /// PA15: LCD_CMD_DATA (1=data, 0=command)
 const LCD_CMD_DATA_PIN: u32 = 15;
@@ -30,6 +36,12 @@ impl Gpio {
     /// GPIOB[15:0]'a 16-bit veri yaz
     #[inline(always)]
     pub fn write_data_bus(&self, value: u16) {
+        Self::write_data_bus_raw(value);
+    }
+
+    /// GPIOB[15:0]'a 16-bit veri yaz. Useful from static syscall handlers.
+    #[inline(always)]
+    pub fn write_data_bus_raw(value: u16) {
         unsafe {
             let bop = (GPIOB_BASE + GPIO_BOP_OFFSET) as *mut u32;
             // Üst 16 bit = reset, alt 16 bit = set
@@ -38,9 +50,51 @@ impl Gpio {
         }
     }
 
+    /// Configure GPIOB[15:0] as the LCD/FPGA output data bus.
+    #[inline(always)]
+    pub fn set_data_bus_output() {
+        unsafe {
+            core::ptr::write_volatile(
+                (GPIOB_BASE + GPIO_CTL0_OFFSET) as *mut u32,
+                GPIOB_OUTPUT_PP_50MHZ,
+            );
+            core::ptr::write_volatile(
+                (GPIOB_BASE + GPIO_CTL1_OFFSET) as *mut u32,
+                GPIOB_OUTPUT_PP_50MHZ,
+            );
+        }
+    }
+
+    /// Configure GPIOB[15:0] as floating inputs.
+    #[inline(always)]
+    pub fn set_data_bus_input() {
+        unsafe {
+            core::ptr::write_volatile(
+                (GPIOB_BASE + GPIO_CTL0_OFFSET) as *mut u32,
+                GPIOB_INPUT_FLOATING,
+            );
+            core::ptr::write_volatile(
+                (GPIOB_BASE + GPIO_CTL1_OFFSET) as *mut u32,
+                GPIOB_INPUT_FLOATING,
+            );
+        }
+    }
+
+    /// Read the current GPIOB[15:0] input state.
+    #[inline(always)]
+    pub fn read_data_bus() -> u16 {
+        unsafe { core::ptr::read_volatile((GPIOB_BASE + GPIO_ISTAT_OFFSET) as *const u32) as u16 }
+    }
+
     /// PA15: command/data seç (0=command, 1=data)
     #[inline(always)]
     pub fn set_cmd_data(&self, is_data: bool) {
+        Self::set_cmd_data_raw(is_data);
+    }
+
+    /// PA15: command/data seç (0=command, 1=data). Useful from static syscall handlers.
+    #[inline(always)]
+    pub fn set_cmd_data_raw(is_data: bool) {
         unsafe {
             if is_data {
                 let bop = (GPIOA_BASE + GPIO_BOP_OFFSET) as *mut u32;
@@ -56,6 +110,12 @@ impl Gpio {
     /// Resting state: PA12 HIGH. Matches original firmware timing.
     #[inline(always)]
     pub fn clock_pulse(&self) {
+        Self::clock_pulse_raw();
+    }
+
+    /// PA12: clock pulse — FPGA latches on falling edge.
+    #[inline(always)]
+    pub fn clock_pulse_raw() {
         unsafe {
             // PA12 LOW — falling edge (FPGA latches data here)
             let bc = (GPIOA_BASE + GPIO_BC_OFFSET) as *mut u32;

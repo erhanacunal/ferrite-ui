@@ -1,0 +1,38 @@
+// gd32.fl — Syscall constants for the GD32F103 / NX8048K070 target
+// Usage: #include "gd32.fl"
+//
+// GPIOB is the 16-bit LCD/FPGA data bus. If you switch it to input, LCD
+// rendering cannot drive the bus again until you switch it back to output.
+
+const SYS_GPIOB_MODE  = 0x30; // (mode) -> 0; mode: 0=input floating, 1=output push-pull 50MHz
+const SYS_GPIOB_READ  = 0x31; // () -> GPIOB[15:0]
+const SYS_GPIOB_WRITE = 0x32; // (value) -> 0
+const SYS_FPGA_CMD_ONLY = 0x33; // (cmd) -> 0; command strobe without a following data word
+const SYS_FPGA_CLOCK = 0x34; // () -> 0; pulse PA12 once
+
+const GPIOB_INPUT  = 0;
+const GPIOB_OUTPUT = 1;
+
+fn gpiob_input() {
+    return syscall(SYS_GPIOB_MODE, GPIOB_INPUT);
+}
+
+fn gpiob_output() {
+    return syscall(SYS_GPIOB_MODE, GPIOB_OUTPUT);
+}
+
+fn gpiob_read() {
+    return syscall(SYS_GPIOB_READ);
+}
+
+fn gpiob_write(value) {
+    return syscall(SYS_GPIOB_WRITE, value);
+}
+
+fn fpga_cmd_only(cmd) {
+    return syscall(SYS_FPGA_CMD_ONLY, cmd);
+}
+
+fn fpga_clock() {
+    return syscall(SYS_FPGA_CLOCK);
+}

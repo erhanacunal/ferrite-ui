@@ -33,7 +33,7 @@ mod touch;
 mod types;
 mod usart;
 mod vm;
-mod watchdog;
+//mod watchdog;
 mod widget;
 
 use cortex_m_rt::entry;
@@ -85,6 +85,14 @@ const ERR_EMPTY_RUN: u8 = 0xFE; // recovery mode — skip program load
 // === Max program code size ===
 
 const MAX_CODE_SIZE: usize = 4096;
+
+// === Device syscalls ===
+
+const SYS_GPIOB_MODE: u8 = 0x30; // (0=input floating, 1=output PP 50MHz) -> 0
+const SYS_GPIOB_READ: u8 = 0x31; // () -> GPIOB[15:0]
+const SYS_GPIOB_WRITE: u8 = 0x32; // (u16 value) -> 0
+const SYS_FPGA_CMD_ONLY: u8 = 0x33; // (cmd) -> 0; command strobe without data word
+const SYS_FPGA_CLOCK: u8 = 0x34; // () -> 0; pulse PA12 once
 
 // === RCU registers ===
 
@@ -425,6 +433,12 @@ fn format_error_code(code: u8, buf: &mut [u8; 16]) -> usize {
         buf[6] = b'0' + code;
         7
     }
+}
+
+fn write_hex_byte(usart: &Usart, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    usart.write_byte(HEX[(byte >> 4) as usize]);
+    usart.write_byte(HEX[(byte & 0x0F) as usize]);
 }
 
 fn error_description(code: u8) -> &'static [u8] {
@@ -871,7 +885,7 @@ fn main() -> ! {
     init_ports();
 
     let gpio = Gpio::init();
-    let usart = Usart::init();
+    let usart = Usart::init();    
     let mut touch = Touch::init();
     // --- Application context (heap allocated) ---
     let mut ctx = Box::new(Ctx {
@@ -1001,6 +1015,50 @@ fn main() -> ! {
 
     // 6. Single VM — heap allocated, owns code and function table
     let mut vm = Box::new(Vm::new());
+    vm.syscall_fn = Some(|id, args, _strpool| match id {
+        SYS_GPIOB_MODE => {
+            if args.len() != 1 {
+                return None;
+            }
+            match args[0] {
+                0 => Gpio::set_data_bus_input(),
+                1 => Gpio::set_data_bus_output(),
+                _ => return None,
+            }
+            Some(0)
+        }
+        SYS_GPIOB_READ => {
+            if !args.is_empty() {
+                return None;
+            }
+            Some(Gpio::read_data_bus() as i32)
+        }
+        SYS_GPIOB_WRITE => {
+            if args.len() != 1 {
+                return None;
+            }
+            Gpio::write_data_bus_raw(args[0] as u16);
+            Some(0)
+        }
+        SYS_FPGA_CMD_ONLY => {
+            if args.len() != 1 {
+                return None;
+            }
+            Gpio::set_data_bus_output();
+            Gpio::set_cmd_data_raw(false);
+            Gpio::write_data_bus_raw(args[0] as u16);
+            Gpio::clock_pulse_raw();
+            Some(0)
+        }
+        SYS_FPGA_CLOCK => {
+            if !args.is_empty() {
+                return None;
+            }
+            Gpio::clock_pulse_raw();
+            Some(0)
+        }
+        _ => None,
+    });
 
     // 7. Load main program into VM (image header + opcodes)
     if error_code == 0 {
@@ -1086,15 +1144,15 @@ fn main() -> ! {
 
     // === MAIN LOOP ===
 
-    watchdog::init();
+    //watchdog::init();
 
     let mut kb = keyboard::Keyboard::new();
     let mut scroll_id = widget::WidgetId::NONE;
     let mut scroll_active = false; // true when dragging scrollbar
-    let mut protocol = Protocol::new();
+    let mut protocol = Protocol::new();    
 
     loop {
-        watchdog::feed();
+        //watchdog::feed();
 
         // If a modal is open and its result has been set (typically by a
         // callback that ran on the previous loop iteration), destroy the

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["epaper"]
+default = ["firmware"]
 firmware = ["dep:cortex-m", "dep:cortex-m-rt"]
 host = ["dep:minifb"]
 epaper = ["dep:esp-hal","dep:esp-bootloader-esp-idf", "dep:critical-section", "dep:xtensa-lx", "dep:esp-alloc", "dep:esp-storage", "dep:nb"]
@@ -44,5 +44,7 @@ required-features = ["epaper"]
 [profile.release]
 codegen-units = 1
 opt-level = "s"
-lto = 'fat'
-debug = 2
+# lto = 'fat'
+# debug = 2
+lto = true
+debug = false

@@ -120,7 +120,7 @@ pub fn rx_read_byte() -> Option<u8> {
         let head = read_volatile(&raw const RX_HEAD);
 
         if tail == head {
-            RX_READY.store(false, Ordering::Release);
+            RX_READY.store(false, Ordering::Release);            
             return None;
         }
 

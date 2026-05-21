@@ -2,10 +2,11 @@ use super::LcdBackend;
 use crate::gpio::Gpio;
 
 /// FPGA command codes (Ghidra reverse engineering)
-const CMD_FRONT_SWAP: u16 = 0x04;
-const CMD_BACK_SELECT: u16 = 0x05;
+
 const CMD_Y_START: u16 = 0x02;
 const CMD_X_START: u16 = 0x03;
+const CMD_FRONT_SWAP: u16 = 0x04;
+const CMD_BACK_SELECT: u16 = 0x05;
 const CMD_Y_END: u16 = 0x06;
 const CMD_X_END: u16 = 0x07;
 const CMD_PIXEL_WRITE: u16 = 0x0F;

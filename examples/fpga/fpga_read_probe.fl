@@ -1,0 +1,166 @@
+// fpga_read_probe.fl - Probe FPGA CMD 0x0E as a possible read command.
+//
+// Sequence:
+// 1. Draw known RGB565 words at known pixel addresses.
+// 2. Re-select a pixel address.
+// 3. Send command 0x0E without a data word.
+// 4. Switch GPIOB[15:0] to input and sample the bus.
+// 5. Switch GPIOB back to output before any more LCD/FPGA writes.
+
+#include "gd32.fl"
+
+const CMD_Y_START = 0x02;
+const CMD_X_START = 0x03;
+const CMD_Y_END   = 0x06;
+const CMD_X_END   = 0x07;
+const CMD_READ    = 0x01;
+const CMD_WRITE   = 0x0F;
+
+var x;
+var y;
+var expected;
+var v0;
+var v1;
+var v2;
+var msg;
+var pass;
+
+var cmdX = 0x08;
+
+fn usart_line(s) {
+    sendUsart(s);
+    sendUsart(str("\r\n"));
+    strClear();
+}
+
+fn set_addr(px, py) {
+    gpiob_output();
+    fpgaCmd(CMD_X_START, px);
+    fpgaCmd(CMD_Y_START, py);
+    fpgaCmd(CMD_X_END, px);
+    fpgaCmd(CMD_Y_END, py);
+}
+
+fn write_pixel_word(px, py, color) {
+    usart_line(str("write_pixel: set_addr"));
+    set_addr(px, py);
+    usart_line(str("write_pixel: cmd0f"));
+    fpga_cmd_only(CMD_WRITE);
+    usart_line(str("write_pixel: data"));
+    fpgaData(color);
+    usart_line(str("write_pixel: done"));
+}
+
+fn read_probe_word(px, py) {
+    usart_line(str("read_probe: set_addr"));
+    set_addr(px, py);
+
+    // CMD 0x0E is the unknown candidate. This helper clocks only the command.
+    usart_line(str("read_probe: cmd0e"));
+    fpga_cmd_only(cmdX);
+
+    cmdX = cmdX + 1;
+    if (cmdX == 15) {
+        cmdX = 16;
+    } else if (cmdX > 30) {
+        cmdX = 8;
+    }
+
+    // Release GPIOB so the FPGA can drive the 16-bit bus.
+    usart_line(str("read_probe: input"));
+    gpiob_input();
+    delay(1);
+
+    // First sample is immediate; later samples pulse PA12 in case the read
+    // interface advances data on clock edges.
+    usart_line(str("read_probe: read0"));
+    v0 = gpiob_read();
+    usart_line(str("read_probe: clock1"));
+    fpga_clock();
+    usart_line(str("read_probe: read1"));
+    v1 = gpiob_read();
+    usart_line(str("read_probe: clock2"));
+    fpga_clock();
+    usart_line(str("read_probe: read2"));
+    v2 = gpiob_read();
+
+    // Restore output before any draw, fpgaCmd, or fpgaData call.
+    usart_line(str("read_probe: output"));
+    gpiob_output();
+
+    msg = sprintf(
+        "READ0E x=%d y=%d expect=0x%X r0=0x%X r1=0x%X r2=0x%X",
+        px,
+        py,
+        expected,
+        v0,
+        v1,
+        v2
+    );
+    usart_line(msg);
+    strClear();
+}
+
+fn setup() {
+    setBrightness(100);
+
+    fillRect(0, 0, 800, 480, 0x0000);
+    drawText(20, 30, 0, 0xFFFF, 0, "FPGA CMD 0x0E READ PROBE");
+
+    usart_line(str("fpga_read_probe start"));
+    pass = 0;
+
+    return 0;
+}
+
+fn loop() {
+    usart_line(str("loop: pass start"));
+
+    // Keep setup harmless. If a probe operation wedges the bus, the protocol
+    // had a chance to run after setup returned.
+    if (pass == 0) {
+        usart_line(str("first loop reached"));
+        delay(250);
+    }
+
+    // Known memory locations and known words.
+    usart_line(str("loop: write red"));
+    write_pixel_word(20, 20, 0xF800);
+    delay(10);
+
+    usart_line(str("loop: write green"));
+    write_pixel_word(21, 20, 0x07E0);
+    delay(10);
+
+    usart_line(str("loop: write blue"));
+    write_pixel_word(22, 20, 0x001F);
+    delay(10);
+
+    usart_line(str("loop: write white"));
+    write_pixel_word(23, 20, 0xFFFF);
+    delay(10);
+
+    x = 20;
+    y = 20;
+    expected = 0xF800;
+    read_probe_word(x, y);
+
+    x = 21;
+    y = 20;
+    expected = 0x07E0;
+    read_probe_word(x, y);
+
+    x = 22;
+    y = 20;
+    expected = 0x001F;
+    read_probe_word(x, y);
+
+    x = 23;
+    y = 20;
+    expected = 0xFFFF;
+    read_probe_word(x, y);
+
+    usart_line(str("fpga_read_probe pass complete"));
+    pass = pass + 1;
+    delay(1000);
+}

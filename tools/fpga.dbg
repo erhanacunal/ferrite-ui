@@ -1,0 +1,104 @@
+{
+  "functions": [
+    {
+      "length": 106,
+      "locals": {},
+      "name": "setup",
+      "offset": 0
+    },
+    {
+      "length": 7,
+      "locals": {},
+      "name": "gpiob_input",
+      "offset": 106
+    },
+    {
+      "length": 7,
+      "locals": {},
+      "name": "gpiob_output",
+      "offset": 113
+    },
+    {
+      "length": 6,
+      "locals": {},
+      "name": "gpiob_read",
+      "offset": 120
+    },
+    {
+      "length": 8,
+      "locals": {
+        "0": "value"
+      },
+      "name": "gpiob_write",
+      "offset": 126
+    },
+    {
+      "length": 8,
+      "locals": {
+        "0": "cmd"
+      },
+      "name": "fpga_cmd_only",
+      "offset": 134
+    },
+    {
+      "length": 6,
+      "locals": {},
+      "name": "fpga_clock",
+      "offset": 142
+    },
+    {
+      "length": 14,
+      "locals": {
+        "0": "s"
+      },
+      "name": "usart_line",
+      "offset": 148
+    },
+    {
+      "length": 25,
+      "locals": {
+        "0": "px",
+        "1": "py"
+      },
+      "name": "set_addr",
+      "offset": 162
+    },
+    {
+      "length": 118,
+      "locals": {
+        "0": "px",
+        "1": "py",
+        "2": "color"
+      },
+      "name": "write_pixel_word",
+      "offset": 187
+    },
+    {
+      "length": 339,
+      "locals": {
+        "0": "px",
+        "1": "py"
+      },
+      "name": "read_probe_word",
+      "offset": 305
+    },
+    {
+      "length": 343,
+      "locals": {},
+      "name": "loop",
+      "offset": 644
+    }
+  ],
+  "globals": {
+    "0": "x",
+    "1": "y",
+    "2": "expected",
+    "3": "v0",
+    "4": "v1",
+    "5": "v2",
+    "6": "msg",
+    "7": "pass"
+  },
+  "source": "examples\\fpga\\fpga_read_probe.fl",
+  "version": 1
+}

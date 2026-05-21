@@ -3,7 +3,7 @@ target = "thumbv7m-none-eabi"
 # target = "xtensa-esp32s3-none-elf"
 
 [target.thumbv7m-none-eabi]
-rustflags = ["-C", "link-arg=-Tlink.x"]
+rustflags = ["-C", "link-arg=-Tgd32-link.x"]
 
 # ESP32-S3 (epaper) build:
 #   cargo +esp build --no-default-features --features epaper \

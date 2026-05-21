@@ -56,24 +56,27 @@ else {
 }
 
 # ── Build ────────────────────────────────────────────────────────────────────
-Write-Host ""
-Write-Host "[1/2] Building epaper firmware  (target: $Target)" -ForegroundColor Cyan
-$Features = 'epaper'
-
-cargo +esp build "-Zbuild-std=core,alloc" `
-    --no-default-features `
-    --features $Features `
-    --bin epaper `
-    --target $Target `
-    --release
-
-if ($LASTEXITCODE -ne 0) {
+if (-not $Action -in @('flashfs')) {
     Write-Host ""
-    Write-Error "Build failed."
-}
+    Write-Host "[1/2] Building epaper firmware  (target: $Target)" -ForegroundColor Cyan
+    $Features = 'epaper'
 
-Write-Host ""
-Write-Host "ELF: $Root\$Elf"
+    cargo +esp build "-Zbuild-std=core,alloc" `
+        --no-default-features `
+        --features $Features `
+        --bin epaper `
+        --target $Target `
+        --release
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Error "Build failed."
+    }
+
+    Write-Host ""
+    Write-Host "ELF: $Root\$Elf"
+
+}
 
 # ── Flash ─────────────────────────────────────────────────────────────────────
 if ($Action -iin @('flash')) {

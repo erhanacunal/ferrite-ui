@@ -5,12 +5,13 @@ use std::path::PathBuf;
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // Add OUT_DIR to the linker search path so copied linker-script files are found.
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
     if target_arch == "xtensa" {
+        // Add OUT_DIR to the linker search path so copied linker-script files are found.
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
         linker_be_nice();
         println!("cargo:rustc-link-arg=-Tlinkall.x");
         // Embed ferrite_fs.bin into the binary for XIP-safe flash reads.
@@ -27,13 +28,12 @@ fn main() {
         }
         println!("cargo:rerun-if-changed=ferrite_fs.bin");
     } else {
-        // Cortex-M / host build: supply the GD32F103 interrupt-vector definition.
-        fs::copy("gd32-memory.x", out_dir.join("memory.x")).unwrap();
-        if fs::copy("gd32-device.x", out_dir.join("device.x")).is_err() {
-            // device.x is only required for the firmware target; ignore missing on host.
-        }
-        println!("cargo:rerun-if-changed=gd32-device.x");
-        println!("cargo:rerun-if-changed=gd32-memory.x");
+        // Cortex-M firmware build: supply the GD32F103 linker scripts under
+        // the conventional names expected by cortex-m-rt's link.x.
+        // fs::copy("gd32-memory.x", out_dir.join("memory.x")).unwrap();
+        // fs::copy("gd32-device.x", out_dir.join("device.x")).unwrap();
+        // println!("cargo:rerun-if-changed=gd32-device.x");
+        // println!("cargo:rerun-if-changed=gd32-memory.x");
     }
 }
 
