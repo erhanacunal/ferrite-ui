@@ -29,6 +29,9 @@ pub const FLAG_RENDERED: u16 = 1 << 9;
 /// reuse by `alloc`. Treated as not-visible by `is_tree_visible`.
 pub const FLAG_DESTROYED: u16 = 1 << 10;
 
+/// Label text is rendered as multiple lines split by '\n'.
+pub const FLAG_MULTI_LINE: u16 = 1 << 11;
+
 
 // --- Widget Kind ---
 
@@ -43,6 +46,7 @@ pub const KIND_INPUT: u8 = 7;
 pub const KIND_GAUGE: u8 = 8;
 pub const KIND_DROPDOWN: u8 = 9;
 pub const KIND_GRAPH: u8 = 10;
+pub const KIND_IMAGE: u8 = 11;
 
 // --- Text Alignment ---
 

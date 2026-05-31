@@ -92,6 +92,17 @@ impl StringPool {
         self.meta[id as usize].len
     }
 
+    /// Compare two strings lexicographically. Returns -1, 0, or 1.
+    pub fn compare(&self, a: u16, b: u16) -> i32 {
+        let a_data = self.get(a);
+        let b_data = self.get(b);
+        match a_data.cmp(b_data) {
+            core::cmp::Ordering::Less => -1,
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Greater => 1,
+        }
+    }
+
     /// Concatenate two strings. Returns new string ID or None if full.
     pub fn concat(&mut self, a: u16, b: u16) -> Option<u16> {
         if a as usize >= self.count as usize || b as usize >= self.count as usize {

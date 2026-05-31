@@ -68,6 +68,7 @@ pub const PROP_GRADIENT_DIR: u8 = 0x2C;  // 0=none, 1=horizontal, 2=vertical
 pub const PROP_GRAPH_ARR: u8 = 0x2D;
 pub const PROP_GRAPH_COUNT: u8 = 0x2E;
 pub const PROP_GRAPH_FLAGS: u8 = 0x2F;
+pub const PROP_MULTI_LINE: u8 = 0x30; // 0=off, 1=on (label text splits on \n)
 
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;

@@ -292,6 +292,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
             &embedded_font::CODEPOINTS,
             &embedded_font::BITMAP,
             embedded_font::Y_ADVANCE,
+            embedded_font::BPP,
         );
         let flash = Flash::new();
 
@@ -455,6 +456,7 @@ fn main() -> ! {
         &embedded_font::CODEPOINTS,
         &embedded_font::BITMAP,
         embedded_font::Y_ADVANCE,
+        embedded_font::BPP,
     ));
 
     // Map logical FS addresses into ferrite partition (compact vs padded `ferrite_fs.bin`).

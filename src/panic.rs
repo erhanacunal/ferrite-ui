@@ -72,6 +72,7 @@ fn panic(info: &PanicInfo) -> ! {
         &embedded_font::CODEPOINTS,
         &embedded_font::BITMAP,
         embedded_font::Y_ADVANCE,
+        embedded_font::BPP,
     );
 
     // Dummy flash (embedded font reads from ROM, never touches flash hardware)

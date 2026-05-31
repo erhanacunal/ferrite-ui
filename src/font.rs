@@ -4,13 +4,26 @@
 ///   1. Flash: combined resource via load/load_by_id
 ///   2. Embedded: codepoints + glyph table + bitmap in ROM via from_embedded
 ///
-/// Flash resource layout (sparse format, N = num_glyphs):
-///   [0..2]         num_glyphs: u16 LE
-///   [2]            y_advance: u8
-///   [3]            font_id: u8
-///   [4..4+N*2]     codepoints[] (N × u16 LE, sorted ascending)
-///   [4+N*2..4+N*9] glyphs[] (N × 7 bytes)
-///   [4+N*9..]      bitmap data (1-bit packed, MSB first)
+/// Flash resource layouts:
+///
+///   V1 (1bpp monochrome, legacy):
+///     [0..1]         num_glyphs: u16 LE
+///     [2]            y_advance: u8
+///     [3]            font_id: u8
+///     [4..4+N*2]     codepoints[] (N × u16 LE, sorted ascending)
+///     [4+N*2..4+N*9] glyphs[] (N × 7 bytes)
+///     [4+N*9..]      bitmap data (1-bit packed, MSB first)
+///
+///   V2 (2bpp anti-aliased):
+///     [0..1]         magic: 0x00, 0x02
+///     [2..3]         num_glyphs: u16 LE
+///     [4]            y_advance: u8
+///     [5]            font_id: u8
+///     [6]            bpp: u8  (2 = 4-level AA)
+///     [7..7+N*2]     codepoints[] (N × u16 LE, sorted ascending)
+///     [7+N*2..7+N*9] glyphs[] (N × 7 bytes)
+///     [7+N*9..]      bitmap data (2bpp packed, MSB first; 4 pixels per byte;
+///                    each pixel = 2 bits: 0=0%, 1=33%, 2=67%, 3=100%)
 ///
 /// GfxGlyph (7 bytes, packed):
 ///   bitmapOffset: u16, width: u8, height: u8,
@@ -21,7 +34,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use crate::flash::Flash;
 use crate::fs::{Fs, RES_FONT};
-use crate::lcd::Lcd;
+use crate::lcd::{Lcd, lerp_rgb565};
 
 /// Per-glyph info — Adafruit GFX format (7 bytes)
 #[derive(Clone, Copy)]
@@ -102,6 +115,8 @@ impl GlyphData {
 /// Font — sparse format, binary search on sorted codepoints[].
 pub struct Font {
     pub font_id: u8,
+    /// Bits per pixel: 1 = monochrome, 2 = 2bpp anti-aliased
+    pub bpp: u8,
     y_advance: u8,
     glyphs: GlyphData,
     /// Absolute flash address of bitmap data
@@ -118,6 +133,7 @@ impl Font {
     fn empty() -> Self {
         Font {
             font_id: 0xFF,
+            bpp: 1,
             y_advance: 0,
             glyphs: GlyphData::Heap {
                 glyphs: Vec::new(),
@@ -134,27 +150,39 @@ impl Font {
         Self::load_from_entry(flash, &entry)
     }
 
-    /// Load font from a ResourceEntry (sparse format).
+    /// Load font from a ResourceEntry (detects V1/V2 format).
     pub fn load_from_entry(flash: &Flash, entry: &crate::fs::ResourceEntry) -> Option<Self> {
         if entry.size < 4 {
             return None;
         }
 
-        let mut hdr = [0u8; 4];
-        flash.read(entry.offset, &mut hdr);
+        // Read first 7 bytes (max header size); V1 only uses first 4.
+        let mut hdr = [0u8; 7];
+        let read_len = 7.min(entry.size as usize);
+        flash.read(entry.offset, &mut hdr[..read_len]);
 
-        let num_glyphs = u16::from_le_bytes([hdr[0], hdr[1]]) as usize;
-        let y_advance = hdr[2];
-        let font_id = hdr[3];
+        // Detect V2: magic bytes [0x00, 0x02] at positions 0-1.
+        // A V1 font with 512 glyphs (0x0200 LE) would collide, but this is
+        // impossible on 128 KB flash (512×9B table = 4608B alone).
+        let (num_glyphs, y_advance, font_id, bpp, hdr_len): (usize, u8, u8, u8, u32) =
+            if hdr[0] == 0x00 && hdr[1] == 0x02 && entry.size >= 7 {
+                // V2: 7-byte header
+                let n = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+                (n, hdr[4], hdr[5], hdr[6], 7)
+            } else {
+                // V1: 4-byte header (bpp=1 legacy)
+                let n = u16::from_le_bytes([hdr[0], hdr[1]]) as usize;
+                (n, hdr[2], hdr[3], 1, 4)
+            };
 
         let cp_bytes = (num_glyphs * 2) as u32;
         let gl_bytes = (num_glyphs * 7) as u32;
 
-        if entry.size < 4 + cp_bytes + gl_bytes {
+        if entry.size < hdr_len + cp_bytes + gl_bytes {
             return None;
         }
 
-        let cp_base = entry.offset + 4;
+        let cp_base = entry.offset + hdr_len;
         let mut codepoints = Vec::with_capacity(num_glyphs);
         for i in 0..num_glyphs {
             let mut buf = [0u8; 2];
@@ -181,6 +209,7 @@ impl Font {
 
         Some(Font {
             font_id,
+            bpp,
             y_advance,
             glyphs: GlyphData::Heap { glyphs, codepoints },
             bitmap_addr,
@@ -200,9 +229,16 @@ impl Font {
                 if entry.size < 4 {
                     continue;
                 }
-                let mut hdr = [0u8; 4];
-                flash.read(entry.offset, &mut hdr);
-                if hdr[3] == font_id {
+                // Read enough bytes to check font_id in both V1 and V2 layouts
+                let mut hdr = [0u8; 7];
+                let read_len = 7.min(entry.size as usize);
+                flash.read(entry.offset, &mut hdr[..read_len]);
+                let id = if hdr[0] == 0x00 && hdr[1] == 0x02 && entry.size >= 7 {
+                    hdr[5] // V2: font_id at byte 5
+                } else {
+                    hdr[3] // V1: font_id at byte 3
+                };
+                if id == font_id {
                     return Self::load_from_entry(flash, &entry);
                 }
             }
@@ -217,9 +253,11 @@ impl Font {
         codepoints: &'static [u16],
         bitmap: &'static [u8],
         y_advance: u8,
+        bpp: u8,
     ) -> Self {
         Font {
             font_id: EMBEDDED_FONT_ID,
+            bpp,
             y_advance,
             glyphs: GlyphData::Static { glyphs, codepoints },
             bitmap_addr: 0,
@@ -336,25 +374,41 @@ impl Font {
             return glyph.x_advance;
         }
 
-        let total_bits = glyph.width as u32 * glyph.height as u32;
-        let total_bytes = (total_bits + 7) / 8;
-        // Copy fields before releasing the borrow via find_glyph
         let bitmap_offset = glyph.bitmap_offset;
         let width = glyph.width;
         let height = glyph.height;
         let x_advance = glyph.x_advance;
 
-        if let Some(bg_color) = bg {
-            self.draw_opaque(
+        if self.bpp == 1 {
+            // 1bpp: traditional opaque / transparent paths
+            if let Some(bg_color) = bg {
+                let total_bits = width as u32 * height as u32;
+                let total_bytes = (total_bits + 7) / 8;
+                self.draw_opaque(
+                    lcd, flash, total_bytes,
+                    bitmap_offset, width, height,
+                    draw_x, draw_y, fg, bg_color,
+                );
+            } else {
+                let total_bits = width as u32 * height as u32;
+                let total_bytes = (total_bits + 7) / 8;
+                self.draw_transparent(
+                    lcd, flash, total_bytes,
+                    bitmap_offset, width, height,
+                    draw_x, draw_y, fg,
+                );
+            }
+        } else {
+            // 2bpp: always blend fg with bg via begin_pixels stream.
+            // bg=None falls back to black — callers should always pass a
+            // known background for correct anti-aliased rendering.
+            let bg_color = bg.unwrap_or(0);
+            let total_pixels = width as u32 * height as u32;
+            let total_bytes = (total_pixels + 3) / 4;
+            self.draw_2bpp(
                 lcd, flash, total_bytes,
                 bitmap_offset, width, height,
                 draw_x, draw_y, fg, bg_color,
-            );
-        } else {
-            self.draw_transparent(
-                lcd, flash, total_bytes,
-                bitmap_offset, width, height,
-                draw_x, draw_y, fg,
             );
         }
 
@@ -377,7 +431,7 @@ impl Font {
         }
     }
 
-    // --- Draw implementations ---
+    // --- 1bpp draw implementations (unchanged) ---
 
     fn draw_opaque(
         &self,
@@ -456,6 +510,51 @@ impl Font {
                         lcd.fill_rect(px as u16, py as u16, 1, 1, fg);
                     }
                     bit_idx += 1;
+                }
+            }
+
+            bytes_read += chunk as u32;
+        }
+    }
+
+    // --- 2bpp anti-aliased draw ---
+
+    fn draw_2bpp(
+        &self,
+        lcd: &Lcd,
+        flash: &Flash,
+        total_bytes: u32,
+        bitmap_offset: u16,
+        width: u8,
+        height: u8,
+        draw_x: i16,
+        draw_y: i16,
+        fg: u16,
+        bg: u16,
+    ) {
+        let total_pixels = width as u32 * height as u32;
+
+        lcd.begin_pixels(draw_x as u16, draw_y as u16, width as u16, height as u16);
+
+        let mut pixel_idx: u32 = 0;
+        let mut bytes_read: u32 = 0;
+
+        while bytes_read < total_bytes {
+            let chunk = (total_bytes - bytes_read).min(BITMAP_BUF_SIZE as u32) as usize;
+            let mut buf = [0u8; BITMAP_BUF_SIZE];
+            self.read_bitmap(flash, bitmap_offset, bytes_read, &mut buf[..chunk]);
+
+            for i in 0..chunk {
+                let byte = buf[i];
+                // 4 pixels per byte, MSB first: bits [7:6]=p0, [5:4]=p1, [3:2]=p2, [1:0]=p3
+                for shift in [6u8, 4, 2, 0] {
+                    if pixel_idx >= total_pixels {
+                        return;
+                    }
+                    let alpha = (byte >> shift) & 0x03;
+                    let color = lerp_rgb565(bg, fg, alpha as u16, 3);
+                    lcd.write_pixel(color);
+                    pixel_idx += 1;
                 }
             }
 

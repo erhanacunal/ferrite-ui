@@ -129,6 +129,7 @@ class Op:
     SEND_USART_STR  = 0x99
     RTC_READ        = 0x9A
     RTC_WRITE       = 0x9B
+    STR_CMP         = 0xAC  # (str_id, str_id) → -1/0/1
 
     # Float ops (all no-arg)
     ITOF = 0xC0
@@ -207,6 +208,7 @@ class Builtin:
     SET_DIALOG_RESULT = 40 # (result) → void; latches result on innermost modal frame
     # index 41 = 0xA9 is SPRINTF (emitted directly via str_sprintf, not via asm.builtin)
     FILE_SEEK = 42  # (handle, pos) → void; seek to byte position (clamped to [0, size])
+    STR_CMP = 43    # (str_id, str_id) → -1/0/1
 
 
 class Prop:
@@ -260,6 +262,7 @@ class Prop:
     GRAPH_ARR = 0x2D       # VM array id holding sample values (i32 each)
     GRAPH_COUNT = 0x2E     # Cap on samples drawn (0 = full array length)
     GRAPH_FLAGS = 0x2F     # bit 0: 0=spline / 1=linear, bit 1: fill area
+    MULTI_LINE = 0x30     # label: split text by \n, 0=off 1=on
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -859,6 +862,10 @@ class Asm:
         """Pop [str_b, str_a], push concatenated str_id."""
         self._emit(Op.CONCAT)
 
+    def str_cmp(self):
+        """Pop [str_b, str_a], push -1/0/1 (lexicographic compare)."""
+        self._emit(Op.STR_CMP)
+
     def str_parse_int(self):
         """Pop str_id, push parsed i32."""
         self._emit(Op.PARSE_INT)
@@ -982,6 +989,7 @@ OP_NAMES = {
     0xAB: 'syscall',
     0xA6: 'arrToStr',
     0xA7: 'showModal', 0xA8: 'setDialogResult', 0xA9: 'sprintf',
+    0xAC: 'strCmp',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -1007,6 +1015,7 @@ PROP_NAMES = {
     0x29: 'SCROLL_Y', 0x2A: 'CLIP_CHILDREN',
     0x2B: 'GRADIENT_COLOR', 0x2C: 'GRADIENT_DIR',
     0x2D: 'GRAPH_ARR', 0x2E: 'GRAPH_COUNT', 0x2F: 'GRAPH_FLAGS',
+    0x30: 'MULTI_LINE',
     0x40: 'LOCATION', 0x41: 'SIZE', 0x42: 'MARGIN',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -1279,6 +1288,7 @@ PROP_MAP = {
     'graph_array': (Prop.GRAPH_ARR, False),
     'graph_count': (Prop.GRAPH_COUNT, False),
     'graph_flags': (Prop.GRAPH_FLAGS, False),
+    'multi_line': (Prop.MULTI_LINE, False),
     'text': (Prop.TEXT, True),
     'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }

@@ -5,9 +5,9 @@ use crate::types::{Color, Edges, Rect};
 use crate::vm::Vm;
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED,
-    FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_DROPDOWN, KIND_GAUGE, KIND_GRAPH,
-    KIND_INPUT, KIND_LABEL, KIND_PROGRESS, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt,
-    WidgetId, WidgetTree,
+    FLAG_MULTI_LINE, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_DROPDOWN, KIND_GAUGE,
+    KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_PROGRESS, KIND_RADIO, KIND_SLIDER,
+    Widget, WidgetExt, WidgetId, WidgetTree,
 };
 
 const SCREEN: Rect = Rect::new(0, 0, lcd::WIDTH, lcd::HEIGHT);
@@ -397,6 +397,43 @@ fn effective_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
     widget.background_color
 }
 
+/// Walk up the widget tree to find the actual visible background color for
+/// text rendering.  When a label has `background_color = 0` it means
+/// "transparent" — the text sits on its parent's filled background.  This
+/// function resolves that parent colour so anti-aliased glyphs blend
+/// correctly instead of blending against black.
+fn resolved_text_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
+    // If this widget has a non-zero background, use it directly (after
+    // factoring in press state).
+    let bg = effective_bg(tree, widget, ext);
+    if bg != 0 {
+        return bg;
+    }
+
+    // Walk up the tree to find the first ancestor with a non-zero
+    // background_color, respecting press state along the way.
+    let mut pid = widget.parent;
+    let max = tree.count();
+    let mut depth = 0usize;
+    while pid.is_some() {
+        let p = tree.get(pid);
+        let p_ext = tree.ext(pid).unwrap_or(&WidgetExt::DEFAULT);
+        let ancestor_bg = effective_bg(tree, p, p_ext);
+        if ancestor_bg != 0 {
+            return ancestor_bg;
+        }
+        pid = p.parent;
+        depth += 1;
+        if depth > max {
+            break;
+        }
+    }
+
+    // No ancestor has a background — fall back to white (typical screen
+    // background).
+    0xFFFF
+}
+
 /// Draw widget without clipping (full render path).
 fn draw_widget(ctx: &Ctx, vm: &Vm, id: WidgetId, abs: &Rect) {
     let widget = ctx.tree.get(id);
@@ -404,7 +441,7 @@ fn draw_widget(ctx: &Ctx, vm: &Vm, id: WidgetId, abs: &Rect) {
     let b = ext.border;
     let r = ext.border_radius;
     let bg_color = effective_bg(&ctx.tree, widget, ext);
-    let draw_bg = bg_color != 0 || widget.kind != KIND_LABEL;
+    let draw_bg = bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE);
     // Only apply gradient when the widget is in its normal (non-pressed) state.
     let gdir = if bg_color == widget.background_color { ctx.tree.gradient_dir(id) } else { 0 };
     let gcol = if gdir != 0 { ctx.tree.gradient_color(id) } else { 0 };
@@ -537,6 +574,11 @@ fn draw_widget(ctx: &Ctx, vm: &Vm, id: WidgetId, abs: &Rect) {
         let inner = inner_rect(abs, &b);
         draw_graph(&ctx.lcd, vm, widget, &inner, ext);
     }
+
+    // Image widget — draw image centered in content area
+    if widget.kind == KIND_IMAGE {
+        draw_widget_image(ctx, abs, ext);
+    }
 }
 
 /// Draw widget with clip region (dirty render path).
@@ -546,7 +588,7 @@ fn draw_widget_clipped(ctx: &Ctx, vm: &Vm, id: WidgetId, abs: &Rect, clip: &Clip
     let b = ext.border;
     let r = ext.border_radius;
     let bg_color = effective_bg(&ctx.tree, widget, ext);
-    let draw_bg = bg_color != 0 || widget.kind != KIND_LABEL;
+    let draw_bg = bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE);
     let gdir = if bg_color == widget.background_color { ctx.tree.gradient_dir(id) } else { 0 };
     let gcol = if gdir != 0 { ctx.tree.gradient_color(id) } else { 0 };
 
@@ -666,6 +708,11 @@ fn draw_widget_clipped(ctx: &Ctx, vm: &Vm, id: WidgetId, abs: &Rect, clip: &Clip
         let inner = inner_rect(abs, &b);
         draw_graph(&ctx.lcd, vm, widget, &inner, ext);
     }
+
+    // Image widget — draw image centered in content area
+    if widget.kind == KIND_IMAGE {
+        draw_widget_image(ctx, abs, ext);
+    }
 }
 
 /// Draw background image at the inner rect origin.
@@ -676,6 +723,33 @@ fn draw_bg_image(ctx: &Ctx, image_id: u8, inner: &Rect) {
     if let Some(img) = ctx.images.find(image_id) {
         let x = if inner.x < 0 { 0u16 } else { inner.x as u16 };
         let y = if inner.y < 0 { 0u16 } else { inner.y as u16 };
+        img.draw(&ctx.lcd, &ctx.flash, x, y);
+    }
+}
+
+/// Draw image widget content — image centered in the content area.
+fn draw_widget_image(ctx: &Ctx, abs: &Rect, ext: &WidgetExt) {
+    if ext.image_id == 0 {
+        return;
+    }
+    let inner = inner_rect(abs, &ext.border);
+    if inner.is_empty() {
+        return;
+    }
+    if let Some(img) = ctx.images.find(ext.image_id) {
+        // Center the image horizontally and vertically within the inner rect
+        let dx = if inner.w > img.width {
+            inner.x + ((inner.w - img.width) / 2) as i16
+        } else {
+            inner.x
+        };
+        let dy = if inner.h > img.height {
+            inner.y + ((inner.h - img.height) / 2) as i16
+        } else {
+            inner.y
+        };
+        let x = if dx < 0 { 0u16 } else { dx as u16 };
+        let y = if dy < 0 { 0u16 } else { dy as u16 };
         img.draw(&ctx.lcd, &ctx.flash, x, y);
     }
 }
@@ -709,24 +783,83 @@ fn draw_label_text(ctx: &Ctx, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
         return;
     }
 
-    let tw = font.text_width(text) as i16;
     let lh = font.line_height() as i16;
 
-    let tx = match ext.text_align {
-        ALIGN_CENTER => cx + (cw as i16 - tw) / 2,
-        ALIGN_RIGHT => cx + cw as i16 - tw,
-        _ => cx,
-    };
+    // Always pass a background color — required for correct anti-aliased
+    // blending.  resolved_text_bg walks up the tree, so even "transparent"
+    // labels (background_color=0) get the parent's actual fill color.
+    let bg_color = resolved_text_bg(&ctx.tree, widget, ext);
+    let bg = Some(bg_color);
 
-    let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
+    // Multi-line mode: split on '\n', center block vertically
+    if widget.flags & FLAG_MULTI_LINE != 0 {
+        // Count lines (first pass) — max 16 lines
+        let mut line_count: usize = 0;
+        let mut has_content = false;
+        let bytes = text;
+        let mut i: usize = 0;
+        while i < bytes.len() {
+            let end = memchr_byte(b'\n', bytes, i);
+            if !bytes[i..end].is_empty() {
+                has_content = true;
+            }
+            line_count += 1;
+            if end >= bytes.len() {
+                break;
+            }
+            i = end + 1;
+        }
+        if !has_content || line_count == 0 {
+            return;
+        }
 
-    let bg_color = effective_bg(&ctx.tree, widget, ext);
-    let bg = if bg_color == 0 && widget.kind == KIND_LABEL {
-        None
+        let block_h = (line_count as i16).saturating_mul(lh);
+        let base_y = cy + (ch as i16 - block_h) / 2;
+
+        // Second pass: draw each line
+        let mut li: usize = 0;
+        let mut i: usize = 0;
+        while i < bytes.len() {
+            let end = memchr_byte(b'\n', bytes, i);
+            let line = &bytes[i..end];
+            if !line.is_empty() {
+                let lw = font.text_width(line) as i16;
+                let lx = match ext.text_align {
+                    ALIGN_CENTER => cx + (cw as i16 - lw) / 2,
+                    ALIGN_RIGHT => cx + cw as i16 - lw,
+                    _ => cx,
+                };
+                let ly = base_y + li as i16 * lh + (lh * 3) / 4;
+                font.draw_str(&ctx.lcd, &ctx.flash, line, lx, ly, ext.text_color, bg);
+            }
+            li += 1;
+            if end >= bytes.len() {
+                break;
+            }
+            i = end + 1;
+        }
     } else {
-        Some(bg_color)
-    };
-    font.draw_str(&ctx.lcd, &ctx.flash, text, tx, ty, ext.text_color, bg);
+        // Single-line mode (original behavior)
+        let tw = font.text_width(text) as i16;
+        let tx = match ext.text_align {
+            ALIGN_CENTER => cx + (cw as i16 - tw) / 2,
+            ALIGN_RIGHT => cx + cw as i16 - tw,
+            _ => cx,
+        };
+        let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
+        font.draw_str(&ctx.lcd, &ctx.flash, text, tx, ty, ext.text_color, bg);
+    }
+}
+
+/// Scan for `byte` in `data[start..]`, returning the index of the first
+/// match or `data.len()` if not found (analogous to memchr).
+fn memchr_byte(byte: u8, data: &[u8], start: usize) -> usize {
+    for i in start..data.len() {
+        if data[i] == byte {
+            return i;
+        }
+    }
+    data.len()
 }
 
 /// Draw input text with cursor in the content area.

@@ -904,6 +904,7 @@ fn main() -> ! {
         &embedded_font::CODEPOINTS,
         &embedded_font::BITMAP,
         embedded_font::Y_ADVANCE,
+        embedded_font::BPP,
     ));
 
     // --- Config store (flash sector 0) ---

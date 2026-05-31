@@ -74,6 +74,7 @@ fn main() -> ExitCode {
         &embedded_font::CODEPOINTS,
         &embedded_font::BITMAP,
         embedded_font::Y_ADVANCE,
+        embedded_font::BPP,
     ));
 
     // --- Mount filesystem ---

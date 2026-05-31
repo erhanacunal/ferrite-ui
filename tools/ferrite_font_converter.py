@@ -6,19 +6,35 @@ VERBS
   resource  Write a binary font resource (.bin) for device flash.
   code      Write a Rust source (.rs) for ROM-embedded fonts.
 
-BINARY RESOURCE LAYOUT  (sparse format, N = num_glyphs):
-  [0..2]         num_glyphs   u16 LE
-  [2]            y_advance    u8
-  [3]            font_id      u8
-  [4..4+N*2]     codepoints   N x u16 LE, sorted ascending
-  [4+N*2..4+N*9] glyphs       N x 7 bytes
-                              (bitmapOffset u16 LE, width u8, height u8,
-                               xAdvance u8, xOffset i8, yOffset i8)
-  [4+N*9..]      bitmap       1-bit packed, MSB first;
-                              each glyph padded to a byte boundary
+BINARY RESOURCE LAYOUT
+
+  V1 (1bpp monochrome, default):
+    [0..1]         num_glyphs   u16 LE
+    [2]            y_advance    u8
+    [3]            font_id      u8
+    [4..4+N*2]     codepoints   N x u16 LE, sorted ascending
+    [4+N*2..4+N*9] glyphs       N x 7 bytes
+    [4+N*9..]      bitmap       1-bit packed, MSB first
+
+  V2 (anti-aliased, --bpp 2):
+    [0..1]         magic        0x00, 0x02
+    [2..3]         num_glyphs   u16 LE
+    [4]            y_advance    u8
+    [5]            font_id      u8
+    [6]            bpp          u8 (2)
+    [7..7+N*2]     codepoints   N x u16 LE, sorted ascending
+    [7+N*2..7+N*9] glyphs       N x 7 bytes
+    [7+N*9..]      bitmap       2bpp packed, MSB first; 4 pixels per byte;
+                                each pixel = 2 bits: 0=0%, 1=33%, 2=67%, 3=100%
+                                each glyph padded to a byte boundary
+
+  Glyph entry (7 bytes):
+    bitmapOffset u16 LE, width u8, height u8,
+    xAdvance u8, xOffset i8, yOffset i8
 
 RUST CODE OUTPUT  (arrays for use as an embedded ROM font):
   pub const Y_ADVANCE:  u8           = ...;
+  pub const BPP:        u8           = ...;
   pub static CODEPOINTS: [u16; N]    = [...];
   pub static BITMAP:    [u8;  M]     = [...];
   pub static GLYPHS:    [GfxGlyph; N] = [...];
@@ -42,8 +58,10 @@ import sys
 
 import freetype
 from freetype import (
+    FT_LOAD_DEFAULT,
     FT_LOAD_TARGET_MONO,
     FT_RENDER_MODE_MONO,
+    FT_RENDER_MODE_NORMAL,
     FT_Property_Set,
     FT_UInt,
 )
@@ -97,14 +115,30 @@ def _char_label(code):
     return ""
 
 
+# ── 2bpp quantisation ─────────────────────────────────────────────────────────
+
+def _gray_to_2bpp(gray8):
+    """Quantise 8-bit gray (0–255) → 2-bit alpha (0–3)."""
+    if gray8 < 64:
+        return 0
+    elif gray8 < 128:
+        return 1
+    elif gray8 < 192:
+        return 2
+    else:
+        return 3
+
+
 # ── rasterization ─────────────────────────────────────────────────────────────
 
-def rasterize(font_path, size, codes):
+def rasterize(font_path, size, codes, bpp=1):
     """
     Rasterize `codes` (sorted list of BMP codepoints) at `size` points.
 
+    `bpp`: 1 = monochrome (FT_RENDER_MODE_MONO), 2 = 2bpp anti-aliased.
+
     Returns (bitmap_bytes, table, y_advance):
-      bitmap_bytes  bytes                -- packed 1-bit bitmap data
+      bitmap_bytes  bytes                -- packed bitmap data
       table         list[(int, dict)]    -- (codepoint, glyph metrics)
                     metrics: bitmapOffset, width, height, xAdvance, xOffset, yOffset
       y_advance     int                  -- line height in pixels
@@ -126,30 +160,78 @@ def rasterize(font_path, size, codes):
 
     freetype.FT_Set_Char_Size(face, size << 6, 0, DPI, 0)
 
-    # MSB-first bit accumulator -> raw bytes
     bitmap_buf = bytearray()
-    _bits = [0, 7]  # [current_byte, current_shift]
 
-    def enbit(v):
-        if v:
-            _bits[0] |= 1 << _bits[1]
-        _bits[1] -= 1
-        if _bits[1] < 0:
-            bitmap_buf.append(_bits[0])
-            _bits[0] = 0
-            _bits[1] = 7
+    if bpp == 1:
+        # Monochrome accumulator: 1 bit at a time, 8 per byte
+        _acc = [0, 7]  # [current_byte, current_shift]
+
+        def enbit(v):
+            if v:
+                _acc[0] |= 1 << _acc[1]
+            _acc[1] -= 1
+            if _acc[1] < 0:
+                bitmap_buf.append(_acc[0])
+                _acc[0] = 0
+                _acc[1] = 7
+
+        def flush_acc():
+            if _acc[1] != 7:
+                bitmap_buf.append(_acc[0])
+                _acc[0] = 0
+                _acc[1] = 7
+
+        def pad_bits(total_bits):
+            tail = total_bits & 7
+            if tail:
+                for _ in range(8 - tail):
+                    enbit(0)
+
+        def glyph_byte_count(w, rows):
+            return (w * rows + 7) // 8
+
+    else:  # bpp == 2
+        # 2bpp accumulator: 2 bits at a time, 4 pixels per byte
+        _acc = [0, 6]  # [current_byte, current_shift]
+
+        def enbit(v):
+            # v is 0-3
+            _acc[0] |= (v & 0x03) << _acc[1]
+            _acc[1] -= 2
+            if _acc[1] < 0:
+                bitmap_buf.append(_acc[0])
+                _acc[0] = 0
+                _acc[1] = 6
+
+        def flush_acc():
+            if _acc[1] != 6:
+                bitmap_buf.append(_acc[0])
+                _acc[0] = 0
+                _acc[1] = 6
+
+        def pad_bits(total_pixels):
+            tail = total_pixels & 3
+            if tail:
+                for _ in range(4 - tail):
+                    enbit(0)
+
+        def glyph_byte_count(w, rows):
+            return (w * rows + 3) // 4
 
     table = []
     bmap_offset = 0
 
+    load_target = FT_LOAD_TARGET_MONO if bpp == 1 else FT_LOAD_DEFAULT
+    render_mode = FT_RENDER_MODE_MONO if bpp == 1 else FT_RENDER_MODE_NORMAL
+
     for code in codes:
-        err = freetype.FT_Load_Char(face, code, FT_LOAD_TARGET_MONO)
+        err = freetype.FT_Load_Char(face, code, load_target)
         if err:
             sys.stderr.write("Warning: error %d loading U+%04X\n" % (err, code))
             table.append((code, _zero_glyph(bmap_offset)))
             continue
 
-        err = freetype.FT_Render_Glyph(face.contents.glyph, FT_RENDER_MODE_MONO)
+        err = freetype.FT_Render_Glyph(face.contents.glyph, render_mode)
         if err:
             sys.stderr.write("Warning: error %d rendering U+%04X\n" % (err, code))
             table.append((code, _zero_glyph(bmap_offset)))
@@ -186,25 +268,30 @@ def rasterize(font_path, size, codes):
         buf_len = pitch * rows if pitch > 0 else 0
         raw = bytes(freetype.string_at(bmp.buffer, buf_len)) if buf_len > 0 else b""
 
-        for y in range(rows):
-            for x in range(w):
-                bi = x // 8
-                bm = 0x80 >> (x & 7)
-                ao = y * pitch + bi
-                enbit(raw[ao] & bm if 0 <= ao < len(raw) else 0)
+        total_pixels = w * rows
+
+        if bpp == 1:
+            # 1bpp: extract bits from monochrome bitmap
+            for y in range(rows):
+                for x in range(w):
+                    bi = x // 8
+                    bm = 0x80 >> (x & 7)
+                    ao = y * pitch + bi
+                    enbit(raw[ao] & bm if 0 <= ao < len(raw) else 0)
+        else:
+            # 2bpp: extract 8-bit gray, quantise to 2 bits
+            for y in range(rows):
+                row_start = y * pitch
+                for x in range(w):
+                    g = raw[row_start + x] if row_start + x < len(raw) else 0
+                    enbit(_gray_to_2bpp(g))
 
         # Pad to byte boundary
-        tail = (w * rows) & 7
-        if tail:
-            for _ in range(8 - tail):
-                enbit(0)
-
-        bmap_offset += (w * rows + 7) // 8
+        pad_bits(total_pixels)
+        bmap_offset += glyph_byte_count(w, rows)
         freetype.FT_Done_Glyph(ft_glyph)
 
-    # Safety flush (should be a no-op when padding is correct)
-    if _bits[1] != 7:
-        bitmap_buf.append(_bits[0])
+    flush_acc()
 
     metrics = face.contents.size.contents.metrics
     y_advance = (metrics.height >> 6) if metrics.height else (
@@ -224,12 +311,12 @@ def _zero_glyph(bmap_offset):
 
 # ── output: binary resource ───────────────────────────────────────────────────
 
-def write_resource(bitmap, table, y_advance, font_id, out):
+def write_resource(bitmap, table, y_advance, font_id, bpp, out):
     """
     Write the binary font resource to `out` (binary-mode file or buffer).
 
-    Layout:
-      4-byte header  | N*2 codepoints | N*7 glyphs | bitmap
+    V1 (bpp=1):  4-byte header  | N*2 codepoints | N*7 glyphs | bitmap
+    V2 (bpp>=2): 7-byte header  | N*2 codepoints | N*7 glyphs | bitmap
     """
     if not (0 <= y_advance <= 255):
         max_pt = int(255 * 72 / DPI)
@@ -238,7 +325,11 @@ def write_resource(bitmap, table, y_advance, font_id, out):
             f"reduce point size — try ≤{max_pt}pt at {DPI} DPI")
 
     n = len(table)
-    out.write(struct.pack("<HBB", n, y_advance, font_id))
+    if bpp == 1:
+        out.write(struct.pack("<HBB", n, y_advance, font_id))
+    else:
+        out.write(struct.pack("<BBHBBB", 0x00, 0x02, n, y_advance, font_id, bpp))
+
     for code, _g in table:
         out.write(struct.pack("<H", code))
     for code, g in table:
@@ -265,23 +356,24 @@ def write_resource(bitmap, table, y_advance, font_id, out):
 
 # ── output: Rust source ───────────────────────────────────────────────────────
 
-def write_code(bitmap, table, y_advance, out):
+def write_code(bitmap, table, y_advance, bpp, out):
     """
     Write Rust source to `out` (text-mode file).
 
-    Produces: Y_ADVANCE, CODEPOINTS, BITMAP, GLYPHS with fixed names.
+    Produces: Y_ADVANCE, BPP, CODEPOINTS, BITMAP, GLYPHS with fixed names.
     Intended use: save as src/embedded_font.rs (or similar), then
-    call Font::from_embedded(&GLYPHS, &CODEPOINTS, &BITMAP, Y_ADVANCE).
+    call Font::from_embedded(&GLYPHS, &CODEPOINTS, &BITMAP, Y_ADVANCE, BPP).
     """
     n = len(table)
     m = len(bitmap)
 
-    out.write("// Generated by ferrite_font_converter.py (code mode).\n")
+    out.write("// Generated by ferrite_font_converter.py (code mode, bpp=%d).\n" % bpp)
     out.write("// %d glyphs, y_advance=%d, bitmap=%d bytes\n" % (n, y_advance, m))
     out.write("\n")
     out.write("use crate::font::GfxGlyph;\n")
     out.write("\n")
     out.write("pub const Y_ADVANCE: u8 = %d;\n" % y_advance)
+    out.write("pub const BPP: u8 = %d;\n" % bpp)
     out.write("\n")
 
     # CODEPOINTS — CP_COLS per row
@@ -335,6 +427,9 @@ def _common_args(p):
              "E.g. '32-127,0xC7,0xD6,0x011E-0x011F'")
     p.add_argument("-o", "--output", metavar="FILE",
                    help="output file (default: stdout)")
+    p.add_argument(
+        "--bpp", type=int, choices=[1, 2], default=1,
+        help="bits per pixel: 1 = monochrome (default), 2 = anti-aliased (4 gray levels)")
 
 
 def _resolve_codes(args):
@@ -348,29 +443,30 @@ def cmd_resource(args):
         sys.exit("error: font-id 0 is reserved for the embedded font "
                  "(load_by_id always skips it)")
     codes = _resolve_codes(args)
-    bitmap, table, y_advance = rasterize(args.fontfile, args.size, codes)
+    bitmap, table, y_advance = rasterize(args.fontfile, args.size, codes, args.bpp)
     n, m = len(table), len(bitmap)
-    total = 4 + n * 9 + m
-    sys.stderr.write("resource: %d glyphs, bitmap %d B, total %d B\n"
-                     % (n, m, total))
+    hdr = 4 if args.bpp == 1 else 7
+    total = hdr + n * 9 + m
+    sys.stderr.write("resource: %d glyphs, bpp=%d, bitmap %d B, total %d B\n"
+                     % (n, args.bpp, m, total))
     if args.output:
         with open(args.output, "wb") as f:
-            write_resource(bitmap, table, y_advance, args.font_id, f)
+            write_resource(bitmap, table, y_advance, args.font_id, args.bpp, f)
     else:
-        write_resource(bitmap, table, y_advance, args.font_id,
+        write_resource(bitmap, table, y_advance, args.font_id, args.bpp,
                        sys.stdout.buffer)
 
 
 def cmd_code(args):
     codes = _resolve_codes(args)
-    bitmap, table, y_advance = rasterize(args.fontfile, args.size, codes)
+    bitmap, table, y_advance = rasterize(args.fontfile, args.size, codes, args.bpp)
     n, m = len(table), len(bitmap)
-    sys.stderr.write("code: %d glyphs, bitmap %d B\n" % (n, m))
+    sys.stderr.write("code: %d glyphs, bpp=%d, bitmap %d B\n" % (n, args.bpp, m))
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
-            write_code(bitmap, table, y_advance, f)
+            write_code(bitmap, table, y_advance, args.bpp, f)
     else:
-        write_code(bitmap, table, y_advance, sys.stdout)
+        write_code(bitmap, table, y_advance, args.bpp, sys.stdout)
 
 
 def main(argv=None):
@@ -397,9 +493,9 @@ def main(argv=None):
         "code",
         help="write Rust source for ROM-embedded font",
         description=(
-            "Write a Rust .rs source with Y_ADVANCE, CODEPOINTS, BITMAP, GLYPHS "
+            "Write a Rust .rs source with Y_ADVANCE, BPP, CODEPOINTS, BITMAP, GLYPHS "
             "arrays. Use with Font::from_embedded(&GLYPHS, &CODEPOINTS, &BITMAP, "
-            "Y_ADVANCE)."
+            "Y_ADVANCE, BPP)."
         ),
     )
     _common_args(pc)

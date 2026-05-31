@@ -8,10 +8,10 @@ use crate::proto::{
     PROP_CLIP_CHILDREN, PROP_CURSOR_POS, PROP_ENABLED, PROP_FONT_ID, PROP_GRADIENT_COLOR,
     PROP_GRADIENT_DIR, PROP_GRAPH_ARR, PROP_GRAPH_COUNT, PROP_GRAPH_FLAGS, PROP_IMAGE_ID,
     PROP_KIND, PROP_LOC_X, PROP_LOC_Y, PROP_LOCATION, PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L,
-    PROP_MARGIN_R, PROP_MARGIN_T, PROP_MAX_LENGTH, PROP_ON_CHANGE, PROP_ON_CLICK, PROP_ON_PAINT,
-    PROP_ON_TAP, PROP_PADDING, PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R, PROP_PADDING_T,
-    PROP_PRESS_COLOR, PROP_SCROLL_Y, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W, PROP_TEXT,
-    PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VALUE, PROP_VISIBLE,
+    PROP_MARGIN_R, PROP_MARGIN_T, PROP_MAX_LENGTH, PROP_MULTI_LINE, PROP_ON_CHANGE, PROP_ON_CLICK,
+    PROP_ON_PAINT, PROP_ON_TAP, PROP_PADDING, PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R,
+    PROP_PADDING_T, PROP_PRESS_COLOR, PROP_SCROLL_Y, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W,
+    PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VALUE, PROP_VISIBLE,
 };
 use crate::render;
 use crate::strpool;
@@ -19,7 +19,8 @@ use crate::strpool::StringPool;
 use crate::systick;
 use crate::types::{Edges, Offset, Size};
 use crate::widget::{
-    FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_VISIBLE, WidgetId,
+    FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_MULTI_LINE, FLAG_VISIBLE,
+    WidgetId,
 };
 use alloc::vec::Vec;
 
@@ -317,6 +318,7 @@ const OP_FPGA_DAT: u8 = 0x9E; // pop data → send_data(data)
 const OP_CRITICAL: u8 = 0x9F; // enter critical section — run until next yield
 const OP_SET_BRIGHTNESS: u8 = 0xA0; // pop percent → set backlight
 const OP_BRIGHTNESS: u8 = 0xA1; // push current backlight percent
+const OP_STR_CMP: u8 = 0xAC; // pop str_id, pop str_id → push -1/0/1
 const OP_FILE_OPEN: u8 = 0xA2; // pop str_id (name) → push handle (1|2|0xFF)
 const OP_FILE_READ: u8 = 0xA3; // pop handle → push byte (0..255) or -1 on EOF
 const OP_FILE_SIZE: u8 = 0xA4; // pop handle → push size
@@ -1701,6 +1703,11 @@ impl Vm {
                 let id = self.pop() as u16;
                 self.push(ctx.strpool.len(id) as i32);
             }
+            OP_STR_CMP => {
+                let b = self.pop() as u16;
+                let a = self.pop() as u16;
+                self.push(ctx.strpool.compare(a, b));
+            }
             OP_SET_TEXT => {
                 let str_id = self.pop() as u16;
                 if self.target.is_some() {
@@ -2162,6 +2169,14 @@ impl Vm {
                 );
                 return;
             }
+            PROP_MULTI_LINE => {
+                set_flag(
+                    &mut ctx.tree.get_mut(self.target).flags,
+                    FLAG_MULTI_LINE,
+                    val != 0,
+                );
+                return;
+            }
             PROP_BG_COLOR => {
                 ctx.tree.get_mut(self.target).background_color = val as u16;
                 return;
@@ -2256,6 +2271,13 @@ impl Vm {
             }
             PROP_CLIP_CHILDREN => {
                 if w.flags & FLAG_CLIP_CHILDREN != 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+            PROP_MULTI_LINE => {
+                if w.flags & FLAG_MULTI_LINE != 0 {
                     1
                 } else {
                     0

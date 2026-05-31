@@ -188,9 +188,10 @@ KIND_SLIDER = 4
 KIND_CHECKBOX = 5
 KIND_RADIO = 6
 KIND_DROPDOWN = 9
+KIND_IMAGE = 11
 
-KIND_NAMES = ["Base", "Label", "Button", "Progress", "Slider", "Checkbox", "Radio", "Dropdown"]
-KIND_VALUES = [KIND_BASE, KIND_LABEL, KIND_BUTTON, KIND_PROGRESS, KIND_SLIDER, KIND_CHECKBOX, KIND_RADIO, KIND_DROPDOWN]
+KIND_NAMES = ["Base", "Label", "Button", "Progress", "Slider", "Checkbox", "Radio", "Dropdown", "", "Image"]
+KIND_VALUES = [KIND_BASE, KIND_LABEL, KIND_BUTTON, KIND_PROGRESS, KIND_SLIDER, KIND_CHECKBOX, KIND_RADIO, KIND_DROPDOWN, KIND_IMAGE]
 KIND_PREFIXES = {
     KIND_BASE: "panel",
     KIND_LABEL: "lbl",
@@ -200,6 +201,7 @@ KIND_PREFIXES = {
     KIND_CHECKBOX: "cb",
     KIND_RADIO: "radio",
     KIND_DROPDOWN: "dropdown",
+    KIND_IMAGE: "img",
 }
 
 KIND_ICON_NAMES = {
@@ -211,6 +213,7 @@ KIND_ICON_NAMES = {
     KIND_CHECKBOX: "fa5s.check-square",
     KIND_RADIO:    "fa5s.dot-circle",
     KIND_DROPDOWN: "fa5s.caret-square-down",
+    KIND_IMAGE:    "fa5s.image",
 }
 
 
@@ -526,6 +529,7 @@ class WidgetNode:
         self.clickable = False
         self.value = 0
         self.checked = False
+        self.multi_line = False
         self.image_id = 0
 
         self.on_click = ""
@@ -568,7 +572,8 @@ class WidgetNode:
             "text": self.text, "font_id": self.font_id, "text_align": self.text_align,
             "visible": self.visible, "enabled": self.enabled,
             "clickable": self.clickable,
-            "value": self.value, "checked": self.checked, "image_id": self.image_id,
+            "value": self.value, "checked": self.checked, "multi_line": self.multi_line,
+            "image_id": self.image_id,
             "on_click": self.on_click, "on_tap": self.on_tap, "on_paint": self.on_paint,
         }
 
@@ -578,7 +583,7 @@ class WidgetNode:
         for key in ("loc_x", "loc_y", "size_w", "size_h", "bg_color", "border_color",
                      "border_radius", "text_color", "press_color", "text", "font_id",
                      "text_align", "visible", "enabled", "clickable", "value", "checked",
-                     "image_id", "on_click", "on_tap", "on_paint"):
+                     "multi_line", "image_id", "on_click", "on_tap", "on_paint"):
             if key in d:
                 setattr(n, key, d[key])
         for key in ("margin", "border", "padding"):
@@ -1839,6 +1844,7 @@ class PropertyEditor(QScrollArea):
         self._add_bool(g, "clickable", "Clickable")
         self._add_int(g, "value", "Value", 0, 100)
         self._add_bool(g, "checked", "Checked")
+        self._add_bool(g, "multi_line", "Multi-line")
         self._add_resource_combo(g, "image_id", "Image", "images")
 
         # Callbacks (double-click to auto-create handler)
@@ -2083,6 +2089,7 @@ class PropertyEditor(QScrollArea):
         self._set_editor("clickable", node.clickable)
         self._set_editor("value", node.value)
         self._set_editor("checked", node.checked)
+        self._set_editor("multi_line", node.multi_line)
         self._set_editor("image_id", node.image_id)
 
         self._set_editor("on_click", node.on_click)
@@ -2826,6 +2833,8 @@ def generate_designer_fl(model):
             lines.append(f"    {node.name}.value = {node.value};")
         if node.checked:
             lines.append(f"    {node.name}.checked = 1;")
+        if node.multi_line:
+            lines.append(f"    {node.name}.multi_line = 1;")
         if node.image_id != 0:
             lines.append(f"    {node.name}.image_id = {node.image_id};")
 

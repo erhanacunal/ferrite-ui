@@ -91,6 +91,7 @@ KIND_BASE = 0
 KIND_LABEL = 1
 KIND_BUTTON = 2
 KIND_DROPDOWN = 9
+KIND_IMAGE = 11
 
 ALIGN_MAP = {"left": 0, "center": 1, "right": 2}
 
@@ -293,6 +294,8 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
             cc.set_prop("kind", KIND_BUTTON)
         elif wtype == "dropdown":
             cc.set_prop("kind", KIND_DROPDOWN)
+        elif wtype == "image":
+            cc.set_prop("kind", KIND_IMAGE)
 
         # Location
         if "location" in w:
