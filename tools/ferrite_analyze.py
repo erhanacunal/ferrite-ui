@@ -158,6 +158,8 @@ _KIND_NAMES = {
     0: 'setup', 1: 'loop', 2: 'func', 3: 'on_program_start',
     4: 'on_page_changing', 5: 'on_page_changed', 6: 'on_user_message',
     7: 'on_touch_down', 8: 'on_touch_up', 9: 'on_touch_move',
+    10: 'on_swipe', 11: 'on_long_press',
+    12: '__on_click_dispatch', 13: '__on_tap_dispatch', 14: '__on_paint_dispatch',
 }
 
 

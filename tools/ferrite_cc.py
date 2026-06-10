@@ -1321,6 +1321,11 @@ class FunctionKind:
     ON_TOUCH_DOWN = 7
     ON_TOUCH_UP = 8
     ON_TOUCH_MOVE = 9
+    ON_SWIPE = 10
+    ON_LONG_PRESS = 11
+    ON_CLICK = 12
+    ON_TAP = 13
+    ON_PAINT = 14
 
 
 # Map system callback names to FunctionKind values
@@ -1334,6 +1339,12 @@ SYSTEM_CALLBACK_KINDS = {
     'on_touch_down':    FunctionKind.ON_TOUCH_DOWN,
     'on_touch_up':      FunctionKind.ON_TOUCH_UP,
     'on_touch_move':    FunctionKind.ON_TOUCH_MOVE,
+    'on_swipe':              FunctionKind.ON_SWIPE,
+    'on_long_press':         FunctionKind.ON_LONG_PRESS,
+    # Generated compile-time dispatchers (names reserved, prefixed with __)
+    '__on_click_dispatch':   FunctionKind.ON_CLICK,
+    '__on_tap_dispatch':     FunctionKind.ON_TAP,
+    '__on_paint_dispatch':   FunctionKind.ON_PAINT,
 }
 
 

@@ -1,0 +1,19 @@
+[package]
+name = "bsp-epaper"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ferrite-ui"
+path = "src/main.rs"
+
+[dependencies]
+ferrite-core = { path = "../../ferrite-core", features = ["epaper"] }
+esp-hal = { version = "1.1.0", features = ["esp32s3", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+critical-section = "1.2.0"
+xtensa-lx = "0.13.0"
+esp-alloc = { version = "0.10.0", default-features = false }
+esp-storage = { version = "0.9.0", features = ["esp32s3"] }
+nb = "1"
+libm = "0.2"

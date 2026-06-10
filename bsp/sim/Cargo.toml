@@ -1,0 +1,12 @@
+[package]
+name = "bsp-sim"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sim"
+path = "src/main.rs"
+
+[dependencies]
+ferrite-core = { path = "../../ferrite-core", features = ["host"] }
+minifb = "0.27"

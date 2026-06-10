@@ -1,14 +1,16 @@
+# Default target is the GD32 (nextion). Build it from the workspace root with:
+#   cargo build -p bsp-nextion --release
 [build]
 target = "thumbv7m-none-eabi"
-# target = "xtensa-esp32s3-none-elf"
 
+# nextion links against the GD32 script at the repo root (linker CWD = root).
 [target.thumbv7m-none-eabi]
 rustflags = ["-C", "link-arg=-Tgd32-link.x"]
 
-# ESP32-S3 (epaper) build:
-#   cargo +esp build --no-default-features --features epaper \
-#         --bin epaper --target xtensa-esp32s3-none-elf --release
-# Requires Espressif Rust fork: espup install
+# ESP32-S3 (epaper) build (Espressif Rust fork — `espup install`):
+#   cargo +esp build -p bsp-epaper --target xtensa-esp32s3-none-elf \
+#         -Zbuild-std=core,alloc --release
+# (or just `.\epaper.ps1`)
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --chip esp32s3 --flash-mode dio --flash-size 16mb --monitor"
 rustflags = [

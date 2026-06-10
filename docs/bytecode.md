@@ -67,6 +67,8 @@ Function kinds:
 | `7` | `on_touch_down` |
 | `8` | `on_touch_up` |
 | `9` | `on_touch_move` |
+| `10` | `on_swipe` |
+| `11` | `on_long_press` |
 
 Older images are still parsed:
 

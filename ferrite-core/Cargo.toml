@@ -1,0 +1,37 @@
+[package]
+name = "ferrite-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ferrite_core"
+path = "src/lib.rs"
+
+# Device-agnostic framework library, generic over `P: Platform`. Concrete device
+# backends, entry points and panic handlers live in the `bsp/*` crates; this
+# crate owns the HAL traits, the framework modules and the shared
+# `runtime::run` loop.
+[features]
+default = []
+# Host-only mock platform for type-checking the generic framework without an
+# embedded toolchain. See src/mock.rs.
+mock = []
+# Selected by `bsp-sim`: build the lib with std (the host sim is a std binary).
+host = []
+# Selected by `bsp-epaper`: the BSP supplies its own global allocator
+# (`esp_alloc`), so the lib's static heap is disabled and `heap::stats` reports
+# through `esp_alloc`.
+epaper = ["dep:esp-alloc"]
+# Selected by `bsp-tdo-y13`: the BSP registers the f1c100s HAL's thread-safe
+# allocator as `#[global_allocator]` (the target runs a preemptive scheduler),
+# so the lib's single-threaded static heap must not also claim that role. The
+# BSP overrides `PlatformRuntime::heap_stats` to report through its allocator.
+external_alloc = []
+# Larger VM string pool for RAM-rich targets: 1 MB buffer / 256 strings instead
+# of the default 2 KB / 64. Enabled by BSPs like `bsp-tdo-y13` (32 MB DRAM).
+strpool_large = []
+
+[dependencies]
+libm = "0.2"
+# Used only by `heap.rs` under the `epaper` feature (allocator is BSP-provided).
+esp-alloc = { version = "0.10.0", optional = true }

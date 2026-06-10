@@ -3139,7 +3139,75 @@ SYSTEM_CALLBACKS = {
     'on_touch_down':    2,
     'on_touch_up':      0,
     'on_touch_move':    2,
+    # Generated compile-time dispatchers injected by _generate_dispatchers()
+    '__on_click_dispatch': 1,  # (widget_id)
+    '__on_tap_dispatch':   2,  # (widget_id, packed_xy)
+    '__on_paint_dispatch': 1,  # (widgets — array id)
 }
+
+
+import re as _re
+
+# Matches: identifier.(on_click|on_tap|on_paint|on_change) = @handler
+_CB_RE = _re.compile(r'(\w+)\.(on_click|on_tap|on_paint|on_change)\s*=\s*@(\w+)')
+
+
+def _generate_dispatchers(source):
+    """Pre-scan preprocessed source for widget callback assignments and return
+    generated dispatcher function source code to append before compilation.
+
+    Widget callback syntax:  widget_var.on_click = @handler_func
+    Supported events:        on_click, on_tap, on_paint, on_change (aliases on_tap)
+
+    Returns an empty string when no registrations are found.
+    Names starting with __ are reserved — user functions must not use them.
+    """
+    registry = {'on_click': [], 'on_tap': [], 'on_paint': []}
+    seen = set()
+    for m in _CB_RE.finditer(source):
+        widget_var, event, handler = m.group(1), m.group(2), m.group(3)
+        event_key = 'on_tap' if event == 'on_change' else event
+        key = (event_key, widget_var, handler)
+        if key not in seen:
+            seen.add(key)
+            registry[event_key].append((widget_var, handler))
+
+    parts = []
+
+    if registry['on_click']:
+        lines = ['fn __on_click_dispatch(widget_id) {']
+        for var_name, handler in registry['on_click']:
+            lines.append(f'    if (widget_id == {var_name}) {{ {handler}(widget_id); }}')
+        lines.append('}')
+        parts.append('\n'.join(lines))
+
+    if registry['on_tap']:
+        lines = ['fn __on_tap_dispatch(widget_id, packed_xy) {']
+        for var_name, handler in registry['on_tap']:
+            lines.append(
+                f'    if (widget_id == {var_name}) {{ {handler}(widget_id, packed_xy); }}'
+            )
+        lines.append('}')
+        parts.append('\n'.join(lines))
+
+    if registry['on_paint']:
+        lines = [
+            'fn __on_paint_dispatch(widgets) {',
+            '    var i = 0;',
+            '    while (i < arrLen(widgets)) {',
+            '        var widget_id = widgets[i];',
+        ]
+        for var_name, handler in registry['on_paint']:
+            lines.append(
+                f'        if (widget_id == {var_name}) {{ {handler}(widget_id); }}'
+            )
+        lines.append('        i++;')
+        lines.append('    }')
+        lines.append('    arrFree(widgets);')
+        lines.append('}')
+        parts.append('\n'.join(lines))
+
+    return '\n\n'.join(parts)
 
 
 def compile_with_meta(source, filename="<input>", include_dirs=None):
@@ -3171,6 +3239,14 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         hint_wc, hint_ec = _extract_hint_widgets(source)
 
         source = preprocess(source, filename, include_dirs)
+
+        # Generate and append compile-time widget callback dispatchers.
+        # Must run on the preprocessed source so #include'd callback
+        # assignments are visible.
+        dispatchers = _generate_dispatchers(source)
+        if dispatchers:
+            source = source + '\n\n' + dispatchers
+
         tokens = tokenize(source)
         parser = Parser(tokens)
         program = parser.parse()

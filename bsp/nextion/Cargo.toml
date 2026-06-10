@@ -1,0 +1,17 @@
+[package]
+name = "bsp-nextion"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ferrite-ui"
+path = "src/main.rs"
+
+# Depends on the device-agnostic framework lib with NO device features: the BSP
+# owns every concrete backend and the global allocator comes from ferrite-core's
+# heap module (active on non-epaper targets).
+[dependencies]
+ferrite-core = { path = "../../ferrite-core" }
+cortex-m = "0.7"
+cortex-m-rt = { version = "0.7", features = ["device"] }
+libm = "0.2"

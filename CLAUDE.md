@@ -55,7 +55,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **HTML-like nesting** — widgets inside widgets, tree structure
 - **Heap-allocated Vec** — widgets grow on demand, max 254 (WidgetId is u8)
 - **Tree structure:** left-child right-sibling (parent + first_child + next_sibling)
-- **WidgetId:** `u8` index, `0xFF` = NONE sentinel
+- **WidgetId:** `u16` index, `0xFFFF` = NONE sentinel (max 1024 widgets)
 - **Split struct: Widget (18B base) + WidgetExt (32B on-demand)**
   - **Widget (base):** tree links, flags, kind, location, size, background_color, border_color, ext index
   - **WidgetExt:** margin/border/padding edges, text fields, press_color, border_radius, image_id, callbacks, value
@@ -159,6 +159,16 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   }
   ```
 
+### Touch Gestures
+- **Swipe (OnSwipe = 10):** fires on release when displacement ≥ 40 px and dominant axis ≥ 2× minor; args: `(direction, widget_id, dominant_delta)`
+  - Directions: 0=left, 1=right, 2=up, 3=down (use `lib/touch.fl` constants `SWIPE_LEFT`…`SWIPE_DOWN`)
+  - Mutually exclusive with `on_click` — a touch that becomes a swipe never fires `on_click`
+- **Long press (OnLongPress = 11):** fires once after ~60 hold frames while finger stays within 20 px of press origin; args: `(widget_id, x, y)`
+  - Suppresses `on_click` on the subsequent release
+- **Gesture state** tracked in main loop locals: `gesture_start_x/y`, `hold_count`, `long_press_fired`
+- **Constants:** `LONG_PRESS_FRAMES = 60`, `LONG_PRESS_MAX_MOVE_SQ = 400`, `SWIPE_MIN_DIST_SQ = 1600`, `SWIPE_AXIS_RATIO = 2`
+- **Language library:** `lib/touch.fl` — include in `.fl` programs to get named `SWIPE_*` constants
+
 ### Recovery Mode
 - **Hold top-left corner for 3 seconds at boot** → recovery mode
 - Red progress bar fills to indicate progress, release to cancel
@@ -191,35 +201,45 @@ Nextion is a registered trademark of ITEAD — this project is fully independent
 
 ## File Structure
 
+Cargo **virtual workspace** (root `Cargo.toml` = `[workspace]` only). The framework is
+generic over `P: Platform`; each board is a thin BSP crate that owns its hardware
+backends + entry point and calls `ferrite_core::runtime::run::<P>()`. See `HANDOFF.md`
+for the platform-abstraction design.
+
+A single base library, **`ferrite-core`** (crate `ferrite_core`), holds the HAL backend
+traits, the generic wrappers and the entire device-agnostic framework — there is no
+separate framework crate.
+
 ```
-ferrite-ui/
-├── .cargo/config.toml  — thumbv7m-none-eabi target + linker flags
-├── Cargo.toml          — cortex-m, cortex-m-rt (device feature)
-├── memory.x            — GD32F103RBT6 linker script (128K Flash, 20K RAM)
-├── device.x            — Interrupt vector definitions (USART0)
-├── build.rs            — device.x → linker search path
-└── src/
-    ├── main.rs         — entry point, startup sequence, USART command loop
-    ├── gpio.rs         — GPIOA/B init, 16-bit data bus, clock pulse
-    ├── lcd.rs          — FPGA protocol, fill_rect, begin_pixels/write_pixel
-    ├── types.rs        — Rect, Offset, Size, Edges, Color (RGB565)
-    ├── widget.rs       — Widget struct (7 kinds), WidgetId, WidgetTree (DFS cache)
-    ├── clip.rs         — ClipRegion (32 rect pool, subtract algorithm)
-    ├── flash.rs        — W25Q256 SPI flash driver (hardware SPI0, 4-byte addr)
-    ├── font.rs         — Adafruit GFX bitmap font renderer (flash + embedded)
-    ├── embedded_font.rs — Embedded FreeMono9pt7b font data (in ROM)
-    ├── fs.rs           — Flash filesystem (TOC, resource access by name)
-    ├── image.rs        — Ferrite Image (FI) format decoder (raw/rle/indexed+rle)
-    ├── render.rs       — render_all + render_dirty + render_buffered (painter's algorithm)
-    ├── panic.rs        — Custom panic handler (LCD error display + USART output)
-    ├── touch.rs        — XPT2046 SPI bit-bang, hit test, debounce, PENIRQ GPIO, recovery
-    ├── sdcard.rs       — SD card SPI driver (SPI0 shared, Mode 0)
-    ├── fat.rs          — FAT16/32 filesystem reader
-    ├── vm.rs           — Bytecode interpreter (57+ opcodes, sparse vars, W_ALLTAR)
-    ├── backlight.rs    — LCD backlight PWM (TIMER0_CH0, PA8)
-    ├── usart.rs        — USART0 serial + RX interrupt ring buffer
-    ├── irq.rs          — GD32F103 interrupt vector table (__INTERRUPTS)
-    └── protocol.rs     — USART protobuf protocol (ping/pong, execute, restart, fs write)
+ferrite-ui/                  (workspace root — virtual manifest + shared release profile)
+├── Cargo.toml               — [workspace] members + [profile.release]
+├── .cargo/config.toml       — default target thumbv7m (nextion) + gd32-link.x
+├── gd32-{link,memory,device}.x — GD32 linker scripts (used for nextion-from-root)
+├── ferrite-core/            — THE base library (crate `ferrite_core`): HAL backend
+│   │                          traits (LcdBackend…) + generic wrappers (LcdImpl<B>…) +
+│   │                          Platform + MockPlatform (feature "mock") + the whole
+│   │                          device-agnostic framework. Features: mock / host / epaper.
+│   └── src/
+│       ├── lib.rs           — module tree + mock monomorphization guard (cfg "mock")
+│       ├── runtime.rs       — run::<P>() loop + PlatformRuntime + InputHandler
+│       │                      (FullInput / BasicInput), error screen
+│       ├── ctx.rs           — Ctx<P> (all hardware-backed fields use P's backends)
+│       ├── vm.rs            — bytecode interpreter   ├── render.rs — painter's algorithm
+│       ├── widget.rs        — Widget/WidgetTree      ├── clip.rs   — ClipRegion
+│       ├── font.rs/embedded_font.rs — sparse UTF-8 font + ROM font
+│       ├── fs.rs/image.rs/strpool.rs/keyboard.rs/config.rs/proto.rs/protocol.rs/heap.rs
+│       ├── platform.rs/mock.rs/gfx_glyph.rs
+│       ├── types.rs         — Rect, Offset, Size, Edges, Color (RGB565)
+│       └── {lcd,flash,rtc,backlight,sdcard,touch,usart,systick}.rs
+│                            — backend trait + generic Impl<B> + cfg(mock) type alias
+│                              (touch.rs also has hit_test)
+└── bsp/
+    ├── nextion/  — GD32F103 + NX8048K070. main.rs (clock/port bring-up), platform.rs,
+    │              panic.rs, gpio.rs, irq.rs, fat.rs, <periph>/{mod.rs,hw.rs}
+    ├── epaper/   — ESP32-S3 + ED047TC1. main.rs, platform.rs, panic.rs, battery.rs,
+    │              lcd/{mod,epaper,display,ed047tc1,rmt,error}.rs, <periph>/{mod,epaper}.rs
+    └── sim/      — host (minifb). main.rs, platform.rs (window pump via frame_end),
+                   <periph>/{mod.rs,sim.rs}
 ```
 
 ## Memory Usage
@@ -256,6 +276,7 @@ ferrite-ui/
 - [x] Startup sequence (backlight → display → recovery check → font → fs → vm)
 - [x] Error protocol (display + USART, 7 error codes)
 - [x] Touch event → VM callback (on_click, on_tap, on_paint, on_touch_down/up/move)
+- [x] Touch gestures (swipe left/right/up/down, long press — global callbacks OnSwipe=10, OnLongPress=11)
 - [x] Iterative render (flat DFS instead of recursive, DFS cache)
 - [x] PENIRQ GPIO polling (skip SPI when idle)
 - [x] SPI timing constants (SPI_HALF_CLK=54, ~1MHz)

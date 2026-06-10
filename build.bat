@@ -3,10 +3,10 @@ setlocal
 
 set TARGET=thumbv7m-none-eabi
 set BIN=ferrite-ui
-REM set OBJCOPY=D:\armeabi_none_toolchain\bin\arm-none-eabi-objcopy.exe
+set OBJCOPY=D:\armeabi_none_toolchain\bin\arm-none-eabi-objcopy.exe
 set ELF=target\%TARGET%\release\%BIN%
 
-cargo build --release --no-default-features --features firmware --bin %BIN% --target %TARGET%
+cargo build -p bsp-nextion --release --no-default-features --bin %BIN% --target %TARGET%
 if errorlevel 1 (
     echo Build failed.
     exit /b 1
@@ -17,8 +17,8 @@ REM    echo Objcopy not found: %OBJCOPY%
 REM    exit /b 1
 REM )
 
-REM "%OBJCOPY%" -v -O binary "%ELF%" firmware.bin
-cargo objcopy --release --no-default-features --features firmware --bin ferrite-ui --target thumbv7m-none-eabi -- -O binary firmware.bin
+"%OBJCOPY%" -v -O binary "%ELF%" firmware.bin
+REM cargo objcopy --release --no-default-features --features firmware --bin ferrite-ui --target thumbv7m-none-eabi -- -O binary firmware.bin
 if errorlevel 1 (
     echo Objcopy failed.
     exit /b 1

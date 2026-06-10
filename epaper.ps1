@@ -42,7 +42,8 @@ $Root = $PSScriptRoot
 Set-Location $Root
 
 $Target = 'xtensa-esp32s3-none-elf'
-$Elf = "target\$Target\release\epaper"
+# The epaper firmware is now the `bsp-epaper` crate; its bin is named `ferrite-ui`.
+$Elf = "target\$Target\release\ferrite-ui"
 $PartitionTable = "partition.csv"
 
 # ── ESP environment ──────────────────────────────────────────────────────────
@@ -56,17 +57,14 @@ else {
 }
 
 # ── Build ────────────────────────────────────────────────────────────────────
-if (-not $Action -in @('flashfs')) {
+if ($Action -ne 'flashfs') {
     Write-Host ""
     Write-Host "[1/2] Building epaper firmware  (target: $Target)" -ForegroundColor Cyan
-    $Features = 'epaper'
 
     cargo +esp build "-Zbuild-std=core,alloc" `
-        --no-default-features `
-        --features $Features `
-        --bin epaper `
+        -p bsp-epaper `
         --target $Target `
-        --release
+        --release        
 
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
@@ -135,6 +133,7 @@ else {
     Write-Host ""
     Write-Host "To flash:   .\epaper.ps1 flash [COM?] [-FlashFs]"
     Write-Host "To monitor: .\epaper.ps1 monitor [COM?]"
+    Write-Host "To flash FS only: .\epaper.ps1 flashfs [COM?]"
 }
 
 Write-Host ""

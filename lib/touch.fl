@@ -1,0 +1,24 @@
+// touch.fl — Touch gesture constants
+// Usage: #include "touch.fl"
+//
+// Gesture callbacks (register at program level):
+//
+//   fn @on_swipe(dir, widget, delta) { ... }
+//     dir    — swipe direction, one of SWIPE_* below
+//     widget — id of the widget that was pressed at swipe start (NONE if none)
+//     delta  — signed pixel displacement on the dominant axis
+//
+//   fn @on_long_press(widget, x, y) { ... }
+//     widget — id of the widget held (NONE if none)
+//     x, y   — screen position when long press fired
+//
+// Notes:
+//   - on_swipe and on_click are mutually exclusive for the same touch.
+//   - on_long_press fires once per touch; on_click is suppressed after it fires.
+//   - Long press requires the finger to stay within ~20px of the press point.
+
+// Swipe directions — passed as the first argument to @on_swipe
+const SWIPE_LEFT  = 0;
+const SWIPE_RIGHT = 1;
+const SWIPE_UP    = 2;
+const SWIPE_DOWN  = 3;

@@ -1,0 +1,12 @@
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --chip esp32s3 --flash-mode dio --flash-size 16mb --monitor"
+rustflags = ["-C", "link-arg=-nostartfiles"]
+
+# The Espressif Rust fork ships no precompiled xtensa `core`/`alloc`, so build
+# them from rust-src. Effective only when cargo is invoked from this directory;
+# from the workspace root pass `-Zbuild-std=core,alloc` explicitly.
+[unstable]
+build-std = ["core", "alloc"]

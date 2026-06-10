@@ -1279,11 +1279,17 @@ Define these functions to handle system events:
 | `fn on_touch_down(x, y)` | Touch press | screen x, y |
 | `fn on_touch_up()` | Touch release | none |
 | `fn on_touch_move(x, y)` | Touch held + moving | screen x, y |
+| `fn on_swipe(dir, widget, delta)` | Swipe gesture (release after ≥40px travel) | direction (`SWIPE_*`), pressed widget id, signed dominant-axis delta |
+| `fn on_long_press(widget, x, y)` | Finger held still for ~1 s | pressed widget id, screen x, y |
 | `fn on_user_message(arr_id)` | USART message received | array of bytes |
 
 ```c
 fn on_touch_down(x, y) {
     fillCircle(x, y, 5, 0xF800);
+}
+
+fn on_swipe(dir, widget, delta) {
+    // dir is one of the SWIPE_* constants from lib/touch.fl
 }
 
 fn on_user_message(arr_id) {
@@ -1340,6 +1346,59 @@ fn loop() {}
 | `on_tap` | Tap with coordinates | `(widget_id, packed_xy)` |
 
 For `on_tap`, extract coordinates: `x = coords / 65536`, `y = coords & 0xFFFF`.
+
+### Touch Gestures
+
+Two gesture callbacks fire globally (once per program, not per-widget). Include `lib/touch.fl` for the named direction constants.
+
+```c
+#include "touch.fl"
+
+fn @on_swipe(dir, widget, delta) {
+    if (dir == SWIPE_LEFT)  { /* swipe left  */ }
+    if (dir == SWIPE_RIGHT) { /* swipe right */ }
+    if (dir == SWIPE_UP)    { /* swipe up    */ }
+    if (dir == SWIPE_DOWN)  { /* swipe down  */ }
+    // widget — id of the pressed widget at swipe start (NONE if no widget)
+    // delta  — signed pixel displacement on the dominant axis
+}
+
+fn @on_long_press(widget, x, y) {
+    // fires once after the finger holds still for ~1 s within a 20px radius
+    // widget — pressed widget id, x/y — screen position when long press fired
+}
+```
+
+**Mutual exclusion rules:**
+- `on_swipe` and `on_click` are mutually exclusive for the same touch — a touch that becomes a swipe never fires `on_click`.
+- `on_long_press` fires once while the finger is still down; if it fires, `on_click` is suppressed on release.
+- `on_touch_down`, `on_touch_move`, and `on_touch_up` always fire regardless of gesture state.
+
+**Detection thresholds:**
+- Swipe: minimum 40 px travel, dominant axis must be at least 2× the minor axis (diagonal touches are ignored).
+- Long press: ~60 main-loop frames (~1–2 s), finger must stay within 20 px of the press point.
+
+**Page-swipe example:**
+
+```c
+#include "touch.fl"
+
+var page;  // 0 or 1
+
+fn @on_swipe(dir, widget, delta) {
+    if (dir == SWIPE_LEFT && page == 0) {
+        page = 1;
+        show_page(1);
+    } else if (dir == SWIPE_RIGHT && page == 1) {
+        page = 0;
+        show_page(0);
+    }
+}
+
+fn @on_long_press(widget, x, y) {
+    // show context menu at (x, y)
+}
+```
 
 ### Function References (`@name`)
 
@@ -1522,13 +1581,13 @@ ext_count:      u8      (pre-allocation hint)
 opcodes...
 ```
 
-Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnUserMessage=6, OnTouchDown=7, OnTouchUp=8, OnTouchMove=9.
+Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnPageChanging=4, OnPageChanged=5, OnUserMessage=6, OnTouchDown=7, OnTouchUp=8, OnTouchMove=9, OnSwipe=10, OnLongPress=11.
 
 ## VM Limits
 
 | Resource | Limit |
 |----------|-------|
-| Widget arena | 254 widgets |
+| Widget arena | 1024 widgets |
 | Variable slots | 256 (sparse map, shared globals + function locals) |
 | Eval stack | 16 deep |
 | Call stack | 8 deep |
