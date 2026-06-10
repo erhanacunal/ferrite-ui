@@ -1,0 +1,15 @@
+[target.'cfg(target_arch = "arm")']
+# The linker script is supplied by build.rs (with a search path), so it resolves
+# regardless of the linker's working directory.
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "panic=abort",
+]
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+# Recent nightlies gate `.json` custom target specs behind this flag.
+json-target-spec = true
+
+[build]
+target = "armv5te-none-eabi.json"

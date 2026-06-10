@@ -1,0 +1,14 @@
+[package]
+name = "bsp-tdo-y13"
+version = "0.1.0"
+edition = "2024"
+description = "BSP for TDO Y13 — Allwinner F1C100s + 480×480 circular LCD"
+
+[[bin]]
+name = "ferrite-ui"
+path = "src/main.rs"
+
+[dependencies]
+ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "strpool_large"] }
+f1c100s = { path = "../../vendor/f1c100s_rs" }
+libm = "0.2"

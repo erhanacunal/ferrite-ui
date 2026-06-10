@@ -16,3 +16,11 @@ runner = "espflash flash --chip esp32s3 --flash-mode dio --flash-size 16mb --mon
 rustflags = [
     "-C", "link-arg=-nostartfiles"
 ]
+
+[target.'cfg(target_arch = "arm")']
+# tdo_y13 (armv5te) build. The linker script is supplied by its build.rs with a
+# search path, so it resolves regardless of the linker's working directory.
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "panic=abort",
+]
