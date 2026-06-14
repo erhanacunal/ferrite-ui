@@ -74,13 +74,22 @@ static mut IDLE_STACK: [u8; 1024] = [0u8; 1024];
 static mut UI_STACK: [u8; 32768] = [0u8; 32768];
 
 fn idle_task(_: *mut ()) {
+    // The idle thread must ALWAYS be runnable so the scheduler has something to
+    // switch to whenever every other thread blocks. If idle instead blocks
+    // (e.g. thread_sleep), then when the UI thread waits on an IPC event — such
+    // as the interrupt-driven I2C transfer for touch — `ready_bitmap` becomes
+    // empty, `do_schedule()` can't switch away, `block_current()` is a no-op,
+    // and the wait returns `Timeout` immediately (the ISR never gets to run).
+    // Wait-for-interrupt parks the core until the next IRQ without blocking.
     loop {
-        thread::thread_sleep(1000);
+        f1c100s::cpu::wfi();
     }
 }
 
 fn ui_task(_: *mut ()) {
-    
+
+    unsafe { touch::init(); }
+
     let ctx = Box::new(Ctx::<TdoY13Platform> {
         lcd: LcdImpl::with_backend(lcd::new()),
         flash: FlashImpl::with_backend(flash::new()),
@@ -96,7 +105,6 @@ fn ui_task(_: *mut ()) {
         audio: ferrite_core::audio::AudioImpl::none(),
         cursor_visible: false,
     });
-
     let touch = TouchImpl::with_backend(touch::new());
     ferrite_core::runtime::run::<TdoY13Platform>(ctx, touch);
 }
@@ -118,6 +126,8 @@ pub extern "C" fn rust_main() -> ! {
     //     MemDesc::new(0x80000000, 0x81FF_FFFF, 0x80000000, RW_CB),
     // ]);
 
+    init_gpio_mux();
+
     f1c100s::interrupt::init();
 
     // Initialize the heap over all DRAM above the loaded image/.bss (`_end`),
@@ -131,13 +141,10 @@ pub extern "C" fn rust_main() -> ! {
     }
 
     
-    unsafe { flash::init(); }
-    unsafe { touch::init(); }
+    unsafe { flash::init(); }    
     unsafe { backlight::init(); }
     unsafe { lcd::init(); }
-    unsafe { usart::init(); }
-
-    init_gpio_mux();
+    unsafe { usart::init(); }    
     
     thread::sched_init();
 
