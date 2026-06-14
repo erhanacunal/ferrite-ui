@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "device": "tdo_y13",
+  "screen": [480, 480],
+  "render_mode": "dirty",
+  "include_dirs": ["../../lib"],
+  "images": [
+    {
+      "name": "sprite",
+      "image_id": 1,
+      "source": "assets/sprite.png",
+      "mode": "auto"
+    }
+  ],
+  "programs": [
+    {
+      "name": "main",
+      "source": "alpha_demo.fl",
+      "exec_mode": "flash"
+    }
+  ]
+}

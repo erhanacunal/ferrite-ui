@@ -207,6 +207,11 @@ pub struct WidgetExt {
     pub gradient_color: Color, // End color (background_color is start)
     pub gradient_dir: u8,      // 0=none, 1=horizontal (L→R), 2=vertical (T→B)
 
+    // Background opacity, 255 = opaque (1 byte — fills the alignment pad
+    // before prev_rect_a). Only honored on LcdBackend::HAS_ALPHA devices;
+    // others draw the background solid.
+    pub alpha: u8,
+
     // Rect at which the widget was last drawn to buffers A and B.
     // The renderer compares each against the current absolute_rect and, when
     // they differ, redraws the widgets behind `prev_rect_X` clipped to that
@@ -234,6 +239,7 @@ impl WidgetExt {
         value: 0,
         gradient_color: 0,
         gradient_dir: 0,
+        alpha: 255,
         prev_rect_a: Rect::new(0, 0, 0, 0),
         prev_rect_b: Rect::new(0, 0, 0, 0),
     };
@@ -439,6 +445,10 @@ impl WidgetTree {
 
     pub fn gradient_dir(&self, id: WidgetId) -> u8 {
         self.ext(id).map_or(0, |e| e.gradient_dir)
+    }
+
+    pub fn alpha(&self, id: WidgetId) -> u8 {
+        self.ext(id).map_or(255, |e| e.alpha)
     }
 
     // --- Tree operations ---

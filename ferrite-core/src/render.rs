@@ -103,6 +103,11 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
             }
         }
 
+        // Translucent widgets must not blend over their own previous output
+        // in this buffer — restore what is behind them first.
+        if ctx.lcd.has_alpha() && ctx.tree.alpha(id) < 255 {
+            redraw_behind(ctx, vm, i, abs);
+        }
         draw_widget(ctx, vm, id, &abs);
         ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
     }
@@ -182,17 +187,31 @@ fn redraw_behind<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm, target_idx: usize, stal
     if clip.is_empty() {
         return;
     }
+    redraw_behind_region(ctx, vm, target_idx, &clip, &stale);
+}
 
+/// `redraw_behind` over a prebuilt clip region (`bounds` is its enclosing
+/// rect, used for the cheap intersection pre-test). Also used to restore the
+/// pixels under a translucent widget before it is re-blended — without this,
+/// a widget with `alpha < 255` redrawn in place blends over its own previous
+/// output and accumulates toward solid a little more every frame.
+fn redraw_behind_region<P: Platform>(
+    ctx: &mut Ctx<P>,
+    vm: &Vm,
+    target_idx: usize,
+    clip: &ClipRegion,
+    bounds: &Rect,
+) {
     for i in 0..target_idx {
         let uid = ctx.tree.dfs_at(i);
         if !ctx.tree.is_tree_visible(uid) {
             continue;
         }
         let u_abs = ctx.tree.absolute_rect(uid);
-        if !u_abs.intersects(&stale) {
+        if !u_abs.intersects(bounds) {
             continue;
         }
-        draw_widget_clipped(ctx, vm, uid, &u_abs, &clip);
+        draw_widget_clipped(ctx, vm, uid, &u_abs, clip);
     }
 }
 
@@ -390,6 +409,11 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
             }
 
             if !clip.is_empty() {
+                // Translucent widgets must not blend over their own previous
+                // output — restore what is behind them (same clip) first.
+                if ctx.lcd.has_alpha() && ctx.tree.alpha(sid) < 255 {
+                    redraw_behind_region(ctx, vm, si, &clip, &sabs);
+                }
                 draw_widget_clipped(ctx, vm, sid, &sabs, &clip);
                 ctx.tree.get_mut(sid).flags |= FLAG_RENDERED;
             }
@@ -489,6 +513,10 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, vm: &Vm, id: WidgetId, abs: &Rect) {
     let r = ext.border_radius;
     let bg_color = effective_bg(&ctx.tree, widget, ext);
     let draw_bg = bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE);
+    // Background opacity — only honored on blending-capable backends (the
+    // has_alpha() branch folds away at compile time on the others, where the
+    // background stays solid). Gradients remain opaque (not supported).
+    let alpha = if ctx.lcd.has_alpha() { ext.alpha } else { 255 };
     // Only apply gradient when the widget is in its normal (non-pressed) state.
     let gdir = if bg_color == widget.background_color {
         ctx.tree.gradient_dir(id)
@@ -524,6 +552,8 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, vm: &Vm, id: WidgetId, abs: &Rect) {
                 let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
                 if gdir != 0 {
                     fill_gradient_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color, gcol, gdir);
+                } else if alpha < 255 {
+                    fill_rounded_rect_blend_screen(&ctx.lcd, bg, inner_r, bg_color, alpha);
                 } else {
                     fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
                 }
@@ -577,6 +607,8 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, vm: &Vm, id: WidgetId, abs: &Rect) {
             if !bg.is_empty() {
                 if gdir != 0 {
                     fill_gradient_rect_screen(&ctx.lcd, bg, bg, bg_color, gcol, gdir);
+                } else if alpha < 255 {
+                    blend_rect_screen(&ctx.lcd, bg, bg_color, alpha);
                 } else {
                     fill_rect_screen(&ctx.lcd, bg, bg_color);
                 }
@@ -650,6 +682,8 @@ fn draw_widget_clipped<P: Platform>(
     let r = ext.border_radius;
     let bg_color = effective_bg(&ctx.tree, widget, ext);
     let draw_bg = bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE);
+    // See draw_widget — background opacity, blending-capable backends only.
+    let alpha = if ctx.lcd.has_alpha() { ext.alpha } else { 255 };
     let gdir = if bg_color == widget.background_color {
         ctx.tree.gradient_dir(id)
     } else {
@@ -685,6 +719,8 @@ fn draw_widget_clipped<P: Platform>(
                 // Rounded rect clip is not applied (same as solid — too complex to clip a rounded fill).
                 if gdir != 0 {
                     fill_gradient_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color, gcol, gdir);
+                } else if alpha < 255 {
+                    fill_rounded_rect_blend_screen(&ctx.lcd, bg, inner_r, bg_color, alpha);
                 } else {
                     fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
                 }
@@ -724,6 +760,8 @@ fn draw_widget_clipped<P: Platform>(
             if !bg.is_empty() {
                 if gdir != 0 {
                     fill_gradient_clipped(&ctx.lcd, &bg, bg_color, gcol, gdir, clip);
+                } else if alpha < 255 {
+                    blend_clipped(&ctx.lcd, &bg, bg_color, alpha, clip);
                 } else {
                     fill_clipped(&ctx.lcd, &bg, bg_color, clip);
                 }
@@ -1402,10 +1440,33 @@ fn fill_gradient_clipped<B: LcdBackend>(
     }
 }
 
+/// Blend rect clipped against clip region. Clip rects are disjoint (region
+/// subtraction yields non-overlapping strips), so no pixel blends twice.
+fn blend_clipped<B: LcdBackend>(
+    lcd: &LcdImpl<B>,
+    rect: &Rect,
+    color: Color,
+    alpha: u8,
+    clip: &ClipRegion,
+) {
+    for cr in clip.iter() {
+        if let Some(visible) = rect.intersection(cr) {
+            blend_rect_screen(lcd, visible, color, alpha);
+        }
+    }
+}
+
 /// Draw rect clipped to screen bounds.
 fn fill_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, color: Color) {
     if let Some(r) = rect.intersection(&screen_rect::<B>()) {
         lcd.fill_rect(r.x as u16, r.y as u16, r.w, r.h, color);
+    }
+}
+
+/// Blend rect clipped to screen bounds.
+fn blend_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, color: Color, alpha: u8) {
+    if let Some(r) = rect.intersection(&screen_rect::<B>()) {
+        lcd.blend_rect(r.x as u16, r.y as u16, r.w, r.h, color, alpha);
     }
 }
 
@@ -1464,6 +1525,19 @@ fn rounded_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, radius: u16,
 fn fill_rounded_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, radius: u16, color: Color) {
     if let Some(r) = rect.intersection(&screen_rect::<B>()) {
         lcd.fill_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, color);
+    }
+}
+
+/// Blend rounded rect clipped to screen bounds.
+fn fill_rounded_rect_blend_screen<B: LcdBackend>(
+    lcd: &LcdImpl<B>,
+    rect: Rect,
+    radius: u16,
+    color: Color,
+    alpha: u8,
+) {
+    if let Some(r) = rect.intersection(&screen_rect::<B>()) {
+        lcd.fill_rounded_rect_blend(r.x as u16, r.y as u16, r.w, r.h, radius, color, alpha);
     }
 }
 

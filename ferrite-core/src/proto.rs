@@ -63,6 +63,7 @@ pub const PROP_GRAPH_ARR: u8 = 0x2D;
 pub const PROP_GRAPH_COUNT: u8 = 0x2E;
 pub const PROP_GRAPH_FLAGS: u8 = 0x2F;
 pub const PROP_MULTI_LINE: u8 = 0x30;
+pub const PROP_ALPHA: u8 = 0x31;
 
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;

@@ -135,6 +135,7 @@ fn main() -> ! {
         rtc: rtc::init(),
         usart: usart::init(),
         systick: systick::Systick::handle(),
+        audio: ferrite_core::audio::AudioImpl::none(),
         cursor_visible: false,
     });
 

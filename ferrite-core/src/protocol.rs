@@ -22,7 +22,6 @@
 extern crate alloc;
 
 use crate::flash::{FlashBackend, FlashImpl};
-use crate::fs::FS_BASE;
 use crate::usart::{UsartBackend, UsartImpl};
 use alloc::vec::Vec;
 
@@ -50,6 +49,9 @@ enum RxState {
 // --- FS Writer (chunked flash write with heap-allocated sector buffer) ---
 
 struct FsWriter {
+    /// Base flash address the FS is written to (board-specific — see
+    /// [`crate::platform::Platform::FS_BASE`]). `writefs` targets this.
+    fs_base: u32,
     /// Current flash write address
     addr: u32,
     /// Sector buffer — heap-allocated on demand (4KB, freed on device restart)
@@ -65,9 +67,10 @@ struct FsWriter {
 }
 
 impl FsWriter {
-    fn new() -> Self {
+    fn new(fs_base: u32) -> Self {
         Self {
-            addr: 0,
+            fs_base,
+            addr: fs_base,
             buf: Vec::new(),
             total_size: 0,
             received: 0,
@@ -97,7 +100,7 @@ impl FsWriter {
         let b = &self.header_buf;
         self.total_size =
             (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24);
-        self.addr = FS_BASE;
+        self.addr = self.fs_base;
         self.received = 0;
         self.buf.clear();
     }
@@ -199,11 +202,13 @@ pub struct Protocol {
 }
 
 impl Protocol {
-    pub fn new() -> Self {
+    /// `fs_base` is the flash address `writefs` writes the resource image to
+    /// (see [`crate::platform::Platform::FS_BASE`]).
+    pub fn new(fs_base: u32) -> Self {
         Self {
             state: RxState::Idle,
             program_buf: Vec::new(),
-            fs_writer: FsWriter::new(),
+            fs_writer: FsWriter::new(fs_base),
             user_msg_buf: [0; MAX_USER_MSG],
             user_msg_len: 0,
             datetime_buf: [0; 7],

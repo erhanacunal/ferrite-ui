@@ -9,16 +9,23 @@
 ///     [4..6] height: u16 LE
 ///     [6]    flags: u8
 ///            bit 0-1: mode (0=raw, 1=rle, 2=indexed_rle)
+///            bit 2: has_alpha — pixel/palette units carry an alpha byte
 ///     [7]    colors: u8 — palette color count (indexed mode, 0=256)
 ///     [8]    image_id: u8 — unique ID (0 = no image, 1-254 = user images)
 ///
-///   Indexed mode: palette — colors × 2 bytes (RGB565 LE)
+///   Indexed mode: palette — colors × 2 bytes (RGB565 LE),
+///                 or colors × 3 bytes (RGB565 LE + alpha u8) with has_alpha
 ///   Pixel data: depends on mode
 ///
 /// Modes:
 ///   Raw (0): RGB565 pixel array (width × height × 2 bytes)
 ///   RLE (1): PackBits RLE compressed RGB565
 ///   Indexed+RLE (2): Palette + PackBits RLE compressed indices
+///
+/// Alpha (bit 2): raw/RLE units widen to 3 bytes (RGB565 LE + alpha u8);
+///   indexed palette entries widen instead, the index stream is unchanged.
+///   Drawn via `LcdBackend::blend_pixel` — on devices without HAS_ALPHA this
+///   degrades to a 1-bit cutout at threshold 128.
 ///
 /// RLE encoding:
 ///   0x00..0x7F: literal run — next (n+1) units as-is
@@ -43,6 +50,9 @@ const MODE_RAW: u8 = 0;
 const MODE_RLE: u8 = 1;
 const MODE_INDEXED_RLE: u8 = 2;
 
+/// Flags bit 2 — units carry an alpha byte.
+const FLAG_ALPHA: u8 = 0x04;
+
 /// Image metadata from flash. Pixel data is streamed during drawing.
 /// RAM cost: ~22 bytes (palette stays in flash, read to stack during draw).
 pub struct Image {
@@ -50,6 +60,7 @@ pub struct Image {
     pub width: u16,
     pub height: u16,
     mode: u8,
+    has_alpha: bool,
     palette_count: u16,
     palette_addr: u32,
     data_addr: u32,
@@ -64,6 +75,7 @@ impl Image {
             width: 0,
             height: 0,
             mode: 0,
+            has_alpha: false,
             palette_count: 0,
             palette_addr: 0,
             data_addr: 0,
@@ -101,6 +113,7 @@ impl Image {
         let image_id = hdr[8];
 
         let mode = flags & 0x03;
+        let has_alpha = flags & FLAG_ALPHA != 0;
 
         let (palette_count, palette_addr, data_addr) = if mode == MODE_INDEXED_RLE {
             let count = if colors_raw == 0 {
@@ -109,7 +122,8 @@ impl Image {
                 colors_raw as u16
             };
             let pal_addr = entry.offset + HEADER_SIZE;
-            let dat_addr = pal_addr + count as u32 * 2;
+            let entry_size = if has_alpha { 3u32 } else { 2u32 };
+            let dat_addr = pal_addr + count as u32 * entry_size;
             (count, pal_addr, dat_addr)
         } else {
             (0u16, 0u32, entry.offset + HEADER_SIZE)
@@ -122,6 +136,7 @@ impl Image {
             width,
             height,
             mode,
+            has_alpha,
             palette_count,
             palette_addr,
             data_addr,
@@ -165,6 +180,19 @@ impl Image {
             return;
         }
 
+        if self.has_alpha {
+            // Alpha images blend per positioned pixel — the streaming
+            // begin_pixels/write_pixel cursor cannot read back the target.
+            let mut cur = PixelCursor::new(x, y, self.width);
+            match self.mode {
+                MODE_RAW => self.draw_raw_alpha(lcd, flash, &mut cur),
+                MODE_RLE => self.draw_rle_alpha(lcd, flash, &mut cur),
+                MODE_INDEXED_RLE => self.draw_indexed_rle_alpha(lcd, flash, &mut cur),
+                _ => {}
+            }
+            return;
+        }
+
         lcd.begin_pixels(x, y, self.width, self.height);
 
         match self.mode {
@@ -176,7 +204,8 @@ impl Image {
     }
 
     /// Draw a region of the image (sprite sheet, atlas usage).
-    /// Only supported in raw mode — RLE has no random access.
+    /// Only supported in raw mode — RLE has no random access. Alpha images
+    /// are not supported here yet (full `draw` only).
     pub fn draw_region<B: LcdBackend, F: FlashBackend>(
         &self,
         lcd: &LcdImpl<B>,
@@ -188,7 +217,7 @@ impl Image {
         sw: u16,
         sh: u16,
     ) {
-        if sw == 0 || sh == 0 || self.mode != MODE_RAW {
+        if sw == 0 || sh == 0 || self.mode != MODE_RAW || self.has_alpha {
             return;
         }
 
@@ -285,6 +314,155 @@ impl Image {
                         return;
                     }
                     lcd.write_pixel(color);
+                    emitted += 1;
+                }
+            }
+        }
+    }
+
+    // --- Alpha variants: 3-byte units (RGB565 + alpha), positioned blend ---
+
+    fn draw_raw_alpha<B: LcdBackend, F: FlashBackend>(
+        &self,
+        lcd: &LcdImpl<B>,
+        flash: &FlashImpl<F>,
+        cur: &mut PixelCursor,
+    ) {
+        let total_pixels = self.width as u32 * self.height as u32;
+        let mut reader = FlashReader::new(self.data_addr, self.data_size);
+        for _ in 0..total_pixels {
+            let lo = reader.next(flash).unwrap_or(0);
+            let hi = reader.next(flash).unwrap_or(0);
+            let a = reader.next(flash).unwrap_or(0);
+            cur.emit(lcd, u16::from_le_bytes([lo, hi]), a);
+        }
+    }
+
+    fn draw_rle_alpha<B: LcdBackend, F: FlashBackend>(
+        &self,
+        lcd: &LcdImpl<B>,
+        flash: &FlashImpl<F>,
+        cur: &mut PixelCursor,
+    ) {
+        let mut reader = FlashReader::new(self.data_addr, self.data_size);
+        let total_pixels = self.width as u32 * self.height as u32;
+        let mut emitted: u32 = 0;
+
+        while emitted < total_pixels {
+            let ctrl = match reader.next(flash) {
+                Some(b) => b,
+                None => return,
+            };
+
+            if ctrl <= 0x7F {
+                // Literal: (ctrl+1) units
+                let count = ctrl as u32 + 1;
+                for _ in 0..count {
+                    if emitted >= total_pixels {
+                        return;
+                    }
+                    let lo = reader.next(flash).unwrap_or(0);
+                    let hi = reader.next(flash).unwrap_or(0);
+                    let a = reader.next(flash).unwrap_or(0);
+                    cur.emit(lcd, u16::from_le_bytes([lo, hi]), a);
+                    emitted += 1;
+                }
+            } else {
+                // Repeat: next unit (ctrl - 126) times
+                let count = ctrl as u32 - 126;
+                let lo = reader.next(flash).unwrap_or(0);
+                let hi = reader.next(flash).unwrap_or(0);
+                let a = reader.next(flash).unwrap_or(0);
+                let color = u16::from_le_bytes([lo, hi]);
+                for _ in 0..count {
+                    if emitted >= total_pixels {
+                        return;
+                    }
+                    cur.emit(lcd, color, a);
+                    emitted += 1;
+                }
+            }
+        }
+    }
+
+    fn draw_indexed_rle_alpha<B: LcdBackend, F: FlashBackend>(
+        &self,
+        lcd: &LcdImpl<B>,
+        flash: &FlashImpl<F>,
+        cur: &mut PixelCursor,
+    ) {
+        // Read 3-byte palette entries (RGB565 + alpha) to heap
+        let mut colors = vec![0u16; MAX_PALETTE];
+        let mut alphas = vec![0u8; MAX_PALETTE];
+        let pal_count = self.palette_count as usize;
+
+        {
+            let total_pal_bytes = pal_count * 3;
+            let mut pal_buf = [0u8; READ_BUF];
+            let mut pal_read = 0usize;
+            let mut pal_idx = 0usize;
+
+            while pal_read < total_pal_bytes {
+                let remaining = total_pal_bytes - pal_read;
+                let chunk = if remaining < READ_BUF {
+                    remaining
+                } else {
+                    READ_BUF - (READ_BUF % 3) // 3-byte aligned
+                };
+
+                flash.read(self.palette_addr + pal_read as u32, &mut pal_buf[..chunk]);
+
+                let mut i = 0;
+                while i + 3 <= chunk {
+                    colors[pal_idx] = u16::from_le_bytes([pal_buf[i], pal_buf[i + 1]]);
+                    alphas[pal_idx] = pal_buf[i + 2];
+                    pal_idx += 1;
+                    i += 3;
+                }
+
+                pal_read += chunk;
+            }
+        }
+
+        // RLE decode — unit = u8 index, lookup to (color, alpha)
+        let mut reader = FlashReader::new(self.data_addr, self.data_size);
+        let total_pixels = self.width as u32 * self.height as u32;
+        let mut emitted: u32 = 0;
+
+        while emitted < total_pixels {
+            let ctrl = match reader.next(flash) {
+                Some(b) => b,
+                None => return,
+            };
+
+            if ctrl <= 0x7F {
+                let count = ctrl as u32 + 1;
+                for _ in 0..count {
+                    if emitted >= total_pixels {
+                        return;
+                    }
+                    let idx = reader.next(flash).unwrap_or(0) as usize;
+                    let (color, a) = if idx < pal_count {
+                        (colors[idx], alphas[idx])
+                    } else {
+                        (0, 0)
+                    };
+                    cur.emit(lcd, color, a);
+                    emitted += 1;
+                }
+            } else {
+                let count = ctrl as u32 - 126;
+                let idx = reader.next(flash).unwrap_or(0) as usize;
+                let (color, a) = if idx < pal_count {
+                    (colors[idx], alphas[idx])
+                } else {
+                    (0, 0)
+                };
+                for _ in 0..count {
+                    if emitted >= total_pixels {
+                        return;
+                    }
+                    cur.emit(lcd, color, a);
                     emitted += 1;
                 }
             }
@@ -432,6 +610,39 @@ impl ImageList {
             return self.add(image);
         }
         false
+    }
+}
+
+// === Positioned pixel cursor (alpha decode) ===
+
+/// Tracks the (x, y) raster position for alpha image decode, emitting each
+/// pixel through `blend_pixel` (positioned read-modify-write) instead of the
+/// streaming `write_pixel` cursor.
+struct PixelCursor {
+    x: u16,
+    y: u16,
+    start_x: u16,
+    end_x: u16,
+}
+
+impl PixelCursor {
+    fn new(x: u16, y: u16, w: u16) -> Self {
+        Self {
+            x,
+            y,
+            start_x: x,
+            end_x: x + w,
+        }
+    }
+
+    #[inline]
+    fn emit<B: LcdBackend>(&mut self, lcd: &LcdImpl<B>, color: u16, alpha: u8) {
+        lcd.blend_pixel(self.x, self.y, color, alpha);
+        self.x += 1;
+        if self.x >= self.end_x {
+            self.x = self.start_x;
+            self.y += 1;
+        }
     }
 }
 

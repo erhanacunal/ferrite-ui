@@ -4,8 +4,8 @@ use crate::ctx::Ctx;
 use crate::flash::{FlashBackend, FlashImpl};
 use crate::platform::Platform;
 use crate::proto::{
-    self, PROP_BG_COLOR, PROP_BORDER_B, PROP_BORDER_COLOR, PROP_BORDER_EDGES, PROP_BORDER_L,
-    PROP_BORDER_R, PROP_BORDER_RADIUS, PROP_BORDER_T, PROP_CHECKED, PROP_CLICKABLE,
+    self, PROP_ALPHA, PROP_BG_COLOR, PROP_BORDER_B, PROP_BORDER_COLOR, PROP_BORDER_EDGES,
+    PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_RADIUS, PROP_BORDER_T, PROP_CHECKED, PROP_CLICKABLE,
     PROP_CLIP_CHILDREN, PROP_CURSOR_POS, PROP_ENABLED, PROP_FONT_ID, PROP_GRADIENT_COLOR,
     PROP_GRADIENT_DIR, PROP_GRAPH_ARR, PROP_GRAPH_COUNT, PROP_GRAPH_FLAGS, PROP_IMAGE_ID,
     PROP_KIND, PROP_LOC_X, PROP_LOC_Y, PROP_LOCATION, PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L,
@@ -2273,6 +2273,7 @@ impl Vm {
                 PROP_SCROLL_Y => ext.value = val as i16,
                 PROP_GRADIENT_COLOR => ext.gradient_color = val as u16,
                 PROP_GRADIENT_DIR => ext.gradient_dir = val as u8,
+                PROP_ALPHA => ext.alpha = val as u8,
                 // KIND_GRAPH props share storage with value/max_length/image_id;
                 // safe because a single widget kind is exclusive.
                 PROP_GRAPH_ARR => ext.value = val as i16,
@@ -2364,6 +2365,7 @@ impl Vm {
             PROP_SCROLL_Y => ctx.tree.value(self.target) as i32,
             PROP_GRADIENT_COLOR => ctx.tree.gradient_color(self.target) as i32,
             PROP_GRADIENT_DIR => ctx.tree.gradient_dir(self.target) as i32,
+            PROP_ALPHA => ctx.tree.alpha(self.target) as i32,
             PROP_GRAPH_ARR => ctx.tree.value(self.target) as i32,
             PROP_GRAPH_COUNT => ctx.tree.max_length(self.target) as i32,
             PROP_GRAPH_FLAGS => ctx.tree.image_id(self.target) as i32,

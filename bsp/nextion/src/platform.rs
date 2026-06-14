@@ -11,7 +11,7 @@ use ferrite_core::runtime::{ERR_EMPTY_RUN, FullInput, PlatformRuntime};
 use ferrite_core::strpool::StringPool;
 use ferrite_core::types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
 use ferrite_core::vm::Vm;
-use ferrite_core::{config, fs, protocol, render};
+use ferrite_core::{config, protocol, render};
 
 use crate::gpio::Gpio;
 use crate::systick::delay_ms;
@@ -37,6 +37,7 @@ impl Platform for NextionPlatform {
     type SdCardB = crate::sdcard::hw::SpiSd;
     type UsartB = crate::usart::hw::Hw;
     type SystickB = crate::systick::Gd32Systick;
+    type AudioB = ferrite_core::audio::NoAudio;
 }
 
 impl PlatformRuntime for NextionPlatform {
@@ -106,7 +107,7 @@ impl PlatformRuntime for NextionPlatform {
 
     fn boot(ctx: &mut Ctx<Self>, touch: &mut TouchImpl<Self::TouchB>) -> u8 {
         // Load saved touch calibration from config (flash sector 0).
-        let cfg = config::ConfigStore::mount_or_format(&ctx.flash);
+        let cfg = config::ConfigStore::mount_or_format(&ctx.flash, Self::CONFIG_BASE);
         let mut cal_buf = [0u8; 9];
         if let Some(len) = cfg.read(&ctx.flash, config::KEY_TOUCH_CAL, &mut cal_buf) {
             if len >= 9 {
@@ -144,7 +145,7 @@ impl PlatformRuntime for NextionPlatform {
         match ev {
             RxEvent::TouchCalibrate => {
                 let cal = touch::run_calibration(touch, &ctx.lcd);
-                let mut cfg = config::ConfigStore::mount_or_format(&ctx.flash);
+                let mut cfg = config::ConfigStore::mount_or_format(&ctx.flash, Self::CONFIG_BASE);
                 cfg.write(&ctx.flash, config::KEY_TOUCH_CAL, &cal.to_bytes());
                 protocol::send_touch_cal(&ctx.usart, &cal);
                 render::render_all(ctx, vm);
@@ -281,7 +282,7 @@ fn sd_boot_check(ctx: &Ctx<NextionPlatform>) -> u8 {
     const PAGE: usize = 256;
     let mut buf = alloc::vec![0u8; SECTOR];
     let mut offset: u32 = 0;
-    let dest_base: u32 = fs::FS_BASE;
+    let dest_base: u32 = NextionPlatform::FS_BASE;
 
     while offset < file_size {
         let remaining = (file_size - offset) as usize;

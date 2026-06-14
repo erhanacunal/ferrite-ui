@@ -1,0 +1,94 @@
+// alpha_demo.fl — Alpha blending showcase (tdo_y13, 480x480)
+//
+// Left: two solid color blocks with a translucent white panel overlapping
+//       both — the panel tints whatever is underneath.
+// Right: rounded translucent panel over a gradient.
+// Bottom: an RGBA PNG (soft-edged sprite) over a checkered background.
+// The translucent panel toggles its color every ~1.5s (and on tap) —
+// regression test for dirty-mode double blending: a redrawn translucent
+// widget must NOT get darker with each redraw.
+
+#include "core.fl"
+#include "color.fl"
+
+var glass;
+var last_toggle;
+
+fn on_glass(wid) {
+    target(glass);
+    var c = get(bg_color);
+    if (c == WHITE) { set(bg_color, CYAN); }
+    else            { set(bg_color, WHITE); }
+    dirty(glass);
+}
+
+fn setup() {
+    // Title
+    var l = alloc(); target(l);
+    set(kind, KIND_LABEL);
+    set(size, 480, 24);
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER);
+    set(text, "Alpha Blending Demo");
+    parent(0);
+
+    // ── Solid blocks underneath ──
+    var p = alloc(); target(p);
+    set(location, 20, 50); set(size, 120, 160);
+    set(bg_color, RED);
+    parent(0);
+
+    p = alloc(); target(p);
+    set(location, 140, 50); set(size, 120, 160);
+    set(bg_color, BLUE);
+    parent(0);
+
+    // ── Translucent panel overlapping both (tap to cycle color) ──
+    glass = alloc(); target(glass);
+    set(location, 60, 90); set(size, 160, 80);
+    set(bg_color, WHITE); set(alpha, 128);
+    set(clickable, ON); set(on_click, @on_glass);
+    parent(0);
+
+    // ── Rounded translucent over a gradient ──
+    p = alloc(); target(p);
+    set(location, 300, 50); set(size, 160, 160);
+    set(bg_color, NAVY); set(gradient_color, ORANGE); set(gradient_dir, 2);
+    parent(0);
+
+    p = alloc(); target(p);
+    set(location, 330, 80); set(size, 100, 100);
+    set(bg_color, BLACK); set(alpha, 96); set(border_radius, 16);
+    parent(0);
+
+    // ── Checkerboard + alpha sprite ──
+    var cx = 0;
+    var cy = 0;
+    for (cy = 0; cy < 4; cy = cy + 1) {
+        for (cx = 0; cx < 6; cx = cx + 1) {
+            p = alloc(); target(p);
+            set(location, 20 + cx * 40, 260 + cy * 40);
+            set(size, 40, 40);
+            if ((cx + cy) % 2 == 0) { set(bg_color, GRAY); }
+            else                    { set(bg_color, LIGHT_GRAY); }
+            parent(0);
+        }
+    }
+
+    p = alloc(); target(p);
+    set(kind, KIND_IMAGE);
+    set(location, 60, 280); set(size, 120, 120);
+    set(image_id, 1);
+    parent(0);
+
+    last_toggle = millis();
+    render();
+    return 0;
+}
+
+fn loop() {
+    var now = millis();
+    if (now - last_toggle >= 1500) {
+        last_toggle = now;
+        on_glass(glass);
+    }
+}

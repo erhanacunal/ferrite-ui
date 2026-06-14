@@ -44,6 +44,7 @@ impl Platform for EpaperPlatform {
     type SdCardB = crate::sdcard::epaper::EspSdCard;
     type UsartB = crate::usart::epaper::EspUart;
     type SystickB = crate::systick::EpdSystick;
+    type AudioB = ferrite_core::audio::NoAudio;
 }
 
 impl PlatformRuntime for EpaperPlatform {

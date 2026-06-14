@@ -129,4 +129,5 @@ impl Platform for MockPlatform {
     type SdCardB = MockSdCard;
     type UsartB = MockUsart;
     type SystickB = MockSystick;
+    type AudioB = crate::audio::NoAudio;
 }

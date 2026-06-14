@@ -13,6 +13,7 @@ const KIND_INPUT    = 7;
 const KIND_GAUGE    = 8;
 const KIND_DROPDOWN = 9;
 const KIND_GRAPH    = 10;
+const KIND_IMAGE    = 11;
 
 // Text alignment
 const ALIGN_LEFT   = 0;

@@ -8,6 +8,13 @@ pub trait LcdBackend {
     const WIDTH: u16;
     const HEIGHT: u16;
 
+    /// True when the backend can alpha-blend against existing pixels
+    /// (requires framebuffer readback — impossible on the write-only Nextion
+    /// FPGA bus). Backends that set this must override `blend_rect` and
+    /// `blend_pixel`. Mirror the value in `tools/devices/<id>.json`
+    /// (`caps.alpha` / `caps.image_alpha`).
+    const HAS_ALPHA: bool = false;
+
     fn begin_frame(&mut self);
     fn end_frame(&mut self);
     fn back_buf(&self) -> u8;
@@ -30,6 +37,25 @@ pub trait LcdBackend {
     /// Default: fill a 1x1 rect (no bounds check — backend handles clipping).
     fn draw_pixel(&self, x: u16, y: u16, color: u16) {
         self.fill_rect(x, y, 1, 1, color);
+    }
+
+    /// Blend a solid rect over existing content. Default (no readback):
+    /// opaque fill — a translucent widget background degrades to solid,
+    /// which is better than half-missing UI. The designer hides the alpha
+    /// editor for devices without `caps.alpha`, so this only triggers when
+    /// an image built for an alpha-capable board runs elsewhere.
+    fn blend_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16, alpha: u8) {
+        let _ = alpha;
+        self.fill_rect(x, y, w, h, color);
+    }
+
+    /// Blend a single pixel over existing content. Default (no readback):
+    /// 1-bit cutout at threshold 128 — alpha images degrade to hard-edged
+    /// transparency, preserving sprite silhouettes.
+    fn blend_pixel(&self, x: u16, y: u16, color: u16, alpha: u8) {
+        if alpha >= 128 {
+            self.draw_pixel(x, y, color);
+        }
     }
 }
 
@@ -73,6 +99,22 @@ impl<B: LcdBackend> LcdImpl<B> {
     #[inline]
     pub fn draw_pixel(&self, x: u16, y: u16, color: u16) {
         self.be.draw_pixel(x, y, color)
+    }
+
+    /// Whether the backend supports true alpha blending.
+    #[inline]
+    pub fn has_alpha(&self) -> bool {
+        B::HAS_ALPHA
+    }
+
+    #[inline]
+    pub fn blend_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16, alpha: u8) {
+        self.be.blend_rect(x, y, w, h, color, alpha)
+    }
+
+    #[inline]
+    pub fn blend_pixel(&self, x: u16, y: u16, color: u16, alpha: u8) {
+        self.be.blend_pixel(x, y, color, alpha)
     }
 
     #[inline(always)]
@@ -303,6 +345,57 @@ impl<B: LcdBackend> LcdImpl<B> {
 
         self.fill_rect(x + r, y, w.saturating_sub(2 * r), r, color);
         self.fill_rect(x + r, y + h - r, w.saturating_sub(2 * r), r, color);
+    }
+
+    /// `fill_rounded_rect` with alpha. Built from one span per row (circle
+    /// inset via `isqrt`) instead of the Midpoint Circle layout: the opaque
+    /// version overdraws where corner spans meet the middle band — harmless
+    /// when solid, but overlapping spans would blend twice and show darker
+    /// bands. On non-alpha backends each span degrades to an opaque fill
+    /// (see `LcdBackend::blend_rect`).
+    pub fn fill_rounded_rect_blend(
+        &self,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        r: u16,
+        color: u16,
+        alpha: u8,
+    ) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let r = r.min(w / 2).min(h / 2);
+        if r == 0 {
+            self.blend_rect(x, y, w, h, color, alpha);
+            return;
+        }
+        let ri = r as i32;
+        let hi = h as i32;
+        for row in 0..hi {
+            // Distance from the straight-edged middle band into the arcs.
+            let dy = if row < ri {
+                ri - row
+            } else if row >= hi - ri {
+                row - (hi - 1 - ri)
+            } else {
+                0
+            };
+            let inset = if dy == 0 {
+                0
+            } else {
+                (ri - isqrt(ri * ri - dy * dy) as i32) as u16
+            };
+            self.blend_rect(
+                x + inset,
+                y + row as u16,
+                w - 2 * inset,
+                1,
+                color,
+                alpha,
+            );
+        }
     }
 
     pub fn draw_gradient(&self, full: &Rect, c1: u16, c2: u16, dir: u8) {

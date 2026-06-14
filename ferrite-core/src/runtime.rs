@@ -170,7 +170,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
 
     // --- Mount flash filesystem ---
     if error_code == 0 {
-        match fs::Fs::mount(&ctx.flash) {
+        match fs::Fs::mount(&ctx.flash, P::FS_BASE) {
             Ok(f) => ctx.fs = Some(f),
             Err(_) => error_code = ERR_NO_FILESYSTEM,
         }
@@ -212,7 +212,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
 
     // --- Main loop ---
     let mut input = <P::Input as InputHandler<P>>::new();
-    let mut protocol = Protocol::new();
+    let mut protocol = Protocol::new(P::FS_BASE);
 
     loop {
         // Resume a suspended showModal whose result is now ready.

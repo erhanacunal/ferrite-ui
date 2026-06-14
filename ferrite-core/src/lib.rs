@@ -7,6 +7,7 @@ extern crate std;
 
 // --- HAL backend traits + generic wrappers + Platform ---
 
+pub mod audio;
 pub mod backlight;
 pub mod flash;
 pub mod gfx_glyph;

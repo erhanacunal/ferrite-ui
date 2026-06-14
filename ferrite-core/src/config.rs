@@ -18,7 +18,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use crate::flash::{FlashBackend, FlashImpl};
 
-const CONFIG_BASE: u32 = 0x0000;
+/// Default config-store address (sector 0) for boards whose firmware lives on a
+/// separate chip. Overridable per-board via [`crate::platform::Platform::CONFIG_BASE`].
+pub const DEFAULT_CONFIG_BASE: u32 = 0x0000;
 const CONFIG_MAGIC: u32 = 0x4746_4346; // "FCFG" LE
 const CONFIG_VERSION: u8 = 1;
 const HEADER_SIZE: usize = 8;
@@ -34,14 +36,17 @@ pub const KEY_TOUCH_CAL: u16 = 0x0001;
 
 pub struct ConfigStore {
     entry_count: u8,
+    /// Flash address of this store's sector (board-specific — see
+    /// [`crate::platform::Platform::CONFIG_BASE`]).
+    base: u32,
 }
 
 impl ConfigStore {
-    /// Mount existing config store from flash sector 0.
+    /// Mount existing config store from its flash sector.
     /// Returns None if not formatted (bad magic or version).
-    pub fn mount<F: FlashBackend>(flash: &FlashImpl<F>) -> Option<Self> {
+    pub fn mount<F: FlashBackend>(flash: &FlashImpl<F>, base: u32) -> Option<Self> {
         let mut buf = [0u8; 8];
-        flash.read(CONFIG_BASE, &mut buf);
+        flash.read(base, &mut buf);
 
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != CONFIG_MAGIC {
@@ -54,26 +59,30 @@ impl ConfigStore {
 
         Some(Self {
             entry_count: buf[5],
+            base,
         })
     }
 
-    /// Format sector 0 as a fresh config store (erases existing data).
-    pub fn format<F: FlashBackend>(flash: &FlashImpl<F>) -> Self {
-        flash.erase_sector(CONFIG_BASE);
+    /// Format the config sector as a fresh store (erases existing data).
+    pub fn format<F: FlashBackend>(flash: &FlashImpl<F>, base: u32) -> Self {
+        flash.erase_sector(base);
 
         let mut header = [0u8; 8];
         header[0..4].copy_from_slice(&CONFIG_MAGIC.to_le_bytes());
         header[4] = CONFIG_VERSION;
         header[5] = 0;
 
-        flash.write(CONFIG_BASE, &header);
+        flash.write(base, &header);
 
-        Self { entry_count: 0 }
+        Self {
+            entry_count: 0,
+            base,
+        }
     }
 
     /// Mount if formatted, otherwise format fresh.
-    pub fn mount_or_format<F: FlashBackend>(flash: &FlashImpl<F>) -> Self {
-        Self::mount(flash).unwrap_or_else(|| Self::format(flash))
+    pub fn mount_or_format<F: FlashBackend>(flash: &FlashImpl<F>, base: u32) -> Self {
+        Self::mount(flash, base).unwrap_or_else(|| Self::format(flash, base))
     }
 
     /// Read entry by key ID. Copies data into buf, returns data length or None.
@@ -86,7 +95,7 @@ impl ConfigStore {
         let mut entry_buf = [0u8; ENTRY_SIZE];
 
         for i in 0..self.entry_count {
-            let addr = CONFIG_BASE + HEADER_SIZE as u32 + i as u32 * ENTRY_SIZE as u32;
+            let addr = self.base + HEADER_SIZE as u32 + i as u32 * ENTRY_SIZE as u32;
             flash.read(addr, &mut entry_buf);
 
             let k = u16::from_le_bytes([entry_buf[0], entry_buf[1]]);
@@ -109,7 +118,7 @@ impl ConfigStore {
         // Read used portion of sector into heap buffer
         let used = HEADER_SIZE + self.entry_count as usize * ENTRY_SIZE;
         let mut sector: Vec<u8> = vec![0u8; used + ENTRY_SIZE]; // room for one more
-        flash.read(CONFIG_BASE, &mut sector[..used]);
+        flash.read(self.base, &mut sector[..used]);
 
         // Search for existing entry
         let mut found = false;
@@ -151,12 +160,12 @@ impl ConfigStore {
         let total = HEADER_SIZE + self.entry_count as usize * ENTRY_SIZE;
 
         // Erase and rewrite sector
-        flash.erase_sector(CONFIG_BASE);
+        flash.erase_sector(self.base);
         let mut offset: usize = 0;
         while offset < total {
             let page_len = (total - offset).min(256);
             flash.write(
-                CONFIG_BASE + offset as u32,
+                self.base + offset as u32,
                 &sector[offset..offset + page_len],
             );
             offset += page_len;

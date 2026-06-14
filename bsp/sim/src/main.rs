@@ -51,7 +51,7 @@ fn main() {
     };
 
     // Report what the filesystem contains (informational; `run` mounts it again).
-    match Fs::mount(&flash) {
+    match Fs::mount(&flash, ferrite_fs::DEFAULT_FS_BASE) {
         Ok(f) => {
             let progs = f.count_by_kind(&flash, ferrite_fs::RES_PROGRAM);
             let fonts = f.count_by_kind(&flash, ferrite_fs::RES_FONT);
@@ -94,6 +94,7 @@ fn main() {
         rtc: rtc::init(),
         usart: usart::init(),
         systick: systick::Systick::handle(),
+        audio: ferrite_core::audio::AudioImpl::none(),
         cursor_visible: false,
     });
 
@@ -121,12 +122,12 @@ fn load_flash(path: Option<&str>) -> Result<flash::Flash, String> {
             // An fs-only image (starts with "FERR" at offset 0) is padded with
             // 0x1000 reserved bytes so the header lands at FS_BASE.
             if bytes.len() >= 4 && &bytes[..4] == b"FERR" {
-                let mut padded = std::vec![0xFFu8; ferrite_fs::FS_BASE as usize];
+                let mut padded = std::vec![0xFFu8; ferrite_fs::DEFAULT_FS_BASE as usize];
                 padded.extend_from_slice(&bytes);
                 bytes = padded;
                 println!(
                     "loaded {raw_len} bytes from {p} (fs-only image — padded with {}B prefix)",
-                    ferrite_fs::FS_BASE
+                    ferrite_fs::DEFAULT_FS_BASE
                 );
             } else {
                 println!("loaded {raw_len} bytes from {p}");

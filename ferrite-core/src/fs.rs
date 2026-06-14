@@ -1,10 +1,12 @@
 /// Flash File System — compact TOC (Table of Contents) on W25Q256
 ///
-/// Sector 0 (0x000000-0x000FFF) is reserved for ConfigStore.
-/// FS starts at FS_BASE (0x001000):
-///   FS_BASE + 0x00 - 0x0F : Header (16 bytes)
-///   FS_BASE + 0x10 - ...  : Resource Table (N × 32 bytes)
-///   immediately after     : Resource data (packed)
+/// The resource flash is partitioned by the board (see `Platform::FS_BASE` /
+/// `Platform::CONFIG_BASE`). A 4 KB ConfigStore sector sits below the FS; the
+/// FS itself begins at `base` — 0x001000 by default, but pushed past the
+/// firmware region on boards that share the flash with firmware (e.g. tdo_y13):
+///   base + 0x00 - 0x0F : Header (16 bytes)
+///   base + 0x10 - ...  : Resource Table (N × 32 bytes)
+///   immediately after  : Resource data (packed)
 ///
 /// Resources are accessed by name (null-terminated ASCII, max 15 chars).
 /// Kind: Font=0, Image=1, Program=2, Page=3, File=4
@@ -12,17 +14,13 @@ use crate::flash::{FlashBackend, FlashImpl};
 
 // --- Layout constants ---
 
-/// FS base address — sector 0 is reserved for ConfigStore
-pub const FS_BASE: u32 = 0x1000;
-
-/// Header starts at FS_BASE
-const HEADER_OFFSET: u32 = FS_BASE;
+/// Default FS base address (sector 1) for boards whose firmware lives on a
+/// separate chip — sector 0 is reserved for ConfigStore. Overridable per-board
+/// via [`crate::platform::Platform::FS_BASE`].
+pub const DEFAULT_FS_BASE: u32 = 0x1000;
 
 /// Header size in bytes
 const HEADER_SIZE: u32 = 16;
-
-/// Resource table starts right after the header
-const TABLE_OFFSET: u32 = HEADER_OFFSET + HEADER_SIZE;
 
 /// Magic number: "FERR" (little-endian)
 const MAGIC: u32 = 0x5252_4546;
@@ -57,6 +55,10 @@ pub struct Fs {
     pub screen_h: u16,
     pub resource_count: u16,
     pub checksum: u32,
+    /// Flash address of the FS header (board-specific — see
+    /// [`crate::platform::Platform::FS_BASE`]). All table/resource offsets are
+    /// relative to it.
+    base: u32,
 }
 
 /// Tek bir resource entry (find sonucu).
@@ -81,11 +83,18 @@ pub enum FsError {
 }
 
 impl Fs {
+    /// Resource table starts right after the header.
+    #[inline]
+    fn table_offset(&self) -> u32 {
+        self.base + HEADER_SIZE
+    }
+
     /// Flash'taki dosya sistemini mount et.
     /// Header'ı okur, magic'i doğrular, metadata'yı cache'ler.
-    pub fn mount<F: FlashBackend>(flash: &FlashImpl<F>) -> Result<Self, FsError> {
+    /// `base` is the flash address of the FS header (see `Platform::FS_BASE`).
+    pub fn mount<F: FlashBackend>(flash: &FlashImpl<F>, base: u32) -> Result<Self, FsError> {
         let mut buf = [0u8; 16];
-        flash.read(HEADER_OFFSET, &mut buf);
+        flash.read(base, &mut buf);
 
         // Magic (4B LE)
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -118,6 +127,7 @@ impl Fs {
             screen_h,
             resource_count,
             checksum,
+            base,
         })
     }
 
@@ -131,7 +141,7 @@ impl Fs {
         let mut entry_buf = [0u8; ENTRY_SIZE];
 
         for i in 0..self.resource_count as u32 {
-            let addr = TABLE_OFFSET + i * ENTRY_SIZE as u32;
+            let addr = self.table_offset() + i * ENTRY_SIZE as u32;
             flash.read(addr, &mut entry_buf);
 
             // İsim karşılaştır (null-terminated)
@@ -191,7 +201,7 @@ impl Fs {
         let mut entry_buf = [0u8; ENTRY_SIZE];
 
         for i in 0..self.resource_count as u32 {
-            let addr = TABLE_OFFSET + i * ENTRY_SIZE as u32;
+            let addr = self.table_offset() + i * ENTRY_SIZE as u32;
             flash.read(addr, &mut entry_buf);
             if entry_buf[16] == kind {
                 count += 1;
@@ -213,7 +223,7 @@ impl Fs {
         }
 
         let mut entry_buf = [0u8; ENTRY_SIZE];
-        let addr = TABLE_OFFSET + index as u32 * ENTRY_SIZE as u32;
+        let addr = self.table_offset() + index as u32 * ENTRY_SIZE as u32;
         flash.read(addr, &mut entry_buf);
 
         let kind = entry_buf[16];
@@ -241,7 +251,7 @@ impl Fs {
         let mut entry_buf = [0u8; ENTRY_SIZE];
 
         for i in 0..self.resource_count as u32 {
-            let addr = TABLE_OFFSET + i * ENTRY_SIZE as u32;
+            let addr = self.table_offset() + i * ENTRY_SIZE as u32;
             flash.read(addr, &mut entry_buf);
 
             if entry_buf[16] == kind {
@@ -284,7 +294,7 @@ impl Fs {
         let mut buf = [0u8; ENTRY_SIZE];
 
         for i in 0..self.resource_count as u32 {
-            let addr = TABLE_OFFSET + i * ENTRY_SIZE as u32;
+            let addr = self.table_offset() + i * ENTRY_SIZE as u32;
             flash.read(addr, &mut buf);
             for &b in &buf {
                 sum = sum.wrapping_add(b as u32);
