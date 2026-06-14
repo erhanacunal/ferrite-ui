@@ -33,7 +33,7 @@ try:
     from PySide6.QtGui import (
         QColor, QPainter, QPen, QBrush, QFont, QAction, QIcon,
         QPainterPath, QKeySequence, QSyntaxHighlighter, QTextCharFormat,
-        QFontDatabase, QImage,
+        QFontDatabase, QImage, QTextCursor,
     )
     from PySide6.QtWidgets import QListWidget, QListWidgetItem
 except ImportError:
@@ -141,44 +141,13 @@ def set_icon(widget, name, fallback=None):
 # Constants
 # ============================================================
 
-SCREEN_W, SCREEN_H = 800, 480
-
-DEVICE_SPECS = {
-    "nextion": {
-        "name": "Nextion NX8048K070 / GD32",
-        "screen": (800, 480),
-        "color_model": "RGB565",
-        "color_count": 65536,
-        "render_mode": "dirty",
-        "image_max_colors": 256,
-        "root_bg": 0x0000,
-        "text_color": 0xFFFF,
-    },
-    "epaper": {
-        "name": "LilyGo T5 e-Paper S3",
-        "screen": (960, 540),
-        "color_model": "4-bit grayscale",
-        "color_count": 16,
-        "render_mode": "epaper",
-        "image_max_colors": 16,
-        "root_bg": 0xFFFF,
-        "text_color": 0x0000,
-    },
-}
-
-DEFAULT_DEVICE_ID = "nextion"
-
-
-def device_spec(device_id):
-    return DEVICE_SPECS.get(device_id, DEVICE_SPECS[DEFAULT_DEVICE_ID])
-
-
-def infer_device_id(screen, render_mode):
-    if render_mode == "epaper":
-        return "epaper"
-    if list(screen or []) == [960, 540]:
-        return "epaper"
-    return DEFAULT_DEVICE_ID
+# Device definitions come from tools/devices/*.json via the shared loader.
+from ferrite_devices import (
+    DEFAULT_DEVICE_ID,
+    device_spec,
+    infer_device_id,
+    load_devices,
+)
 
 KIND_BASE = 0
 KIND_LABEL = 1
@@ -286,6 +255,9 @@ def _is_sparse_font(data):
     """
     if len(data) < 4:
         return False
+    # V2 (2bpp anti-aliased): magic bytes 0x00, 0x02 at positions 0-1.
+    if len(data) >= 7 and data[0] == 0x00 and data[1] == 0x02:
+        return True
     n = _struct.unpack_from("<H", data, 0)[0]
     if n == 0 or n > 0x3FFF:
         return False
@@ -335,14 +307,25 @@ class GfxFontPreview:
     def __init__(self, binary):
         if len(binary) < 4:
             raise ValueError("font binary too short")
-        n = _struct.unpack_from("<H", binary, 0)[0]
-        self.y_advance = binary[2]
-        # font_id at byte 3 — not needed for rendering
-        cp_end = 4 + n * 2
+        # V2 (2bpp): 7-byte header  magic(0x00,0x02) + n u16 + y_adv + font_id + bpp
+        # V1 (1bpp): 4-byte header  n u16 + y_adv + font_id
+        if len(binary) >= 7 and binary[0] == 0x00 and binary[1] == 0x02:
+            n = _struct.unpack_from("<H", binary, 2)[0]
+            self.y_advance = binary[4]
+            self.bpp = binary[6]
+            hdr_len = 7
+        else:
+            n = _struct.unpack_from("<H", binary, 0)[0]
+            self.y_advance = binary[2]
+            self.bpp = 1
+            hdr_len = 4
+        # font_id not needed for rendering
+        cp_end = hdr_len + n * 2
         glyph_end = cp_end + n * 7
         if len(binary) < glyph_end:
             raise ValueError("font binary truncated")
-        self.codepoints = [_struct.unpack_from("<H", binary, 4 + i * 2)[0] for i in range(n)]
+        self.codepoints = [_struct.unpack_from("<H", binary, hdr_len + i * 2)[0]
+                           for i in range(n)]
         self.glyphs = []  # (bitmap_offset, w, h, x_advance, x_offset, y_offset)
         for i in range(n):
             off = cp_end + i * 7
@@ -400,29 +383,63 @@ class GfxFontPreview:
         return ascent, descent
 
     def draw_text(self, painter, x, y, text, color):
-        """Draw text at (x, y=baseline) using 1-bit glyph bitmaps."""
+        """Draw text at (x, y=baseline).
+
+        1bpp: opaque foreground pixels.  2bpp: anti-aliased — each pixel's
+        2-bit gray level (0-3) maps to an alpha so the glyph blends with
+        whatever is painted underneath (mirrors the hardware fg/bg blend).
+        """
         pen = painter.pen()
         painter.setPen(Qt.NoPen)
-        brush = QBrush(color)
-        for ch in text:
-            idx = self._find(ord(ch))
-            if idx < 0:
-                continue
-            bm_off, gw, gh, x_adv, x_off, y_off = self.glyphs[idx]
-            if gw == 0 or gh == 0:
+        if self.bpp == 1:
+            brush = QBrush(color)
+            for ch in text:
+                idx = self._find(ord(ch))
+                if idx < 0:
+                    continue
+                bm_off, gw, gh, x_adv, x_off, y_off = self.glyphs[idx]
+                if gw == 0 or gh == 0:
+                    x += x_adv
+                    continue
+                gx = x + x_off
+                gy = y + y_off
+                bit = 0
+                for row in range(gh):
+                    for col in range(gw):
+                        byte_idx = bm_off + (bit >> 3)
+                        if byte_idx < len(self.bitmap):
+                            if self.bitmap[byte_idx] & (0x80 >> (bit & 7)):
+                                painter.fillRect(gx + col, gy + row, 1, 1, brush)
+                        bit += 1
                 x += x_adv
-                continue
-            gx = x + x_off
-            gy = y + y_off
-            bit = 0
-            for row in range(gh):
-                for col in range(gw):
-                    byte_idx = bm_off + (bit >> 3)
-                    if byte_idx < len(self.bitmap):
-                        if self.bitmap[byte_idx] & (0x80 >> (bit & 7)):
-                            painter.fillRect(gx + col, gy + row, 1, 1, brush)
-                    bit += 1
-            x += x_adv
+        else:
+            # 2bpp: 4 pixels per byte, MSB first (shifts 6,4,2,0).  Pre-build a
+            # brush per non-zero gray level (alpha = level/3).
+            r, g, b = color.red(), color.green(), color.blue()
+            brushes = {lvl: QBrush(QColor(r, g, b, (lvl * 255) // 3))
+                       for lvl in (1, 2, 3)}
+            for ch in text:
+                idx = self._find(ord(ch))
+                if idx < 0:
+                    continue
+                bm_off, gw, gh, x_adv, x_off, y_off = self.glyphs[idx]
+                if gw == 0 or gh == 0:
+                    x += x_adv
+                    continue
+                gx = x + x_off
+                gy = y + y_off
+                p = 0
+                for row in range(gh):
+                    for col in range(gw):
+                        byte_idx = bm_off + (p >> 2)
+                        if byte_idx < len(self.bitmap):
+                            shift = 6 - 2 * (p & 3)
+                            level = (self.bitmap[byte_idx] >> shift) & 0x03
+                            if level:
+                                painter.fillRect(gx + col, gy + row, 1, 1,
+                                                 brushes[level])
+                        p += 1
+                x += x_adv
         painter.setPen(pen)
 
 
@@ -519,6 +536,7 @@ class WidgetNode:
         self.border_radius = 0
         self.text_color = 0xFFFF
         self.press_color = 0x0000
+        self.alpha = 255  # background opacity (alpha-capable devices only)
 
         self.text = ""
         self.font_id = 0
@@ -569,6 +587,7 @@ class WidgetNode:
             "bg_color": self.bg_color, "border_color": self.border_color,
             "border_radius": self.border_radius,
             "text_color": self.text_color, "press_color": self.press_color,
+            "alpha": self.alpha,
             "text": self.text, "font_id": self.font_id, "text_align": self.text_align,
             "visible": self.visible, "enabled": self.enabled,
             "clickable": self.clickable,
@@ -581,9 +600,9 @@ class WidgetNode:
     def from_dict(d):
         n = WidgetNode(d["name"], d.get("kind", 0))
         for key in ("loc_x", "loc_y", "size_w", "size_h", "bg_color", "border_color",
-                     "border_radius", "text_color", "press_color", "text", "font_id",
-                     "text_align", "visible", "enabled", "clickable", "value", "checked",
-                     "multi_line", "image_id", "on_click", "on_tap", "on_paint"):
+                     "border_radius", "text_color", "press_color", "alpha", "text",
+                     "font_id", "text_align", "visible", "enabled", "clickable", "value",
+                     "checked", "multi_line", "image_id", "on_click", "on_tap", "on_paint"):
             if key in d:
                 setattr(n, key, d[key])
         for key in ("margin", "border", "padding"):
@@ -627,7 +646,7 @@ class DesignerModel(QWidget):
         self.main_fl = DEFAULT_MAIN_FL  # user code — embedded in .fui
 
     def set_device(self, device_id):
-        self.device_id = device_id if device_id in DEVICE_SPECS else DEFAULT_DEVICE_ID
+        self.device_id = device_id if device_id in load_devices() else DEFAULT_DEVICE_ID
         spec = device_spec(self.device_id)
         self.screen_w, self.screen_h = spec["screen"]
         self.render_mode = spec["render_mode"]
@@ -873,7 +892,7 @@ class DesignerModel(QWidget):
         has_render_mode = "render_mode" in data
         render_mode = data.get("render_mode", "dirty")
         self.device_id = data.get("device") or infer_device_id(screen, render_mode)
-        if self.device_id not in DEVICE_SPECS:
+        if self.device_id not in load_devices():
             self.device_id = DEFAULT_DEVICE_ID
         spec = device_spec(self.device_id)
         self.screen_w, self.screen_h = tuple(screen) if screen else spec["screen"]
@@ -1127,6 +1146,8 @@ class WidgetItem(QGraphicsItem):
         bg = rgb565_to_qcolor(node.bg_color)
         if node.bg_color == 0 and node is not self.model.root:
             bg = QColor(0, 0, 0, 0)
+        elif node.alpha < 255 and device_spec(self.model.device_id)["caps"].get("alpha"):
+            bg.setAlpha(node.alpha)
 
         if r > 0:
             path = QPainterPath()
@@ -1410,14 +1431,37 @@ class DesignerScene(QGraphicsScene):
                           self.model.screen_w + 2 * CANVAS_MARGIN,
                           self.model.screen_h + 2 * CANVAS_MARGIN)
 
+    def _screen_shape(self):
+        return device_spec(self.model.device_id).get("shape", "rect")
+
     def drawBackground(self, painter, rect):
         # Dark gray background outside the screen
         painter.fillRect(rect, QColor(50, 50, 50))
-        # Screen boundary
-        painter.setPen(QPen(QColor(100, 100, 100), 1))
-        painter.drawRect(QRectF(-1, -1, self.model.screen_w + 2, self.model.screen_h + 2))
+        # Screen boundary — round screens get their outline in drawForeground,
+        # over the corner mask, so skip the rectangular outline here.
+        if self._screen_shape() != "round":
+            painter.setPen(QPen(QColor(100, 100, 100), 1))
+            painter.drawRect(QRectF(-1, -1, self.model.screen_w + 2, self.model.screen_h + 2))
 
     def drawForeground(self, painter, rect):
+        # Round screen: mask the corners (outside the inscribed circle) so the
+        # canvas reads as a circular display and overflowing widgets are clipped.
+        if self._screen_shape() == "round":
+            sw, sh = self.model.screen_w, self.model.screen_h
+            screen_rect = QRectF(0, 0, sw, sh)
+            corners = QPainterPath()
+            corners.addRect(screen_rect)
+            disc = QPainterPath()
+            disc.addEllipse(screen_rect)
+            painter.save()
+            painter.setPen(Qt.NoPen)
+            painter.fillPath(corners.subtracted(disc), QColor(50, 50, 50))
+            # Circular screen outline
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(100, 100, 100), 1))
+            painter.drawEllipse(screen_rect)
+            painter.restore()
+
         # Smart guide lines
         if self._h_guides or self._v_guides:
             pen = QPen(QColor(0, 210, 255), 0)
@@ -1824,6 +1868,9 @@ class PropertyEditor(QScrollArea):
         self._add_int(g, "border_radius", "Radius", 0, 999)
         self._add_color(g, "text_color", "Text Color")
         self._add_color(g, "press_color", "Press Color")
+        # Background opacity — only shown for devices with caps.alpha
+        self._add_int(g, "alpha", "Alpha", 0, 255)
+        self._alpha_layout = g
 
         # Box model
         g = self._group("Box Model")
@@ -2073,6 +2120,15 @@ class PropertyEditor(QScrollArea):
         self._set_editor("border_radius", node.border_radius)
         self._set_editor("text_color", node.text_color)
         self._set_editor("press_color", node.press_color)
+        self._set_editor("alpha", node.alpha)
+        # Alpha blending requires framebuffer readback — hide the editor on
+        # devices that cannot do it (see devices/*.json caps.alpha).
+        has_alpha = bool(device_spec(self.model.device_id)["caps"].get("alpha"))
+        alpha_editor = self._editors["alpha"]
+        alpha_editor.setVisible(has_alpha)
+        alpha_label = self._alpha_layout.labelForField(alpha_editor)
+        if alpha_label is not None:
+            alpha_label.setVisible(has_alpha)
 
         self._set_editor("border", node.border)
         self._set_editor("margin", node.margin)
@@ -2190,9 +2246,16 @@ class AddFontDialog(QDialog):
         self._ranges_edit.setText(self.DEFAULT_RANGES)
         layout.addRow("Codepoint ranges:", self._ranges_edit)
 
+        # Anti-aliasing (bits per pixel)
+        self._bpp_combo = QComboBox()
+        self._bpp_combo.addItem("Anti-aliased (2bpp, 4 gray levels)", 2)
+        self._bpp_combo.addItem("Monochrome (1bpp)", 1)
+        layout.addRow("Rendering:", self._bpp_combo)
+
         hint = QLabel(
             "Sizes: comma-separated point sizes (each becomes a separate font entry).\n"
-            "Ranges: decimal, hex (0x011E), or char ('A'), dash for inclusive ranges.")
+            "Ranges: decimal, hex (0x011E), or char ('A'), dash for inclusive ranges.\n"
+            "Rendering: anti-aliased is smoother; monochrome is half the size.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray; font-size: 11px;")
         layout.addRow("", hint)
@@ -2266,6 +2329,9 @@ class AddFontDialog(QDialog):
 
     def ranges_spec(self):
         return self._ranges_edit.text().strip() or self.DEFAULT_RANGES
+
+    def bpp(self):
+        return self._bpp_combo.currentData()
 
 
 # ============================================================
@@ -2516,8 +2582,8 @@ class ResourcePanel(QWidget):
         em_row.addSpacing(20)
         em_row.addWidget(QLabel("Render mode:"))
         self.render_combo = QComboBox()
-        self.render_combo.addItems(["dirty", "buffered", "epaper"])
-        self.render_combo.currentTextChanged.connect(lambda v: setattr(model, 'render_mode', v))
+        self.render_combo.addItems(device_spec(model.device_id)["render_modes"])
+        self.render_combo.currentTextChanged.connect(lambda v: v and setattr(model, 'render_mode', v))
         em_row.addWidget(self.render_combo)
         em_row.addStretch()
         layout.addLayout(em_row)
@@ -2554,6 +2620,14 @@ class ResourcePanel(QWidget):
         idx = self.exec_combo.findText(self.model.exec_mode)
         if idx >= 0:
             self.exec_combo.setCurrentIndex(idx)
+        # Render-mode choices follow the project's device (may change on load).
+        modes = device_spec(self.model.device_id)["render_modes"]
+        if modes != [self.render_combo.itemText(i)
+                     for i in range(self.render_combo.count())]:
+            self.render_combo.blockSignals(True)
+            self.render_combo.clear()
+            self.render_combo.addItems(modes)
+            self.render_combo.blockSignals(False)
         idx = self.render_combo.findText(self.model.render_mode)
         if idx >= 0:
             self.render_combo.setCurrentIndex(idx)
@@ -2581,6 +2655,7 @@ class ResourcePanel(QWidget):
         font_path = dlg.font_file()
         sizes = dlg.sizes()
         ranges_spec = dlg.ranges_spec()
+        bpp = dlg.bpp()
         basename = (os.path.splitext(os.path.basename(font_path))[0]
                     .lower().replace(" ", "_"))
 
@@ -2618,9 +2693,9 @@ class ResourcePanel(QWidget):
                 continue
 
             try:
-                bitmap, table, y_advance = rasterize(font_path, size, codes)
+                bitmap, table, y_advance = rasterize(font_path, size, codes, bpp)
                 buf = _io.BytesIO()
-                write_resource(bitmap, table, y_advance, next_id, buf)
+                write_resource(bitmap, table, y_advance, next_id, bpp, buf)
                 self.model.fonts.append({
                     "name": name,
                     "font_id": next_id,
@@ -2807,6 +2882,8 @@ def generate_designer_fl(model):
             lines.append(f"    {node.name}.text_color = 0x{node.text_color:04X};")
         if node.press_color != 0:
             lines.append(f"    {node.name}.press_color = 0x{node.press_color:04X};")
+        if node.alpha != 255:
+            lines.append(f"    {node.name}.alpha = {node.alpha};")
 
         if any(v > 0 for v in node.border):
             lines.append(f"    {node.name}.border = [{node.border[0]}, {node.border[1]}, {node.border[2]}, {node.border[3]}];")
@@ -3261,7 +3338,7 @@ class DeviceChoiceDialog(QDialog):
         layout.addWidget(QLabel("Select the target device for this project:"))
 
         self.combo = QComboBox()
-        for key, spec in DEVICE_SPECS.items():
+        for key, spec in load_devices().items():
             w, h = spec["screen"]
             self.combo.addItem(f"{spec['name']} ({w}x{h}, {spec['color_model']})", key)
         idx = self.combo.findData(device_id)
@@ -3287,9 +3364,10 @@ class DeviceChoiceDialog(QDialog):
         spec = device_spec(self.selected_device())
         w, h = spec["screen"]
         self.details.setText(
-            f"Screen: {w}x{h}\n"
+            f"Screen: {w}x{h} ({spec.get('shape', 'rect')})\n"
             f"Colors: {spec['color_model']} ({spec['color_count']} supported)\n"
-            f"Default render mode: {spec['render_mode']}"
+            f"Render modes: {', '.join(spec['render_modes'])} "
+            f"(default: {spec['render_mode']})"
         )
 
 
@@ -3610,7 +3688,7 @@ class DeviceDialog(QDialog):
 
             pct = (i + 1) * 100 // chunk_count
             # Update last log line
-            self.log.moveCursor(self.log.textCursor().End)
+            self.log.moveCursor(QTextCursor.MoveOperation.End)
             self._log(f"  [{i + 1}/{chunk_count}] {pct}%")
 
         self._log(f"Upload complete! Device will restart.")

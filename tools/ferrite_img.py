@@ -2,28 +2,35 @@
 """ferrite_img.py — PNG → Ferrite Image (.fi) converter.
 
 Ferrite Image (FI) format:
-  Header (8 byte):
+  Header (8 bytes):
     [0..2] magic: u16 LE = 0x4649 ("FI")
     [2..4] width: u16 LE
     [4..6] height: u16 LE
-    [6]    flags: u8  (bit 0-1: mode)
-    [7]    colors: u8 (palette count, indexed modda, 0=256)
-  Indexed modda: palette — colors × 2 byte (RGB565 LE)
-  Piksel verisi: mode'a göre raw / RLE / indexed+RLE
+    [6]    flags: u8  (bit 0-1: mode, bit 2: has_alpha)
+    [7]    colors: u8 (palette count in indexed mode, 0=256)
+  Indexed mode: palette — colors × 2 bytes (RGB565 LE),
+                or colors × 3 bytes (RGB565 LE + alpha u8) when has_alpha
+  Pixel data: raw / RLE / indexed+RLE depending on mode
 
-Modlar:
+Modes:
   0 = Raw RGB565
   1 = RLE RGB565 (PackBits)
   2 = Indexed + RLE (palette + PackBits)
 
-RLE encoding (PackBits varyantı):
-  0x00..0x7F: literal run — sonraki (n+1) birim olduğu gibi
-  0x80..0xFF: repeat run — sonraki birim (n−126) kez tekrar [2..129]
+Alpha (flags bit 2, only for devices with caps.image_alpha):
+  Pixel units widen from 2 to 3 bytes (RGB565 LE + alpha u8) in raw/RLE
+  modes; in indexed mode the palette entries widen instead and the index
+  stream is unchanged. A repeat run requires color AND alpha to match.
+
+RLE encoding (PackBits variant):
+  0x00..0x7F: literal run — next (n+1) units verbatim
+  0x80..0xFF: repeat run — next unit repeated (n−126) times [2..129]
 
 Usage:
   python ferrite_img.py input.png output.fi [--mode auto|raw|rle|indexed]
   python ferrite_img.py info image.fi
   python ferrite_img.py input.png output.fi --max-colors 64
+  python ferrite_img.py input.png output.fi --alpha
 """
 
 import struct
@@ -42,6 +49,7 @@ MAGIC = 0x4649
 MODE_RAW = 0
 MODE_RLE = 1
 MODE_INDEXED_RLE = 2
+FLAG_ALPHA = 0x04  # flags bit 2 — pixel/palette units carry an alpha byte
 
 MODE_NAMES = {MODE_RAW: "raw", MODE_RLE: "rle", MODE_INDEXED_RLE: "indexed_rle"}
 
@@ -100,8 +108,17 @@ def rle_encode(data: list[int]) -> bytearray:
     return out
 
 
-def rle_encode_u16(data: list[int]) -> bytearray:
-    """PackBits RLE for RGB565 (2 byte units)."""
+def pack_unit(unit: int, has_alpha: bool) -> bytes:
+    """Serialize one pixel/palette unit: RGB565 LE, plus alpha byte when
+    has_alpha (units carry the alpha in bits 16-23)."""
+    if has_alpha:
+        return struct.pack("<H", unit & 0xFFFF) + bytes([(unit >> 16) & 0xFF])
+    return struct.pack("<H", unit)
+
+
+def rle_encode_units(data: list[int], has_alpha: bool) -> bytearray:
+    """PackBits RLE over pixel units (2 or 3 bytes each). A repeat run
+    requires the full unit to match — color AND alpha."""
     out = bytearray()
     n = len(data)
     i = 0
@@ -113,7 +130,7 @@ def rle_encode_u16(data: list[int]) -> bytearray:
             while i + run < n and data[i + run] == val and run < 129:
                 run += 1
             out.append(run + 126)
-            out.extend(struct.pack("<H", val))
+            out.extend(pack_unit(val, has_alpha))
             i += run
         else:
             lit_start = i
@@ -126,9 +143,14 @@ def rle_encode_u16(data: list[int]) -> bytearray:
             lit_count = i - lit_start
             out.append(lit_count - 1)
             for j in range(lit_start, lit_start + lit_count):
-                out.extend(struct.pack("<H", data[j]))
+                out.extend(pack_unit(data[j], has_alpha))
 
     return out
+
+
+def rle_encode_u16(data: list[int]) -> bytearray:
+    """PackBits RLE for RGB565 (2 byte units)."""
+    return rle_encode_units(data, has_alpha=False)
 
 
 # --- Image analysis ---
@@ -153,25 +175,33 @@ def analyze_image(img: Image.Image) -> tuple[list[int], list[tuple[int, int, int
 
 # --- Encoder ---
 
-def encode_raw(pixels: list[int]) -> bytearray:
-    """Raw RGB565 encode."""
+def encode_raw(pixels: list[int], has_alpha: bool = False) -> bytearray:
+    """Raw encode — one 2- or 3-byte unit per pixel."""
     out = bytearray()
     for c in pixels:
-        out.extend(struct.pack("<H", c))
+        out.extend(pack_unit(c, has_alpha))
     return out
 
 
-def encode_rle(pixels: list[int]) -> bytearray:
-    """RLE RGB565 encode."""
-    return rle_encode_u16(pixels)
+def encode_rle(pixels: list[int], has_alpha: bool = False) -> bytearray:
+    """RLE encode over pixel units."""
+    return rle_encode_units(pixels, has_alpha)
 
 
-def encode_indexed_rle(pixels: list[int], palette: list[int]) -> tuple[bytearray, bytearray]:
-    """Indexed + RLE encode. Returns (palette_bytes, rle_data)."""
+def encode_indexed_rle(
+    pixels: list[int],
+    palette: list[int],
+    has_alpha: bool = False,
+) -> tuple[bytearray, bytearray]:
+    """Indexed + RLE encode. Returns (palette_bytes, rle_data).
+
+    With alpha, palette entries are (color, alpha) units (3 bytes each);
+    the index stream itself is unchanged.
+    """
     # Palette lookup
     pal_map = {c: i for i, c in enumerate(palette)}
 
-    # Pikselleri index'e çevir
+    # Map pixels to palette indices
     indices = [pal_map.get(c, 0) for c in pixels]
 
     # RLE encode (u8 indices)
@@ -180,7 +210,7 @@ def encode_indexed_rle(pixels: list[int], palette: list[int]) -> tuple[bytearray
     # Palette binary
     pal_bytes = bytearray()
     for c in palette:
-        pal_bytes.extend(struct.pack("<H", c))
+        pal_bytes.extend(pack_unit(c, has_alpha))
 
     return pal_bytes, rle_data
 
@@ -191,12 +221,13 @@ def build_fi(
     pixels: list[int],
     mode: int,
     palette: list[int] | None = None,
+    has_alpha: bool = False,
 ) -> bytearray:
-    """FI binary oluştur."""
+    """Build the FI binary."""
     out = bytearray()
 
     # Header
-    flags = mode & 0x03
+    flags = (mode & 0x03) | (FLAG_ALPHA if has_alpha else 0)
     colors = len(palette) if palette and mode == MODE_INDEXED_RLE else 0
     if colors == 256:
         colors = 0  # 0 means 256
@@ -209,33 +240,61 @@ def build_fi(
 
     # Palette (indexed mode only)
     if mode == MODE_INDEXED_RLE and palette:
-        pal_bytes, rle_data = encode_indexed_rle(pixels, palette)
+        pal_bytes, rle_data = encode_indexed_rle(pixels, palette, has_alpha)
         out.extend(pal_bytes)
         out.extend(rle_data)
     elif mode == MODE_RLE:
-        out.extend(encode_rle(pixels))
+        out.extend(encode_rle(pixels, has_alpha))
     else:
-        out.extend(encode_raw(pixels))
+        out.extend(encode_raw(pixels, has_alpha))
 
     return out
 
 
 # --- Main converter ---
 
-def convert(
-    input_path: str,
-    output_path: str,
+def _ordered_unique(values: list[int]) -> list[int]:
+    """Unique values in first-seen order."""
+    seen = {}
+    for v in values:
+        if v not in seen:
+            seen[v] = len(seen)
+    return list(seen.keys())
+
+
+def convert_bytes(
+    img: Image.Image,
     mode: str = "auto",
     max_colors: int = 256,
-) -> dict:
-    """PNG → FI dönüşümü."""
-    img = Image.open(input_path)
+    want_alpha: bool = False,
+) -> tuple[bytes, dict]:
+    """Convert a PIL image to FI binary. Shared core for the CLI and
+    ferrite_build.
+
+    `want_alpha` opts the image into FI alpha encoding (gate it on the
+    target device's caps.image_alpha); the alpha plane is only emitted
+    when the source actually contains non-opaque pixels.
+    """
     width, height = img.size
 
-    pixels, unique = analyze_image(img)
+    # Pixel units: rgb565, or rgb565 | (alpha << 16) when alpha is active.
+    has_alpha = False
+    alphas = None
+    if want_alpha:
+        rgba = img.convert("RGBA")
+        alphas = [p[3] for p in rgba.getdata()]
+        has_alpha = any(a < 255 for a in alphas)
+
+    if has_alpha:
+        pixels = [
+            rgb_to_565(r, g, b) | (a << 16) for r, g, b, a in rgba.getdata()
+        ]
+        unique = _ordered_unique(pixels)
+    else:
+        pixels, unique = analyze_image(img)
     num_colors = len(unique)
 
-    # Mode seçimi
+    # Mode selection
     if mode == "auto":
         if num_colors <= max_colors:
             chosen_mode = MODE_INDEXED_RLE
@@ -250,40 +309,75 @@ def convert(
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    # Indexed modda renk sayısı kontrolü
+    # Indexed mode: quantize when the palette would overflow
     palette = None
     if chosen_mode == MODE_INDEXED_RLE:
         if num_colors > 256:
-            # Quantize: Pillow ile renk azaltma
-            img_q = img.convert("RGB").quantize(colors=max_colors, method=Image.Quantize.MEDIANCUT)
-            img_rgb = img_q.convert("RGB")
-            pixels, unique = analyze_image(img_rgb)
+            if has_alpha:
+                # Quantize the RGB channels, re-attach each pixel's alpha.
+                img_q = rgba.convert("RGB").quantize(
+                    colors=max_colors, method=Image.Quantize.MEDIANCUT
+                ).convert("RGB")
+                q565 = [rgb_to_565(r, g, b) for r, g, b in img_q.getdata()]
+                pixels = [c | (a << 16) for c, a in zip(q565, alphas)]
+                unique = _ordered_unique(pixels)
+                if len(unique) > 256:
+                    # Too many (color, alpha) pairs — quantize alpha too.
+                    # MEDIANCUT rejects RGBA; FASTOCTREE handles it.
+                    img_q = rgba.quantize(
+                        colors=max_colors, method=Image.Quantize.FASTOCTREE
+                    ).convert("RGBA")
+                    pixels = [
+                        rgb_to_565(r, g, b) | (a << 16)
+                        for r, g, b, a in img_q.getdata()
+                    ]
+                    unique = _ordered_unique(pixels)
+            else:
+                img_q = img.convert("RGB").quantize(
+                    colors=max_colors, method=Image.Quantize.MEDIANCUT
+                )
+                img_rgb = img_q.convert("RGB")
+                pixels, unique = analyze_image(img_rgb)
             num_colors = len(unique)
         palette = unique[:256]
 
     # Encode
     raw_size = width * height * 2
-    fi_data = build_fi(width, height, pixels, chosen_mode, palette)
-
-    # Write
-    Path(output_path).write_bytes(fi_data)
+    fi_data = build_fi(width, height, pixels, chosen_mode, palette, has_alpha)
 
     stats = {
         "width": width,
         "height": height,
         "mode": MODE_NAMES[chosen_mode],
         "colors": num_colors,
+        "alpha": has_alpha,
         "raw_size": raw_size,
         "fi_size": len(fi_data),
         "ratio": len(fi_data) / raw_size * 100 if raw_size > 0 else 0,
     }
+    return bytes(fi_data), stats
+
+
+def convert(
+    input_path: str,
+    output_path: str,
+    mode: str = "auto",
+    max_colors: int = 256,
+    want_alpha: bool = False,
+) -> dict:
+    """PNG → FI file conversion."""
+    img = Image.open(input_path)
+    fi_data, stats = convert_bytes(
+        img, mode=mode, max_colors=max_colors, want_alpha=want_alpha
+    )
+    Path(output_path).write_bytes(fi_data)
     return stats
 
 
 # --- Info command ---
 
 def info(path: str):
-    """FI dosyasının bilgilerini göster."""
+    """Print info about an FI file."""
     data = Path(path).read_bytes()
     if len(data) < 8:
         print("Error: File too small")
@@ -295,12 +389,15 @@ def info(path: str):
         return
 
     mode = flags & 0x03
+    has_alpha = bool(flags & FLAG_ALPHA)
     pal_count = 256 if colors == 0 and mode == MODE_INDEXED_RLE else colors
 
     print(f"Ferrite Image: {width}×{height}")
     print(f"Mode: {MODE_NAMES.get(mode, f'unknown({mode})')}")
+    print(f"Alpha: {'yes' if has_alpha else 'no'}")
     if mode == MODE_INDEXED_RLE:
-        print(f"Palette: {pal_count} colors")
+        entry = 3 if has_alpha else 2
+        print(f"Palette: {pal_count} colors ({entry} bytes/entry)")
     print(f"File size: {len(data)} bytes")
     print(f"Raw equiv: {width * height * 2} bytes")
     if width * height > 0:
@@ -333,6 +430,7 @@ def main():
 
     mode = "auto"
     max_colors = 256
+    want_alpha = False
 
     i = 2
     while i < len(args):
@@ -342,15 +440,20 @@ def main():
         elif args[i] == "--max-colors" and i + 1 < len(args):
             max_colors = int(args[i + 1])
             i += 2
+        elif args[i] == "--alpha":
+            want_alpha = True
+            i += 1
         else:
             print(f"Unknown option: {args[i]}")
             return
 
-    stats = convert(input_path, output_path, mode=mode, max_colors=max_colors)
+    stats = convert(input_path, output_path, mode=mode, max_colors=max_colors,
+                    want_alpha=want_alpha)
 
     print(f"Converted: {input_path} → {output_path}")
     print(f"  Size: {stats['width']}×{stats['height']}")
-    print(f"  Mode: {stats['mode']} ({stats['colors']} unique colors)")
+    print(f"  Mode: {stats['mode']} ({stats['colors']} unique colors"
+          f"{', alpha' if stats['alpha'] else ''})")
     print(f"  Raw:  {stats['raw_size']} bytes")
     print(f"  FI:   {stats['fi_size']} bytes ({stats['ratio']:.1f}%)")
 

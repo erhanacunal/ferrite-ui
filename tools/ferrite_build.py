@@ -67,6 +67,7 @@ from pathlib import Path
 # ferrite_cc ve ferrite_img'den import
 sys.path.insert(0, str(Path(__file__).parent))
 from ferrite_cc import Asm, Compiler, Prop, encode_svarint
+import ferrite_devices
 
 # --- Constants (fs.rs ile birebir aynı) ---
 
@@ -123,138 +124,23 @@ def parse_color(val) -> int:
     return int(s) & 0xFFFF
 
 
-# --- Image conversion (ferrite_img.py logic inlined) ---
+# --- Image conversion (shared encoder in ferrite_img.py) ---
 
-def convert_image(source_path: str, mode: str = "auto", max_colors: int = 256) -> bytes:
-    """PNG → FI binary."""
-    try:
-        from PIL import Image
-    except ImportError:
-        print("Error: Pillow required — pip install Pillow", file=sys.stderr)
-        sys.exit(1)
+def convert_image(source_path: str, mode: str = "auto", max_colors: int = 256,
+                  want_alpha: bool = False) -> bytes:
+    """PNG → FI binary via the shared ferrite_img encoder.
 
-    FI_MAGIC = 0x4649
-    MODE_RAW = 0
-    MODE_RLE = 1
-    MODE_INDEXED_RLE = 2
+    `want_alpha` comes from the target device's caps.image_alpha; alpha is
+    only emitted when the source actually has non-opaque pixels.
+    """
+    # Deferred import keeps the PIL dependency lazy (as before); ferrite_img
+    # itself reports a clear error and exits when Pillow is missing.
+    import ferrite_img
 
-    img = Image.open(source_path).convert("RGB")
-    width, height = img.size
-    pixels_rgb = list(img.getdata())
-    pixels_565 = [((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3) for r, g, b in pixels_rgb]
-
-    # Unique colors
-    seen = {}
-    for c in pixels_565:
-        if c not in seen:
-            seen[c] = len(seen)
-    unique = list(seen.keys())
-    num_colors = len(unique)
-
-    # Mode selection
-    if mode == "auto":
-        chosen = MODE_INDEXED_RLE if num_colors <= max_colors else MODE_RLE
-    elif mode == "raw":
-        chosen = MODE_RAW
-    elif mode == "rle":
-        chosen = MODE_RLE
-    elif mode == "indexed":
-        chosen = MODE_INDEXED_RLE
-    else:
-        chosen = MODE_RLE
-
-    # Quantize if needed
-    palette = None
-    if chosen == MODE_INDEXED_RLE:
-        if num_colors > 256:
-            img_q = img.quantize(colors=max_colors, method=Image.Quantize.MEDIANCUT)
-            img_rgb = img_q.convert("RGB")
-            pixels_rgb = list(img_rgb.getdata())
-            pixels_565 = [((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3) for r, g, b in pixels_rgb]
-            seen = {}
-            for c in pixels_565:
-                if c not in seen:
-                    seen[c] = len(seen)
-            unique = list(seen.keys())
-        palette = unique[:256]
-
-    # Header
-    colors_byte = len(palette) if palette else 0
-    if colors_byte == 256:
-        colors_byte = 0
-    out = bytearray(struct.pack("<HHHBB", FI_MAGIC, width, height, chosen & 0x03, colors_byte))
-
-    # Encode
-    if chosen == MODE_INDEXED_RLE and palette:
-        pal_map = {c: i for i, c in enumerate(palette)}
-        indices = [pal_map.get(c, 0) for c in pixels_565]
-        for c in palette:
-            out.extend(struct.pack("<H", c))
-        out.extend(_rle_encode_u8(indices))
-    elif chosen == MODE_RLE:
-        out.extend(_rle_encode_u16(pixels_565))
-    else:
-        for c in pixels_565:
-            out.extend(struct.pack("<H", c))
-
-    return bytes(out)
-
-
-def _rle_encode_u8(data):
-    """PackBits RLE for u8 values."""
-    out = bytearray()
-    n = len(data)
-    i = 0
-    while i < n:
-        if i + 1 < n and data[i] == data[i + 1]:
-            val = data[i]
-            run = 1
-            while i + run < n and data[i + run] == val and run < 129:
-                run += 1
-            out.append(run + 126)
-            out.append(val)
-            i += run
-        else:
-            lit_start = i
-            while i < n:
-                if i + 1 < n and data[i] == data[i + 1]:
-                    break
-                i += 1
-                if i - lit_start >= 128:
-                    break
-            lit_count = i - lit_start
-            out.append(lit_count - 1)
-            out.extend(data[lit_start:i])
-    return out
-
-
-def _rle_encode_u16(data):
-    """PackBits RLE for RGB565 (2-byte units)."""
-    out = bytearray()
-    n = len(data)
-    i = 0
-    while i < n:
-        if i + 1 < n and data[i] == data[i + 1]:
-            val = data[i]
-            run = 1
-            while i + run < n and data[i + run] == val and run < 129:
-                run += 1
-            out.append(run + 126)
-            out.extend(struct.pack("<H", val))
-            i += run
-        else:
-            lit_start = i
-            while i < n:
-                if i + 1 < n and data[i] == data[i + 1]:
-                    break
-                i += 1
-                if i - lit_start >= 128:
-                    break
-            lit_count = i - lit_start
-            out.append(lit_count - 1)
-            for j in range(lit_start, lit_start + lit_count):
-                out.extend(struct.pack("<H", data[j]))
-    return out
+    img = ferrite_img.Image.open(source_path)
+    fi_data, _stats = ferrite_img.convert_bytes(
+        img, mode=mode, max_colors=max_colors, want_alpha=want_alpha)
+    return fi_data
 
 
 # --- Page: widget tree JSON → bytecode ---
@@ -342,6 +228,8 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
             cc.set_prop("gradient_color", parse_color(w["gradient_color"]))
         if "gradient_dir" in w:
             cc.set_prop("gradient_dir", int(w["gradient_dir"]))
+        if "alpha" in w:
+            cc.set_prop("alpha", int(w["alpha"]))
 
         # Flags
         if w.get("clickable", False):
@@ -399,10 +287,14 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty") ->
 
 # --- Flash filesystem builder ---
 
-def build_fs(project: dict, resources: list[tuple[str, int, bytes, int]]) -> bytes:
+def build_fs(project: dict, resources: list[tuple[str, int, bytes, int]],
+             fs_base: int = FS_BASE) -> bytes:
     """Flash filesystem binary oluştur.
 
     resources: [(name, kind, data, flags), ...]
+    `fs_base` is the absolute flash address the image is written to (the
+    board's Platform::FS_BASE). Resource offsets in the TOC are absolute, so
+    this MUST match where the device mounts the FS or lookups read garbage.
     """
     if len(resources) > MAX_RESOURCES:
         raise ValueError(f"Too many resources: {len(resources)} (max {MAX_RESOURCES})")
@@ -423,8 +315,8 @@ def build_fs(project: dict, resources: list[tuple[str, int, bytes, int]]) -> byt
         name_bytes = name.encode("ascii")[:15]
         name_padded = name_bytes + b'\x00' * (16 - len(name_bytes))
 
-        # Offset: absolute flash address (FS image is written at FS_BASE)
-        offset = FS_BASE + data_base_rel + len(data_blob)
+        # Offset: absolute flash address (FS image is written at fs_base)
+        offset = fs_base + data_base_rel + len(data_blob)
 
         # Entry: name[16] + kind(1) + pad(3) + offset(4) + size(4) + reserved(4)
         entry = bytearray(ENTRY_SIZE)
@@ -465,6 +357,29 @@ def build(project_path: str, output_path: str) -> dict:
     """JSON proje → flash binary."""
     project_dir = Path(project_path).parent
     project = json.loads(Path(project_path).read_text(encoding="utf-8"))
+
+    # Validate against the device definition when the project declares one.
+    # Projects without a "device" key build exactly as before (legacy).
+    device_id = project.get("device")
+    device = None
+    fs_base = FS_BASE
+    if device_id is not None:
+        if device_id not in ferrite_devices.load_devices():
+            print(f"warning: unknown device '{device_id}' — skipping device checks",
+                  file=sys.stderr)
+        else:
+            device = ferrite_devices.device_spec(device_id)
+            fs_base = device.get("fs_base", FS_BASE)
+            screen = project.get("screen")
+            if screen is not None and tuple(screen) != device["screen"]:
+                dw, dh = device["screen"]
+                print(f"warning: project screen {screen[0]}x{screen[1]} does not "
+                      f"match device '{device_id}' ({dw}x{dh})", file=sys.stderr)
+            render_mode = project.get("render_mode", device["render_mode"])
+            if render_mode not in device["render_modes"]:
+                raise ValueError(
+                    f"render_mode '{render_mode}' is not supported by device "
+                    f"'{device_id}' (supported: {', '.join(device['render_modes'])})")
 
     # Resolve include directories relative to project dir
     include_dirs = [str(project_dir / d) for d in project.get("include_dirs", [])]
@@ -528,8 +443,14 @@ def build(project_path: str, output_path: str) -> dict:
         source = project_dir / image["source"]
         mode = image.get("mode", "auto")
         max_colors = image.get("max_colors", 256)
+        # Alpha encoding only for devices that can blend (caps.image_alpha);
+        # legacy projects (no device key) never emit it.
+        want_alpha = bool(device and device["caps"].get("image_alpha"))
 
-        fi_data = bytearray(convert_image(str(source), mode=mode, max_colors=max_colors))
+        fi_data = bytearray(convert_image(str(source), mode=mode, max_colors=max_colors,
+                                          want_alpha=want_alpha))
+        if want_alpha and len(fi_data) >= 7 and fi_data[6] & 0x04:
+            print(f"  note: image '{name}' encoded with alpha (FI flags bit 2)")
         # FI header is 8 bytes; extend to 9 by inserting image_id at byte 8
         # Original: magic[2] + width[2] + height[2] + flags[1] + colors[1] = 8 bytes
         # New:      ... + image_id[1] = 9 bytes
@@ -597,8 +518,11 @@ def build(project_path: str, output_path: str) -> dict:
         resources.append((name, RES_FILE, data, 0))
 
     # 6. Build flash binary
-    fs_binary = build_fs(project, resources)
+    fs_binary = build_fs(project, resources, fs_base)
     Path(output_path).write_bytes(fs_binary)
+    if fs_base != FS_BASE:
+        print(f"  FS base: 0x{fs_base:X} (device '{device_id}') — "
+              f"write image to this flash address")
 
     # Stats
     header_and_table = HEADER_SIZE + len(resources) * ENTRY_SIZE

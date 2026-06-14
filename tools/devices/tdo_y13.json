@@ -1,0 +1,13 @@
+{
+  "id": "tdo_y13",
+  "name": "TDO Y13 (F1C100s, 480x480 round)",
+  "bsp": "bsp/tdo_y13",
+  "screen": { "width": 480, "height": 480, "shape": "round" },
+  "flash": { "fs_base": "0x601000" },
+  "color": { "model": "RGB565", "count": 65536, "image_max_colors": 256 },
+  "render_modes": ["dirty", "buffered"],
+  "default_render_mode": "dirty",
+  "widgets": ["base", "label", "button", "progress", "slider", "checkbox", "radio", "input", "gauge", "dropdown", "image"],
+  "caps": { "alpha": true, "audio": true, "video": false, "image_alpha": true },
+  "defaults": { "root_bg": "0x0000", "text_color": "0xFFFF" }
+}

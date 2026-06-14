@@ -1,0 +1,13 @@
+{
+  "id": "nextion",
+  "name": "Nextion NX8048K070 / GD32",
+  "bsp": "bsp/nextion",
+  "screen": { "width": 800, "height": 480, "shape": "rect" },
+  "flash": { "fs_base": "0x1000" },
+  "color": { "model": "RGB565", "count": 65536, "image_max_colors": 256 },
+  "render_modes": ["dirty", "buffered"],
+  "default_render_mode": "dirty",
+  "widgets": ["base", "label", "button", "progress", "slider", "checkbox", "radio", "input", "gauge", "dropdown", "image"],
+  "caps": { "alpha": false, "audio": false, "video": false, "image_alpha": false },
+  "defaults": { "root_bg": "0x0000", "text_color": "0xFFFF" }
+}

@@ -263,6 +263,7 @@ class Prop:
     GRAPH_COUNT = 0x2E     # Cap on samples drawn (0 = full array length)
     GRAPH_FLAGS = 0x2F     # bit 0: 0=spline / 1=linear, bit 1: fill area
     MULTI_LINE = 0x30     # label: split text by \n, 0=off 1=on
+    ALPHA = 0x31           # background opacity 0-255 (alpha-capable devices)
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -1015,7 +1016,7 @@ PROP_NAMES = {
     0x29: 'SCROLL_Y', 0x2A: 'CLIP_CHILDREN',
     0x2B: 'GRADIENT_COLOR', 0x2C: 'GRADIENT_DIR',
     0x2D: 'GRAPH_ARR', 0x2E: 'GRAPH_COUNT', 0x2F: 'GRAPH_FLAGS',
-    0x30: 'MULTI_LINE',
+    0x30: 'MULTI_LINE', 0x31: 'ALPHA',
     0x40: 'LOCATION', 0x41: 'SIZE', 0x42: 'MARGIN',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -1289,6 +1290,7 @@ PROP_MAP = {
     'graph_count': (Prop.GRAPH_COUNT, False),
     'graph_flags': (Prop.GRAPH_FLAGS, False),
     'multi_line': (Prop.MULTI_LINE, False),
+    'alpha': (Prop.ALPHA, False),
     'text': (Prop.TEXT, True),
     'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }
