@@ -1,0 +1,188 @@
+{
+    "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+    "name": "Ferrite",
+    "scopeName": "source.ferrite",
+    "fileTypes": [".fl"],
+    "patterns": [
+        {
+            "include": "#comments"
+        },
+        {
+            "include": "#preprocessor"
+        },
+        {
+            "include": "#strings"
+        },
+        {
+            "include": "#numbers"
+        },
+        {
+            "include": "#keywords"
+        },
+        {
+            "include": "#types"
+        },
+        {
+            "include": "#builtins"
+        },
+        {
+            "include": "#constants"
+        },
+        {
+            "include": "#function-refs"
+        },
+        {
+            "include": "#function-decls"
+        },
+        {
+            "include": "#operators"
+        },
+        {
+            "include": "#property-access"
+        }
+    ],
+    "repository": {
+        "comments": {
+            "patterns": [
+                {
+                    "name": "comment.line.double-slash.ferrite",
+                    "match": "//.*$"
+                },
+                {
+                    "name": "comment.block.ferrite",
+                    "begin": "/\\*",
+                    "end": "\\*/"
+                }
+            ]
+        },
+        "preprocessor": {
+            "patterns": [
+                {
+                    "name": "keyword.control.preprocessor.ferrite",
+                    "match": "^[ \\t]*(#include|#hint_widgets)\\b"
+                },
+                {
+                    "name": "string.quoted.double.ferrite",
+                    "match": "(?:#include\\s+)\"([^\"]*)\"",
+                    "captures": {
+                        "1": { "name": "string.quoted.double.ferrite" }
+                    }
+                }
+            ]
+        },
+        "strings": {
+            "name": "string.quoted.double.ferrite",
+            "begin": "\"",
+            "end": "\"",
+            "patterns": [
+                {
+                    "name": "constant.character.escape.ferrite",
+                    "match": "\\\\[nt\"\\\\]"
+                }
+            ]
+        },
+        "numbers": {
+            "patterns": [
+                {
+                    "name": "constant.numeric.hex.ferrite",
+                    "match": "\\b0[xX][0-9a-fA-F_]+\\b"
+                },
+                {
+                    "name": "constant.numeric.binary.ferrite",
+                    "match": "\\b0[bB][01_]+\\b"
+                },
+                {
+                    "name": "constant.numeric.float.ferrite",
+                    "match": "\\b\\d+\\.\\d+(?:[eE][+-]?\\d+)?\\b"
+                },
+                {
+                    "name": "constant.numeric.integer.ferrite",
+                    "match": "\\b\\d[\\d_]*\\b"
+                }
+            ]
+        },
+        "keywords": {
+            "patterns": [
+                {
+                    "name": "keyword.control.ferrite",
+                    "match": "\\b(var|const|fn|if|else|while|for|return|break|continue)\\b"
+                },
+                {
+                    "name": "constant.language.boolean.ferrite",
+                    "match": "\\b(true|false)\\b"
+                },
+                {
+                    "name": "keyword.operator.logical.ferrite",
+                    "match": "\\bnot\\b"
+                }
+            ]
+        },
+        "types": {
+            "patterns": [
+                {
+                    "name": "storage.type.ferrite",
+                    "match": "\\b(int|float|widget|string|array)\\b"
+                }
+            ]
+        },
+        "builtins": {
+            "patterns": [
+                {
+                    "name": "support.function.builtin.ferrite",
+                    "match": "\\b(alloc|target|set|get|parent|dirty|render|halt|yield_op|fillRect|rect|line|circle|fillCircle|drawImage|drawText|delay|itof|ftoi|fneg|fadd|fsub|fmul|fdiv|feq|fne|flt|fle|fgt|fge|sin|cos|sqrt|abs|atan2|floor|ceil|str|itos|ftos|sprintf|concat|strcat|parseInt|parseFloat|strLen|strlen|strcmp|setText|drawStr|strClear|strFree|arrFree|arrToStr|roundedRect|fillRoundedRect|arc|beginFrame|endFrame|sendUsart|millis|fpgaCmd|fpgaData|critical|setBrightness|brightness|rtcRead|rtcWrite|fileOpen|fileRead|fileSize|fileClose|fileSeek|syscall|showModal|setDialogResult)\\b"
+                }
+            ]
+        },
+        "constants": {
+            "patterns": [
+                {
+                    "name": "variable.other.constant.ferrite",
+                    "match": "\\b[A-Z][A-Z_0-9]*\\b"
+                }
+            ]
+        },
+        "function-refs": {
+            "patterns": [
+                {
+                    "name": "entity.name.function.reference.ferrite",
+                    "match": "@\\w+"
+                }
+            ]
+        },
+        "function-decls": {
+            "patterns": [
+                {
+                    "name": "meta.function.ferrite",
+                    "begin": "\\b(fn)\\s+(\\w+)",
+                    "end": "(?=\\{)",
+                    "beginCaptures": {
+                        "1": { "name": "keyword.control.ferrite" },
+                        "2": { "name": "entity.name.function.ferrite" }
+                    },
+                    "patterns": [
+                        {
+                            "name": "variable.parameter.ferrite",
+                            "match": "\\b\\w+\\b"
+                        }
+                    ]
+                }
+            ]
+        },
+        "operators": {
+            "patterns": [
+                {
+                    "name": "keyword.operator.ferrite",
+                    "match": "==|!=|<=|>=|&&|\\|\\||<<|>>|->|\\+\\+|--|\\+=|-=|\\*=|/=|%=|[+\\-*/%&|!<>=]"
+                }
+            ]
+        },
+        "property-access": {
+            "patterns": [
+                {
+                    "name": "meta.property.ferrite",
+                    "match": "(?<=\\.)\\b(?:loc_[xy]|size_[wh]|width|height|visible|enabled|clickable|bg_color|background_color|border_color|flags|location|pos|size|margin|border|padding|margin_top|margin_right|margin_bottom|margin_left|border_top|border_right|border_bottom|border_left|padding_top|padding_right|padding_bottom|padding_left|kind|text_color|font_id|text_align|press_color|image_id|on_click|on_paint|on_tap|border_radius|radius|value|checked|max_length|cursor_pos|on_change|scroll_y|clip_children|gradient_color|gradient_dir|graph_arr|graph_array|graph_count|graph_flags|multi_line|alpha|text|text_id)\\b"
+                }
+            ]
+        }
+    }
+}

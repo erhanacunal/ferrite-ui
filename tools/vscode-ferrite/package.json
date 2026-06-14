@@ -1,0 +1,69 @@
+{
+    "name": "ferrite-lang",
+    "displayName": "Ferrite Language Support",
+    "description": "Language support for ferrite-lang (.fl) — syntax highlighting, diagnostics, completions, and more.",
+    "version": "1.0.0",
+    "publisher": "ferrite-ui",
+    "license": "MIT",
+    "engines": {
+        "vscode": "^1.75.0"
+    },
+    "categories": [
+        "Programming Languages"
+    ],
+    "activationEvents": [
+        "onLanguage:ferrite"
+    ],
+    "main": "./extension.js",
+    "contributes": {
+        "languages": [
+            {
+                "id": "ferrite",
+                "aliases": [
+                    "Ferrite",
+                    "ferrite"
+                ],
+                "extensions": [
+                    ".fl"
+                ],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "ferrite",
+                "scopeName": "source.ferrite",
+                "path": "./syntaxes/ferrite.tmLanguage.json"
+            }
+        ],
+        "snippets": [
+            {
+                "language": "ferrite",
+                "path": "./snippets/ferrite.json"
+            }
+        ],
+        "configuration": {
+            "title": "Ferrite Language",
+            "properties": {
+                "ferrite.server.python": {
+                    "type": "string",
+                    "default": "python",
+                    "description": "Python interpreter to run the LSP server."
+                },
+                "ferrite.server.path": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Path to ferrite_lsp.py. If empty, looks in the workspace tools/ directory."
+                },
+                "ferrite.server.includeDirs": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "description": "Additional include directories passed to the compiler."
+                }
+            }
+        }
+    }
+}

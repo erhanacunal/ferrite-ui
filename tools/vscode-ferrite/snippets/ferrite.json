@@ -1,0 +1,163 @@
+{
+    "function": {
+        "prefix": "fn",
+        "body": [
+            "fn ${1:name}(${2:params}) -> ${3:int} {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Function definition"
+    },
+    "function system callback": {
+        "prefix": "setup",
+        "body": [
+            "fn setup() {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Setup system callback"
+    },
+    "function loop callback": {
+        "prefix": "loop",
+        "body": [
+            "fn loop() {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "Loop system callback"
+    },
+    "var": {
+        "prefix": "var",
+        "body": "var ${1:name}: ${2:int} = ${3:0};",
+        "description": "Variable declaration"
+    },
+    "const": {
+        "prefix": "const",
+        "body": "const ${1:NAME} = ${2:value};",
+        "description": "Constant declaration"
+    },
+    "if": {
+        "prefix": "if",
+        "body": [
+            "if (${1:cond}) {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "If statement"
+    },
+    "if-else": {
+        "prefix": "ifelse",
+        "body": [
+            "if (${1:cond}) {",
+            "\t${2}",
+            "} else {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "If-else statement"
+    },
+    "while": {
+        "prefix": "while",
+        "body": [
+            "while (${1:cond}) {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "While loop"
+    },
+    "for": {
+        "prefix": "for",
+        "body": [
+            "for (var ${1:i} = ${2:0}; ${1:i} < ${3:n}; ${1:i}++) {",
+            "\t${0}",
+            "}"
+        ],
+        "description": "For loop"
+    },
+    "return": {
+        "prefix": "ret",
+        "body": "return ${0:value};",
+        "description": "Return statement"
+    },
+    "alloc widget": {
+        "prefix": "alloc",
+        "body": "var ${1:widget}: widget = alloc();",
+        "description": "Allocate a new widget"
+    },
+    "target + set location": {
+        "prefix": "target",
+        "body": [
+            "target(${1:widget});",
+            "set(location, ${2:x}, ${3:y});",
+            "set(size, ${4:w}, ${5:h});"
+        ],
+        "description": "Target a widget and set position/size"
+    },
+    "dot access set": {
+        "prefix": "wset",
+        "body": "${1:widget}.${2:prop} = ${3:value};",
+        "description": "Set widget property via dot syntax"
+    },
+    "#include": {
+        "prefix": "inc",
+        "body": "#include \"${1:file}.fl\"",
+        "description": "Include another source file"
+    },
+    "fillRect": {
+        "prefix": "fillrect",
+        "body": "fillRect(${1:x}, ${2:y}, ${3:w}, ${4:h}, ${5:color});",
+        "description": "Draw filled rectangle"
+    },
+    "drawText": {
+        "prefix": "drawtext",
+        "body": "drawText(${1:x}, ${2:y}, ${3:font_id}, ${4:fg}, ${5:bg}, \"${5:text}\");",
+        "description": "Draw static text"
+    },
+    "drawStr": {
+        "prefix": "drawstr",
+        "body": "drawStr(${1:x}, ${2:y}, ${3:font_id}, ${4:fg}, ${5:bg}, ${6:str_id});",
+        "description": "Draw dynamic string"
+    },
+    "on_click handler": {
+        "prefix": "onclick",
+        "body": "${1:widget}.on_click = @${2:handler};",
+        "description": "Attach click handler to widget"
+    },
+    "on_tap handler": {
+        "prefix": "ontap",
+        "body": "${1:widget}.on_tap = @${2:handler};",
+        "description": "Attach tap handler to widget"
+    },
+    "on_paint handler": {
+        "prefix": "onpaint",
+        "body": "${1:widget}.on_paint = @${2:handler};",
+        "description": "Attach paint handler to widget"
+    },
+    "sprintf": {
+        "prefix": "sprintf",
+        "body": "sprintf(${1:fmt}, ${2:args});",
+        "description": "Format string"
+    },
+    "fileOpen loop": {
+        "prefix": "fileopen",
+        "body": [
+            "var ${1:handle} = fileOpen(${2:name});",
+            "if (${1:handle} == 0xFF) {",
+            "\treturn;",
+            "}",
+            "var ${3:len} = fileSize(${1:handle});",
+            "while (${3:len} > 0) {",
+            "\tvar ${4:b} = fileRead(${1:handle});",
+            "\t${0}",
+            "\t${3:len}--;",
+            "}",
+            "fileClose(${1:handle});"
+        ],
+        "description": "Open, read, and close a file"
+    },
+    "showModal": {
+        "prefix": "modal",
+        "body": "var ${1:result} = showModal(@${2:builder});",
+        "description": "Show a modal dialog"
+    }
+}
