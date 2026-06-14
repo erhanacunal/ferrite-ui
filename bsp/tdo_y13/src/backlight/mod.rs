@@ -4,7 +4,7 @@
 //! 0% = off, 100% = full brightness.
 
 use ferrite_core::backlight::BacklightBackend;
-use f1c100s::pwm::{Pwm, PwmChannel, PwmConfig, PwmMode, PwmPolarity};
+use f1c100s::pwm::{self, Pwm, PwmChannel, PwmConfig, PwmMode, PwmPolarity};
 
 /// Global PWM instance. Initialized by `init()`.
 static mut PWM_INSTANCE: Option<Pwm> = None;
@@ -20,14 +20,16 @@ impl BacklightBackend for PwmBl {
         if pct == 0 {
             pwm.disable();
         } else {
-            let pulse_ns = (pct as u32) * 10_000;
+            pwm.disable();
+            let pulse_ns = (pct as u32) * 1000;
             let cfg = PwmConfig {
                 period_ns: 1_000_000,
-                pulse_ns,
+                pulse_ns: pulse_ns,
                 polarity: PwmPolarity::ActiveHigh,
                 mode: PwmMode::Continuous,
             };
             let _ = pwm.configure(&cfg);
+            pwm.enable();
         }
     }
 
@@ -36,23 +38,20 @@ impl BacklightBackend for PwmBl {
     }
 }
 
-/// Initialize PWM0 on PA2 for LCD backlight control.
+/// Initialize PWM0 on PE12 for LCD backlight control.
 ///
 /// # Safety
 /// Must be called once at boot, after GPIO mux is configured.
 pub unsafe fn init() {
-    use f1c100s::pwm::pins::PWM0_PA2;
-
-    let pwm = unsafe { Pwm::new(PwmChannel::Ch0) };
-    pwm.init(&PWM0_PA2);
-    let _ = pwm.configure(&PwmConfig {
+    let backlight = pwm::pwm0_pe12();    
+    let _ = backlight.configure(&PwmConfig {
         period_ns: 1_000_000,
         pulse_ns: 10_000,
         polarity: PwmPolarity::ActiveHigh,
         mode: PwmMode::Continuous,
     });
 
-    unsafe { PWM_INSTANCE = Some(pwm) };
+    unsafe { PWM_INSTANCE = Some(backlight) };
 }
 
 /// Return a new `PwmBl` instance. Must call `init()` first.

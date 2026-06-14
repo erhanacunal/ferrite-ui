@@ -14,14 +14,16 @@ use ferrite_core::types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
 const WIDTH: usize = 480;
 const HEIGHT: usize = 480;
 
-fn fb() -> &'static mut [u16] {
-    let ptr = unsafe { crate::lcd::framebuffer_mut_ptr() as *mut u16 };
+fn fb() -> &'static mut [u32] {
+    // The DEBE framebuffer is ARGB8888 (one u32 per pixel), so index it as u32.
+    let ptr = unsafe { crate::lcd::framebuffer_mut_ptr() as *mut u32 };
     unsafe { core::slice::from_raw_parts_mut(ptr, WIDTH * HEIGHT) }
 }
 
 fn fb_pixel(x: usize, y: usize, color: u16) {
     if x < WIDTH && y < HEIGHT {
-        fb()[y * WIDTH + x] = color;
+        // Colors are RGB565; convert to the framebuffer's ARGB8888 word.
+        fb()[y * WIDTH + x] = crate::lcd::rgb565_to_argb8888(color);
     }
 }
 

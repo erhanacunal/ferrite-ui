@@ -21,6 +21,9 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use f1c100s::thread;
+use f1c100s::timer;
+use f1c100s::interrupt;
+use f1c100s::gpio;
 
 
 use ferrite_core::backlight::BacklightImpl;
@@ -90,6 +93,7 @@ fn ui_task(_: *mut ()) {
         rtc: RtcImpl::with_backend(rtc::new()),
         usart: UsartImpl::with_backend(usart::new()),
         systick: systick::handle(),
+        audio: ferrite_core::audio::AudioImpl::none(),
         cursor_visible: false,
     });
 
@@ -97,15 +101,22 @@ fn ui_task(_: *mut ()) {
     ferrite_core::runtime::run::<TdoY13Platform>(ctx, touch);
 }
 
+// ── Scheduler tick ISR (called from TIMER1 every 10 ms) ──────────────────────
+
+fn sched_tick_isr() {
+    thread::sched_tick();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main() -> ! {
-    systick::init();
+    timer::avs_init();
+    
 
-    use f1c100s::mmu::{MemDesc, RW_CB, RW_NCNB};
-    f1c100s::mmu::init(&[
-        MemDesc::new(0x00000000, 0xFFFF_FFFF, 0x00000000, RW_NCNB),
-        MemDesc::new(0x80000000, 0x81FF_FFFF, 0x80000000, RW_CB),
-    ]);
+    // use f1c100s::mmu::{MemDesc, RW_CB, RW_NCNB};
+    // f1c100s::mmu::init(&[
+    //     MemDesc::new(0x00000000, 0xFFFF_FFFF, 0x00000000, RW_NCNB),
+    //     MemDesc::new(0x80000000, 0x81FF_FFFF, 0x80000000, RW_CB),
+    // ]);
 
     f1c100s::interrupt::init();
 
@@ -119,12 +130,12 @@ pub extern "C" fn rust_main() -> ! {
         f1c100s::allocator::init_heap(heap_start as *mut u8, DRAM_END - heap_start);
     }
 
+    
     unsafe { flash::init(); }
     unsafe { touch::init(); }
     unsafe { backlight::init(); }
     unsafe { lcd::init(); }
     unsafe { usart::init(); }
-
 
     init_gpio_mux();
     
@@ -138,13 +149,15 @@ pub extern "C" fn rust_main() -> ! {
         "ui", ui_task, core::ptr::null_mut(),
         unsafe { &mut *core::ptr::addr_of_mut!(UI_STACK) }, 1, 5,
     );
+    
+    systick::init();
 
     thread::sched_start();
 }
 
 fn init_gpio_mux() {
     use f1c100s::gpio::{self, Port, DriveLevel};
-    use f1c100s::timer::delay_ms;
+    
     // ── Touch controller GPIOs ───────────────────────────────────────────────
     // Note: I2C comms (init, probe) happen in the ui thread after sched_start.
     // Calling TWI/I2C here would panic — EventFlags::wait() needs a current thread.
@@ -154,7 +167,7 @@ fn init_gpio_mux() {
     gpio::set_pull_mode(Port::E, 9,  gpio::PullMode::Disable);
 
     // Assert / de-assert reset (bring chip out of reset before I2C init)
-    gpio::set_value(Port::E, 10, false); delay_ms(10);
-    gpio::set_value(Port::E, 10, true);  delay_ms(10);
+    gpio::set_value(Port::E, 10, false); timer::delay_ms(10);
+    gpio::set_value(Port::E, 10, true);  timer::delay_ms(10);
     
 }

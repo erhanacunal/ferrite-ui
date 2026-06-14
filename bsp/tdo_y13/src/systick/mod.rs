@@ -23,8 +23,7 @@ pub struct F1cSystick;
 
 impl SystickBackend for F1cSystick {
     fn init() {
-        unsafe {
-            timer::avs_init();
+        unsafe {           
 
             // 24 MHz / prescaler_128 = 187.5 kHz → 1875 ticks per 10ms
             let timer1 = Timer::new(TimerChannel::Ch1);

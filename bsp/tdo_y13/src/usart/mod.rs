@@ -5,7 +5,7 @@
 
 use core::ptr::addr_of;
 use ferrite_core::usart::UsartBackend;
-use f1c100s::uart::{self, Uart};
+use f1c100s::uart::{self, Uart, init_uart2};
 
 static mut UART2: Option<Uart> = None;
 
@@ -59,16 +59,8 @@ pub unsafe fn init() {
     use f1c100s::gpio::{self, Port, PullMode};
     use f1c100s::interrupt;
 
-    // UART2: PE7=TX, PE8=RX (FUNC2).
-    gpio::set_function(Port::E, 7, gpio::function::FUNC2);
-    gpio::set_pull_mode(Port::E, 7, PullMode::Disable);
-    gpio::set_function(Port::E, 8, gpio::function::FUNC2);
-    gpio::set_pull_mode(Port::E, 8, PullMode::Up);
-
-    clock::bus_clk_init(BusGate::Uart2);
-
-    let uart = unsafe { Uart::new(uart::UART2_BASE) };
-    uart.configure(&uart::UartConfig::default());
+    
+    let uart = init_uart2();    
     uart.enable_rx_interrupt();
 
     interrupt::install(interrupt::UART2_INTERRUPT, uart_rx_isr);

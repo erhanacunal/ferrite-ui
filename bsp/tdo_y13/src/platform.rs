@@ -24,6 +24,18 @@ impl Platform for TdoY13Platform {
     type SdCardB = crate::sdcard::StubSd;
     type UsartB = crate::usart::HwUart;
     type SystickB = crate::systick::F1cSystick;
+    // F1C100s has a built-in audio codec — switch to a real backend (and set
+    // CAP_AUDIO + devices.json caps.audio) when the audio milestone lands.
+    type AudioB = ferrite_core::audio::NoAudio;
+
+    // The F1C100s BootROM loads firmware from offset 0 of the *same* SPI NOR
+    // that holds the resources (BY25Q128AS, 128 Mbit = 16 MB), so the flash is
+    // partitioned:
+    //   0x000000 - 0x5FFFFF  firmware       6 MB, reserved
+    //   0x600000 - 0x600FFF  config store   4 KB, one sector
+    //   0x601000 - 0xFFFFFF  resource FS    ~9.99 MB (writefs target)
+    const CONFIG_BASE: u32 = 6 * 1024 * 1024; // 0x60_0000
+    const FS_BASE: u32 = 6 * 1024 * 1024 + 4 * 1024; // 0x60_1000
 }
 
 impl PlatformRuntime for TdoY13Platform {

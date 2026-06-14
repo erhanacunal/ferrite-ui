@@ -1,4 +1,4 @@
-//! Flash backend for TDO Y13 — W25Q128 / GD25Q128 SPI NOR flash (16 MB).
+//! Flash backend for TDO Y13 — BY25Q128AS SPI NOR flash (128 Mbit = 16 MB).
 //!
 //! Uses the f1c100s HAL `SpiFlash` driver over SPI0. The flash is external
 //! (not memory-mapped) so all reads/writes go through SPI commands.
