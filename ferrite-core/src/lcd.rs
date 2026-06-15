@@ -311,40 +311,27 @@ impl<B: LcdBackend> LcdImpl<B> {
             self.fill_rect(x, y, w, h, color);
             return;
         }
-        let xi = x as i16;
-        let yi = y as i16;
-        let wi = w as i16;
-        let hi = h as i16;
-        let ri = r as i16;
 
-        self.fill_rect(x, y + r, w, h - 2 * r, color);
-
-        let cx_l = xi + ri;
-        let cx_r = xi + wi - ri - 1;
-        let mut py: i16 = ri;
-        let mut px: i16 = 0;
-        let mut d: i16 = 1 - ri;
-        let mut last_px: i16 = -1;
-
-        while px <= py {
-            if px != last_px {
-                self.hline_clipped(cx_l - py, cx_l - px, yi + ri - px, color);
-                self.hline_clipped(cx_l - py, cx_l - px, yi + ri + px, color);
-                self.hline_clipped(cx_r + px, cx_r + py, yi + ri - px, color);
-                self.hline_clipped(cx_r + px, cx_r + py, yi + ri + px, color);
-                last_px = px;
-            }
-            if d < 0 {
-                d += 2 * px + 3;
+        // One horizontal span per row: straight full-width band through the
+        // middle, corners inset by the circle equation. Same geometry as
+        // `fill_rounded_rect_blend`, just opaque.
+        let ri = r as i32;
+        let hi = h as i32;
+        for row in 0..hi {
+            let dy = if row < ri {
+                ri - row
+            } else if row >= hi - ri {
+                row - (hi - 1 - ri)
             } else {
-                d += 2 * (px - py) + 5;
-                py -= 1;
-            }
-            px += 1;
+                0
+            };
+            let inset = if dy == 0 {
+                0
+            } else {
+                (ri - isqrt(ri * ri - dy * dy) as i32) as u16
+            };
+            self.fill_rect(x + inset, y + row as u16, w - 2 * inset, 1, color);
         }
-
-        self.fill_rect(x + r, y, w.saturating_sub(2 * r), r, color);
-        self.fill_rect(x + r, y + h - r, w.saturating_sub(2 * r), r, color);
     }
 
     /// `fill_rounded_rect` with alpha. Built from one span per row (circle
