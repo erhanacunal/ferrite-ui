@@ -50,6 +50,7 @@ impl Platform for EpaperPlatform {
 impl PlatformRuntime for EpaperPlatform {
     const BG_COLOR: u16 = COLOR_WHITE;
     const FG_COLOR: u16 = COLOR_BLACK;
+    const DEFAULT_BG_COLOR: u16 = COLOR_WHITE;
     // The e-paper panel only updates on explicit `render()` calls; force EPaper
     // mode regardless of the image header so the per-frame loop never drives it.
     const FORCED_RENDER_MODE: Option<RenderMode> = Some(RenderMode::EPaper);

@@ -62,5 +62,7 @@ pub trait Platform {
 
     /// Optional board capabilities — OR of the `CAP_*` bits above. Only set
     /// a bit when the corresponding backend is real (keep CAPS truthful).
-    const CAPS: u32 = 0;
+    const CAPS: u32 = 0;    
+    // Default background color for the board (used when no widget has a background). 
+    const DEFAULT_BG_COLOR: u16 = 0x0000; // black
 }

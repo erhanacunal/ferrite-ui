@@ -473,7 +473,7 @@ fn effective_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
 /// "transparent" — the text sits on its parent's filled background.  This
 /// function resolves that parent colour so anti-aliased glyphs blend
 /// correctly instead of blending against black.
-fn resolved_text_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
+fn resolved_text_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt, fallback: Color) -> Color {
     // If this widget has a non-zero background, use it directly (after
     // factoring in press state).
     let bg = effective_bg(tree, widget, ext);
@@ -500,9 +500,8 @@ fn resolved_text_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Colo
         }
     }
 
-    // No ancestor has a background — fall back to white (typical screen
-    // background).
-    0xFFFF
+    // No ancestor has a background — use the platform's default background.
+    fallback
 }
 
 /// Draw widget without clipping (full render path).
@@ -819,7 +818,7 @@ fn draw_widget_clipped<P: Platform>(
     // Image widget — draw image centered in content area
     if widget.kind == KIND_IMAGE {
         draw_widget_image(ctx, abs, ext);
-    }
+    }    
 }
 
 /// Draw background image at the inner rect origin.
@@ -895,7 +894,8 @@ fn draw_label_text<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: 
     // Always pass a background color — required for correct anti-aliased
     // blending.  resolved_text_bg walks up the tree, so even "transparent"
     // labels (background_color=0) get the parent's actual fill color.
-    let bg_color = resolved_text_bg(&ctx.tree, widget, ext);
+    // Falls back to the platform's DEFAULT_BG_COLOR when no ancestor has one.
+    let bg_color = resolved_text_bg(&ctx.tree, widget, ext, P::DEFAULT_BG_COLOR);
     let bg = Some(bg_color);
 
     // Multi-line mode: split on '\n', center block vertically
