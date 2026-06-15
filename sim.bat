@@ -46,4 +46,4 @@ if errorlevel 1 (
 
 echo.
 echo [2/2] Launching simulator
-cargo run --target x86_64-pc-windows-msvc --features host --bin sim -- --fsimage "%FLASH%"
+cargo run -p bsp-sim --target x86_64-pc-windows-msvc -- --fsimage "%FLASH%"
