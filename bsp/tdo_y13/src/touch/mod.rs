@@ -8,7 +8,6 @@
 
 use alloc::boxed::Box;
 use f1c100s::cst8xx::Cst8xx;
-use f1c100s::touch::transform;
 use ferrite_core::touch::{CalParams, TouchBackend};
 
 /// Global CST8xx driver instance. Initialized by `init()`.
@@ -24,17 +23,31 @@ impl TouchBackend for CstTouch {
         driver.touch_count().unwrap_or(0) > 0
     }
 
-    fn read_screen(&self, _cal: &CalParams) -> Option<(u16, u16)> {
+    fn read_screen(&self, cal: &CalParams) -> Option<(u16, u16)> {
         let driver = unsafe { &*core::ptr::addr_of!(TOUCH_DRIVER) }
             .as_ref().expect("touch::init() not called");
-        // Return the coordinates whenever a point is present. Press/release is
-        // tracked by the touch count (`is_active`), NOT the CST8xx event bits:
-        // this controller reports event=None even during a valid contact, so
-        // filtering on the event would drop every touch.
         match driver.read_point() {
-            Ok(Some(point)) => Some((point.x, point.y)),
+            Ok(Some(point)) => {
+                let mut x = point.x;
+                let mut y = point.y;
+                if cal.xy_swap {
+                    core::mem::swap(&mut x, &mut y);
+                }
+                x = apply_orient(x, cal.x_flip, 480);
+                y = apply_orient(y, cal.y_flip, 480);
+                Some((x, y))
+            }
             _ => None,
         }
+    }
+}
+
+/// Apply a single-axis flip and clamp to screen bounds.
+fn apply_orient(val: u16, flip: bool, max: u16) -> u16 {
+    if flip {
+        max.saturating_sub(1).saturating_sub(val)
+    } else {
+        val.min(max.saturating_sub(1))
     }
 }
 
@@ -52,7 +65,10 @@ pub unsafe fn init() {
 
     let mut driver = Cst8xx::new(twi_ref);
     driver.set_range(480, 480);
-    driver.set_transform(transform::Y_REVERSE);
+    // Orientation is owned by CalParams and applied in `read_screen` (default
+    // y_flip=true, plus any saved calibration). Keep the hardware transform at
+    // identity so the two don't stack into a double-flip.
+    driver.set_transform(0);
     driver.init().ok();
 
     unsafe { TOUCH_DRIVER = Some(driver) };
