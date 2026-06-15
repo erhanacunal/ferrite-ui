@@ -413,11 +413,23 @@ def build(project_path: str, output_path: str) -> dict:
         font_path = project_dir / font["file"]
         font_data = bytearray(font_path.read_bytes())
 
-        # Verify minimum length and patch font_id at byte 3
+        # Patch the project-assigned font_id into the header. The byte offset
+        # differs by format: V1 (legacy 1bpp) keeps font_id at byte 3, while
+        # V2 (2bpp, magic 0x00 0x02) keeps it at byte 5 — byte 3 there is the
+        # high byte of num_glyphs, so writing to it corrupts the glyph count.
         if len(font_data) < 4:
             print(f"Error: font '{name}' binary too small ({len(font_data)} bytes)", file=sys.stderr)
             sys.exit(1)
-        font_data[3] = font_id
+        if font_data[0] == 0x00 and font_data[1] == 0x02:
+            # V2: [0..1]=magic, [2..3]=num_glyphs, [4]=y_adv, [5]=font_id, [6]=bpp
+            if len(font_data) < 7:
+                print(f"Error: font '{name}' V2 binary too small ({len(font_data)} bytes)",
+                      file=sys.stderr)
+                sys.exit(1)
+            font_data[5] = font_id
+        else:
+            # V1: [0..1]=num_glyphs, [2]=y_adv, [3]=font_id
+            font_data[3] = font_id
 
         resources.append((name, RES_FONT, bytes(font_data), 0))
 
