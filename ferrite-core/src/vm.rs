@@ -1512,6 +1512,12 @@ impl Vm {
                             ctx.images.find_or_load(val as u8, fs, &ctx.flash);
                         }
                     }
+                    // A property write that changes appearance schedules a
+                    // redraw, so `render()` repaints without an explicit
+                    // `dirty(widget)` call.
+                    if prop_is_visual(prop_id) {
+                        ctx.tree.mark_dirty(self.target);
+                    }
                 }
             }
             OP_W_GET => {
@@ -1551,6 +1557,9 @@ impl Vm {
                     self.pc = end as u16;
                     if self.target.is_some() {
                         self.set_compound_prop(prop_id, &buf[..n], ctx);
+                        if prop_is_visual(prop_id) {
+                            ctx.tree.mark_dirty(self.target);
+                        }
                     }
                 } else {
                     self.state = VmState::Error;
@@ -1746,6 +1755,9 @@ impl Vm {
                     if let Some(ext) = ctx.tree.ensure_ext(self.target) {
                         ext.text_id = str_id;
                     }
+                    // Text change repaints on the next render() — same as the
+                    // W_SET text path.
+                    ctx.tree.mark_dirty(self.target);
                 }
             }
             OP_DRAW_STR => {
@@ -2682,4 +2694,22 @@ fn set_flag(flags: &mut u16, mask: u16, val: bool) {
     } else {
         *flags &= !mask;
     }
+}
+
+/// Whether writing `prop_id` changes the widget's on-screen appearance and so
+/// should schedule a redraw. Defaults to `true`; only behaviour-only props
+/// (state flags, event-handler hooks, input metadata) are excluded so they
+/// don't trigger needless repaints.
+fn prop_is_visual(prop_id: u8) -> bool {
+    !matches!(
+        prop_id,
+        PROP_ENABLED
+            | PROP_CLICKABLE
+            | PROP_ON_CLICK
+            | PROP_ON_PAINT
+            | PROP_ON_TAP
+            | PROP_ON_CHANGE
+            | PROP_MAX_LENGTH
+            | PROP_CURSOR_POS
+    )
 }
