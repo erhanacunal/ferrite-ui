@@ -168,26 +168,81 @@ _KIND_NAMES = {
 # ============================================================
 
 def parse_image_header(data):
-    """Parse VM image header. Returns (functions, opcode_start, global_count).
+    """Parse VM image header. Returns (functions, opcode_start, global_count,
+    widget_count, ext_count, header_flags).
 
     functions: list of {id, name, kind, offset, length}
     opcode_start: byte offset where opcodes begin
     global_count: number of global variable slots (v2+, 0 for v1)
+    widget_count: alloc() call sites (v4+, 0 for earlier)
+    ext_count: widgets needing WidgetExt (v4+, 0 for earlier)
+    header_flags: render_mode etc. (v3+, 0 for earlier)
+
+    Header formats:
+      v1: version(u8) + func_count(u16)                    = 3 bytes
+      v2: version(u8) + func_count(u16) + global_count(u16) = 5 bytes
+      v3: version(u8) + func_count(u16) + global_count(u16) + flags(u16) = 7 bytes
+      v4: v3 + widget_count(u8) + ext_count(u8)             = 9 bytes
     """
-    if len(data) < 5:
-        raise ValueError("Image too small for header")
+    if len(data) < 3:
+        raise ValueError("Image too small for header (need at least 3 bytes)")
 
     version = data[0]
+    if version < 1 or version > 4:
+        raise ValueError(
+            f"Unsupported image version {version} (expected 1-4). "
+            f"Is this a VM image binary? Flash dumps are not supported."
+        )
+
+    if version == 1:
+        header_size = 3
+        global_count = 0
+        header_flags = 0
+        widget_count = 0
+        ext_count = 0
+    elif version == 2:
+        header_size = 5
+        header_flags = 0
+        widget_count = 0
+        ext_count = 0
+    else:  # version 3 or 4
+        header_size = 9 if version >= 4 else 7
+
+    if len(data) < header_size:
+        raise ValueError(
+            f"Image too small for v{version} header (need at least {header_size} bytes)"
+        )
+
     func_count = struct.unpack_from('<H', data, 1)[0]
     global_count = struct.unpack_from('<H', data, 3)[0] if version >= 2 else 0
-    opcode_start = 5 + func_count * 12
+    header_flags = struct.unpack_from('<H', data, 5)[0] if version >= 3 else 0
+    widget_count = data[7] if version >= 4 else 0
+    ext_count = data[8] if version >= 4 else 0
+
+    # Sanity checks on func_count
+    if func_count > 256:
+        raise ValueError(
+            f"func_count {func_count} is unreasonably large (max 256). "
+            f"Is this a VM image binary?"
+        )
+
+    func_table_size = func_count * 12
+    opcode_start = header_size + func_table_size
+    if opcode_start > len(data):
+        raise ValueError(
+            f"Image header requires {opcode_start} bytes for {func_count} functions "
+            f"but data is only {len(data)} bytes"
+        )
 
     # Get real names if available (from _ImageBytes)
     real_names = getattr(data, 'func_names', {})
 
     functions = []
     for i in range(func_count):
-        base = 5 + i * 12
+        base = header_size + i * 12
+        # Bounds already verified above, but defensive check
+        if base + 12 > len(data):
+            break
         func_id = struct.unpack_from('<H', data, base)[0]
         kind = data[base + 2]
         offset = struct.unpack_from('<I', data, base + 4)[0]
@@ -207,7 +262,250 @@ def parse_image_header(data):
             'length': length,
         })
 
-    return functions, opcode_start, global_count
+    return functions, opcode_start, global_count, widget_count, ext_count, header_flags
+
+
+# ============================================================
+# Flash filesystem parser
+# ============================================================
+
+# Flash FS layout (W25Q256)
+DEFAULT_FS_BASE = 0x1000       # default FS header offset
+FS_HEADER_SIZE = 16            # header bytes
+FS_ENTRY_SIZE = 32             # resource table entry bytes
+FS_MAGIC = b"FERR"             # magic bytes
+FS_VERSION = 2                 # current version
+
+# Resource types
+RES_FONT = 0
+RES_IMAGE = 1
+RES_PROGRAM = 2
+RES_PAGE = 3
+RES_FILE = 4
+
+_RES_TYPE_NAMES = {
+    RES_FONT: "Font",
+    RES_IMAGE: "Image",
+    RES_PROGRAM: "Program",
+    RES_PAGE: "Page",
+    RES_FILE: "File",
+}
+
+# Resource flags
+RES_FLAG_FLASH_EXEC = 0x01
+
+
+def parse_flash_header(data, base=DEFAULT_FS_BASE):
+    """Parse flash filesystem header at `base` offset.
+
+    Returns dict with: version, screen_w, screen_h, resource_count, checksum
+    Raises ValueError on invalid magic, version, or count.
+    """
+    if len(data) < base + FS_HEADER_SIZE:
+        raise ValueError(
+            f"File too small for flash FS header at 0x{base:06X} "
+            f"(need {base + FS_HEADER_SIZE} bytes, have {len(data)})"
+        )
+
+    hdr = data[base:base + FS_HEADER_SIZE]
+
+    magic = hdr[0:4]
+    if magic != FS_MAGIC:
+        raise ValueError(
+            f"Bad flash FS magic: expected {FS_MAGIC!r}, got {magic!r} at 0x{base:06X}"
+        )
+
+    version = struct.unpack_from('<H', hdr, 4)[0]
+    if version != FS_VERSION:
+        raise ValueError(
+            f"Unsupported flash FS version {version} (expected {FS_VERSION})"
+        )
+
+    screen_w = struct.unpack_from('<H', hdr, 6)[0]
+    screen_h = struct.unpack_from('<H', hdr, 8)[0]
+    resource_count = struct.unpack_from('<H', hdr, 10)[0]
+    checksum = struct.unpack_from('<I', hdr, 12)[0]
+
+    if resource_count > 1000:
+        raise ValueError(f"resource_count {resource_count} is unreasonably large (max 1000)")
+
+    return {
+        'version': version,
+        'screen_w': screen_w,
+        'screen_h': screen_h,
+        'resource_count': resource_count,
+        'checksum': checksum,
+    }
+
+
+def parse_resource_entries(data, base=DEFAULT_FS_BASE, count=0):
+    """Parse resource table entries from flash image.
+
+    Returns list of dicts: {name, kind, kind_name, offset, size, flags}
+    """
+    table_offset = base + FS_HEADER_SIZE
+    entries = []
+
+    for i in range(count):
+        off = table_offset + i * FS_ENTRY_SIZE
+        if off + FS_ENTRY_SIZE > len(data):
+            break
+
+        entry = data[off:off + FS_ENTRY_SIZE]
+
+        # Name: null-terminated, up to 15 chars
+        name_bytes = entry[0:16]
+        null_pos = name_bytes.find(b'\x00')
+        if null_pos >= 0:
+            name = name_bytes[:null_pos].decode('ascii', errors='replace')
+        else:
+            name = name_bytes.decode('ascii', errors='replace')
+
+        kind = entry[16]
+        offset = struct.unpack_from('<I', entry, 20)[0]
+        size = struct.unpack_from('<I', entry, 24)[0]
+        flags = entry[28]
+
+        entries.append({
+            'name': name,
+            'kind': kind,
+            'kind_name': _RES_TYPE_NAMES.get(kind, f'Unknown({kind})'),
+            'offset': offset,
+            'size': size,
+            'flags': flags,
+        })
+
+    return entries
+
+
+def detect_flash_image(data, base=DEFAULT_FS_BASE):
+    """Check if data looks like a flash FS image.
+
+    Checks both the given base offset and offset 0.
+    Returns (header_offset, detected_base) or (None, None) if not found.
+    header_offset is where the FERR magic was found in the file.
+    detected_base is the absolute flash address corresponding to header_offset.
+    """
+    # Check user-specified base first, then offset 0
+    candidates = [base, 0] if base != 0 else [0]
+    for off in candidates:
+        if len(data) >= off + FS_HEADER_SIZE and data[off:off + 4] == FS_MAGIC:
+            if off > 0:
+                # Header at non-zero offset: file offset = base (typical flash dump)
+                return off, off
+            else:
+                # Header at offset 0: file was built starting from 0,
+                # need to infer the absolute fs_base from entries
+                return off, None  # None = infer from data
+    return None, None
+
+
+def _infer_fs_base(data, header_offset, resource_count):
+    """Infer absolute fs_base from first resource entry's offset.
+
+    When the FS image is built at offset 0, resource offsets are absolute
+    flash addresses. The first resource data starts immediately after the
+    header + table, so we back-compute: fs_base = first_offset - table_end.
+    """
+    if resource_count == 0:
+        return 0
+    table_end = header_offset + FS_HEADER_SIZE + resource_count * FS_ENTRY_SIZE
+    first_entry = data[header_offset + FS_HEADER_SIZE:
+                       header_offset + FS_HEADER_SIZE + FS_ENTRY_SIZE]
+    first_offset = struct.unpack_from('<I', first_entry, 20)[0]
+    return first_offset - table_end
+
+
+def analyze_flash_image(data, base=DEFAULT_FS_BASE, exec_mode=None):
+    """Analyze a flash filesystem image.
+
+    Handles two formats:
+      - Flash dump: header at non-zero offset; resource offsets are absolute.
+      - Build output: header at offset 0; resource offsets are absolute
+        (need to infer fs_base to map to file positions).
+
+    Returns dict with:
+      - flash: header info + resource summary
+      - programs: list of {name, analysis: AnalysisResult} for each Program resource
+    """
+    hdr_off, detected_base = detect_flash_image(data, base)
+    if hdr_off is None:
+        raise ValueError("Not a valid flash FS image (no FERR magic found)")
+
+    header = parse_flash_header(data, hdr_off)
+
+    # Determine fs_base (absolute flash address of the header)
+    if detected_base is not None:
+        fs_base = detected_base
+    else:
+        fs_base = _infer_fs_base(data, hdr_off, header['resource_count'])
+
+    entries = parse_resource_entries(data, hdr_off, header['resource_count'])
+
+    # Add file_offset to each entry (offset within the binary file)
+    for e in entries:
+        e['file_offset'] = e['offset'] - fs_base
+
+    # Categorize resources
+    by_kind = {}
+    for e in entries:
+        kind_name = e['kind_name']
+        by_kind.setdefault(kind_name, []).append(e)
+
+    # Analyze each program
+    programs = []
+    for e in entries:
+        if e['kind'] == RES_PROGRAM:
+            # Convert absolute offset to file offset
+            file_off = e['offset'] - fs_base
+            end_off = file_off + e['size']
+            if file_off < 0:
+                prog_data = b''
+            elif end_off > len(data):
+                prog_data = data[file_off:len(data)]
+            else:
+                prog_data = data[file_off:end_off]
+
+            prog_exec_mode = exec_mode
+            if prog_exec_mode is None and (e['flags'] & RES_FLAG_FLASH_EXEC):
+                prog_exec_mode = 'flash'
+
+            try:
+                analysis = analyze_image(prog_data, prog_exec_mode)
+            except ValueError as ex:
+                analysis = str(ex)
+
+            programs.append({
+                'name': e['name'],
+                'size': e['size'],
+                'flags': e['flags'],
+                'offset': e['offset'],
+                'file_offset': file_off,
+                'analysis': analysis,
+            })
+
+    # Flash usage stats (in absolute flash address space)
+    flash_total = 32 * 1024 * 1024  # W25Q256 = 32 MB
+    if entries:
+        last = max(entries, key=lambda e: e['offset'] + e['size'])
+        data_end = last['offset'] + last['size']
+        flash_used = data_end - fs_base
+    else:
+        flash_used = 0
+
+    return {
+        'flash': {
+            'header': header,
+            'fs_base': fs_base,
+            'header_offset': hdr_off,
+            'entries': entries,
+            'by_kind': by_kind,
+            'flash_used': flash_used,
+            'flash_total': flash_total,
+            'file_size': len(data),
+        },
+        'programs': programs,
+    }
 
 
 # ============================================================
@@ -458,7 +756,7 @@ def analyze_bytecode(data, opcode_start=0, opcode_end=None):
         if op == Op.STORE or op == Op.LOAD:
             slot = data[addr + 1]
             if slot & 0x80:
-                pass  # local — tracked via FRAME
+                pass  # local, tracked via FRAME
             else:
                 result.global_var_slots.add(slot)
         elif Op.LOAD_0 <= op <= Op.LOAD_4:
@@ -517,21 +815,35 @@ def analyze_bytecode(data, opcode_start=0, opcode_end=None):
 
 def analyze_image(data, exec_mode=None):
     """Analyze a compiled VM image (header + bytecode). Returns AnalysisResult."""
-    functions, opcode_start, global_count = parse_image_header(data)
+    functions, opcode_start, global_count, widget_count, ext_count, header_flags = \
+        parse_image_header(data)
 
     result = analyze_bytecode(data, opcode_start, len(data))
     result.image_size = len(data)
     result.header_size = opcode_start
     result.opcode_size = len(data) - opcode_start
     result.functions = functions
-    result.exec_mode = exec_mode or ('ram' if result.opcode_size <= 4096 else 'flash')
-    result.widgets_with_ext = len(result._ext_widget_targets)
     result.global_count = global_count
+
+    # Exec mode: header flags overrides command-line, which overrides auto
+    if exec_mode is None and (header_flags & 0x01):
+        exec_mode = 'flash'
+    result.exec_mode = exec_mode or ('ram' if result.opcode_size <= 4096 else 'flash')
+
+    # v4+ headers carry exact widget/ext counts from the compiler
+    if widget_count > 0:
+        result.widget_allocs = widget_count
+    if ext_count > 0:
+        result.widgets_with_ext = ext_count
+    else:
+        result.widgets_with_ext = len(result._ext_widget_targets)
 
     # Per-function analysis
     for func in functions:
         func_start = opcode_start + func['offset']
         func_end = func_start + func['length']
+        if func_start >= len(data):
+            continue
         if func_end > len(data):
             func_end = len(data)
 
@@ -779,6 +1091,223 @@ def format_json(result):
 
 
 # ============================================================
+# Flash image formatting
+# ============================================================
+
+def _flash_resource_summary(entries):
+    """Build a summary dict: {kind_name: (count, total_size)}"""
+    summary = {}
+    for e in entries:
+        kn = e['kind_name']
+        c, s = summary.get(kn, (0, 0))
+        summary[kn] = (c + 1, s + e['size'])
+    return summary
+
+
+def format_flash_report(result, verbose=False):
+    """Format flash FS analysis as human-readable text."""
+    lines = []
+    lines.append("=" * 60)
+    lines.append("  FERRITE FLASH IMAGE ANALYSIS")
+    lines.append("=" * 60)
+
+    flash = result['flash']
+    header = flash['header']
+    entries = flash['entries']
+    programs = result['programs']
+
+    # -- Flash header --
+    lines.append("")
+    lines.append("FLASH FILESYSTEM HEADER")
+    lines.append(f"  FS base:             0x{flash['fs_base']:06X}")
+    lines.append(f"  FS version:          {header['version']}")
+    lines.append(f"  Screen:              {header['screen_w']} x {header['screen_h']}")
+    lines.append(f"  Resource count:      {header['resource_count']}")
+    lines.append(f"  Checksum:            0x{header['checksum']:08X}")
+
+    # -- Resource summary --
+    lines.append("")
+    lines.append("RESOURCE SUMMARY")
+    summary = _flash_resource_summary(entries)
+    total_data = sum(e['size'] for e in entries)
+    lines.append(f"  Total resources:     {len(entries)}")
+    lines.append(f"  Total data size:     {format_bytes(total_data)}")
+    for kind_name in ('Program', 'Font', 'Image', 'Page', 'File'):
+        if kind_name in summary:
+            c, s = summary[kind_name]
+            lines.append(f"  {kind_name:<10}          {c:>4}  ({format_bytes(s)})")
+
+    # -- Flash usage --
+    lines.append("")
+    lines.append("FLASH USAGE (W25Q256, 32 MB)")
+    used = flash['flash_used']
+    pct = used / flash['flash_total'] * 100
+    lines.append(f"  FS region used:      {format_bytes(used)}")
+    lines.append(f"  Flash total:         {format_bytes(flash['flash_total'])}")
+    lines.append(f"  Usage:               {pct:.1f}%")
+    if flash['file_size'] < flash['fs_base'] + used:
+        lines.append(f"  Note: file is {format_bytes(flash['file_size'])}, "
+                     f"truncated before end of data region")
+
+    # -- Resource table --
+    lines.append("")
+    lines.append("RESOURCE TABLE")
+    lines.append(f"  {'Name':<17} {'Type':<10} {'Flash':>10} {'File':>10} {'Size':>10}  Flags")
+    lines.append(f"  {'-' * 17} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10}  {'-' * 5}")
+    for e in entries:
+        flags_str = ""
+        if e['flags'] & RES_FLAG_FLASH_EXEC:
+            flags_str = "flash-exec"
+        lines.append(
+            f"  {e['name']:<17} {e['kind_name']:<10} "
+            f"0x{e['offset']:08X} 0x{e['file_offset']:06X}  "
+            f"{format_bytes(e['size']):>10}  {flags_str}"
+        )
+
+    # -- Program analysis --
+    if programs:
+        for prog in programs:
+            lines.append("")
+            lines.append(f"--- Program: {prog['name']} ---")
+            lines.append(f"  Size:       {format_bytes(prog['size'])}")
+            lines.append(f"  Offset:     0x{prog['offset']:08X}")
+            if prog['flags'] & RES_FLAG_FLASH_EXEC:
+                lines.append("  Exec mode:  flash (flag set)")
+            else:
+                lines.append("  Exec mode:  ram (or overridden)")
+
+            analysis = prog['analysis']
+            if isinstance(analysis, str):
+                lines.append(f"  ERROR: {analysis}")
+                continue
+
+            lines.append(f"  Functions:  {len(analysis.functions)}")
+            lines.append(f"  Instrs:     {analysis.total_instructions}")
+            lines.append(f"  Bytecode:   {format_bytes(analysis.opcode_size)}")
+
+            mem = analysis.estimate_memory()
+            lines.append(f"  RAM est.:   {format_bytes(mem['total'])}")
+            heap_pct = mem['total'] / 14336 * 100
+            lines.append(f"  Heap usage: {heap_pct:.1f}%  (widgets: {analysis.total_widgets()}, "
+                         f"globals: {len(analysis.global_var_slots)})")
+
+            if verbose:
+                lines.append("  Functions:")
+                for func in analysis.functions:
+                    stats = analysis.func_stats.get(func['name'], {})
+                    lines.append(
+                        f"    {func['name']:<24} "
+                        f"{stats.get('bytes', 0):>5}B  "
+                        f"{stats.get('instructions', 0):>4} instrs"
+                    )
+
+                cats = sorted(analysis.category_counts.items(), key=lambda x: -x[1])
+                if cats:
+                    lines.append("  Categories:")
+                    for cat, count in cats[:5]:
+                        lines.append(f"    {cat:<12} {count:>5}")
+
+            # Warnings
+            if analysis.rtc_reads > 0 and analysis.arr_frees == 0:
+                lines.append("  ! rtcRead() used but no arrFree()")
+            if analysis.str_allocs > analysis.str_frees + 5:
+                lines.append(f"  ! String allocs ({analysis.str_allocs}) >> frees ({analysis.str_frees})")
+            if analysis.widget_allocs > 60:
+                lines.append(f"  ! Widgets ({analysis.total_widgets()}) near limit (64)")
+            if analysis.opcode_size > 4096 and analysis.exec_mode != 'flash':
+                lines.append("  ! Bytecode > 4KB but not flash exec")
+
+    lines.append("")
+    return '\n'.join(lines)
+
+
+def format_flash_json(result):
+    """Format flash FS analysis as JSON."""
+    flash = result['flash']
+    header = flash['header']
+    entries = flash['entries']
+
+    summary = _flash_resource_summary(entries)
+    by_kind_json = {
+        kn: {'count': c, 'total_size': s}
+        for kn, (c, s) in summary.items()
+    }
+
+    programs_json = []
+    for prog in result['programs']:
+        analysis = prog['analysis']
+        if isinstance(analysis, str):
+            prog_json = {
+                'name': prog['name'],
+                'size': prog['size'],
+                'offset': prog['offset'],
+                'flags': prog['flags'],
+                'error': analysis,
+            }
+        else:
+            mem = analysis.estimate_memory()
+            prog_json = {
+                'name': prog['name'],
+                'size': prog['size'],
+                'offset': prog['offset'],
+                'flags': prog['flags'],
+                'exec_mode': analysis.exec_mode,
+                'functions': len(analysis.functions),
+                'instructions': analysis.total_instructions,
+                'bytecode_size': analysis.opcode_size,
+                'widgets': analysis.total_widgets(),
+                'widgets_with_ext': analysis.widgets_with_ext,
+                'global_vars': len(analysis.global_var_slots),
+                'max_local_frame': analysis.max_local_frame,
+                'array_allocs': analysis.arr_allocs,
+                'array_frees': analysis.arr_frees,
+                'string_allocs': analysis.str_allocs,
+                'string_frees': analysis.str_frees,
+                'ram_estimate': mem['total'],
+                'heap_usage_pct': round(mem['total'] / 14336 * 100, 1),
+                'categories': analysis.category_counts,
+                'functions_detail': [
+                    {
+                        'name': f['name'],
+                        'kind': f['kind_name'],
+                        'bytes': f['length'],
+                        'instructions': analysis.func_stats.get(f['name'], {}).get('instructions', 0),
+                    }
+                    for f in analysis.functions
+                ],
+            }
+        programs_json.append(prog_json)
+
+    return {
+        'flash': {
+            'fs_base': flash['fs_base'],
+            'version': header['version'],
+            'screen_w': header['screen_w'],
+            'screen_h': header['screen_h'],
+            'resource_count': header['resource_count'],
+            'checksum': f"0x{header['checksum']:08X}",
+            'flash_used': flash['flash_used'],
+            'flash_total': flash['flash_total'],
+            'file_size': flash['file_size'],
+            'resources': by_kind_json,
+        },
+        'resource_table': [
+            {
+                'name': e['name'],
+                'kind': e['kind'],
+                'kind_name': e['kind_name'],
+                'offset': e['offset'],
+                'file_offset': e['file_offset'],
+                'size': e['size'],
+                'flags': e['flags'],
+            }
+            for e in entries
+        ],
+        'programs': programs_json,
+    }
+
+
+# ============================================================
 # CLI
 # ============================================================
 
@@ -789,15 +1318,18 @@ def main():
         epilog="""examples:
   %(prog)s demo.fl                     analyze source file
   %(prog)s demo.fl -I lib/             with include path
-  %(prog)s --bin firmware.bin           analyze compiled binary
+  %(prog)s --bin firmware.bin           analyze compiled VM image
+  %(prog)s --bin flash.bin              auto-detected as flash image
   %(prog)s demo.fl --json              JSON output
   %(prog)s demo.fl -v                  verbose (per-function details)
 """)
 
     parser.add_argument('source', nargs='?', help='.fl source file')
-    parser.add_argument('--bin', metavar='FILE', help='analyze compiled binary instead of source')
+    parser.add_argument('--bin', metavar='FILE', help='analyze compiled VM image or flash dump')
     parser.add_argument('-I', '--include', action='append', default=[], help='include directory (repeatable)')
     parser.add_argument('--exec-mode', choices=['ram', 'flash'], help='override exec mode')
+    parser.add_argument('--flash-base', type=lambda x: int(x, 0), default=None,
+                        help='flash FS base address (default: 0x1000, auto-detected)')
     parser.add_argument('--json', action='store_true', help='output as JSON')
     parser.add_argument('-v', '--verbose', action='store_true', help='show per-function breakdown')
 
@@ -810,15 +1342,30 @@ def main():
         if args.bin:
             with open(args.bin, 'rb') as f:
                 data = f.read()
-            result = analyze_image(data, args.exec_mode)
+
+            # Auto-detect: check for flash FS magic
+            fs_base = args.flash_base if args.flash_base is not None else DEFAULT_FS_BASE
+            hdr_off, _detected = detect_flash_image(data, fs_base)
+
+            if hdr_off is not None:
+                result = analyze_flash_image(data, fs_base, args.exec_mode)
+                if args.json:
+                    print(json.dumps(format_flash_json(result), indent=2))
+                else:
+                    print(format_flash_report(result, verbose=args.verbose))
+            else:
+                result = analyze_image(data, args.exec_mode)
+                if args.json:
+                    print(json.dumps(format_json(result), indent=2))
+                else:
+                    print(format_report(result, verbose=args.verbose))
         else:
             data = compile_source(args.source, args.include)
             result = analyze_image(data, args.exec_mode)
-
-        if args.json:
-            print(json.dumps(format_json(result), indent=2))
-        else:
-            print(format_report(result, verbose=args.verbose))
+            if args.json:
+                print(json.dumps(format_json(result), indent=2))
+            else:
+                print(format_report(result, verbose=args.verbose))
 
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
