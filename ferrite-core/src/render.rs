@@ -1,15 +1,15 @@
 use crate::clip::ClipRegion;
 use crate::ctx::Ctx;
 use crate::lcd::{self};
-use crate::types::{Color, Edges, Rect};
+use crate::types::{Color, Edges, Offset, Rect};
 use crate::vm::Vm;
 use crate::lcd::{LcdBackend, LcdImpl};
 use crate::platform::Platform;
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
-    FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_DROPDOWN, KIND_GAUGE, KIND_GRAPH, KIND_IMAGE,
-    KIND_INPUT, KIND_LABEL, KIND_PROGRESS, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId,
-    WidgetTree,
+    FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
+    KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_PROGRESS,
+    KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
 };
 
 /// Screen-bounds rect for the panel backing `B`. The panel defines its own
@@ -511,7 +511,14 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, vm: &Vm, id: WidgetId, abs: &Rect) {
     let b = ext.border;
     let r = ext.border_radius;
     let bg_color = effective_bg(&ctx.tree, widget, ext);
-    let draw_bg = bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE);
+    // Freeform shapes (circle/polygon/line) paint their own fill + stroke
+    // below, so neutralize the default rectangular background/border here:
+    // zero the border edges and skip the bg fill. The shape draws read the
+    // real thickness from `ext.border`, not this shadowed `b`.
+    let freeform = is_freeform_shape(widget.kind);
+    let b = if freeform { Edges::ZERO } else { b };
+    let draw_bg =
+        !freeform && (bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE));
     // Background opacity — only honored on blending-capable backends (the
     // has_alpha() branch folds away at compile time on the others, where the
     // background stays solid). Gradients remain opaque (not supported).
@@ -665,6 +672,21 @@ fn draw_widget<P: Platform>(ctx: &Ctx<P>, vm: &Vm, id: WidgetId, abs: &Rect) {
     if widget.kind == KIND_IMAGE {
         draw_widget_image(ctx, abs, ext);
     }
+
+    // Shape widgets — fill = bg_color, stroke = border_color (thickness from
+    // the border width). These skipped the default bg/border above.
+    if widget.kind == KIND_CIRCLE {
+        draw_circle_shape(&ctx.lcd, widget, abs, ext);
+    }
+    if widget.kind == KIND_ELLIPSE {
+        draw_ellipse_shape(&ctx.lcd, widget, abs, ext);
+    }
+    if widget.kind == KIND_POLYGON {
+        draw_polygon_shape(ctx, widget, abs, ext);
+    }
+    if widget.kind == KIND_LINE {
+        draw_line_shape(&ctx.lcd, widget, abs, ext);
+    }
 }
 
 /// Draw widget with clip region (dirty render path).
@@ -680,7 +702,14 @@ fn draw_widget_clipped<P: Platform>(
     let b = ext.border;
     let r = ext.border_radius;
     let bg_color = effective_bg(&ctx.tree, widget, ext);
-    let draw_bg = bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE);
+    // Freeform shapes (circle/polygon/line) paint their own fill + stroke
+    // below, so neutralize the default rectangular background/border here:
+    // zero the border edges and skip the bg fill. The shape draws read the
+    // real thickness from `ext.border`, not this shadowed `b`.
+    let freeform = is_freeform_shape(widget.kind);
+    let b = if freeform { Edges::ZERO } else { b };
+    let draw_bg =
+        !freeform && (bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE));
     // See draw_widget — background opacity, blending-capable backends only.
     let alpha = if ctx.lcd.has_alpha() { ext.alpha } else { 255 };
     let gdir = if bg_color == widget.background_color {
@@ -818,7 +847,183 @@ fn draw_widget_clipped<P: Platform>(
     // Image widget — draw image centered in content area
     if widget.kind == KIND_IMAGE {
         draw_widget_image(ctx, abs, ext);
+    }
+
+    // Shape widgets — fill = bg_color, stroke = border_color (thickness from
+    // the border width). These skipped the default bg/border above.
+    if widget.kind == KIND_CIRCLE {
+        draw_circle_shape(&ctx.lcd, widget, abs, ext);
+    }
+    if widget.kind == KIND_ELLIPSE {
+        draw_ellipse_shape(&ctx.lcd, widget, abs, ext);
+    }
+    if widget.kind == KIND_POLYGON {
+        draw_polygon_shape(ctx, widget, abs, ext);
+    }
+    if widget.kind == KIND_LINE {
+        draw_line_shape(&ctx.lcd, widget, abs, ext);
     }    
+}
+
+/// Circle/Polygon/Line draw their own fill + stroke and skip the default
+/// rectangular background/border. Rectangle keeps the default rect rendering.
+fn is_freeform_shape(kind: u8) -> bool {
+    matches!(
+        kind,
+        KIND_CIRCLE | KIND_ELLIPSE | KIND_POLYGON | KIND_LINE
+    )
+}
+
+/// Stroke / line thickness for shape widgets: the border width (max edge),
+/// clamped to a 1px minimum.
+fn shape_stroke(ext: &WidgetExt) -> u16 {
+    let t = ext
+        .border
+        .top
+        .max(ext.border.right)
+        .max(ext.border.bottom)
+        .max(ext.border.left);
+    (t as u16).max(1)
+}
+
+/// Circle shape: fill with `bg_color` (if set), stroke with `border_color`
+/// drawn as `thickness` concentric rings. Centered in the widget's box.
+fn draw_circle_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    let r = (abs.w.min(abs.h) / 2) as i16;
+    if r <= 0 {
+        return;
+    }
+    let cx = abs.x + abs.w as i16 / 2;
+    let cy = abs.y + abs.h as i16 / 2;
+    if widget.background_color != 0 {
+        lcd.fill_circle(cx, cy, r, widget.background_color);
+    }
+    if widget.border_color != 0 {
+        let t = shape_stroke(ext) as i16;
+        let mut rr = r;
+        let mut drawn = 0;
+        while drawn < t && rr > 0 {
+            lcd.draw_circle(cx, cy, rr, widget.border_color);
+            rr -= 1;
+            drawn += 1;
+        }
+    }
+}
+
+/// Ellipse shape: fill with `bg_color` (if set), stroke with `border_color`
+/// drawn as `thickness` concentric outlines. Fills the widget's w×h box.
+fn draw_ellipse_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    let rx = (abs.w / 2) as i16;
+    let ry = (abs.h / 2) as i16;
+    if rx <= 0 || ry <= 0 {
+        return;
+    }
+    let cx = abs.x + rx;
+    let cy = abs.y + ry;
+    if widget.background_color != 0 {
+        lcd.fill_ellipse(cx, cy, rx, ry, widget.background_color);
+    }
+    if widget.border_color != 0 {
+        let t = shape_stroke(ext) as i16;
+        let mut i = 0;
+        while i < t && rx - i > 0 && ry - i > 0 {
+            lcd.draw_ellipse(cx, cy, rx - i, ry - i, widget.border_color);
+            i += 1;
+        }
+    }
+}
+
+/// Line shape: the widget-box diagonal `(x,y) → (x+w-1, y+h-1)`, drawn in
+/// `border_color` (falling back to `bg_color`) at the border thickness.
+fn draw_line_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    let color = if widget.border_color != 0 {
+        widget.border_color
+    } else {
+        widget.background_color
+    };
+    if color == 0 || abs.w == 0 || abs.h == 0 {
+        return;
+    }
+    lcd.draw_line_thick(
+        abs.x,
+        abs.y,
+        abs.right() - 1,
+        abs.bottom() - 1,
+        color,
+        shape_stroke(ext),
+    );
+}
+
+/// Polygon shape: points parsed from `text` ("x,y x,y …", relative to the
+/// widget's top-left), filled with `bg_color` and outlined in `border_color`.
+fn draw_polygon_shape<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    if ext.text_id == 0xFFFF {
+        return;
+    }
+    let text = ctx.strpool.get(ext.text_id);
+    let mut pts = [Offset { x: 0, y: 0 }; lcd::MAX_POLY_POINTS];
+    let n = parse_points(text, &mut pts);
+    if n < 2 {
+        return;
+    }
+    // Points are relative to the widget's top-left (border-box origin).
+    for p in pts[..n].iter_mut() {
+        p.x += abs.x;
+        p.y += abs.y;
+    }
+    let poly = &pts[..n];
+    if widget.background_color != 0 && n >= 3 {
+        ctx.lcd.fill_polygon(poly, widget.background_color);
+    }
+    if widget.border_color != 0 {
+        ctx.lcd
+            .draw_polyline(poly, widget.border_color, true, shape_stroke(ext));
+    }
+}
+
+/// Parse `"x,y x,y …"` (signed ints, any non-digit/`-` separators) into `out`
+/// as alternating x/y. Returns the number of complete points written.
+fn parse_points(bytes: &[u8], out: &mut [Offset]) -> usize {
+    let mut pending_x: i16 = 0;
+    let mut have_x = false;
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() && count < out.len() {
+        // Skip separators up to the next number.
+        while i < bytes.len() && !(bytes[i].is_ascii_digit() || bytes[i] == b'-') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let neg = bytes[i] == b'-';
+        if neg {
+            i += 1;
+        }
+        let mut v: i32 = 0;
+        let mut digits = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            v = v * 10 + (bytes[i] - b'0') as i32;
+            i += 1;
+            digits += 1;
+        }
+        if digits == 0 {
+            continue; // lone '-' with no digits
+        }
+        let val = if neg { -v } else { v } as i16;
+        if !have_x {
+            pending_x = val;
+            have_x = true;
+        } else {
+            out[count] = Offset {
+                x: pending_x,
+                y: val,
+            };
+            count += 1;
+            have_x = false;
+        }
+    }
+    count
 }
 
 /// Draw background image at the inner rect origin.

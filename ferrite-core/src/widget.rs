@@ -53,6 +53,13 @@ pub const KIND_GAUGE: u8 = 8;
 pub const KIND_DROPDOWN: u8 = 9;
 pub const KIND_GRAPH: u8 = 10;
 pub const KIND_IMAGE: u8 = 11;
+// Shape widgets — fill = background_color, stroke = border_color, stroke
+// thickness = border width. KIND_POLYGON reads its points from `text`.
+pub const KIND_RECTANGLE: u8 = 12;
+pub const KIND_CIRCLE: u8 = 13;
+pub const KIND_POLYGON: u8 = 14;
+pub const KIND_LINE: u8 = 15;
+pub const KIND_ELLIPSE: u8 = 16;
 
 // --- Text Alignment ---
 

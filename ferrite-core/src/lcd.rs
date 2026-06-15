@@ -1,6 +1,10 @@
 /// Backend abstraction for LCD primitives.
 /// Hardware backends implement this trait; the framework uses LcdImpl<B> for all drawing.
-use crate::types::Rect;
+use crate::types::{Offset, Rect};
+
+/// Maximum vertices a polygon shape can hold (bounds the scanline-fill
+/// intersection buffer and the point parser; 16 × 4 B = 64 B of stack).
+pub const MAX_POLY_POINTS: usize = 16;
 
 pub trait LcdBackend {
     /// Panel dimensions in pixels. The framework builds its screen-clip rect
@@ -181,6 +185,105 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
     }
 
+    /// Bresenham line with a pixel thickness. `thickness <= 1` is `draw_line`;
+    /// thicker lines are approximated by parallel passes offset perpendicular
+    /// to the dominant axis — adequate for the small stroke widths shapes use.
+    pub fn draw_line_thick(&self, x0: i16, y0: i16, x1: i16, y1: i16, color: u16, thickness: u16) {
+        let t = thickness.max(1);
+        if t == 1 {
+            self.draw_line(x0, y0, x1, y1, color);
+            return;
+        }
+        let half = (t / 2) as i16;
+        let dx = (x1 - x0).abs();
+        let dy = (y1 - y0).abs();
+        for i in 0..t as i16 {
+            let off = i - half;
+            if dx >= dy {
+                // Mostly horizontal — offset in Y.
+                self.draw_line(x0, y0 + off, x1, y1 + off, color);
+            } else {
+                // Mostly vertical — offset in X.
+                self.draw_line(x0 + off, y0, x1 + off, y1, color);
+            }
+        }
+    }
+
+    /// Connect `points` with straight segments of the given thickness. When
+    /// `closed` is true the last point is also joined back to the first.
+    pub fn draw_polyline(&self, points: &[Offset], color: u16, closed: bool, thickness: u16) {
+        if points.len() < 2 {
+            return;
+        }
+        for i in 0..points.len() - 1 {
+            let a = points[i];
+            let b = points[i + 1];
+            self.draw_line_thick(a.x, a.y, b.x, b.y, color, thickness);
+        }
+        if closed {
+            let a = points[points.len() - 1];
+            let b = points[0];
+            self.draw_line_thick(a.x, a.y, b.x, b.y, color, thickness);
+        }
+    }
+
+    /// Even-odd scanline fill of a closed polygon. No allocation: at most
+    /// `points.len()` (≤ [`MAX_POLY_POINTS`]) edge intersections per scanline.
+    pub fn fill_polygon(&self, points: &[Offset], color: u16) {
+        let n = points.len();
+        if n < 3 {
+            return;
+        }
+        let mut y_min = points[0].y;
+        let mut y_max = points[0].y;
+        for p in &points[1..] {
+            if p.y < y_min {
+                y_min = p.y;
+            }
+            if p.y > y_max {
+                y_max = p.y;
+            }
+        }
+
+        let mut xs = [0i16; MAX_POLY_POINTS];
+        let mut y = y_min;
+        while y <= y_max {
+            // Collect edge crossings of the scanline (PNPOLY half-open rule).
+            let mut count = 0usize;
+            let mut j = n - 1;
+            for i in 0..n {
+                let yi = points[i].y;
+                let yj = points[j].y;
+                if (yi > y) != (yj > y) {
+                    let xi = points[i].x as i32;
+                    let xj = points[j].x as i32;
+                    let x = xi + (y as i32 - yi as i32) * (xj - xi) / (yj as i32 - yi as i32);
+                    if count < xs.len() {
+                        xs[count] = x as i16;
+                        count += 1;
+                    }
+                }
+                j = i;
+            }
+            // Insertion-sort the crossings, then fill between pairs.
+            for a in 1..count {
+                let key = xs[a];
+                let mut b = a;
+                while b > 0 && xs[b - 1] > key {
+                    xs[b] = xs[b - 1];
+                    b -= 1;
+                }
+                xs[b] = key;
+            }
+            let mut k = 0;
+            while k + 1 < count {
+                self.hline_clipped(xs[k], xs[k + 1], y, color);
+                k += 2;
+            }
+            y += 1;
+        }
+    }
+
     pub fn draw_circle(&self, cx: i16, cy: i16, r: i16, color: u16) {
         if r <= 0 {
             return;
@@ -211,6 +314,75 @@ impl<B: LcdBackend> LcdImpl<B> {
             let dx = isqrt(rr - yy) as i16;
             self.hline_clipped(cx - dx, cx + dx, cy + dy, color);
         }
+    }
+
+    /// Solid ellipse with horizontal/vertical radii `rx`/`ry`, filled by one
+    /// span per row via the ellipse equation (reuses `isqrt`).
+    pub fn fill_ellipse(&self, cx: i16, cy: i16, rx: i16, ry: i16, color: u16) {
+        if rx <= 0 || ry <= 0 {
+            return;
+        }
+        let rx2 = rx as i64 * rx as i64;
+        let ryi = ry as i64;
+        let ry2 = ryi * ryi;
+        for dy in -ryi..=ryi {
+            // dx = rx * sqrt(ry² - dy²) / ry — kept in range for isqrt(i32).
+            let dx = isqrt((rx2 * (ry2 - dy * dy) / ry2) as i32) as i16;
+            self.hline_clipped(cx - dx, cx + dx, cy + dy as i16, color);
+        }
+    }
+
+    /// 1px ellipse outline — integer midpoint ellipse algorithm, 4-way symmetry.
+    pub fn draw_ellipse(&self, cx: i16, cy: i16, rx: i16, ry: i16, color: u16) {
+        if rx <= 0 || ry <= 0 {
+            return;
+        }
+        let (cxi, cyi) = (cx as i64, cy as i64);
+        let (rx, ry) = (rx as i64, ry as i64);
+        let (rx2, ry2) = (rx * rx, ry * ry);
+        let (two_rx2, two_ry2) = (2 * rx2, 2 * ry2);
+
+        let mut x: i64 = 0;
+        let mut y: i64 = ry;
+        let mut px: i64 = 0;
+        let mut py: i64 = two_rx2 * y;
+
+        // Region 1 — slope > -1.
+        let mut p: i64 = ry2 - rx2 * ry + rx2 / 4;
+        while px < py {
+            self.plot4_ellipse(cxi, cyi, x, y, color);
+            x += 1;
+            px += two_ry2;
+            if p < 0 {
+                p += ry2 + px;
+            } else {
+                y -= 1;
+                py -= two_rx2;
+                p += ry2 + px - py;
+            }
+        }
+        // Region 2 — slope < -1.
+        let mut p2: i64 = ry2 * (2 * x + 1) * (2 * x + 1) / 4 + rx2 * (y - 1) * (y - 1) - rx2 * ry2;
+        while y >= 0 {
+            self.plot4_ellipse(cxi, cyi, x, y, color);
+            y -= 1;
+            py -= two_rx2;
+            if p2 > 0 {
+                p2 += rx2 - py;
+            } else {
+                x += 1;
+                px += two_ry2;
+                p2 += rx2 - py + px;
+            }
+        }
+    }
+
+    #[inline]
+    fn plot4_ellipse(&self, cx: i64, cy: i64, x: i64, y: i64, color: u16) {
+        self.plot((cx + x) as i16, (cy + y) as i16, color);
+        self.plot((cx - x) as i16, (cy + y) as i16, color);
+        self.plot((cx + x) as i16, (cy - y) as i16, color);
+        self.plot((cx - x) as i16, (cy - y) as i16, color);
     }
 
     fn circle_points_draw(&self, cx: i16, cy: i16, x: i16, y: i16, color: u16) {
