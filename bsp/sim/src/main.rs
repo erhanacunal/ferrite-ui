@@ -145,7 +145,7 @@ fn identity_cal() -> CalParams {
     CalParams {
         xy_swap: false,
         x_flip: false,
-        y_flip: false,
+        y_flip: true,
         x_min: 0,
         x_max: WIDTH - 1,
         y_min: 0,
