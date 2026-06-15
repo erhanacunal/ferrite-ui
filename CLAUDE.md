@@ -68,7 +68,8 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - `location` → relative offset from parent content area
   - `size` → border box dimensions
 - **Flags:** `VISIBLE` (0x01), `ENABLED` (0x02), `CLICKABLE` (0x04), `DIRTY` (0x08), `PRESSED` (0x10), `CHECKED` (0x20)
-- **Widget types:** `KIND_BASE` (0, container), `KIND_LABEL` (1, text), `KIND_BUTTON` (2, clickable container), `KIND_PROGRESS` (3, progress bar), `KIND_SLIDER` (4, slider), `KIND_CHECKBOX` (5, checkbox), `KIND_RADIO` (6, radio button), `KIND_INPUT` (7, text input), `KIND_GAUGE` (8, gauge), `KIND_DROPDOWN` (9, dropdown)
+- **Widget types:** `KIND_BASE` (0, container), `KIND_LABEL` (1, text), `KIND_BUTTON` (2, clickable container), `KIND_PROGRESS` (3, progress bar), `KIND_SLIDER` (4, slider), `KIND_CHECKBOX` (5, checkbox), `KIND_RADIO` (6, radio button), `KIND_INPUT` (7, text input), `KIND_GAUGE` (8, gauge), `KIND_DROPDOWN` (9, dropdown), `KIND_GRAPH` (10, spline graph), `KIND_IMAGE` (11, image)
+- **Shape widgets:** `KIND_RECTANGLE` (12), `KIND_CIRCLE` (13), `KIND_POLYGON` (14), `KIND_LINE` (15), `KIND_ELLIPSE` (16) — fill = `bg_color`, stroke = `border_color`, stroke/line thickness = border width. Polygon points come from `text` as `"x,y x,y …"` (relative to the widget's top-left); Line draws the widget-box diagonal; Circle/Ellipse fill the widget box (ellipse uses the full w×h). Kind numbers are duplicated in `widget.rs`, `tools/ferrite_build.py`, `tools/ferrite_designer.py` — keep in sync. `lib/shapes.fl` provides named `KIND_*` constants.
 - **Label:** text_color, font_id, text_align (LEFT/CENTER/RIGHT), text (from StringPool)
 - **Button:** press_color (background when pressed), accepts child widgets
 - **Color:** RGB565 (`background_color`, `border_color`, `text_color`, `press_color`)

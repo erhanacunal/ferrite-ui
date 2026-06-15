@@ -1,0 +1,6 @@
+{
+  "version": 2,
+  "screen": [480, 480],
+  "include_dirs": ["../../lib"],
+  "programs": [{ "name": "main", "source": "shapes_demo.fl", "exec_mode": "ram" }]
+}

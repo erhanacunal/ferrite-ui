@@ -1,0 +1,35 @@
+// shapes.fl — Shape widget kind constants
+// Usage: #include "shapes.fl"
+//
+// Shape widgets are distinguished by the `kind` property and reuse the normal
+// color properties:
+//   bg_color     — fill color   (0 = no fill)
+//   border_color — stroke color (0 = no stroke)
+//   border       — stroke / line thickness in pixels (default 1)
+//
+// Examples:
+//   s = alloc();
+//   s.kind = KIND_CIRCLE;          // filled + stroked circle in the widget box
+//   s.size = [80, 80];
+//   s.bg_color = 0x001F;           // blue fill
+//   s.border_color = 0xFFFF;       // white outline
+//   s.border = [2, 2, 2, 2];       // 2px stroke
+//
+//   p = alloc();
+//   p.kind = KIND_POLYGON;         // points are "x,y x,y …" relative to the
+//   p.size = [100, 100];           //   widget's top-left, within its size box
+//   p.text = "10,5 90,5 50,90";    // triangle
+//   p.bg_color = 0x07E0;           // green fill
+//   p.border_color = 0xFFFF;
+//
+//   l = alloc();
+//   l.kind = KIND_LINE;            // diagonal of the widget box: (x,y)->(x+w,y+h)
+//   l.size = [100, 60];
+//   l.border_color = 0xFFFF;
+//   l.border = [3, 3, 3, 3];       // 3px line
+
+const KIND_RECTANGLE = 12;  // fill + border (supports border_radius)
+const KIND_CIRCLE    = 13;  // fill + outline, centered in the widget box
+const KIND_POLYGON   = 14;  // points from `text`, filled + outlined
+const KIND_LINE      = 15;  // widget-box diagonal, stroked in border_color
+const KIND_ELLIPSE   = 16;  // fill + outline, fills the full w×h box
