@@ -1667,6 +1667,15 @@ class CodeGen:
         self._current_fn_name = fn.name
         self._current_fn_return_type = info.get('return_type', 'int')
 
+        # Reset the W_TARGET peephole caches at every function boundary. The VM
+        # makes no guarantee about the active target on function entry — a
+        # callback (e.g. on_click) starts with whatever target the interrupted
+        # code left behind. Letting `_current_target` leak from the previously
+        # compiled function would elide a required W_TARGET and make the first
+        # `widget.prop = ...` write hit the wrong (or no) target at runtime.
+        self._current_target = None
+        self._last_alltar_var = None
+
         # Emit FRAME prologue: tells VM how many local slots this function needs
         local_count = len(fn.params) + self._count_var_slots(fn.body)
         self.asm.frame(local_count)
