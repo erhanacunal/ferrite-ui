@@ -33,7 +33,7 @@ try:
     from PySide6.QtGui import (
         QColor, QPainter, QPen, QBrush, QFont, QAction, QIcon,
         QPainterPath, QKeySequence, QSyntaxHighlighter, QTextCharFormat,
-        QFontDatabase, QImage, QTextCursor,
+        QFontDatabase, QImage, QTextCursor, QPolygonF,
     )
     from PySide6.QtWidgets import QListWidget, QListWidgetItem
 except ImportError:
@@ -158,9 +158,20 @@ KIND_CHECKBOX = 5
 KIND_RADIO = 6
 KIND_DROPDOWN = 9
 KIND_IMAGE = 11
+# Shape widgets — fill=bg_color, stroke=border_color; polygon points in `text`.
+KIND_RECTANGLE = 12
+KIND_CIRCLE = 13
+KIND_POLYGON = 14
+KIND_LINE = 15
+KIND_ELLIPSE = 16
 
-KIND_NAMES = ["Base", "Label", "Button", "Progress", "Slider", "Checkbox", "Radio", "Dropdown", "", "Image"]
-KIND_VALUES = [KIND_BASE, KIND_LABEL, KIND_BUTTON, KIND_PROGRESS, KIND_SLIDER, KIND_CHECKBOX, KIND_RADIO, KIND_DROPDOWN, KIND_IMAGE]
+# KIND_NAMES and KIND_VALUES are parallel (combo index ↔ kind value); keep
+# them in lockstep.
+KIND_NAMES = ["Base", "Label", "Button", "Progress", "Slider", "Checkbox", "Radio", "Dropdown",
+              "Image", "Rectangle", "Circle", "Polygon", "Line", "Ellipse"]
+KIND_VALUES = [KIND_BASE, KIND_LABEL, KIND_BUTTON, KIND_PROGRESS, KIND_SLIDER, KIND_CHECKBOX,
+               KIND_RADIO, KIND_DROPDOWN, KIND_IMAGE, KIND_RECTANGLE, KIND_CIRCLE, KIND_POLYGON,
+               KIND_LINE, KIND_ELLIPSE]
 KIND_PREFIXES = {
     KIND_BASE: "panel",
     KIND_LABEL: "lbl",
@@ -171,6 +182,11 @@ KIND_PREFIXES = {
     KIND_RADIO: "radio",
     KIND_DROPDOWN: "dropdown",
     KIND_IMAGE: "img",
+    KIND_RECTANGLE: "rect",
+    KIND_CIRCLE: "circle",
+    KIND_POLYGON: "poly",
+    KIND_LINE: "line",
+    KIND_ELLIPSE: "ellipse",
 }
 
 KIND_ICON_NAMES = {
@@ -183,6 +199,11 @@ KIND_ICON_NAMES = {
     KIND_RADIO:    "fa5s.dot-circle",
     KIND_DROPDOWN: "fa5s.caret-square-down",
     KIND_IMAGE:    "fa5s.image",
+    KIND_RECTANGLE: "fa5s.square",
+    KIND_CIRCLE:   "fa5s.circle",
+    KIND_POLYGON:  "fa5s.draw-polygon",
+    KIND_LINE:     "fa5s.slash",
+    KIND_ELLIPSE:  "fa5s.egg",
 }
 
 
@@ -190,6 +211,28 @@ def kind_name(kind):
     if kind in KIND_VALUES:
         return KIND_NAMES[KIND_VALUES.index(kind)]
     return "?"
+
+
+def parse_shape_points(text):
+    """Parse a polygon `text` ("x,y x,y …") into a list of (x, y) int tuples."""
+    nums = []
+    i, n = 0, len(text or "")
+    while i < n:
+        while i < n and not (text[i].isdigit() or text[i] == '-'):
+            i += 1
+        if i >= n:
+            break
+        neg = text[i] == '-'
+        if neg:
+            i += 1
+        v, digits = 0, 0
+        while i < n and text[i].isdigit():
+            v = v * 10 + (ord(text[i]) - 48)
+            i += 1
+            digits += 1
+        if digits:
+            nums.append(-v if neg else v)
+    return [(nums[k], nums[k + 1]) for k in range(0, len(nums) - 1, 2)]
 
 HANDLE_SIZE = 8
 CANVAS_MARGIN = 40
@@ -708,6 +751,37 @@ class DesignerModel(QWidget):
             node.border_color = 0xFFFF
             node.text_color = 0xFFFF
             node.clickable = True
+        elif kind == KIND_RECTANGLE:
+            node.size_w = 120
+            node.size_h = 80
+            node.bg_color = 0x001F
+            node.border_color = 0xFFFF
+            node.border = [2, 2, 2, 2]
+        elif kind == KIND_CIRCLE:
+            node.size_w = 80
+            node.size_h = 80
+            node.bg_color = 0x001F
+            node.border_color = 0xFFFF
+            node.border = [2, 2, 2, 2]
+        elif kind == KIND_ELLIPSE:
+            node.size_w = 120
+            node.size_h = 80
+            node.bg_color = 0x001F
+            node.border_color = 0xFFFF
+            node.border = [2, 2, 2, 2]
+        elif kind == KIND_POLYGON:
+            node.size_w = 100
+            node.size_h = 100
+            node.bg_color = 0x07E0
+            node.border_color = 0xFFFF
+            node.border = [2, 2, 2, 2]
+            node.text = "10,5 90,5 50,90"
+        elif kind == KIND_LINE:
+            node.size_w = 100
+            node.size_h = 60
+            node.bg_color = 0x0000
+            node.border_color = 0xFFFF
+            node.border = [2, 2, 2, 2]
         if self.device_id == "epaper":
             node.text_color = 0x0000
             if kind == KIND_LABEL:
@@ -1135,12 +1209,46 @@ class WidgetItem(QGraphicsItem):
     def boundingRect(self):
         return QRectF(0, 0, self.node.size_w, self.node.size_h)
 
+    def _paint_shape(self, painter, node, w, h):
+        """Canvas preview for Circle/Polygon/Line shapes."""
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        bw = max(node.border) if any(b > 0 for b in node.border) else 1
+        fill = QBrush(rgb565_to_qcolor(node.bg_color)) if node.bg_color != 0 else Qt.NoBrush
+        stroke = rgb565_to_qcolor(node.border_color) if node.border_color != 0 else None
+
+        if node.kind == KIND_CIRCLE:
+            rad = min(w, h) / 2 - bw / 2
+            painter.setBrush(fill)
+            painter.setPen(QPen(stroke, bw) if stroke else Qt.NoPen)
+            painter.drawEllipse(QPointF(w / 2, h / 2), rad, rad)
+        elif node.kind == KIND_ELLIPSE:
+            painter.setBrush(fill)
+            painter.setPen(QPen(stroke, bw) if stroke else Qt.NoPen)
+            painter.drawEllipse(QRectF(bw / 2, bw / 2, w - bw, h - bw))
+        elif node.kind == KIND_LINE:
+            color = stroke or (rgb565_to_qcolor(node.bg_color)
+                               if node.bg_color != 0 else QColor(255, 255, 255))
+            painter.setPen(QPen(color, bw))
+            painter.drawLine(QPointF(0, 0), QPointF(w - 1, h - 1))
+        elif node.kind == KIND_POLYGON:
+            pts = parse_shape_points(node.text)
+            if len(pts) >= 2:
+                poly = QPolygonF([QPointF(px, py) for px, py in pts])
+                painter.setBrush(fill if len(pts) >= 3 else Qt.NoBrush)
+                painter.setPen(QPen(stroke, bw) if stroke else Qt.NoPen)
+                painter.drawPolygon(poly)
+
     def paint(self, painter, option, widget=None):
         node = self.node
         w, h = node.size_w, node.size_h
         r = node.border_radius
 
         painter.setRenderHint(QPainter.Antialiasing, r > 0)
+
+        # Freeform shapes draw their own fill/stroke; skip the default rect.
+        if node.kind in (KIND_CIRCLE, KIND_ELLIPSE, KIND_POLYGON, KIND_LINE):
+            self._paint_shape(painter, node, w, h)
+            return
 
         # Background
         bg = rgb565_to_qcolor(node.bg_color)

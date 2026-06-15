@@ -93,6 +93,12 @@ KIND_LABEL = 1
 KIND_BUTTON = 2
 KIND_DROPDOWN = 9
 KIND_IMAGE = 11
+# Shape widgets — fill=bg_color, stroke=border_color; polygon points in `text`.
+KIND_RECTANGLE = 12
+KIND_CIRCLE = 13
+KIND_POLYGON = 14
+KIND_LINE = 15
+KIND_ELLIPSE = 16
 
 ALIGN_MAP = {"left": 0, "center": 1, "right": 2}
 
@@ -182,6 +188,16 @@ def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
             cc.set_prop("kind", KIND_DROPDOWN)
         elif wtype == "image":
             cc.set_prop("kind", KIND_IMAGE)
+        elif wtype == "rectangle":
+            cc.set_prop("kind", KIND_RECTANGLE)
+        elif wtype == "circle":
+            cc.set_prop("kind", KIND_CIRCLE)
+        elif wtype == "polygon":
+            cc.set_prop("kind", KIND_POLYGON)
+        elif wtype == "line":
+            cc.set_prop("kind", KIND_LINE)
+        elif wtype == "ellipse":
+            cc.set_prop("kind", KIND_ELLIPSE)
 
         # Location
         if "location" in w:
