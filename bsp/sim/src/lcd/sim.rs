@@ -1,16 +1,80 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::rc::Rc;
 use std::vec;
 use std::vec::Vec;
 
 use super::{HEIGHT, LcdBackend, WIDTH};
 
-/// Shared 32-bit ARGB framebuffer (0xAARRGGBB). The sim binary owns it too —
-/// it pushes the buffer into minifb each frame.
-pub type Framebuffer = Rc<RefCell<Vec<u32>>>;
+/// Two 32-bit ARGB (0xAARRGGBB) framebuffers with hardware-style front/back
+/// indices, so the double-buffered ("buffered") render mode runs on the host
+/// exactly as it does on the tdo_y13 — which flips the DEBE scanout address
+/// between two independent DRAM buffers. The framework draws into the BACK
+/// buffer and publishes it with `end_frame`; the sim binary presents the FRONT
+/// buffer to minifb each frame.
+///
+/// In "dirty" render mode `begin_frame`/`end_frame` are never called, so
+/// `front == back == 0` throughout: every draw lands in the displayed buffer
+/// immediately — identical to the original single-buffer behaviour.
+pub struct DoubleBuffer {
+    bufs: [RefCell<Vec<u32>>; 2],
+    /// Index the window presents (the "displayed" buffer).
+    front: Cell<u8>,
+    /// Index draw primitives write to.
+    back: Cell<u8>,
+}
+
+/// Shared handle to the double framebuffer. Cloned into both the LCD backend
+/// (writer) and the host window pump (reader).
+pub type Framebuffer = Rc<DoubleBuffer>;
 
 pub fn new_framebuffer() -> Framebuffer {
-    Rc::new(RefCell::new(vec![0u32; WIDTH as usize * HEIGHT as usize]))
+    let pixels = WIDTH as usize * HEIGHT as usize;
+    Rc::new(DoubleBuffer {
+        bufs: [
+            RefCell::new(vec![0u32; pixels]),
+            RefCell::new(vec![0u32; pixels]),
+        ],
+        front: Cell::new(0),
+        back: Cell::new(0),
+    })
+}
+
+impl DoubleBuffer {
+    /// Index of the buffer currently being drawn to.
+    #[inline]
+    pub fn back(&self) -> u8 {
+        self.back.get()
+    }
+
+    /// Borrow the buffer the window should present (read-only).
+    #[inline]
+    pub fn front_buffer(&self) -> Ref<'_, Vec<u32>> {
+        self.bufs[self.front.get() as usize].borrow()
+    }
+
+    /// Borrow the back buffer for drawing.
+    #[inline]
+    fn draw(&self) -> RefMut<'_, Vec<u32>> {
+        self.bufs[self.back.get() as usize].borrow_mut()
+    }
+
+    /// Hardware-style `begin_frame`: if the back buffer is the one currently
+    /// displayed (`front == back`, i.e. the previous frame was already
+    /// swapped), move drawing to the other buffer so the visible frame is
+    /// never disturbed mid-draw. Mirrors the tdo_y13 CMD5 / lcd5 toggle.
+    #[inline]
+    fn begin(&self) {
+        if self.front.get() == self.back.get() {
+            self.back.set(self.back.get() ^ 1);
+        }
+    }
+
+    /// Hardware-style `end_frame`: publish the back buffer to the window
+    /// (front ← back). Mirrors the tdo_y13 CMD4 / DEBE address flip.
+    #[inline]
+    fn end(&self) {
+        self.front.set(self.back.get());
+    }
 }
 
 pub struct SimLcd {
@@ -20,7 +84,6 @@ pub struct SimLcd {
     rect_x_start: Cell<u16>,
     rect_x_end: Cell<u16>,
     rect_y_end: Cell<u16>,
-    buf_index: Cell<u8>,
 }
 
 impl SimLcd {
@@ -32,7 +95,6 @@ impl SimLcd {
             rect_x_start: Cell::new(0),
             rect_x_end: Cell::new(0),
             rect_y_end: Cell::new(0),
-            buf_index: Cell::new(0),
         }
     }
 }
@@ -70,15 +132,15 @@ impl LcdBackend for SimLcd {
     // framebuffer path. Non-alpha behavior is covered by the defaults.
     const HAS_ALPHA: bool = true;
     fn begin_frame(&mut self) {
-        self.buf_index.set(self.buf_index.get() ^ 1);
+        self.fb.begin();
     }
 
     fn end_frame(&mut self) {
-        // single-buffer sim — the window reads `fb` directly.
+        self.fb.end();
     }
 
     fn back_buf(&self) -> u8 {
-        self.buf_index.get()
+        self.fb.back()
     }
 
     fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
@@ -86,7 +148,7 @@ impl LcdBackend for SimLcd {
             return;
         }
         let argb = rgb565_to_argb(color);
-        let mut fb = self.fb.borrow_mut();
+        let mut fb = self.fb.draw();
         let stride = WIDTH as usize;
         let x_end = (x + w).min(WIDTH);
         let y_end = (y + h).min(HEIGHT);
@@ -113,7 +175,7 @@ impl LcdBackend for SimLcd {
         let ye = self.rect_y_end.get();
         if x < xe && y < ye && x < WIDTH && y < HEIGHT {
             let argb = rgb565_to_argb(color);
-            self.fb.borrow_mut()[y as usize * WIDTH as usize + x as usize] = argb;
+            self.fb.draw()[y as usize * WIDTH as usize + x as usize] = argb;
         }
         x += 1;
         if x >= xe {
@@ -132,7 +194,7 @@ impl LcdBackend for SimLcd {
 
     fn draw_pixel(&self, x: u16, y: u16, color: u16) {
         if x < WIDTH && y < HEIGHT {
-            self.fb.borrow_mut()[y as usize * WIDTH as usize + x as usize] = rgb565_to_argb(color);
+            self.fb.draw()[y as usize * WIDTH as usize + x as usize] = rgb565_to_argb(color);
         }
     }
 
@@ -149,7 +211,7 @@ impl LcdBackend for SimLcd {
         }
         let src = rgb565_to_argb(color);
         // Borrow once for the whole rect, not per pixel.
-        let mut fb = self.fb.borrow_mut();
+        let mut fb = self.fb.draw();
         let stride = WIDTH as usize;
         let x_end = (x + w).min(WIDTH);
         let y_end = (y + h).min(HEIGHT);
@@ -167,7 +229,7 @@ impl LcdBackend for SimLcd {
             return;
         }
         let src = rgb565_to_argb(color);
-        let mut fb = self.fb.borrow_mut();
+        let mut fb = self.fb.draw();
         let i = y as usize * WIDTH as usize + x as usize;
         fb[i] = if alpha == 255 {
             src
@@ -205,7 +267,7 @@ mod tests {
         lcd.fill_rect(0, 0, 4, 4, 0x0000); // black
         lcd.blend_rect(1, 1, 2, 2, 0xFFFF, 128); // 50% white
 
-        let buf = fb.borrow();
+        let buf = fb.front_buffer();
         assert_eq!(buf[0], BLACK); // outside the blend rect
         let inside = buf[1 * WIDTH as usize + 1];
         assert_eq!(inside, 0xFF80_8080);
@@ -217,8 +279,43 @@ mod tests {
         let lcd = SimLcd::new(fb.clone());
         lcd.fill_rect(0, 0, 2, 2, 0x0000);
         lcd.blend_rect(0, 0, 2, 2, 0xFFFF, 255);
-        assert_eq!(fb.borrow()[0], WHITE);
+        assert_eq!(fb.front_buffer()[0], WHITE);
     }
+
+    #[test]
+    fn dirty_mode_writes_are_immediately_visible() {
+        // No begin_frame/end_frame (dirty mode): front == back == 0, so a draw
+        // lands directly in the displayed buffer.
+        let fb = new_framebuffer();
+        let lcd = SimLcd::new(fb.clone());
+        assert_eq!(lcd.back_buf(), 0);
+        lcd.fill_rect(0, 0, 2, 2, 0xFFFF);
+        assert_eq!(fb.front_buffer()[0], WHITE);
+    }
+
+    #[test]
+    fn buffered_swap_alternates_buffers() {
+        // Buffered mode: each begin/end frame draws into the buffer that is NOT
+        // currently displayed, then publishes it. Two frames touch both buffers.
+        let fb = new_framebuffer();
+        let mut lcd = SimLcd::new(fb.clone());
+
+        // Frame 1: front=0,back=0 -> begin toggles back to 1.
+        lcd.begin_frame();
+        assert_eq!(lcd.back_buf(), 1);
+        lcd.fill_rect(0, 0, 1, 1, 0xFFFF); // white into buffer 1
+        lcd.end_frame();
+        assert_eq!(fb.front_buffer()[0], WHITE); // window now shows buffer 1
+
+        // Frame 2: front=1,back=1 -> begin toggles back to 0 (the stale buffer).
+        lcd.begin_frame();
+        assert_eq!(lcd.back_buf(), 0);
+        lcd.fill_rect(0, 0, 1, 1, BLACK_565); // into buffer 0
+        lcd.end_frame();
+        assert_eq!(fb.front_buffer()[0], BLACK); // window shows buffer 0
+    }
+
+    const BLACK_565: u16 = 0x0000;
 
     #[test]
     fn blend_pixel_clips_to_screen() {

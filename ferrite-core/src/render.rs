@@ -850,19 +850,25 @@ fn draw_widget_clipped<P: Platform>(
     }
 
     // Shape widgets — fill = bg_color, stroke = border_color (thickness from
-    // the border width). These skipped the default bg/border above.
-    if widget.kind == KIND_CIRCLE {
-        draw_circle_shape(&ctx.lcd, widget, abs, ext);
+    // the border width). These skipped the default bg/border above. The shape
+    // primitives draw raw geometry and take no clip, so confine them to the
+    // clip region via the LCD scissor — drawing once per clip rect. Without
+    // this, a clipped redraw (e.g. restoring the background behind a moved
+    // widget in buffered mode) would repaint the entire shape and overwrite
+    // unrelated content.
+    if is_freeform_shape(widget.kind) {
+        for cr in clip.iter() {
+            ctx.lcd.set_scissor(Some(*cr));
+            match widget.kind {
+                KIND_CIRCLE => draw_circle_shape(&ctx.lcd, widget, abs, ext),
+                KIND_ELLIPSE => draw_ellipse_shape(&ctx.lcd, widget, abs, ext),
+                KIND_POLYGON => draw_polygon_shape(ctx, widget, abs, ext),
+                KIND_LINE => draw_line_shape(&ctx.lcd, widget, abs, ext),
+                _ => {}
+            }
+        }
+        ctx.lcd.set_scissor(None);
     }
-    if widget.kind == KIND_ELLIPSE {
-        draw_ellipse_shape(&ctx.lcd, widget, abs, ext);
-    }
-    if widget.kind == KIND_POLYGON {
-        draw_polygon_shape(ctx, widget, abs, ext);
-    }
-    if widget.kind == KIND_LINE {
-        draw_line_shape(&ctx.lcd, widget, abs, ext);
-    }    
 }
 
 /// Circle/Polygon/Line draw their own fill + stroke and skip the default

@@ -70,6 +70,18 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
     /// Render mode forced regardless of the image header (epaper = EPaper).
     const FORCED_RENDER_MODE: Option<RenderMode> = None;
 
+    /// Maximum VM instructions to execute per main-loop iteration.
+    ///
+    /// On-device BSPs leave this at 1: the main loop spins as fast as the CPU
+    /// (no frame pacing), so the VM still runs millions of instructions/sec.
+    /// The host simulator paces the loop to the display refresh (~60 Hz) and
+    /// would otherwise execute only ~60 instructions/sec — far too slow for
+    /// `millis()`-based animation. It raises this so each presented frame runs
+    /// a hardware-like burst of instructions. The loop still stops early on
+    /// YIELD / a blocking state, so a program that yields each frame is
+    /// unaffected.
+    const VM_STEPS_PER_TICK: u32 = 1;
+
     /// Per-frame input handling strategy.
     type Input: InputHandler<Self>;
 
@@ -225,9 +237,21 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
             match vm.state {
                 VmState::Running | VmState::Yielded => {
                     vm.state = VmState::Running;
-                    vm.step(&mut ctx);
-                    while vm.is_critical() && vm.state == VmState::Running {
+                    // Run a burst of instructions per loop iteration. On device
+                    // this is 1 (the loop already spins at CPU speed); the sim
+                    // raises it so animation runs at hardware-like speed instead
+                    // of one instruction per presented frame. A critical section
+                    // always runs to its YIELD regardless of the budget.
+                    let mut budget = P::VM_STEPS_PER_TICK.max(1);
+                    loop {
                         vm.step(&mut ctx);
+                        while vm.is_critical() && vm.state == VmState::Running {
+                            vm.step(&mut ctx);
+                        }
+                        budget -= 1;
+                        if budget == 0 || vm.state != VmState::Running {
+                            break;
+                        }
                     }
                     if vm.state == VmState::Error {
                         error_code = ERR_PROGRAM_ERROR;

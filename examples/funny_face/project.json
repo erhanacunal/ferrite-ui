@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "device": "tdo_y13",
+  "screen": [480, 480],
+  "render_mode": "buffered",
+  "include_dirs": ["../../lib"],
+  "programs": [
+    { "name": "main", "source": "funny_face.fl", "exec_mode": "ram" }
+  ]
+}

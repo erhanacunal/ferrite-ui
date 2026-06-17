@@ -119,12 +119,11 @@ fn sched_tick_isr() {
 pub extern "C" fn rust_main() -> ! {
     timer::avs_init();
     
-
-    // use f1c100s::mmu::{MemDesc, RW_CB, RW_NCNB};
-    // f1c100s::mmu::init(&[
-    //     MemDesc::new(0x00000000, 0xFFFF_FFFF, 0x00000000, RW_NCNB),
-    //     MemDesc::new(0x80000000, 0x81FF_FFFF, 0x80000000, RW_CB),
-    // ]);
+    use f1c100s::mmu::{MemDesc, RW_CB, RW_NCNB};
+    f1c100s::mmu::init(&[
+        MemDesc::new(0x00000000, 0xFFFF_FFFF, 0x00000000, RW_NCNB),
+        MemDesc::new(0x80000000, 0x81FF_FFFF, 0x80000000, RW_CB),
+    ]);
 
     init_gpio_mux();
 

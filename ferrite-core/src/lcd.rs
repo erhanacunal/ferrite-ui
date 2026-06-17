@@ -1,5 +1,7 @@
 /// Backend abstraction for LCD primitives.
 /// Hardware backends implement this trait; the framework uses LcdImpl<B> for all drawing.
+use core::cell::Cell;
+
 use crate::types::{Offset, Rect};
 
 /// Maximum vertices a polygon shape can hold (bounds the scanline-fill
@@ -66,11 +68,27 @@ pub trait LcdBackend {
 /// Generic LCD wrapper — backend-agnostic drawing primitives.
 pub struct LcdImpl<B: LcdBackend> {
     be: B,
+    /// Optional scissor rect. When set, `fill_rect` / `draw_pixel` (and so
+    /// every primitive built on them — circles, ellipses, polygons, lines)
+    /// are clipped to it. Used by the clipped draw path to confine the
+    /// geometry-drawing shape primitives, which take no clip of their own.
+    /// `None` (the normal case) is a single branch with no other cost.
+    scissor: Cell<Option<Rect>>,
 }
 
 impl<B: LcdBackend> LcdImpl<B> {
     pub fn with_backend(be: B) -> Self {
-        Self { be }
+        Self {
+            be,
+            scissor: Cell::new(None),
+        }
+    }
+
+    /// Set (or clear) the scissor rect honored by `fill_rect`/`draw_pixel`.
+    /// Callers must restore it to `None` when done.
+    #[inline]
+    pub fn set_scissor(&self, rect: Option<Rect>) {
+        self.scissor.set(rect);
     }
 
     // --- Primitives (pass-through to backend) ---
@@ -87,6 +105,20 @@ impl<B: LcdBackend> LcdImpl<B> {
 
     #[inline]
     pub fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
+        if let Some(c) = self.scissor.get() {
+            // Intersect the fill with the scissor rect (i32 math avoids u16
+            // wrap when the fill starts left/above the scissor).
+            let x0 = (x as i32).max(c.x as i32);
+            let y0 = (y as i32).max(c.y as i32);
+            let x1 = (x as i32 + w as i32).min(c.x as i32 + c.w as i32);
+            let y1 = (y as i32 + h as i32).min(c.y as i32 + c.h as i32);
+            if x1 <= x0 || y1 <= y0 {
+                return;
+            }
+            return self
+                .be
+                .fill_rect(x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16, color);
+        }
         self.be.fill_rect(x, y, w, h, color)
     }
 
@@ -102,6 +134,17 @@ impl<B: LcdBackend> LcdImpl<B> {
 
     #[inline]
     pub fn draw_pixel(&self, x: u16, y: u16, color: u16) {
+        if let Some(c) = self.scissor.get() {
+            let xi = x as i32;
+            let yi = y as i32;
+            if xi < c.x as i32
+                || yi < c.y as i32
+                || xi >= c.x as i32 + c.w as i32
+                || yi >= c.y as i32 + c.h as i32
+            {
+                return;
+            }
+        }
         self.be.draw_pixel(x, y, color)
     }
 

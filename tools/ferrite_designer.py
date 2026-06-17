@@ -1866,7 +1866,14 @@ class ColorButton(QPushButton):
 
     def _update_style(self):
         qc = rgb565_to_qcolor(self._value)
-        self.setStyleSheet(f"background-color: {qc.name()}; border: 1px solid #888;")
+        # Scope the rule to the ColorButton type. A type-less `background-color:`
+        # rule cascades into every child widget — including the QColorDialog
+        # opened with this button as its parent — which would tint the whole
+        # dialog the swatch color and strip the native style off its OK/Cancel
+        # buttons (rendering them tiny).
+        self.setStyleSheet(
+            f"ColorButton {{ background-color: {qc.name()}; border: 1px solid #888; }}"
+        )
         self.setToolTip(f"0x{self._value:04X}")
 
     def _pick(self):

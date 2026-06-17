@@ -38,12 +38,13 @@ impl Platform for TdoY13Platform {
     //   0x600000 - 0x600FFF  config store   4 KB, one sector
     //   0x601000 - 0xFFFFFF  resource FS    ~9.99 MB (writefs target)
     const CONFIG_BASE: u32 = 6 * 1024 * 1024; // 0x60_0000
-    const FS_BASE: u32 = 6 * 1024 * 1024 + 4 * 1024; // 0x60_1000        
+    const FS_BASE: u32 = 6 * 1024 * 1024 + 4 * 1024; // 0x60_1000            
 }
 
 impl PlatformRuntime for TdoY13Platform {
     const BG_COLOR: u16 = COLOR_BLACK;
     const FG_COLOR: u16 = COLOR_WHITE;
+    const VM_STEPS_PER_TICK: u32 = 1;
     type Input = FullInput;
 
     fn reset() -> ! {

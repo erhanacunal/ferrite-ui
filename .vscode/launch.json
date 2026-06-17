@@ -1,0 +1,148 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug executable 'sim'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--target=x86_64-pc-windows-msvc",
+                    "--bin=sim",
+                    "--package=bsp-sim",
+                    "--",
+                    "--fsimage",
+                    "${workspaceFolder}\\examples\\funny_face\\flash.bin"
+                ]
+            },
+            "args": []
+        },
+        
+        {
+            "name": "Debug unit tests in library 'ferrite_core'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=ferrite-core"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'ferrite-ui'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=ferrite-ui",
+                    "--package=bsp-nextion"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'ferrite-ui'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=ferrite-ui",
+                    "--package=bsp-nextion"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'ferrite-ui'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=ferrite-ui",
+                    "--package=bsp-epaper"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'ferrite-ui'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=ferrite-ui",
+                    "--package=bsp-epaper"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'sim'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=sim",
+                    "--package=bsp-sim"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'sim'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=sim",
+                    "--package=bsp-sim"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'ferrite-ui'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=ferrite-ui",
+                    "--package=bsp-tdo-y13"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'ferrite-ui'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=ferrite-ui",
+                    "--package=bsp-tdo-y13"
+                ]
+            }
+        },
+        {
+            "name": "Debug unit tests in library 'f1c100s'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=f1c100s"
+                ]
+            }
+        }
+    ]
+}

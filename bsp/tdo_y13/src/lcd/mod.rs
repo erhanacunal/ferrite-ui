@@ -1,8 +1,14 @@
-//! LCD backend for TDO Y13 — F1C100s DEBE framebuffer.
+//! LCD backend for TDO Y13 — F1C100s DEBE dual-layer double-buffered framebuffer.
 //!
-//! The F1C100s DEBE (Display Engine Backend) scans out from a framebuffer
-//! in DRAM. This backend writes directly to that framebuffer. The TCON
-//! is configured for the TL021WVC04 480×480 panel in parallel RGB mode.
+//! The F1C100s DEBE (Display Engine Backend) scans out from a framebuffer in
+//! DRAM. This backend keeps **two** framebuffers assigned to two DEBE layers:
+//! layer 0 always scans from framebuffer 0, layer 1 always scans from
+//! framebuffer 1. Only one layer is visible at a time — the DEBE displays the
+//! *front* buffer while the CPU draws the next frame into the *back* buffer.
+//! `end_frame` toggles layer visibility (disable front, enable back). DEBE
+//! register writes take effect immediately, so the toggle is done *inside*
+//! vertical blanking (via `lcd::wait_for_vsync`) — otherwise it tears the frame
+//! mid-scanout.
 
 use ferrite_core::lcd::LcdBackend;
 use f1c100s::lcd::{self, ColorMode, Panel};
@@ -10,19 +16,42 @@ use f1c100s::panels;
 use f1c100s::gpio::{self, DriveLevel, Port};
 use f1c100s::soft_spi::{SoftSpi, SoftSpiConfig, SpiMode};
 use f1c100s::timer::delay_ms;
+use f1c100s::{cpu, mmu};
 
-// 480×480 × 4 bytes per pixel (ARGB8888 — DEBE converts down to the 18-bit bus)
-const FB_SIZE: usize = 480 * 480 * 4;
+// 480×480 pixels, one ARGB8888 word per pixel (DEBE converts down to the 18-bit bus).
+const FB_PIXELS: usize = 480 * 480;
+const FB_SIZE: usize = FB_PIXELS * 4;
 
-/// Static framebuffer in DRAM (placed in .bss by the linker).
-/// SAFETY: this is the only framebuffer; accessed only from the UI thread.
+/// The two framebuffers backing the double buffer (placed in .bss by the
+/// linker). The DEBE scans out the *front* buffer on one layer while the CPU
+/// draws into the *back* buffer on the other layer; `end_frame` toggles layer
+/// visibility during vertical blanking for a tear-free flip.
+///
+/// In `dirty` render mode the framework never calls `begin_frame`/`end_frame`,
+/// so `BACK` stays 0 and only layer 0 (buffer 0) is ever drawn or displayed —
+/// effectively single-buffered, identical to the previous behaviour.
+///
+/// SAFETY: accessed only from the UI thread.
 #[unsafe(link_section = ".bss.framebuffer")]
-#[unsafe(no_mangle)]
-static mut FRAMEBUFFER: [u8; FB_SIZE] = [0u8; FB_SIZE];
+static mut FRAMEBUFFERS: [[u32; FB_PIXELS]; 2] = [[0u32; FB_PIXELS]; 2];
 
 /// Row stride in **pixels** (one u32 per pixel). The framebuffer is indexed
 /// through a `[u32]` view, so the stride is the pixel width — not the byte width.
 const FB_STRIDE: u16 = 480;
+
+/// Base pointer of framebuffer `index` (0 or 1).
+#[inline]
+fn fb_ptr(index: u8) -> *mut u32 {
+    // SAFETY: forms a raw pointer to one of the two framebuffer statics without
+    // creating a reference; the UI thread is the only accessor.
+    unsafe { (&raw mut FRAMEBUFFERS[(index & 1) as usize]).cast::<u32>() }
+}
+
+// ── Double-buffer state (single-threaded: UI thread only) ───────────────────
+/// Layer (0 or 1) the DEBE currently displays.
+static mut FRONT: u8 = 0;
+/// Layer the CPU draws into — target of every fill/pixel/blend operation.
+static mut BACK: u8 = 0;
 
 /// Expand an RGB565 color (the framework's pixel format) into the ARGB8888 word
 /// the DEBE framebuffer stores. Alpha is forced opaque; the 5/6-bit channels are
@@ -59,15 +88,44 @@ impl LcdBackend for DebeLcd {
     const HAS_ALPHA: bool = true;
 
     fn begin_frame(&mut self) {
-        // Single-buffered: no swap needed. The DEBE scans from FRAMEBUFFER.
+        // Buffered mode only (dirty mode never calls this). When both buffers
+        // are in sync — i.e. just after a flip — start drawing into the other
+        // one. The draw primitives read `BACK` to pick their target, so no
+        // hardware "select back buffer" step is needed; the back buffer is
+        // simply the DRAM region they write to.
+        unsafe {
+            if FRONT == BACK {
+                BACK ^= 1;
+            }
+        }
     }
 
     fn end_frame(&mut self) {
-        // Single-buffered: no swap needed.
+        // Publish the freshly drawn back buffer: drain pending writes and write
+        // back the D-cache so the DEBE sees the new pixels, then switch layer
+        // visibility.
+        //
+        // DEBE register writes (layer enable here, layer address for an
+        // address-flip — both tear identically) take effect the instant they
+        // land. Doing the swap while the panel is scanning out tears the frame.
+        // So first block until the controller enters vertical blanking, then do
+        // the disable/enable in that gap: both writes complete in nanoseconds,
+        // far inside the multi-line vblank, so the change is never on screen
+        // mid-scanout. Blocking here also paces rendering to the panel refresh.
+        unsafe {
+            cpu::dsb();
+            if mmu::dcache_status() {
+                mmu::clean_dcache(fb_ptr(BACK) as u32, FB_SIZE as u32);
+            }
+            lcd::wait_for_vsync();
+            lcd::debe_layer_disable(FRONT);
+            lcd::debe_layer_enable(BACK);
+            FRONT = BACK;
+        }
     }
 
     fn back_buf(&self) -> u8 {
-        0 // always buffer 0
+        unsafe { BACK }
     }
 
     fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
@@ -80,7 +138,7 @@ impl LcdBackend for DebeLcd {
         let max_h = (Self::HEIGHT - y).min(h);
 
         let argb = rgb565_to_argb8888(color);
-        let fb = unsafe { &mut *((&raw mut FRAMEBUFFER) as *mut [u32; FB_SIZE / 4]) };
+        let fb = unsafe { &mut *(fb_ptr(BACK) as *mut [u32; FB_PIXELS]) };
 
         for row in 0..max_h {
             let base = (y + row) as usize * FB_STRIDE as usize + x as usize;
@@ -91,20 +149,23 @@ impl LcdBackend for DebeLcd {
     }
 
     fn begin_pixels(&self, x: u16, y: u16, w: u16, _h: u16) {
-        // Store write position in a static for write_pixel to use.
+        // Store write position + the back-buffer base in statics for write_pixel
+        // to use. Capturing the base here avoids re-reading `BACK` per pixel;
+        // `BACK` cannot change between begin_pixels and the pixel run.
         // Single-threaded (UI thread only): safe.
         unsafe {
             PIXEL_X = x;
             PIXEL_Y = y;
             PIXEL_START_X = x;
             PIXEL_W = w;
+            PIXEL_FB = fb_ptr(BACK);
         }
     }
 
     fn write_pixel(&self, color: u16) {
         unsafe {
             if PIXEL_X < Self::WIDTH && PIXEL_Y < Self::HEIGHT {
-                let fb = &mut *((&raw mut FRAMEBUFFER) as *mut [u32; FB_SIZE / 4]);
+                let fb = &mut *(PIXEL_FB as *mut [u32; FB_PIXELS]);
                 fb[PIXEL_Y as usize * FB_STRIDE as usize + PIXEL_X as usize] =
                     rgb565_to_argb8888(color);
             }
@@ -142,7 +203,7 @@ impl LcdBackend for DebeLcd {
         let max_h = (Self::HEIGHT - y).min(h);
 
         let src = rgb565_to_argb8888(color);
-        let fb = unsafe { &mut *((&raw mut FRAMEBUFFER) as *mut [u32; FB_SIZE / 4]) };
+        let fb = unsafe { &mut *(fb_ptr(BACK) as *mut [u32; FB_PIXELS]) };
 
         for row in 0..max_h {
             let base = (y + row) as usize * FB_STRIDE as usize + x as usize;
@@ -157,7 +218,7 @@ impl LcdBackend for DebeLcd {
         if alpha == 0 || x >= Self::WIDTH || y >= Self::HEIGHT {
             return;
         }
-        let fb = unsafe { &mut *((&raw mut FRAMEBUFFER) as *mut [u32; FB_SIZE / 4]) };
+        let fb = unsafe { &mut *(fb_ptr(BACK) as *mut [u32; FB_PIXELS]) };
         let i = y as usize * FB_STRIDE as usize + x as usize;
         let src = rgb565_to_argb8888(color);
         fb[i] = if alpha == 255 {
@@ -173,6 +234,8 @@ static mut PIXEL_X: u16 = 0;
 static mut PIXEL_Y: u16 = 0;
 static mut PIXEL_START_X: u16 = 0;
 static mut PIXEL_W: u16 = 0;
+/// Back-buffer base captured at `begin_pixels` (avoids re-reading `BACK` per pixel).
+static mut PIXEL_FB: *mut u32 = core::ptr::null_mut();
 
 /// TL021WVC04 (ST77916) panel register init over 9-bit software SPI.
 ///
@@ -277,8 +340,10 @@ pub unsafe fn init() {
     let mut panel: Panel = panels::TL021WVC04;
     panel.panel_init = Some(panel_init);
 
-    let fb_ptr = (&raw mut FRAMEBUFFER).cast::<u8>();
-    lcd::init_all(&panel, fb_ptr, ColorMode::Argb8888);
+    // Start the DEBE scanning out layer 0 (buffer 0); layer 1 is pre-configured
+    // with buffer 1 but left hidden. FRONT and BACK are both 0 at boot.
+    lcd::init_all(&panel, fb_ptr(0).cast::<u8>(), ColorMode::Argb8888);
+    lcd::debe_layer_init(1, panel.width, panel.height, fb_ptr(1).cast::<u8>(), ColorMode::Argb8888, false);
 }
 
 /// Return a new `DebeLcd` instance. Must call `init()` first.
@@ -286,10 +351,13 @@ pub fn new() -> DebeLcd {
     DebeLcd
 }
 
-/// Return a raw pointer to the framebuffer (for use by the panic handler).
+/// Return a raw pointer to the framebuffer the DEBE is currently displaying
+/// (for use by the panic handler). Targeting the *front* buffer means the panic
+/// screen is visible immediately, even if a frame was mid-draw into the back
+/// buffer when the panic fired.
 /// # Safety
-/// Returns a raw pointer to the framebuffer static. The caller must ensure
+/// Returns a raw pointer to a framebuffer static. The caller must ensure
 /// no concurrent access occurs.
 pub unsafe fn framebuffer_mut_ptr() -> *mut u8 {
-    (&raw mut FRAMEBUFFER).cast()
+    fb_ptr(unsafe { FRONT }).cast()
 }

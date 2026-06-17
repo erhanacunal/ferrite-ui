@@ -58,6 +58,11 @@ pub fn install_host(window: Window, fb: Framebuffer, mouse: MouseState) {
 impl PlatformRuntime for SimPlatform {
     const BG_COLOR: u16 = COLOR_BLACK;
     const FG_COLOR: u16 = COLOR_WHITE;
+    // The window present paces the loop to ~60 Hz; run a hardware-like burst of
+    // VM instructions per frame so `millis()`-timed animation advances at the
+    // intended rate instead of one instruction per frame. A program that yields
+    // each frame stops the burst early, so this only speeds up busy loops.
+    const VM_STEPS_PER_TICK: u32 = 50_000;
     type Input = FullInput;
 
     fn reset() -> ! {
@@ -95,8 +100,10 @@ impl PlatformRuntime for SimPlatform {
             };
             host.mouse.update(mx, my, pressed && pos.is_some());
 
-            // Present the framebuffer (blocks to the target FPS for pacing).
-            let buf = host.fb.borrow();
+            // Present the front (displayed) buffer (blocks to the target FPS
+            // for pacing). In buffered mode this is whichever buffer the last
+            // end_frame published; in dirty mode it is always buffer 0.
+            let buf = host.fb.front_buffer();
             let _ = host
                 .window
                 .update_with_buffer(&buf, WIDTH as usize, HEIGHT as usize);
