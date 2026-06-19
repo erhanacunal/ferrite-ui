@@ -584,7 +584,10 @@ class Parser:
                 raise CompileError(
                     f"unknown type '{tok.value}' (expected 'int', 'float', 'widget', 'string', or 'array')",
                     tok.line)
-        return 'int'
+        # No annotation → polymorphic. Distinct from an explicit ': int' so an
+        # un-annotated param accepts string/widget/etc. args (e.g. lib/modal.fl's
+        # showConfirmation(title, message) called with str(...)).
+        return 'any'
 
     def _expect_type_name(self):
         """Parse mandatory type name after '->' (no leading colon)."""
@@ -990,6 +993,10 @@ class CodeGen:
     T_STRING = "string"
     T_ARRAY = "array"
     T_WIDGET = "widget"
+    # Un-annotated function parameters. Polymorphic: compatible with any type in
+    # both directions (everything is an i32 slot at runtime). Annotate a param to
+    # opt into strict checking.
+    T_ANY = "any"
 
     def __init__(self):
         self.asm = Asm()
@@ -1627,6 +1634,11 @@ class CodeGen:
         """Check if an expression of type `actual` can be used where
         `expected` is declared.  int→float is the only automatic promotion."""
         if expected == actual:
+            return True
+        # Un-annotated params (T_ANY) are polymorphic in both directions: an
+        # `any` param accepts any argument, and an `any` value satisfies any
+        # declared type. Everything is an i32 slot at runtime.
+        if self.T_ANY in (expected, actual):
             return True
         if expected == self.T_FLOAT and actual == self.T_INT:
             return True  # auto-promote
