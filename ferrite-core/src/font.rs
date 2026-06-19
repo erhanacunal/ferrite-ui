@@ -329,10 +329,16 @@ impl Font {
         let draw_x = cx + glyph.x_offset as i16;
         let draw_y = cy + glyph.y_offset as i16;
 
+        // Cull glyphs that fall outside the panel. Use the real screen bounds
+        // (not a fixed large constant): the opaque text path streams via
+        // `begin_pixels`, which some backends (e.g. the Nextion FPGA bus) do
+        // NOT clamp — so a glyph drawn past the right/bottom edge wraps onto
+        // the visible area. This is what makes an off-screen "parked" panel's
+        // label bleed onto the page that is actually on screen.
         if draw_x + glyph.width as i16 <= 0
             || draw_y + glyph.height as i16 <= 0
-            || draw_x >= 2048
-            || draw_y >= 2048
+            || draw_x >= L::WIDTH as i16
+            || draw_y >= L::HEIGHT as i16
         {
             return glyph.x_advance;
         }
