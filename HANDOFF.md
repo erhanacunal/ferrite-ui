@@ -1,133 +1,182 @@
-# Platform-abstraction migration — Handoff (updated 2026-06-09, PR-5b + PR-4 DONE)
+# Draw-list renderer — design handoff (2026-06-19)
 
-## Goal (achieved)
+Design sketch for moving rendering behind an immutable **draw list** (à la Dear
+ImGui's draw list), so the rasterization can later run on a **separate thread**
+— specifically on a multi-core target (the dual-core ESP32-S3 epaper BSP), while
+the single-core F1C100s keeps drawing synchronously at zero cost.
 
-`Platform` (ferrite-core/src/platform.rs) + `PlatformRuntime` (ferrite-ui/src/runtime.rs)
-are now the single real seam between the device-agnostic framework and the per-device
-BSP crates:
+## Why
 
-- `ferrite-core` — HAL backend traits + generic wrappers (`LcdImpl<B>`…) + `Platform`.
-- `ferrite-ui`   — device-agnostic **framework library**, generic over `P: Platform`.
-  Owns the unified `runtime::run::<P>()` loop. **No `[[bin]]`s, no device deps**
-  (except `esp-alloc`, used only by `heap.rs` under the `epaper` feature).
-- `bsp/{nextion,epaper,sim}` — thin binary crates: concrete backends + `impl Platform`
-  + `impl PlatformRuntime` + a `main` that builds `Ctx<P>` and calls `ferrite_ui::runtime::run`.
+A render thread that executes the drawing primitives needs the widget data to be
+**stable** while it draws. Today `render.rs` (`draw_widget`/`draw_widget_clipped`)
+reads the **live** `WidgetTree` + `StringPool` and calls `ctx.lcd.*` directly. The
+VM thread mutates that same state (`W_ALLOC` grows the `Vec`s and reallocates,
+`set(text,…)` appends to the `StringPool`, `clear()` wipes it). Drawing and
+mutating the tree concurrently is a data race / use-after-free.
 
-## ✅ Status — all three BSPs build/check on `run::<P>()`
+The draw list breaks the dependency: the VM thread walks the tree **once** and
+records a flat, self-contained command buffer; the consumer replays that buffer
+and **never touches the tree**. That is the only thing that makes off-thread
+rendering safe — the threading itself is the easy part.
 
-| BSP            | target                    | gate (from workspace root)                                              | result |
-|----------------|---------------------------|------------------------------------------------------------------------|--------|
-| bsp-nextion    | `thumbv7m-none-eabi`      | `cargo build -p bsp-nextion --release`                                  | LINKS  |
-| bsp-epaper     | `xtensa-esp32s3-none-elf` | `cargo +esp check -p bsp-epaper --target xtensa-esp32s3-none-elf -Zbuild-std=core,alloc` | OK |
-| bsp-sim        | host (`x86_64-*`)         | `cargo build -p bsp-sim --target x86_64-pc-windows-msvc`                | LINKS  |
+> Single-core reality: on the F1C100s this buys **no** throughput (one core,
+> rasterization is serial). The value is (a) the clean decoupling and (b) true
+> parallelism on the **multi-core** epaper board. On F1C100s you keep the
+> synchronous sink and the draw list never exists.
 
-Framework gates (host, no embedded toolchain):
+## Core idea: one tree-walk, two sinks
+
+Insert a trait between the tree-walk and the pixels. The tree-walk targets the
+trait instead of `LcdBackend` directly.
+
+```rust
+/// Receives primitive draw commands. The render.rs tree-walk targets this.
+pub trait DrawSink {
+    fn clip(&mut self, r: Rect);                                   // set scissor
+    fn fill_rect(&mut self, r: Rect, color: u16);
+    fn blend_rect(&mut self, r: Rect, color: u16, alpha: u8);
+    fn gradient(&mut self, r: Rect, c0: u16, c1: u16, dir: u8);
+    fn image(&mut self, r: Rect, image_id: u16);
+    fn text(&mut self, x: i16, y: i16, color: u16, font_id: u8, s: &[u8]);
+    fn circle(&mut self, cx: i16, cy: i16, rad: u16, fill: u16, stroke: u16, sw: u8);
+    fn line(&mut self, a: Offset, b: Offset, color: u16, w: u8);
+    fn polygon(&mut self, pts: &[Offset], fill: u16, stroke: u16);
+    // … ellipse, rounded_rect — one method per primitive render.rs already uses
+}
 ```
-cargo check -p ferrite-core --features mock                              # OK
-cargo check -p ferrite-ui   --features mock --lib --no-default-features  # OK (run::<MockPlatform>)
-cargo check -p ferrite-ui   --lib --no-default-features                  # OK (ZERO device features)
+
+Two implementations:
+
+```rust
+// 1. Direct — exactly today's behavior, zero overhead. F1C100s uses this.
+impl<B: LcdBackend> DrawSink for Direct<'_, B> {
+    fn fill_rect(&mut self, r: Rect, c: u16) { self.lcd.fill_rect(r.x, r.y, r.w, r.h, c); }
+    // text(): the current font draw_str path; etc.
+}
+
+// 2. Record — serialize into a flat, self-contained buffer.
+impl DrawSink for DrawList { /* push a DrawCmd, copy bytes into the arena */ }
 ```
 
-### Why the explicit `--target` / `-Zbuild-std`
-The workspace-root `.cargo/config.toml` pins `[build] target = thumbv7m-none-eabi`
-(for nextion). epaper and sim therefore need an explicit `--target` when invoked
-from the root. The Espressif fork ships **no precompiled xtensa `core`/`alloc`**, so
-epaper also needs `-Zbuild-std=core,alloc` (now also encoded in
-`bsp/epaper/.cargo/config.toml`, effective when cargo runs from that dir — e.g. the
-`epaper.ps1` script). Source `~/export-esp.ps1` before any `cargo +esp` invocation.
+`draw_widget` becomes `fn draw_widget<S: DrawSink>(tree, vm, id, abs, sink: &mut S)`.
+That is the whole structural change — the tree-walk, clip math, occlusion,
+gradients all stay identical; they just target `S` instead of `ctx.lcd`.
 
-## What `run::<P>()` is (ferrite-ui/src/runtime.rs)
+## The draw list (the ImGui draw-list equivalent)
 
-`pub fn run<P: PlatformRuntime>(ctx: Box<Ctx<P>>, touch: TouchImpl<P::TouchB>) -> !`
-owns the shared loop: embedded-font add, `P::boot`, FS mount, root widget, VM build
-(`vm.syscall_fn = Some(P::syscall)`, `vm.forced_render_mode = P::FORCED_RENDER_MODE`),
-program load, setup/on_program_start/loop, then the forever loop (modal resume → VM
-step → USART protocol → input → render phase → drain callbacks → **`P::frame_end`**).
+```rust
+pub enum DrawCmd {
+    Clip(Rect),
+    FillRect  { r: Rect, color: u16 },
+    BlendRect { r: Rect, color: u16, alpha: u8 },
+    Gradient  { r: Rect, c0: u16, c1: u16, dir: u8 },
+    Image     { r: Rect, image_id: u16 },
+    Text      { x: i16, y: i16, color: u16, font_id: u8, off: u32, len: u16 }, // off/len → bytes
+    Circle    { cx: i16, cy: i16, rad: u16, fill: u16, stroke: u16, sw: u8 },
+    Line      { a: Offset, b: Offset, color: u16, w: u8 },
+    Polygon   { off: u32, n: u16, fill: u16, stroke: u16 },                    // points → bytes
+}
 
-Two traits carry all device variance — **no `#[cfg]` in the loop**:
-- **`PlatformRuntime: Platform`** — consts `BG_COLOR`/`FG_COLOR`/`FORCED_RENDER_MODE`,
-  `type Input`, and hooks `reset()`, `syscall()`, `stack_info()`, `boot()`,
-  `initial_render()`, `on_extra_rx()`, and **`frame_end()`** (host window pump; no-op
-  on device). Sensible defaults so a minimal BSP overrides only `reset`+consts+`Input`.
-- **`InputHandler<P>`** — `FullInput` (keyboard + scrollbars + sliders + gestures;
-  nextion + sim) or `BasicInput` (press→on_click; epaper). Monomorphization dead-strips
-  the unused one.
-
-## BSP recipe (all three follow it)
-
-- `Cargo.toml`: `ferrite-ui = { path="../..", default-features=false [, features=[…]] }`.
-  nextion: no features (lib heap is the allocator). epaper: `features=["epaper"]`
-  (disables lib heap → `esp_alloc`; `heap::stats` reports via `esp_alloc`). sim:
-  `features=["host"]` (lib built as std).
-- Backend `mod.rs` files re-export the core trait (`pub use ferrite_core::<p>::*`),
-  `#[path]`-redirect the device backend file from the **root `src/<periph>/{hw,epaper,sim}.rs`**,
-  alias `pub type X = XImpl<Backend>`, and expose **free-fn constructors**
-  (`pub fn new()/init() -> X`). Inherent `impl` on the framework alias is **E0116**
-  (foreign type) — always use a free fn wrapping `with_backend`.
-- Systick gets a ZST `impl SystickBackend` (`Gd32Systick`/`EpdSystick`/`SimSystick`) +
-  `pub type Systick`; hardware init that needs a peripheral handle stays a free fn
-  called from `main` (Ctx uses `Systick::handle()`).
-- `src/platform.rs`: the `impl Platform` (8 assoc types) + `impl PlatformRuntime`.
-- `src/main.rs`: device bring-up (clocks/ports/peripherals), build `Ctx<P>` + `touch`,
-  call `ferrite_ui::runtime::run::<P>`.
-- `panic.rs` is a real BSP file (names concrete `Lcd`/`Flash`).
-
-Device-specific notes:
-- **epaper** forces `RenderMode::EPaper` (`FORCED_RENDER_MODE`); `EpdLcd::pre_full_redraw`
-  ghost-erases (drive all-white); `EspUart::rx_read_byte` drains the USB-Serial-JTAG
-  FIFO; `boot` = `alloc_buffers`+`clear`+`probe_ferrite_fs_preamble`. bsp-epaper has its
-  own `epaper` feature so the `#![cfg(feature="epaper")]` guards in the redirected backend
-  files compile; `#![allow(unsafe_op_in_unsafe_fn)]` covers the pre-2024 backend style.
-- **sim** uses `frame_end` to pump the minifb window (sample mouse → present framebuffer)
-  via a thread-local `HOST` in `platform.rs` (minifb `Window` is `!Send`). `type Input =
-  FullInput` (richer than the old sim_body).
-
-## ferrite-core / framework changes carried in this migration
-- `UsartBackend::rx_read_byte()` (default `None`); the loop drains via `ctx.usart.rx_read_byte()`.
-- `FlashImpl<B>: Clone` + `Platform::FlashB: FlashBackend + Clone` (VM clones a flash
-  handle for flash-exec cache refills). All flash backends derive `Clone`.
-- `heap.rs` global allocator is now `#[cfg(all(not(epaper), not(host)))]` — the 14 KB
-  static heap is the allocator **only** on bare-metal nextion; epaper uses `esp_alloc`,
-  host uses std.
-- `runtime::PlatformRuntime::frame_end` added (host window pump).
-
-## Layout (the root `src/` is gone)
-
-The workspace root is now a **virtual manifest** (`Cargo.toml` = `[workspace]` + the
-shared `[profile.release]`). Every crate is a member directory:
+pub struct DrawList {
+    cmds:  Vec<DrawCmd>,   // ~12–16 B each
+    bytes: Vec<u8>,        // copied strings + polygon points — NO StringPool refs
+}
 ```
-ferrite-core/      HAL backend traits + generic wrappers + Platform
-ferrite-ui/        device-agnostic framework lib (was the root src/) — owns runtime::run
-bsp/nextion/       GD32 backends + entry + panic   (gpio.rs, irq.rs, fat.rs, */hw.rs)
-bsp/epaper/        ESP32-S3 backends + entry + panic (battery.rs, lcd/{epaper,display,
-                   ed047tc1,rmt,error}.rs, */epaper.rs)
-bsp/sim/           host backends + entry            (*/sim.rs)
+
+**The one rule that makes threading safe:** a `DrawCmd` may contain **no
+references into the widget tree or `StringPool`**. Text bytes and polygon points
+are **copied** into `bytes` at record time. After recording, the list is fully
+self-contained and immutable — the consumer needs only read-only resources.
+
+## Record → replay split
+
+```rust
+// UI/VM thread: walk the live tree once, emit ops. All tree/clip/occlusion
+// logic lives here. (This is render_all / render_dirty with sink = &mut list.)
+fn record_frame(ctx, vm) -> DrawList { /* … draw_widget(.., &mut list) … */ }
+
+// Consumer: a dumb, immutable executor. Touches ONLY read-only resources.
+fn replay<B: LcdBackend>(list: &DrawList, lcd: &B, fonts: &FontList, flash: &Flash) {
+    let mut clip = screen_rect();
+    for cmd in &list.cmds {
+        match *cmd {
+            DrawCmd::Clip(r)               => clip = r,
+            DrawCmd::FillRect { r, color } => fill_clipped(lcd, r, color, &clip),
+            DrawCmd::Text { x, y, color, font_id, off, len } =>
+                draw_text(lcd, fonts, flash, font_id, x, y, color,
+                          &list.bytes[off as usize..][..len as usize], &clip),
+            // …
+        }
+    }
+}
 ```
-Each BSP now physically OWNS its device backend files (no more `#[path]` redirects into
-a shared `src/`). The epaper backends lost their `#![cfg(feature="epaper")]` guards (only
-compiled in bsp-epaper now), and bsp-epaper dropped its private `epaper` feature (it still
-enables ferrite-ui's `epaper` feature for the heap). The GD32 linker scripts
-(`gd32-{link,memory,device}.x`) stay at the workspace root because the root
-`.cargo/config.toml` (`-Tgd32-link.x`, CWD = root) is what links nextion when built from
-the root.
 
-## REMAINING (optional polish — nothing blocks a build)
+`replay` needs: `LcdBackend` (framebuffer), `FontList` (RAM glyph headers),
+`Flash` (glyph/image bitmaps), `ImageList`. **All read-only and immutable after
+boot** → safe to share with another thread. It explicitly never touches
+`WidgetTree`, `StringPool`, or `Vm`. That isolation is what lets it run on core 2.
 
-- `bsp/nextion/src/gpio.rs` has Turkish comments (repo is English-only) — clean up.
-- **sim runtime** still hits the upstream `scoped-tls` Rust-2024 issue at *run* time
-  (it compiles + links fine). Resolve when running the sim end-to-end.
-- Reduce BSP warnings (unused `pub use` re-exports in some BSP `usart`/`systick` mods; a
-  few unused vars in backends).
-- nextion has two overlapping linker setups: the root `.cargo/config.toml`
-  (`-Tgd32-link.x`, used when building `-p bsp-nextion` from the root) and
-  `bsp/nextion/.cargo/config.toml` + `memory.x`/`device.x`/`build.rs` (used when building
-  from inside the crate dir). Consolidate if desired.
+## Where it slots into `render_phase`
 
-## Risks (carry forward)
-- **No `dyn` in tight draw loops** — keep static generics for `LcdBackend`. The one
-  `Box<dyn FlashBackend>` in `VmCode` is the only acceptable dyn (cold SPI path).
-- **Behavioral parity not yet runtime-tested** — `run()` is a faithful transcription of
-  the old nextion/epaper main loops (compiled, not yet run on hardware). Watch the
-  on_paint double-drain and the buffered-mode keyboard overlay cadence when flashing.
-  epaper now *forces* EPaper render mode (old body honoured the image header) — confirm
-  this matches the deployed images.
+```rust
+RenderMode::Buffered => if render::buffered_has_dirty(ctx) {
+    // single-core (F1C100s): sink straight to the LCD — no list, no cost
+    #[cfg(not(feature = "threaded_render"))] {
+        ctx.lcd.begin_frame();
+        render::record_frame_into(&mut Direct(&ctx.lcd), ctx, vm); // == today
+        P::present_buffered(ctx);
+    }
+    // multi-core (ESP32-S3): record here, replay on the render thread
+    #[cfg(feature = "threaded_render")] {
+        let list = render::record_frame(ctx, vm);   // UI / core-0
+        P::submit_draw_list(list);                   // hand to core-1
+    }
+}
+```
+
+On single core you keep `sink = &lcd` and the draw list never exists — zero
+overhead, identical to today. The same `record_frame` code drives both.
+
+## Threaded handoff (target: dual-core epaper)
+
+- **Double-buffer the lists** (ping-pong): UI thread records list B while the
+  render thread replays list A. Sync with the existing `Semaphore` (READY/DONE)
+  — same pattern as the dormant present thread, but the payload is the whole
+  frame, not just the flip.
+- **Single framebuffer owner:** the render thread does `begin_frame → replay →
+  end_frame`; the UI thread never touches the LCD.
+- **Arena reuse:** make `DrawList` a bump arena (`cmds`/`bytes` are `clear()`-ed,
+  never freed) → no per-frame heap churn (important for `no_std` determinism).
+  Two arenas, alternated.
+- On ESP32-S3 pin the render thread to core 1, UI/VM to core 0 → real parallel
+  rasterization.
+
+## Migration (each step independently shippable + testable)
+
+1. **Introduce `DrawSink`, route current rendering through `Direct`.** Pure
+   refactor, no behavior change — verify pixel-identical output on sim +
+   F1C100s. This is the bulk of the work and it is mechanical.
+2. **Add `DrawList` as a second sink + `replay`.** Debug path: record then
+   replay inline; assert it matches `Direct`. Still single-threaded.
+3. **Add the render thread on the epaper BSP** behind `threaded_render`.
+   F1C100s stays on `Direct`.
+
+## Cost / care
+
+- List size: ~25 widgets → ~50–150 cmds × ~14 B + a small byte arena ≈ 2–4 KB
+  per frame; double-buffered ≈ 8 KB. Fine on both targets.
+- Step 1 risk is low (no-op refactor). The real care: **every** primitive
+  currently called on `ctx.lcd` inside `render.rs` must go through `DrawSink`.
+  Grep `render.rs` for `.lcd.` — clip fills, gradient, alpha-blend, shapes, font
+  `draw_str`, image blit, and the scissor-based shape path near the bottom of
+  `draw_widget_clipped` (shapes draw raw geometry confined via the LCD scissor;
+  those become a `Clip` op + primitive in the list).
+
+## Status
+
+Not started — design only. The async-**present** scaffolding (present thread,
+`READY/SLOT/VSYNC` semaphores, `vblank_isr`, triple framebuffer) already exists
+dormant in `bsp/tdo_y13/src/lcd/mod.rs` + `main.rs`; it offloads only the vsync
+wait + buffer flip, **not** the drawing. This draw-list design is the path to
+offloading the actual rasterization, and supersedes that approach for the
+multi-core case.

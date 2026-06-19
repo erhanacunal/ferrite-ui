@@ -346,6 +346,9 @@ const OP_ARR_TO_STR: u8 = 0xA6; // pop len, pop arr_id → alloc string from low
 const OP_SHOW_MODAL: u8 = 0xA7; // pop click_fn, pop builder_fn → suspend until setDialogResult, push result on resume
 const OP_SET_DIALOG_RESULT: u8 = 0xA8; // pop result → record on top modal frame; void return
 const OP_SPRINTF: u8 = 0xA9; // + u8 argc — pop argc args + fmt str_id → push result str_id
+const OP_ANIMATE: u8 = 0xAD; // pop on_end, ctrl, duration, to, prop, widget → start tween
+const OP_STOP_ANIM: u8 = 0xAE; // pop widget → cancel all tweens on the widget
+const OP_STOP_ANIM_PROP: u8 = 0xAF; // pop prop, pop widget → cancel that one tween
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -510,6 +513,37 @@ struct ModalFrame {
     builder_call_depth: u8,
 }
 
+// --- Animation engine ---
+
+/// Easing curve selector — low 4 bits of `Anim::ctrl`. Mirrored in lib/anim.fl.
+const EASE_CURVE_MASK: u8 = 0x0F;
+const EASE_IN: u8 = 1;
+const EASE_OUT: u8 = 2;
+const EASE_IN_OUT: u8 = 3;
+/// Repeat-mode flags — high bits of `Anim::ctrl`. Mirrored in lib/anim.fl.
+const ANIM_LOOP: u8 = 0x10;
+const ANIM_YOYO: u8 = 0x20;
+
+/// One active property tween (~24 B). `Copy` so the tick loop can snapshot a
+/// slot by value, release the borrow on `Vm::anims`, then call the
+/// mutably-borrowing property setter without aliasing.
+#[derive(Clone, Copy)]
+struct Anim {
+    target: WidgetId,
+    prop_id: u8,
+    /// Low 4 bits = easing curve; `ANIM_LOOP` / `ANIM_YOYO` in the high bits.
+    ctrl: u8,
+    from: i32,
+    to: i32,
+    start_ms: u32,
+    duration_ms: u16,
+    /// Completion callback func_id (1-based, as pushed by `@fn`); 0 = none.
+    /// Resolved to a bytecode offset when fired. Only fires for non-repeating
+    /// tweens.
+    on_end: u16,
+    active: bool,
+}
+
 pub struct Vm {
     pc: u16,
     stack: [i32; STACK_SIZE],
@@ -555,6 +589,9 @@ pub struct Vm {
     open_files: [Option<OpenFile>; 2],
     // Open modal dialogs (innermost = last). Empty when no dialog is showing.
     modal_stack: Vec<ModalFrame>,
+    // Active property tweens, capped at P::ANIM_SLOTS on insert. Ticked once
+    // per main-loop iteration by tick_animations, independent of VM state.
+    anims: Vec<Anim>,
     // Device-specific syscall handler. Called by OP_SYSCALL; returns None → VM Error.
     pub syscall_fn: Option<fn(id: u8, args: &[i32], strpool: &StringPool) -> Option<i32>>,
 }
@@ -600,6 +637,7 @@ impl Vm {
             ext_count: 0,
             open_files: [None, None],
             modal_stack: Vec::new(),
+            anims: Vec::new(),
             syscall_fn: None,
         }
     }
@@ -1059,6 +1097,7 @@ impl Vm {
         self.render_mode = RenderMode::Dirty;
         self.open_files = [None, None];
         self.modal_stack.clear();
+        self.anims.clear();
     }
 
     pub fn has_code(&self) -> bool {
@@ -1893,6 +1932,28 @@ impl Vm {
                 self.push(ctx.backlight.brightness() as i32);
             }
 
+            // --- Animation engine ---
+            OP_ANIMATE => {
+                // Pushed order: widget, prop, to, duration, ctrl, on_end.
+                let on_end = self.pop() as u16;
+                let ctrl = self.pop() as u8;
+                let duration = self.pop() as u16;
+                let to = self.pop();
+                let prop = self.pop() as u8;
+                let widget = WidgetId(self.pop() as u16);
+                let now = ctx.systick.millis();
+                self.start_anim(ctx, widget, prop, to, duration, ctrl, on_end, now);
+            }
+            OP_STOP_ANIM => {
+                let widget = WidgetId(self.pop() as u16);
+                self.stop_anim(widget);
+            }
+            OP_STOP_ANIM_PROP => {
+                let prop = self.pop() as u8;
+                let widget = WidgetId(self.pop() as u16);
+                self.stop_anim_prop(widget, prop);
+            }
+
             // --- File ops (flash filesystem, read-only) ---
             OP_FILE_OPEN => {
                 let str_id = self.pop() as u16;
@@ -2148,118 +2209,137 @@ impl Vm {
     // --- Property R/W ---
 
     fn set_scalar_prop<P: Platform>(&mut self, ctx: &mut Ctx<P>, prop_id: u8, val: i32) {
+        Self::set_scalar_prop_on(ctx, self.target, prop_id, val);
+    }
+
+    /// Write a scalar property of an explicit `target` widget. Body of
+    /// `set_scalar_prop` lifted to a target-parameterized associated function
+    /// so the animation engine can drive any widget without disturbing the
+    /// VM's current `self.target`. Marks the widget dirty exactly as before.
+    fn set_scalar_prop_on<P: Platform>(ctx: &mut Ctx<P>, target: WidgetId, prop_id: u8, val: i32) {
         // Base widget fields (no extension needed)
+        let mut dirty = false;
+        let mut prop_set = false;
         match prop_id {
             PROP_LOC_X => {
-                ctx.tree.get_mut(self.target).location.x = val as i16;
-                ctx.tree.mark_dirty(self.target);
-                return;
+                ctx.tree.get_mut(target).location.x = val as i16;
+                dirty = true;
+                prop_set = true;
+                
             }
             PROP_LOC_Y => {
-                ctx.tree.get_mut(self.target).location.y = val as i16;
-                ctx.tree.mark_dirty(self.target);
-                return;
+                ctx.tree.get_mut(target).location.y = val as i16;
+                dirty = true;   
+                prop_set = true;
             }
             PROP_SIZE_W => {
-                ctx.tree.get_mut(self.target).size.w = val as u16;
-                ctx.tree.mark_dirty(self.target);
-                return;
+                ctx.tree.get_mut(target).size.w = val as u16;
+                dirty = true;
+                prop_set = true;
             }
             PROP_SIZE_H => {
-                ctx.tree.get_mut(self.target).size.h = val as u16;
-                ctx.tree.mark_dirty(self.target);
-                return;
+                ctx.tree.get_mut(target).size.h = val as u16;
+                dirty = true;
+                prop_set = true;
             }
             PROP_VISIBLE => {
                 set_flag(
-                    &mut ctx.tree.get_mut(self.target).flags,
+                    &mut ctx.tree.get_mut(target).flags,
                     FLAG_VISIBLE,
                     val != 0,
                 );
-                ctx.tree.mark_dirty(self.target);
-                return;
+                dirty = true;
+                prop_set = true;
             }
             PROP_ENABLED => {
                 set_flag(
-                    &mut ctx.tree.get_mut(self.target).flags,
+                    &mut ctx.tree.get_mut(target).flags,
                     FLAG_ENABLED,
                     val != 0,
                 );
-                return;
+                dirty = true;
+                prop_set = true;
             }
             PROP_CLICKABLE => {
                 set_flag(
-                    &mut ctx.tree.get_mut(self.target).flags,
+                    &mut ctx.tree.get_mut(target).flags,
                     FLAG_CLICKABLE,
                     val != 0,
                 );
-                return;
+                prop_set = true;
             }
             PROP_CHECKED => {
                 set_flag(
-                    &mut ctx.tree.get_mut(self.target).flags,
+                    &mut ctx.tree.get_mut(target).flags,
                     FLAG_CHECKED,
                     val != 0,
                 );
-                return;
+                prop_set = true;
             }
             PROP_CLIP_CHILDREN => {
                 set_flag(
-                    &mut ctx.tree.get_mut(self.target).flags,
+                    &mut ctx.tree.get_mut(target).flags,
                     FLAG_CLIP_CHILDREN,
                     val != 0,
                 );
-                return;
+                prop_set = true;
             }
             PROP_MULTI_LINE => {
                 set_flag(
-                    &mut ctx.tree.get_mut(self.target).flags,
+                    &mut ctx.tree.get_mut(target).flags,
                     FLAG_MULTI_LINE,
                     val != 0,
                 );
-                return;
+                prop_set = true;
             }
             PROP_ON_CLICK => {
                 set_flag(
-                    &mut ctx.tree.get_mut(self.target).flags,
+                    &mut ctx.tree.get_mut(target).flags,
                     FLAG_HAS_ON_CLICK,
                     val != 0,
                 );
-                return;
+                prop_set = true;
             }
             PROP_ON_PAINT => {
                 set_flag(
-                    &mut ctx.tree.get_mut(self.target).flags,
+                    &mut ctx.tree.get_mut(target).flags,
                     FLAG_HAS_ON_PAINT,
                     val != 0,
                 );
-                return;
+                prop_set = true;
             }
             PROP_ON_TAP | PROP_ON_CHANGE => {
                 set_flag(
-                    &mut ctx.tree.get_mut(self.target).flags,
+                    &mut ctx.tree.get_mut(target).flags,
                     FLAG_HAS_ON_TAP,
                     val != 0,
                 );
-                return;
+                prop_set = true;
             }
             PROP_BG_COLOR => {
-                ctx.tree.get_mut(self.target).background_color = val as u16;
-                return;
+                ctx.tree.get_mut(target).background_color = val as u16;
+                prop_set = true;
             }
             PROP_BORDER_COLOR => {
-                ctx.tree.get_mut(self.target).border_color = val as u16;
-                return;
+                ctx.tree.get_mut(target).border_color = val as u16;
+                prop_set = true;
             }
             PROP_KIND => {
-                ctx.tree.get_mut(self.target).kind = val as u8;
-                return;
+                ctx.tree.get_mut(target).kind = val as u8;
+                prop_set = true;
             }
             _ => {}
         }
 
+        if dirty {
+            ctx.tree.mark_dirty(target);
+        }
+        if prop_set {
+            return;
+        }
+
         // Extension fields (allocate on demand)
-        if let Some(ext) = ctx.tree.ensure_ext(self.target) {
+        if let Some(ext) = ctx.tree.ensure_ext(target) {
             match prop_id {
                 PROP_MARGIN_T => ext.margin.top = val as u8,
                 PROP_MARGIN_R => ext.margin.right = val as u8,
@@ -2297,7 +2377,15 @@ impl Vm {
     }
 
     fn get_scalar_prop<P: Platform>(&self, ctx: &Ctx<P>, prop_id: u8) -> i32 {
-        let w = ctx.tree.get(self.target);
+        Self::get_scalar_prop_on(ctx, self.target, prop_id)
+    }
+
+    /// Read a scalar property of an explicit `target` widget. Body of
+    /// `get_scalar_prop` lifted to a target-parameterized associated function
+    /// so the animation engine can sample any widget without disturbing the
+    /// VM's current `self.target`.
+    fn get_scalar_prop_on<P: Platform>(ctx: &Ctx<P>, target: WidgetId, prop_id: u8) -> i32 {
+        let w = ctx.tree.get(target);
         match prop_id {
             // Base fields
             PROP_LOC_X => w.location.x as i32,
@@ -2350,38 +2438,161 @@ impl Vm {
             PROP_BORDER_COLOR => w.border_color as i32,
             PROP_KIND => w.kind as i32,
             // Extension fields (return defaults when no extension)
-            PROP_MARGIN_T => ctx.tree.margin(self.target).top as i32,
-            PROP_MARGIN_R => ctx.tree.margin(self.target).right as i32,
-            PROP_MARGIN_B => ctx.tree.margin(self.target).bottom as i32,
-            PROP_MARGIN_L => ctx.tree.margin(self.target).left as i32,
-            PROP_BORDER_T => ctx.tree.border(self.target).top as i32,
-            PROP_BORDER_R => ctx.tree.border(self.target).right as i32,
-            PROP_BORDER_B => ctx.tree.border(self.target).bottom as i32,
-            PROP_BORDER_L => ctx.tree.border(self.target).left as i32,
-            PROP_PADDING_T => ctx.tree.padding(self.target).top as i32,
-            PROP_PADDING_R => ctx.tree.padding(self.target).right as i32,
-            PROP_PADDING_B => ctx.tree.padding(self.target).bottom as i32,
-            PROP_PADDING_L => ctx.tree.padding(self.target).left as i32,
-            PROP_TEXT_COLOR => ctx.tree.text_color(self.target) as i32,
-            PROP_FONT_ID => ctx.tree.font_id(self.target) as i32,
-            PROP_TEXT_ALIGN => ctx.tree.text_align(self.target) as i32,
-            PROP_PRESS_COLOR => ctx.tree.press_color(self.target) as i32,
-            PROP_IMAGE_ID => ctx.tree.image_id(self.target) as i32,
-            PROP_BORDER_RADIUS => ctx.tree.border_radius(self.target) as i32,
-            PROP_VALUE => ctx.tree.value(self.target) as i32,
+            PROP_MARGIN_T => ctx.tree.margin(target).top as i32,
+            PROP_MARGIN_R => ctx.tree.margin(target).right as i32,
+            PROP_MARGIN_B => ctx.tree.margin(target).bottom as i32,
+            PROP_MARGIN_L => ctx.tree.margin(target).left as i32,
+            PROP_BORDER_T => ctx.tree.border(target).top as i32,
+            PROP_BORDER_R => ctx.tree.border(target).right as i32,
+            PROP_BORDER_B => ctx.tree.border(target).bottom as i32,
+            PROP_BORDER_L => ctx.tree.border(target).left as i32,
+            PROP_PADDING_T => ctx.tree.padding(target).top as i32,
+            PROP_PADDING_R => ctx.tree.padding(target).right as i32,
+            PROP_PADDING_B => ctx.tree.padding(target).bottom as i32,
+            PROP_PADDING_L => ctx.tree.padding(target).left as i32,
+            PROP_TEXT_COLOR => ctx.tree.text_color(target) as i32,
+            PROP_FONT_ID => ctx.tree.font_id(target) as i32,
+            PROP_TEXT_ALIGN => ctx.tree.text_align(target) as i32,
+            PROP_PRESS_COLOR => ctx.tree.press_color(target) as i32,
+            PROP_IMAGE_ID => ctx.tree.image_id(target) as i32,
+            PROP_BORDER_RADIUS => ctx.tree.border_radius(target) as i32,
+            PROP_VALUE => ctx.tree.value(target) as i32,
             PROP_ON_CLICK => (w.flags & FLAG_HAS_ON_CLICK != 0) as i32,
             PROP_ON_PAINT => (w.flags & FLAG_HAS_ON_PAINT != 0) as i32,
             PROP_ON_TAP | PROP_ON_CHANGE => (w.flags & FLAG_HAS_ON_TAP != 0) as i32,
-            PROP_MAX_LENGTH => ctx.tree.max_length(self.target) as i32,
-            PROP_CURSOR_POS => ctx.tree.value(self.target) as i32,
-            PROP_SCROLL_Y => ctx.tree.value(self.target) as i32,
-            PROP_GRADIENT_COLOR => ctx.tree.gradient_color(self.target) as i32,
-            PROP_GRADIENT_DIR => ctx.tree.gradient_dir(self.target) as i32,
-            PROP_ALPHA => ctx.tree.alpha(self.target) as i32,
-            PROP_GRAPH_ARR => ctx.tree.value(self.target) as i32,
-            PROP_GRAPH_COUNT => ctx.tree.max_length(self.target) as i32,
-            PROP_GRAPH_FLAGS => ctx.tree.image_id(self.target) as i32,
+            PROP_MAX_LENGTH => ctx.tree.max_length(target) as i32,
+            PROP_CURSOR_POS => ctx.tree.value(target) as i32,
+            PROP_SCROLL_Y => ctx.tree.value(target) as i32,
+            PROP_GRADIENT_COLOR => ctx.tree.gradient_color(target) as i32,
+            PROP_GRADIENT_DIR => ctx.tree.gradient_dir(target) as i32,
+            PROP_ALPHA => ctx.tree.alpha(target) as i32,
+            PROP_GRAPH_ARR => ctx.tree.value(target) as i32,
+            PROP_GRAPH_COUNT => ctx.tree.max_length(target) as i32,
+            PROP_GRAPH_FLAGS => ctx.tree.image_id(target) as i32,
             _ => 0,
+        }
+    }
+
+    // === Animation engine ===
+
+    /// Begin (or replace) a tween on `target`'s `prop_id`. The starting value
+    /// is the property's current value (sampled now). A tween already running
+    /// on the same (target, prop) is overwritten so the newest call wins.
+    /// Silently dropped when the per-BSP pool (`P::ANIM_SLOTS`) is full.
+    fn start_anim<P: Platform>(
+        &mut self,
+        ctx: &Ctx<P>,
+        target: WidgetId,
+        prop_id: u8,
+        to: i32,
+        duration_ms: u16,
+        ctrl: u8,
+        on_end: u16,
+        now: u32,
+    ) {
+        if target.is_none() {
+            return;
+        }
+        let anim = Anim {
+            target,
+            prop_id,
+            ctrl,
+            from: Self::get_scalar_prop_on(ctx, target, prop_id),
+            to,
+            start_ms: now,
+            duration_ms: duration_ms.max(1),
+            on_end,
+            active: true,
+        };
+        // A new tween on a property already animating supersedes the old one.
+        for a in self.anims.iter_mut() {
+            if a.active && a.target == target && a.prop_id == prop_id {
+                *a = anim;
+                return;
+            }
+        }
+        // Reuse a finished slot, else append while under the per-BSP cap.
+        if let Some(slot) = self.anims.iter_mut().find(|a| !a.active) {
+            *slot = anim;
+        } else if self.anims.len() < P::ANIM_SLOTS {
+            self.anims.push(anim);
+        }
+    }
+
+    /// Cancel all tweens on `target`.
+    fn stop_anim(&mut self, target: WidgetId) {
+        for a in self.anims.iter_mut() {
+            if a.target == target {
+                a.active = false;
+            }
+        }
+    }
+
+    /// Cancel the tween on `target`'s specific `prop_id`.
+    fn stop_anim_prop(&mut self, target: WidgetId, prop_id: u8) {
+        for a in self.anims.iter_mut() {
+            if a.target == target && a.prop_id == prop_id {
+                a.active = false;
+            }
+        }
+    }
+
+    /// Advance all active tweens to time `now` (millis). Applies each
+    /// interpolated value through the same property setter + dirty-mark path
+    /// as W_SET, but only when the integer value actually changes — the device
+    /// loop spins far faster than one visible step per frame, so this gate
+    /// avoids redundant redraws. Repeating tweens restart (loop) or reverse
+    /// (yoyo); one-shot tweens deactivate and fire their `on_end` callback.
+    /// Called every main-loop iteration regardless of `self.state`.
+    pub fn tick_animations<P: Platform>(&mut self, ctx: &mut Ctx<P>, now: u32) {
+        let mut any_done = false;
+        let n = self.anims.len();
+        for i in 0..n {
+            let a = self.anims[i]; // snapshot — releases the borrow on self.anims
+            if !a.active {
+                continue;
+            }
+            let dur = a.duration_ms.max(1) as u32;
+            let elapsed = now.wrapping_sub(a.start_ms);
+            let done = elapsed >= dur;
+            let t = if done { 256 } else { (elapsed * 256 / dur) as i32 };
+            let te = ease(a.ctrl, t);
+            let val = if prop_is_color(a.prop_id) {
+                crate::lcd::lerp_rgb565(a.from as u16, a.to as u16, te as u16, 256) as i32
+            } else {
+                a.from + ((a.to - a.from) * te) / 256
+            };
+            if val != Self::get_scalar_prop_on(ctx, a.target, a.prop_id) {
+                Self::set_scalar_prop_on(ctx, a.target, a.prop_id, val);
+                if prop_is_visual(a.prop_id) {
+                    ctx.tree.mark_dirty(a.target);
+                }
+            }
+            if done {
+                if a.ctrl & ANIM_YOYO != 0 {
+                    let s = &mut self.anims[i];
+                    core::mem::swap(&mut s.from, &mut s.to);
+                    s.start_ms = now;
+                } else if a.ctrl & ANIM_LOOP != 0 {
+                    self.anims[i].start_ms = now;
+                } else {
+                    self.anims[i].active = false;
+                    any_done = true;
+                    // `on_end` is a 1-based func_id (as pushed by `@fn`);
+                    // resolve to a bytecode offset before queueing, mirroring
+                    // the widget-callback path. Scope the immutable borrow so
+                    // the mutable enqueue can follow.
+                    if a.on_end != 0 {
+                        let off = self.find_func(a.on_end).map(|f| f.offset as u16);
+                        if let Some(off) = off {
+                            self.enqueue_callback(off, &[a.target.0 as i32, a.prop_id as i32]);
+                        }
+                    }
+                }
+            }
+        }
+        if any_done {
+            self.anims.retain(|a| a.active);
         }
     }
 
@@ -2712,4 +2923,164 @@ fn prop_is_visual(prop_id: u8) -> bool {
             | PROP_MAX_LENGTH
             | PROP_CURSOR_POS
     )
+}
+
+// --- Animation helpers ---
+
+/// Apply an easing curve to `t` (Q8 fixed-point, 0..=256), returning the eased
+/// position in the same Q8 range. Curve picked from the low 4 bits of `ctrl`.
+/// Quadratic in/out/in-out; anything else is linear.
+fn ease(ctrl: u8, t: i32) -> i32 {
+    match ctrl & EASE_CURVE_MASK {
+        EASE_IN => (t * t) >> 8,
+        EASE_OUT => {
+            let u = 256 - t;
+            256 - ((u * u) >> 8)
+        }
+        EASE_IN_OUT => {
+            if t < 128 {
+                (2 * t * t) >> 8
+            } else {
+                let u = 256 - t;
+                256 - ((2 * u * u) >> 8)
+            }
+        }
+        _ => t,
+    }
+}
+
+/// True for properties stored as RGB565 colors — these tween channel-wise via
+/// `lerp_rgb565` rather than by linear integer interpolation.
+fn prop_is_color(prop_id: u8) -> bool {
+    matches!(
+        prop_id,
+        PROP_BG_COLOR | PROP_BORDER_COLOR | PROP_TEXT_COLOR | PROP_PRESS_COLOR | PROP_GRADIENT_COLOR
+    )
+}
+
+#[cfg(all(test, feature = "mock"))]
+mod anim_tests {
+    use super::*;
+    use crate::mock::{MockBacklight, MockFlash, MockLcd, MockPlatform, MockRtc, MockUsart};
+    use crate::backlight::BacklightImpl;
+    use crate::flash::FlashImpl;
+    use crate::lcd::LcdImpl;
+    use crate::rtc::RtcImpl;
+    use crate::systick::SystickImpl;
+    use crate::usart::UsartImpl;
+    use crate::font::FontList;
+    use crate::image::ImageList;
+    use crate::strpool::StringPool;
+    use crate::widget::WidgetTree;
+    use crate::audio::AudioImpl;
+
+    fn mock_ctx() -> Ctx<MockPlatform> {
+        Ctx {
+            lcd: LcdImpl::with_backend(MockLcd),
+            flash: FlashImpl::with_backend(MockFlash),
+            tree: WidgetTree::new(),
+            fonts: FontList::new(),
+            images: ImageList::new(),
+            strpool: StringPool::new(),
+            fs: None,
+            backlight: BacklightImpl::with_backend(MockBacklight),
+            rtc: RtcImpl::with_backend(MockRtc),
+            usart: UsartImpl::with_backend(MockUsart),
+            systick: SystickImpl::init(),
+            audio: AudioImpl::none(),
+            cursor_visible: false,
+        }
+    }
+
+    // Allocate one widget and return its id.
+    fn one_widget(ctx: &mut Ctx<MockPlatform>) -> WidgetId {
+        ctx.tree.alloc().expect("alloc")
+    }
+
+    #[test]
+    fn linear_tween_interpolates_and_completes() {
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        let id = one_widget(&mut ctx);
+        Vm::set_scalar_prop_on(&mut ctx, id, PROP_LOC_X, 0);
+
+        // 0 -> 100 over 100ms, linear, starting at t=1000.
+        vm.start_anim(&ctx, id, PROP_LOC_X, 100, 100, 0, 0, 1000);
+
+        vm.tick_animations(&mut ctx, 1000);
+        assert_eq!(Vm::get_scalar_prop_on(&ctx, id, PROP_LOC_X), 0);
+
+        vm.tick_animations(&mut ctx, 1050);
+        assert_eq!(Vm::get_scalar_prop_on(&ctx, id, PROP_LOC_X), 50);
+
+        // At/after duration: snaps to target and the slot is freed.
+        vm.tick_animations(&mut ctx, 1100);
+        assert_eq!(Vm::get_scalar_prop_on(&ctx, id, PROP_LOC_X), 100);
+        assert!(vm.anims.is_empty(), "completed one-shot tween must be retired");
+    }
+
+    #[test]
+    fn color_tween_blends_channelwise() {
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        let id = one_widget(&mut ctx);
+        // RED (0xF800) -> BLUE (0x001F), linear.
+        Vm::set_scalar_prop_on(&mut ctx, id, PROP_BG_COLOR, 0xF800);
+        vm.start_anim(&ctx, id, PROP_BG_COLOR, 0x001F, 100, 0, 0, 0);
+
+        vm.tick_animations(&mut ctx, 50); // midpoint
+        let mid = Vm::get_scalar_prop_on(&ctx, id, PROP_BG_COLOR) as u16;
+        // Midpoint is a genuine blend: some red left, some blue gained.
+        assert!(mid != 0xF800 && mid != 0x001F, "got 0x{mid:04X}");
+        assert!((mid >> 11) > 0 && (mid >> 11) < 0x1F, "red channel mid");
+        assert!((mid & 0x1F) > 0 && (mid & 0x1F) < 0x1F, "blue channel mid");
+    }
+
+    #[test]
+    fn yoyo_reverses_and_keeps_running() {
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        let id = one_widget(&mut ctx);
+        Vm::set_scalar_prop_on(&mut ctx, id, PROP_LOC_X, 0);
+        vm.start_anim(&ctx, id, PROP_LOC_X, 100, 100, ANIM_YOYO, 0, 0);
+
+        // Reach the far end; yoyo swaps endpoints and restarts (stays active).
+        vm.tick_animations(&mut ctx, 100);
+        assert_eq!(Vm::get_scalar_prop_on(&ctx, id, PROP_LOC_X), 100);
+        assert_eq!(vm.anims.len(), 1, "yoyo tween must not be retired");
+
+        // Now heading back toward 0.
+        vm.tick_animations(&mut ctx, 150);
+        assert_eq!(Vm::get_scalar_prop_on(&ctx, id, PROP_LOC_X), 50);
+    }
+
+    #[test]
+    fn start_anim_replaces_same_property() {
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        let id = one_widget(&mut ctx);
+        Vm::set_scalar_prop_on(&mut ctx, id, PROP_LOC_X, 0);
+        vm.start_anim(&ctx, id, PROP_LOC_X, 100, 100, 0, 0, 0);
+        vm.start_anim(&ctx, id, PROP_LOC_X, 200, 100, 0, 0, 0);
+        assert_eq!(vm.anims.len(), 1, "second tween on same prop replaces the first");
+    }
+
+    #[test]
+    fn pool_is_capped_per_platform() {
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        // MockPlatform inherits the default ANIM_SLOTS (8). Distinct props so
+        // none replace each other.
+        let props = [
+            PROP_LOC_X, PROP_LOC_Y, PROP_SIZE_W, PROP_SIZE_H,
+            PROP_BG_COLOR, PROP_BORDER_COLOR, PROP_TEXT_COLOR, PROP_PRESS_COLOR,
+            PROP_BORDER_RADIUS, PROP_ALPHA, // two beyond the cap
+        ];
+        for &p in &props {
+            let id = one_widget(&mut ctx);
+            vm.start_anim(&ctx, id, p, 10, 100, 0, 0, 0);
+        }
+        assert_eq!(vm.anims.len(), MockPlatform::ANIM_SLOTS);
+        assert_eq!(MockPlatform::ANIM_SLOTS, 8);
+    }
 }

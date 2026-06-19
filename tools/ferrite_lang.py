@@ -976,6 +976,7 @@ NO_VALUE_BUILTINS = {
     'fileClose',
     'fileSeek',
     'setDialogResult',
+    'animate', 'stopAnim', 'stopAnimProp',
 }
 
 # Builtins whose return value is an array ID (so the variable must be in array_vars)
@@ -2922,6 +2923,45 @@ class CodeGen:
                 raise CompileError("setDialogResult() takes 1 argument: result", node.line)
             self._gen_expr(node.args[0])
             self.asm.builtin(Builtin.SET_DIALOG_RESULT)
+            return
+
+        if name == 'animate':
+            # animate(widget, prop, to, durationMs, easing [, @onEnd])
+            # Tween `widget`'s integer property `prop` from its current value to
+            # `to` over `durationMs`, applying easing (low 4 bits) + optional
+            # REPEAT_LOOP/REPEAT_YOYO flags. The optional 6th arg is a completion
+            # callback (@func) invoked with (widget, prop) when a one-shot tween
+            # finishes; pass none for repeating tweens. Stack order pushed here
+            # (widget..on_end) matches the VM's pop order in OP_ANIMATE.
+            if len(node.args) not in (5, 6):
+                raise CompileError(
+                    "animate() takes 5 or 6 arguments: "
+                    "widget, prop, to, durationMs, easing, [@onEnd]",
+                    node.line)
+            for arg in node.args[:5]:
+                self._gen_expr(arg)
+            if len(node.args) == 6:
+                self._gen_expr(node.args[5])  # @onEnd → func_id
+            else:
+                self.asm.push(0)              # no completion callback
+            self.asm.animate()
+            return
+
+        if name == 'stopAnim':
+            # stopAnim(widget) — cancel all tweens on the widget.
+            if len(node.args) != 1:
+                raise CompileError("stopAnim() takes 1 argument: widget", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.stop_anim()
+            return
+
+        if name == 'stopAnimProp':
+            # stopAnimProp(widget, prop) — cancel the tween on one property.
+            if len(node.args) != 2:
+                raise CompileError("stopAnimProp() takes 2 arguments: widget, prop", node.line)
+            self._gen_expr(node.args[0])
+            self._gen_expr(node.args[1])
+            self.asm.stop_anim_prop()
             return
 
         # --- User-defined function ---

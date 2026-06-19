@@ -139,6 +139,20 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
     fn frame_end(ctx: &mut Ctx<Self>) {
         let _ = ctx;
     }
+
+    /// Present a buffered frame after the framework has rasterized it into the
+    /// back buffer. Default: finish synchronously on the calling thread —
+    /// `end_frame` does the vsync wait + buffer flip, then `flush_dirty`.
+    ///
+    /// A BSP with a dedicated render thread overrides this to hand the freshly
+    /// drawn back buffer off and return immediately, so the UI thread does not
+    /// block on the panel's vertical blanking. Only the *present* is deferred:
+    /// rasterization stays on the calling thread, so the widget tree remains
+    /// single-threaded and needs no lock.
+    fn present_buffered(ctx: &mut Ctx<Self>) {
+        ctx.lcd.end_frame();
+        ctx.lcd.flush_dirty();
+    }
 }
 
 /// Per-frame input handling. Owns whatever cross-frame state the strategy needs
@@ -343,6 +357,16 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
             input.tick(&mut ctx);
         }
 
+        // --- Advance property animations ---
+        // Time-driven (millis), independent of VM state, so tweens keep running
+        // even while the program is Halted/Waiting. Runs before render so dirtied
+        // props paint this frame; any onAnimEnd callbacks enqueued here are picked
+        // up by the callback drain below.
+        if error_code == 0 {
+            let now = ctx.systick.millis();
+            vm.tick_animations(&mut ctx, now);
+        }
+
         // --- Render + on_paint dispatch ---
         if error_code == 0 {
             let mut paint = PaintBuf::new();
@@ -493,8 +517,10 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm, input: &mut P::In
                 ctx.lcd.begin_frame();
                 render::render_buffered_content(ctx, vm);
                 input.draw_overlay(ctx, true);
-                ctx.lcd.end_frame();
-                ctx.lcd.flush_dirty();
+                // Rasterization is done (UI thread). Hand off the present
+                // (vsync wait + buffer flip) — synchronous by default, or
+                // deferred to a render thread by BSPs that override this.
+                P::present_buffered(ctx);
             }
         }
         RenderMode::Dirty => {

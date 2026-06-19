@@ -62,7 +62,12 @@ pub trait Platform {
 
     /// Optional board capabilities — OR of the `CAP_*` bits above. Only set
     /// a bit when the corresponding backend is real (keep CAPS truthful).
-    const CAPS: u32 = 0;    
-    // Default background color for the board (used when no widget has a background). 
+    const CAPS: u32 = 0;
+    // Default background color for the board (used when no widget has a background).
     const DEFAULT_BG_COLOR: u16 = 0x0000; // black
+
+    /// Maximum concurrent property tweens (`animate`) the VM keeps live. Sized
+    /// per board to its RAM budget — bigger boards animate richer scenes. The
+    /// default suits the small RAM boards (Nextion, epaper); tdo_y13 raises it.
+    const ANIM_SLOTS: usize = 8;
 }

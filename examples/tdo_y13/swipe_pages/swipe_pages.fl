@@ -1,0 +1,117 @@
+// swipe_pages.fl — Swipe-paged UI without a page system (tdo_y13, 480x480)
+//
+// "Pages" are emulated with two full-screen panels living side-by-side on the
+// root. Only one sits on screen at a time; the other waits off the right edge
+// (x = +SCREEN_W) where the backend scissor clamps it away for free — no need
+// to hide it with the VISIBLE flag (a hidden subtree is skipped entirely and
+// could never slide in).
+//
+// A horizontal swipe slides BOTH panels by the same amount in lock-step, so
+// the outgoing page leaves to one side as the incoming page arrives from the
+// other. The two panels tile exactly (always SCREEN_W apart), so they never
+// overlap mid-slide.
+//
+// The slide is driven by the animation framework (animate(), see lib/anim.fl):
+// each panel's PROP_LOC_X is tweened to its target with an ease-in-out curve.
+// Animations run off the millisecond clock, so loop() stays empty and a swipe
+// arriving mid-slide simply retargets the tweens (they continue from wherever
+// the panels currently are) instead of being blocked.
+//
+// Render mode is "buffered" (see project.json): every animation frame is a
+// clean full redraw to the back buffer, then an atomic FPGA/TCON swap — so a
+// moving panel needs no stale-pixel bookkeeping and shows no tearing.
+
+#include "core.fl"
+#include "color.fl"
+#include "touch.fl"
+#include "anim.fl"
+
+const SCREEN_W = 480;
+const SCREEN_H = 480;
+
+const SLIDE_MS = 220;   // page transition duration
+
+// Panels are global alloc() vars so they are tracked widget variables —
+// usable as target()/parent() targets in setup() and the slide handler.
+var panel_a = alloc();   // page 1 root
+var panel_b = alloc();   // page 2 root
+var cur;                 // which page is on screen: 0 = A, 1 = B
+
+// Slide so that `target_page` (0 or 1) ends at x = 0. The two panels are always
+// SCREEN_W apart, so we just tween each panel's X to its target layout and let
+// the framework interpolate from the panels' current positions.
+fn slide_to(target_page) {
+    if (target_page == cur) { return 0; }
+
+    var ax_to; var bx_to;
+    if (target_page == 0) { ax_to = 0;            bx_to = SCREEN_W; }
+    else                  { ax_to = 0 - SCREEN_W; bx_to = 0; }
+
+    animate(panel_a, PROP_LOC_X, ax_to, SLIDE_MS, EASE_IN_OUT);
+    animate(panel_b, PROP_LOC_X, bx_to, SLIDE_MS, EASE_IN_OUT);
+
+    cur = target_page;
+    return 0;
+}
+
+// Global gesture callback — bound by name (no @ needed).
+//   dir    — SWIPE_LEFT / SWIPE_RIGHT / SWIPE_UP / SWIPE_DOWN
+//   widget — id pressed at swipe start (unused here)
+//   delta  — signed displacement on the dominant axis (unused here)
+fn on_swipe(dir, widget, delta) {
+    // Swipe left reveals the next page (B); swipe right returns to A.
+    if (dir == SWIPE_LEFT)  { slide_to(1); }
+    if (dir == SWIPE_RIGHT) { slide_to(0); }
+}
+
+fn setup() {
+    setBrightness(100);
+
+    // ── Page A: on screen at x = 0 ──
+    target(panel_a);
+    set(location, 0, 0);
+    set(size, SCREEN_W, SCREEN_H);
+    set(bg_color, NAVY);
+    parent(0);
+
+    var a_title = alloc(); target(a_title);
+    set(kind, KIND_LABEL);
+    set(location, 0, 200); set(size, SCREEN_W, 40);
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER);
+    set(text, "PAGE 1");
+    parent(panel_a);
+
+    var a_hint = alloc(); target(a_hint);
+    set(kind, KIND_LABEL);
+    set(location, 0, 440); set(size, SCREEN_W, 24);
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER);
+    set(text, "swipe left  >");
+    parent(panel_a);
+
+    // ── Page B: parked off the right edge at x = +SCREEN_W ──
+    target(panel_b);
+    set(location, SCREEN_W, 0);
+    set(size, SCREEN_W, SCREEN_H);
+    set(bg_color, 0x0320);
+    parent(0);
+
+    var b_title = alloc(); target(b_title);
+    set(kind, KIND_LABEL);
+    set(location, 0, 200); set(size, SCREEN_W, 40);
+    set(text_color, YELLOW); set(text_align, ALIGN_CENTER);
+    set(text, "PAGE 2");
+    parent(panel_b);
+
+    var b_hint = alloc(); target(b_hint);
+    set(kind, KIND_LABEL);
+    set(location, 0, 440); set(size, SCREEN_W, 24);
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER);
+    set(text, "<  swipe right");
+    parent(panel_b);
+
+    cur = 0;
+    render();
+    return 0;
+}
+
+fn loop() {}

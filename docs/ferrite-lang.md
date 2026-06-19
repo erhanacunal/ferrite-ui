@@ -1265,6 +1265,72 @@ Passing `arrToStr(buf)` without a length uses the full array — any unused
 slots contribute NUL bytes, so prefer the two-argument form when the valid
 byte count is known (as it is after a `fileRead` loop).
 
+## Animation
+
+Tween a widget's scalar property from its current value to a target over time.
+Animations are time-driven (millisecond clock), so they keep running smoothly
+regardless of what `loop()` is doing — you start one and forget it. Include
+`lib/anim.fl` for the easing, repeat, and `PROP_*` constants.
+
+```c
+#include "anim.fl"
+
+animate(panel, PROP_LOC_X, 700, 300, EASE_OUT);                  // slide
+animate(box, PROP_BG_COLOR, 0xF800, 1000, EASE_IN_OUT | REPEAT_YOYO); // pulse
+```
+
+### animate(widget, prop, to, durationMs, easing [, @onEnd])
+
+Starts (or replaces) a tween on `widget`'s property `prop`:
+
+- `prop` — a `PROP_*` id (e.g. `PROP_LOC_X`, `PROP_SIZE_W`, `PROP_BG_COLOR`,
+  `PROP_ALPHA`, `PROP_BORDER_RADIUS`, `PROP_VALUE`).
+- `to` — target value. For color properties (`PROP_BG_COLOR`,
+  `PROP_BORDER_COLOR`, `PROP_TEXT_COLOR`, `PROP_PRESS_COLOR`,
+  `PROP_GRADIENT_COLOR`) the value is an RGB565 color and is interpolated
+  channel-wise; every other property interpolates linearly.
+- `durationMs` — tween length in milliseconds.
+- `easing` — an `EASE_*` curve, optionally OR'd with a repeat flag:
+  - `EASE_LINEAR`, `EASE_IN`, `EASE_OUT`, `EASE_IN_OUT`
+  - `| REPEAT_LOOP` — restart from the beginning forever
+  - `| REPEAT_YOYO` — bounce back and forth forever
+- `@onEnd` — *optional* completion callback `fn(widget, prop)`, fired when a
+  one-shot tween finishes. Never fires for `REPEAT_*` tweens.
+
+The starting value is the property's value at the moment `animate` runs.
+Starting a tween on a property that is already animating replaces the old one.
+
+```c
+#include "anim.fl"
+
+fn @slide_done(widget, prop) {
+    // runs once the slide completes
+}
+
+fn on_tap(widget) {
+    animate(widget, PROP_LOC_X, 540, 400, EASE_OUT, @slide_done);
+}
+```
+
+### stopAnim(widget) / stopAnimProp(widget, prop)
+
+Cancel running tweens — all of a widget's, or just one property's. The
+property keeps whatever value it had reached.
+
+```c
+stopAnim(panel);                  // cancel everything on `panel`
+stopAnimProp(panel, PROP_LOC_X);  // cancel only the X-position tween
+```
+
+**Notes:**
+- Concurrent tweens are capped per board (`Platform::ANIM_SLOTS` — 8 on
+  nextion/epaper, 32 on tdo_y13). Starting more than the cap silently drops
+  the extra ones.
+- Tweens repaint through the normal dirty-render path and only re-mark a
+  widget dirty when the interpolated integer value actually changes.
+- e-paper panels accept `animate` but cannot render smooth motion (slow full
+  refresh); use sparingly there.
+
 ## Events and Callbacks
 
 Callbacks are functions called by the system in response to events. They are defined as regular functions with special names. The compiler automatically detects them and assigns the correct function kind in the VM image header.
@@ -1596,6 +1662,7 @@ Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnPageChangin
 | Open files | 2 simultaneous (handles 1 and 2) |
 | Bytecode | limited by flash resource or 2KB via USART |
 | Clip rects | 32 rectangles |
+| Animations | per board: 8 (nextion, epaper), 32 (tdo_y13) |
 
 ## Complete Example
 

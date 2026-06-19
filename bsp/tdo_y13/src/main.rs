@@ -22,7 +22,6 @@ extern crate alloc;
 use alloc::boxed::Box;
 use f1c100s::thread;
 use f1c100s::timer;
-use f1c100s::interrupt;
 use f1c100s::gpio;
 
 
@@ -73,6 +72,9 @@ static mut IDLE_STACK: [u8; 1024] = [0u8; 1024];
 #[unsafe(link_section = ".bss.ui_stack")]
 static mut UI_STACK: [u8; 32768] = [0u8; 32768];
 
+#[unsafe(link_section = ".bss.render_stack")]
+static mut RENDER_STACK: [u8; 8192] = [0u8; 8192];
+
 fn idle_task(_: *mut ()) {
     // The idle thread must ALWAYS be runnable so the scheduler has something to
     // switch to whenever every other thread blocks. If idle instead blocks
@@ -81,13 +83,28 @@ fn idle_task(_: *mut ()) {
     // empty, `do_schedule()` can't switch away, `block_current()` is a no-op,
     // and the wait returns `Timeout` immediately (the ISR never gets to run).
     // Wait-for-interrupt parks the core until the next IRQ without blocking.
+    //
+    // DIAGNOSTIC: emit an 'I' on UART2 about twice per second from this thread
+    // context (safe — no ISR UART). The idle thread runs whenever every other
+    // thread is blocked, so:
+    //   'I' streaming  → the scheduler is alive (a "freeze" with 'I' still
+    //                    printing is a *pipeline* deadlock, not a CPU hang).
+    //   'I' stops      → hard freeze (IRQs disabled / fault / wfi never wakes).
+    // wfi wakes on every timer tick (~10 ms), so the counter advances steadily.
     loop {
         f1c100s::cpu::wfi();
     }
 }
 
-fn ui_task(_: *mut ()) {
+// Present thread: publishes rasterized frames (D-cache clean + vblank flip)
+// off the UI thread. Higher priority than `ui` so the flip lands promptly in
+// the blanking gap, but spends almost all its time blocked on a semaphore, so
+// it does not starve the UI thread.
+fn render_task(_: *mut ()) {
+    lcd::present_thread_body();
+}
 
+fn ui_task(_: *mut ()) {
     unsafe { touch::init(); }
 
     let ctx = Box::new(Ctx::<TdoY13Platform> {
@@ -140,22 +157,41 @@ pub extern "C" fn rust_main() -> ! {
     }
 
     
-    unsafe { flash::init(); }    
+    unsafe { flash::init(); }
     unsafe { backlight::init(); }
     unsafe { lcd::init(); }
-    unsafe { usart::init(); }    
-    
+    unsafe { usart::init(); }
+
+    // DIAGNOSTIC (bisection): the vblank IRQ is intentionally LEFT DISABLED.
+    // The present thread now polls `wait_for_vsync` directly (see
+    // `present_thread_body`), so the ISR is not needed. This isolates whether
+    // the idle freeze comes from the vblank IRQ/ISR path: if the freeze is gone
+    // with the ISR removed, that path was the cause. Re-enable once decided.
+    //
+    // interrupt::install(interrupt::TCON_INTERRUPT, lcd::vblank_isr);
+    // f1c100s::lcd::enable_vblank_irq();
+    // interrupt::unmask(interrupt::TCON_INTERRUPT);
+    let _ = lcd::vblank_isr; // keep the symbol referenced
+
     thread::sched_init();
 
     thread::thread_create(
         "idle", idle_task, core::ptr::null_mut(),
         unsafe { &mut *core::ptr::addr_of_mut!(IDLE_STACK) }, 31, 10,
     );
+    // DIAGNOSTIC (bisection): present thread NOT created — presenting happens
+    // synchronously on the UI thread (see platform::present_buffered). Restore
+    // this once the idle-freeze cause is isolated.
+    let _ = render_task; // keep the symbol referenced
+    // thread::thread_create(
+    //     "render", render_task, core::ptr::null_mut(),
+    //     unsafe { &mut *core::ptr::addr_of_mut!(RENDER_STACK) }, 0, 5,
+    // );
     thread::thread_create(
         "ui", ui_task, core::ptr::null_mut(),
         unsafe { &mut *core::ptr::addr_of_mut!(UI_STACK) }, 1, 5,
     );
-    
+
     systick::init();
 
     thread::sched_start();

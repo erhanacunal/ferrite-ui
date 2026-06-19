@@ -56,6 +56,8 @@ pub fn render_buffered<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
 pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
     let buf = ctx.lcd.back_buf();
     ctx.tree.ensure_dfs();
+    // Whole-screen clip for the unclipped Pass-2 draws (built once).
+    let full = ClipRegion::from_rect(screen_rect::<P::LcdB>());
 
     // Pass 1: for each dirty widget whose rect in THIS buffer is stale,
     // redraw everything behind it clipped to the stale rect.
@@ -108,7 +110,7 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
         if ctx.lcd.has_alpha() && ctx.tree.alpha(id) < 255 {
             redraw_behind(ctx, vm, i, abs);
         }
-        draw_widget(ctx, vm, id, &abs);
+        draw_widget(ctx, vm, id, &abs, &full);
         ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
     }
 
@@ -211,7 +213,7 @@ fn redraw_behind_region<P: Platform>(
         if !u_abs.intersects(bounds) {
             continue;
         }
-        draw_widget_clipped(ctx, vm, uid, &u_abs, clip);
+        draw_widget(ctx, vm, uid, &u_abs, clip);
     }
 }
 
@@ -228,6 +230,9 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
 /// Children of scroll containers are clipped to the viewport.
 fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
     ctx.tree.ensure_dfs();
+    // Whole-screen clip for the full redraw — built once, reused for every
+    // widget so we don't pay region setup in the per-widget loop.
+    let full = ClipRegion::from_rect(screen_rect::<P::LcdB>());
     let mut i = 0;
     while i < ctx.tree.dfs_len() {
         let id = ctx.tree.dfs_at(i);
@@ -252,7 +257,7 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
                 && abs.right() <= viewport.right()
                 && abs.bottom() <= viewport.bottom()
             {
-                draw_widget(ctx, vm, id, &abs);
+                draw_widget(ctx, vm, id, &abs, &full);
                 ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
             } else {
                 // Outside or partially visible — skip entire subtree
@@ -264,7 +269,7 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
                 continue;
             }
         } else {
-            draw_widget(ctx, vm, id, &abs);
+            draw_widget(ctx, vm, id, &abs, &full);
             ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
         }
         i += 1;
@@ -414,7 +419,7 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
                 if ctx.lcd.has_alpha() && ctx.tree.alpha(sid) < 255 {
                     redraw_behind_region(ctx, vm, si, &clip, &sabs);
                 }
-                draw_widget_clipped(ctx, vm, sid, &sabs, &clip);
+                draw_widget(ctx, vm, sid, &sabs, &clip);
                 ctx.tree.get_mut(sid).flags |= FLAG_RENDERED;
             }
         }
@@ -504,193 +509,14 @@ fn resolved_text_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt, fallbac
     fallback
 }
 
-/// Draw widget without clipping (full render path).
-fn draw_widget<P: Platform>(ctx: &Ctx<P>, vm: &Vm, id: WidgetId, abs: &Rect) {
-    let widget = ctx.tree.get(id);
-    let ext = ctx.tree.ext(id).unwrap_or(&WidgetExt::DEFAULT);
-    let b = ext.border;
-    let r = ext.border_radius;
-    let bg_color = effective_bg(&ctx.tree, widget, ext);
-    // Freeform shapes (circle/polygon/line) paint their own fill + stroke
-    // below, so neutralize the default rectangular background/border here:
-    // zero the border edges and skip the bg fill. The shape draws read the
-    // real thickness from `ext.border`, not this shadowed `b`.
-    let freeform = is_freeform_shape(widget.kind);
-    let b = if freeform { Edges::ZERO } else { b };
-    let draw_bg =
-        !freeform && (bg_color != 0 || (widget.kind != KIND_LABEL && widget.kind != KIND_IMAGE));
-    // Background opacity — only honored on blending-capable backends (the
-    // has_alpha() branch folds away at compile time on the others, where the
-    // background stays solid). Gradients remain opaque (not supported).
-    let alpha = if ctx.lcd.has_alpha() { ext.alpha } else { 255 };
-    // Only apply gradient when the widget is in its normal (non-pressed) state.
-    let gdir = if bg_color == widget.background_color {
-        ctx.tree.gradient_dir(id)
-    } else {
-        0
-    };
-    let gcol = if gdir != 0 {
-        ctx.tree.gradient_color(id)
-    } else {
-        0
-    };
-
-    if r > 0 {
-        let bw = b.top.max(b.bottom).max(b.left).max(b.right);
-        if bw > 0 {
-            for i in 0..bw {
-                rounded_rect_screen(
-                    &ctx.lcd,
-                    Rect::new(
-                        abs.x + i as i16,
-                        abs.y + i as i16,
-                        abs.w.saturating_sub(i as u16 * 2),
-                        abs.h.saturating_sub(i as u16 * 2),
-                    ),
-                    r.saturating_sub(i as u16),
-                    widget.border_color,
-                );
-            }
-        }
-        if draw_bg {
-            let bg = inner_rect(abs, &b);
-            if !bg.is_empty() {
-                let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
-                if gdir != 0 {
-                    fill_gradient_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color, gcol, gdir);
-                } else if alpha < 255 {
-                    fill_rounded_rect_blend_screen(&ctx.lcd, bg, inner_r, bg_color, alpha);
-                } else {
-                    fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
-                }
-            }
-        }
-    } else {
-        if b.top > 0 {
-            fill_rect_screen(
-                &ctx.lcd,
-                Rect::new(abs.x, abs.y, abs.w, b.top as u16),
-                widget.border_color,
-            );
-        }
-        if b.bottom > 0 {
-            fill_rect_screen(
-                &ctx.lcd,
-                Rect::new(
-                    abs.x,
-                    abs.bottom() - b.bottom as i16,
-                    abs.w,
-                    b.bottom as u16,
-                ),
-                widget.border_color,
-            );
-        }
-        if b.left > 0 {
-            let inner_y = abs.y + b.top as i16;
-            let inner_h = abs.h.saturating_sub(b.top as u16 + b.bottom as u16);
-            fill_rect_screen(
-                &ctx.lcd,
-                Rect::new(abs.x, inner_y, b.left as u16, inner_h),
-                widget.border_color,
-            );
-        }
-        if b.right > 0 {
-            let inner_y = abs.y + b.top as i16;
-            let inner_h = abs.h.saturating_sub(b.top as u16 + b.bottom as u16);
-            fill_rect_screen(
-                &ctx.lcd,
-                Rect::new(
-                    abs.right() - b.right as i16,
-                    inner_y,
-                    b.right as u16,
-                    inner_h,
-                ),
-                widget.border_color,
-            );
-        }
-        if draw_bg {
-            let bg = inner_rect(abs, &b);
-            if !bg.is_empty() {
-                if gdir != 0 {
-                    fill_gradient_rect_screen(&ctx.lcd, bg, bg, bg_color, gcol, gdir);
-                } else if alpha < 255 {
-                    blend_rect_screen(&ctx.lcd, bg, bg_color, alpha);
-                } else {
-                    fill_rect_screen(&ctx.lcd, bg, bg_color);
-                }
-            }
-        }
-    }
-
-    // Background image. KIND_GRAPH repurposes ext.image_id as graph flags,
-    // so skip the image lookup for graphs.
-    if ext.image_id != 0 && widget.kind != KIND_GRAPH {
-        let bg = inner_rect(abs, &b);
-        draw_bg_image(ctx, ext.image_id, &bg);
-    }
-
-    // Label text
-    if widget.kind == KIND_LABEL {
-        draw_label_text(ctx, widget, abs, ext);
-    }
-
-    // Progress bar / slider fill
-    if widget.kind == KIND_PROGRESS || widget.kind == KIND_SLIDER {
-        let inner = inner_rect(abs, &b);
-        draw_value_fill(&ctx.lcd, widget, &inner, ext);
-    }
-
-    // Checkbox / radio indicator
-    if widget.kind == KIND_CHECKBOX || widget.kind == KIND_RADIO {
-        let inner = inner_rect(abs, &b);
-        draw_check_indicator(&ctx.lcd, widget, &inner, ext);
-    }
-
-    // Input text + cursor
-    if widget.kind == KIND_INPUT {
-        draw_input_text(ctx, widget, abs, ext);
-    }
-
-    // Dropdown selected text + arrow
-    if widget.kind == KIND_DROPDOWN {
-        draw_dropdown(ctx, widget, abs, ext);
-    }
-
-    // Gauge arc
-    if widget.kind == KIND_GAUGE {
-        let inner = inner_rect(abs, &ext.border);
-        draw_gauge(&ctx.lcd, widget, &inner, ext);
-    }
-
-    // Spline graph
-    if widget.kind == KIND_GRAPH {
-        let inner = inner_rect(abs, &b);
-        draw_graph(&ctx.lcd, vm, widget, &inner, ext);
-    }
-
-    // Image widget — draw image centered in content area
-    if widget.kind == KIND_IMAGE {
-        draw_widget_image(ctx, abs, ext);
-    }
-
-    // Shape widgets — fill = bg_color, stroke = border_color (thickness from
-    // the border width). These skipped the default bg/border above.
-    if widget.kind == KIND_CIRCLE {
-        draw_circle_shape(&ctx.lcd, widget, abs, ext);
-    }
-    if widget.kind == KIND_ELLIPSE {
-        draw_ellipse_shape(&ctx.lcd, widget, abs, ext);
-    }
-    if widget.kind == KIND_POLYGON {
-        draw_polygon_shape(ctx, widget, abs, ext);
-    }
-    if widget.kind == KIND_LINE {
-        draw_line_shape(&ctx.lcd, widget, abs, ext);
-    }
-}
-
-/// Draw widget with clip region (dirty render path).
-fn draw_widget_clipped<P: Platform>(
+/// Draw one widget, clipped to `clip`.
+///
+/// This is the single widget-draw path for both full and dirty rendering. The
+/// full-redraw callers pass a whole-screen `ClipRegion`, for which the clipped
+/// fills reduce to plain screen-bounded fills (one rect intersection each, the
+/// same clamp `fill_rect_screen` already does) — so the full path pays nothing
+/// for going through the clip.
+fn draw_widget<P: Platform>(
     ctx: &Ctx<P>,
     vm: &Vm,
     id: WidgetId,

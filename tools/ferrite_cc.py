@@ -131,6 +131,11 @@ class Op:
     RTC_WRITE       = 0x9B
     STR_CMP         = 0xAC  # (str_id, str_id) → -1/0/1
 
+    # Animation engine (args on stack; no return)
+    ANIMATE         = 0xAD  # pop on_end, ctrl, duration, to, prop, widget → start tween
+    STOP_ANIM       = 0xAE  # pop widget → cancel all tweens on the widget
+    STOP_ANIM_PROP  = 0xAF  # pop prop, pop widget → cancel that one tween
+
     # Float ops (all no-arg)
     ITOF = 0xC0
     FTOI = 0xC1
@@ -867,6 +872,18 @@ class Asm:
         """Pop [str_b, str_a], push -1/0/1 (lexicographic compare)."""
         self._emit(Op.STR_CMP)
 
+    def animate(self):
+        """Pop [widget, prop, to, duration, ctrl, on_end] → start a tween."""
+        self._emit(Op.ANIMATE)
+
+    def stop_anim(self):
+        """Pop [widget] → cancel all tweens on the widget."""
+        self._emit(Op.STOP_ANIM)
+
+    def stop_anim_prop(self):
+        """Pop [widget, prop] → cancel that one tween."""
+        self._emit(Op.STOP_ANIM_PROP)
+
     def str_parse_int(self):
         """Pop str_id, push parsed i32."""
         self._emit(Op.PARSE_INT)
@@ -991,6 +1008,7 @@ OP_NAMES = {
     0xA6: 'arrToStr',
     0xA7: 'showModal', 0xA8: 'setDialogResult', 0xA9: 'sprintf',
     0xAC: 'strCmp',
+    0xAD: 'animate', 0xAE: 'stopAnim', 0xAF: 'stopAnimProp',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -1029,6 +1047,7 @@ _NO_ARG_OPS = (
     {0x42, 0x43} |                     # W_TARGET_S, W_PARENT_S
     {op for op in range(0x80, 0xA9)    # 0x80-0xA8 except 0x86, 0x88
      if op not in (0x86, 0x88)} |
+    {0xAD, 0xAE, 0xAF} |               # animate, stopAnim, stopAnimProp
     set(range(0xC0, 0xCD))             # 0xC0-0xCC
 )
 

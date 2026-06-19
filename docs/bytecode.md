@@ -216,8 +216,14 @@ Builtins are single-byte opcodes. Operands are passed on the stack unless noted.
 | `0xA8` | `setDialogResult` | pop result and record on innermost modal frame |
 | `0xA9` | `sprintf` | `u8 argc`; pop `argc` args then fmt str_id; push formatted str_id |
 | `0xAB` | `syscall` | `u8 syscall_id, u8 argc`; pop `argc` args; call host handler; push i32 result |
+| `0xAC` | `strCmp` | pop `str_b`, `str_a`; push `-1`/`0`/`1` |
+| `0xAD` | `animate` | pop `on_end`, `ctrl`, `duration`, `to`, `prop`, `widget`; start a property tween |
+| `0xAE` | `stopAnim` | pop `widget`; cancel all tweens on the widget |
+| `0xAF` | `stopAnimProp` | pop `prop`, pop `widget`; cancel that one tween |
 
 `sprintf` has an inline `u8 argc` byte (number of format arguments after the format string). Stack layout before execution: `[... fmt, arg0, arg1, ..., argN-1]` (fmt pushed first).
+
+`animate` pops six stack values; the compiler pushes them as `widget, prop, to, duration, ctrl, on_end` (so they pop in reverse). `prop` is a scalar property id (see Widget Properties); `to` is the target value (an RGB565 color for color properties, otherwise a plain integer); `duration` is milliseconds; `ctrl` packs the easing curve in the low 4 bits (`0` linear, `1` ease-in, `2` ease-out, `3` ease-in-out) with `0x10` (loop) / `0x20` (yoyo) repeat flags in the high bits; `on_end` is a completion-callback func_id (`0` = none, fired only for non-repeating tweens). The starting value is the property's current value at the time `animate` runs. Tweens advance once per frame in `tick_animations` (driven by the runtime, independent of VM state) and are capped per board by `Platform::ANIM_SLOTS`.
 
 ## Float Opcodes
 

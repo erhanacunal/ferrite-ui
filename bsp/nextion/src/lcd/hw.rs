@@ -94,9 +94,17 @@ impl LcdBackend for FpgaLcd {
         let x2 = x + w - 1;
         let y2 = y + h - 1;
         self.set_address(x, y, x2, y2);
+        // Solid-fill burst: the FPGA latches one pixel per clock while C/D is
+        // held HIGH (data) and the bus holds `color`. set_address ends with
+        // CMD_PIXEL_WRITE (C/D LOW), so assert data and load the bus ONCE here
+        // and then only toggle the clock per pixel. The old per-pixel send_data
+        // re-drove C/D and the (constant) bus value on every pixel — 3 GPIO
+        // writes each; this does 1 setup + 1 clock pulse per pixel.
+        self.gpio.set_cmd_data(true);
+        self.gpio.write_data_bus(color);
         let pixel_count = w as u32 * h as u32;
         for _ in 0..pixel_count {
-            self.send_data(color);
+            self.gpio.clock_pulse();
         }
     }
 

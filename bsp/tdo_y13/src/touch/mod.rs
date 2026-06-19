@@ -13,6 +13,58 @@ use ferrite_core::touch::{CalParams, TouchBackend};
 /// Global CST8xx driver instance. Initialized by `init()`.
 static mut TOUCH_DRIVER: Option<Cst8xx<'static>> = None;
 
+/// Consecutive I²C-read failures, used to trigger bus recovery.
+static mut FAIL_STREAK: u32 = 0;
+
+/// After this many consecutive failed reads, hardware-reset the chip. A small
+/// streak avoids reacting to a single transient glitch; once the CST816S
+/// auto-sleeps and wedges the bus, every read fails so the threshold is reached
+/// almost immediately.
+const RECOVER_AFTER: u32 = 3;
+
+/// Hardware-reset the CST8xx and re-apply its configuration.
+///
+/// When the controller auto-sleeps it holds the I²C bus, so `twi_soft_reset`
+/// (controller-side only) cannot recover it — every transfer then fast-fails
+/// with the bus stuck non-idle, and the UI thread spins on the failing reads,
+/// starving the scheduler. Pulsing the reset line (PE10) releases the bus and
+/// reboots the chip; re-running `init()` re-disables auto-sleep so it stays
+/// awake afterwards.
+fn recover_chip() {
+    use f1c100s::gpio::{self, Port};
+    use f1c100s::timer;
+
+    gpio::set_value(Port::E, 10, false);
+    timer::delay_ms(5);
+    gpio::set_value(Port::E, 10, true);
+    timer::delay_ms(50); // controller boot time
+
+    if let Some(driver) = unsafe { &*core::ptr::addr_of!(TOUCH_DRIVER) }.as_ref() {
+        driver.init().ok();
+    }
+}
+
+/// Run a touch-count read, healing the bus if it has wedged. Returns the live
+/// touch count, or `None` while recovery is in progress.
+fn read_count_or_recover(driver: &Cst8xx<'static>) -> Option<u8> {
+    match driver.touch_count() {
+        Ok(n) => {
+            unsafe { FAIL_STREAK = 0; }
+            Some(n)
+        }
+        Err(_) => {
+            unsafe {
+                FAIL_STREAK += 1;
+                if FAIL_STREAK >= RECOVER_AFTER {
+                    FAIL_STREAK = 0;
+                    recover_chip();
+                }
+            }
+            None
+        }
+    }
+}
+
 /// Hardware backend wrapping the CST8xx I²C driver.
 pub struct CstTouch;
 
@@ -20,7 +72,7 @@ impl TouchBackend for CstTouch {
     fn is_active(&self) -> bool {
         let driver = unsafe { &*core::ptr::addr_of!(TOUCH_DRIVER) }
             .as_ref().expect("touch::init() not called");
-        driver.touch_count().unwrap_or(0) > 0
+        read_count_or_recover(driver).unwrap_or(0) > 0
     }
 
     fn read_screen(&self, cal: &CalParams) -> Option<(u16, u16)> {
@@ -69,7 +121,18 @@ pub unsafe fn init() {
     // y_flip=true, plus any saved calibration). Keep the hardware transform at
     // identity so the two don't stack into a double-flip.
     driver.set_transform(0);
-    driver.init().ok();
+
+    // Retry init: a single failed write here previously left the chip with
+    // auto-sleep still enabled (the `init()` chain aborts on the first error and
+    // `.ok()` swallowed it), so the controller would sleep after a few seconds,
+    // wedge the I²C bus, and the UI thread would spin on the failing reads.
+    // Keep trying until the full config (including DISABLE_AUTOSLEEP) lands.
+    for _ in 0..8 {
+        if driver.init().is_ok() {
+            break;
+        }
+        f1c100s::timer::delay_ms(10);
+    }
 
     unsafe { TOUCH_DRIVER = Some(driver) };
 }

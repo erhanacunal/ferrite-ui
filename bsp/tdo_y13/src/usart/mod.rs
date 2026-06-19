@@ -72,3 +72,11 @@ pub unsafe fn init() {
 pub fn new() -> HwUart {
     HwUart
 }
+
+/// Emit a single raw byte on UART2 for low-level diagnostics (e.g. from an ISR,
+/// where the `Ctx` USART handle is not reachable). No-op until `init()` has run.
+pub fn dbg_putc(byte: u8) {
+    if let Some(uart) = unsafe { &*addr_of!(UART2) } {
+        uart.write_byte(byte);
+    }
+}

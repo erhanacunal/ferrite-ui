@@ -17,10 +17,16 @@ use f1c100s::gpio::{self, DriveLevel, Port};
 use f1c100s::soft_spi::{SoftSpi, SoftSpiConfig, SpiMode};
 use f1c100s::timer::delay_ms;
 use f1c100s::{cpu, mmu};
+use f1c100s::ipc::{Semaphore, critical};
 
 // 480×480 pixels, one ARGB8888 word per pixel (DEBE converts down to the 18-bit bus).
 const FB_PIXELS: usize = 480 * 480;
 const FB_SIZE: usize = FB_PIXELS * 4;
+
+/// Number of framebuffers. Triple-buffering decouples the UI thread from the
+/// present thread: while the present thread waits for vblank to flip frame N,
+/// the UI thread rasterizes frame N+1 into a third buffer instead of stalling.
+const NUM_BUFFERS: usize = 3;
 
 /// The two framebuffers backing the double buffer (placed in .bss by the
 /// linker). The DEBE scans out the *front* buffer on one layer while the CPU
@@ -31,27 +37,68 @@ const FB_SIZE: usize = FB_PIXELS * 4;
 /// so `BACK` stays 0 and only layer 0 (buffer 0) is ever drawn or displayed —
 /// effectively single-buffered, identical to the previous behaviour.
 ///
-/// SAFETY: accessed only from the UI thread.
+/// SAFETY: pixel writes come only from the UI thread (one buffer at a time, the
+/// current `BACK`). The present thread only ever reads a *different* buffer
+/// (`PENDING`) for the D-cache clean + DEBE flip, so the two threads never touch
+/// the same framebuffer concurrently.
 #[unsafe(link_section = ".bss.framebuffer")]
-static mut FRAMEBUFFERS: [[u32; FB_PIXELS]; 2] = [[0u32; FB_PIXELS]; 2];
+static mut FRAMEBUFFERS: [[u32; FB_PIXELS]; NUM_BUFFERS] = [[0u32; FB_PIXELS]; NUM_BUFFERS];
 
 /// Row stride in **pixels** (one u32 per pixel). The framebuffer is indexed
 /// through a `[u32]` view, so the stride is the pixel width — not the byte width.
 const FB_STRIDE: u16 = 480;
 
-/// Base pointer of framebuffer `index` (0 or 1).
+/// Base pointer of framebuffer `index` (0..NUM_BUFFERS).
 #[inline]
 fn fb_ptr(index: u8) -> *mut u32 {
-    // SAFETY: forms a raw pointer to one of the two framebuffer statics without
-    // creating a reference; the UI thread is the only accessor.
-    unsafe { (&raw mut FRAMEBUFFERS[(index & 1) as usize]).cast::<u32>() }
+    // SAFETY: forms a raw pointer to one of the framebuffer statics without
+    // creating a reference.
+    unsafe { (&raw mut FRAMEBUFFERS[index as usize]).cast::<u32>() }
 }
 
-// ── Double-buffer state (single-threaded: UI thread only) ───────────────────
-/// Layer (0 or 1) the DEBE currently displays.
+// ── Triple-buffer state ─────────────────────────────────────────────────────
+//
+// Buffer index == DEBE layer index: layer N always scans from framebuffer N,
+// and exactly one layer is enabled (visible) at a time. `flip` = disable the
+// old layer, enable the new one, inside vertical blanking.
+//
+// Roles (all guarded by `critical()` — a brief interrupt-disable — because they
+// are read/written across the UI thread, the present thread, and the ISR):
+//   FRONT   — buffer the DEBE currently displays (owned by the present thread)
+//   BACK    — buffer the CPU draws into (owned by the UI thread between
+//             begin_frame and submit_present; never touched by other threads)
+//   PENDING — buffer handed to the present thread, awaiting its vblank flip
+/// Buffer/layer the DEBE currently displays.
 static mut FRONT: u8 = 0;
-/// Layer the CPU draws into — target of every fill/pixel/blend operation.
+/// Buffer/layer the CPU draws into — target of every fill/pixel/blend.
 static mut BACK: u8 = 0;
+/// Buffer submitted to the present thread, not yet flipped.
+static mut PENDING: u8 = 0;
+/// Whether a submitted frame is still awaiting its flip.
+static mut HAS_PENDING: bool = false;
+
+// ── Present-thread synchronization ──────────────────────────────────────────
+/// UI → present: a rasterized frame (PENDING) is ready to show.
+static mut READY_SEM: Semaphore = Semaphore::new(0);
+/// Single in-flight present slot. UI takes it in `submit_present`; the present
+/// thread releases it after the flip. Init 1 ⇒ at most one frame in flight ⇒
+/// with 3 buffers there is always a free buffer for the UI to draw into.
+static mut SLOT_SEM: Semaphore = Semaphore::new(1);
+/// Vblank ISR → present thread: a vertical-blank edge has begun.
+static mut VSYNC_SEM: Semaphore = Semaphore::new(0);
+
+#[inline]
+fn ready_sem() -> &'static mut Semaphore {
+    unsafe { &mut *core::ptr::addr_of_mut!(READY_SEM) }
+}
+#[inline]
+fn slot_sem() -> &'static mut Semaphore {
+    unsafe { &mut *core::ptr::addr_of_mut!(SLOT_SEM) }
+}
+#[inline]
+fn vsync_sem() -> &'static mut Semaphore {
+    unsafe { &mut *core::ptr::addr_of_mut!(VSYNC_SEM) }
+}
 
 /// Expand an RGB565 color (the framework's pixel format) into the ARGB8888 word
 /// the DEBE framebuffer stores. Alpha is forced opaque; the 5/6-bit channels are
@@ -88,30 +135,27 @@ impl LcdBackend for DebeLcd {
     const HAS_ALPHA: bool = true;
 
     fn begin_frame(&mut self) {
-        // Buffered mode only (dirty mode never calls this). When both buffers
-        // are in sync — i.e. just after a flip — start drawing into the other
-        // one. The draw primitives read `BACK` to pick their target, so no
-        // hardware "select back buffer" step is needed; the back buffer is
-        // simply the DRAM region they write to.
-        unsafe {
-            if FRONT == BACK {
-                BACK ^= 1;
+        // Buffered mode only (dirty mode never calls this). Pick a free buffer
+        // to draw into — one that is neither displayed (FRONT) nor awaiting a
+        // flip (PENDING). With 3 buffers and at most one in-flight present
+        // (SLOT_SEM init 1), at least one buffer is always free, so this never
+        // blocks. The draw primitives read `BACK` to pick their target.
+        critical(|| unsafe {
+            let busy_a = FRONT;
+            let busy_b = if HAS_PENDING { PENDING } else { FRONT };
+            let mut b: u8 = 0;
+            while b == busy_a || b == busy_b {
+                b += 1;
             }
-        }
+            BACK = b;
+        });
     }
 
     fn end_frame(&mut self) {
-        // Publish the freshly drawn back buffer: drain pending writes and write
-        // back the D-cache so the DEBE sees the new pixels, then switch layer
-        // visibility.
-        //
-        // DEBE register writes (layer enable here, layer address for an
-        // address-flip — both tear identically) take effect the instant they
-        // land. Doing the swap while the panel is scanning out tears the frame.
-        // So first block until the controller enters vertical blanking, then do
-        // the disable/enable in that gap: both writes complete in nanoseconds,
-        // far inside the multi-line vblank, so the change is never on screen
-        // mid-scanout. Blocking here also paces rendering to the panel refresh.
+        // Synchronous present (LcdBackend contract). On tdo_y13 the platform
+        // overrides `present_buffered` to hand the frame to the present thread
+        // via `submit_present`, so this path is NOT taken in normal operation —
+        // it is kept correct as a single-threaded fallback.
         unsafe {
             cpu::dsb();
             if mmu::dcache_status() {
@@ -340,10 +384,95 @@ pub unsafe fn init() {
     let mut panel: Panel = panels::TL021WVC04;
     panel.panel_init = Some(panel_init);
 
-    // Start the DEBE scanning out layer 0 (buffer 0); layer 1 is pre-configured
-    // with buffer 1 but left hidden. FRONT and BACK are both 0 at boot.
+    // Start the DEBE scanning out layer 0 (buffer 0); layers 1 and 2 are
+    // pre-configured with their framebuffers but left hidden. FRONT, BACK and
+    // PENDING are all 0 at boot.
     lcd::init_all(&panel, fb_ptr(0).cast::<u8>(), ColorMode::Argb8888);
     lcd::debe_layer_init(1, panel.width, panel.height, fb_ptr(1).cast::<u8>(), ColorMode::Argb8888, false);
+    lcd::debe_layer_init(2, panel.width, panel.height, fb_ptr(2).cast::<u8>(), ColorMode::Argb8888, false);
+}
+
+// ── Asynchronous present (render thread) ─────────────────────────────────────
+
+/// Hand the freshly rasterized back buffer to the present thread and return
+/// immediately. Called from `TdoY13Platform::present_buffered` on the UI thread
+/// after the framework has finished drawing into `BACK`.
+///
+/// Blocks only on `SLOT_SEM` — and only when the present thread has not yet
+/// flipped the previous frame (backpressure that paces the UI to the panel
+/// refresh). That wait yields the CPU via the scheduler; it does not busy-spin,
+/// so the UI thread reclaims the vblank instead of polling it.
+pub fn submit_present() {
+    let _ = slot_sem().take(None);
+    critical(|| unsafe {
+        PENDING = BACK;
+        HAS_PENDING = true;
+    });
+    let _ = ready_sem().release();
+}
+
+/// Present-thread entry point: publish submitted frames forever. Runs at higher
+/// priority than the UI thread so the vblank flip happens promptly, but spends
+/// almost all its time blocked on a semaphore.
+pub fn present_thread_body() -> ! {
+    loop {
+        // Wait for a rasterized frame.
+        let _ = ready_sem().take(None);
+        let buf = critical(|| unsafe { PENDING });
+
+        // Publish the pixels: drain the write buffer and write the D-cache back
+        // so the DEBE (which scans DRAM directly) sees the new frame.
+        cpu::dsb();
+        if mmu::dcache_status() {
+            mmu::clean_dcache(fb_ptr(buf) as u32, FB_SIZE as u32);
+        }
+
+        // Wait for the next vblank edge before swapping layers, so the DEBE
+        // register writes land inside the blanking gap (a mid-scanout swap
+        // tears).
+        //
+        // DIAGNOSTIC (bisection): poll the vblank status flag directly via the
+        // proven `wait_for_vsync` instead of blocking on VSYNC_SEM / the vblank
+        // IRQ. Paired with the vblank IRQ being left disabled in `rust_main`,
+        // this removes the ISR from the system entirely. If the idle freeze
+        // disappears, the IRQ/ISR path was the cause; if it persists, the cause
+        // is elsewhere (scheduler / threading). This busy-waits at the present
+        // thread's priority, but only while a frame is in flight (never at idle,
+        // where the present thread is parked on READY_SEM), so it does not
+        // affect the idle behaviour we are testing.
+        lcd::wait_for_vsync();
+
+        let old_front = critical(|| unsafe { FRONT });
+        lcd::debe_layer_disable(old_front);
+        lcd::debe_layer_enable(buf);
+        critical(|| unsafe {
+            FRONT = buf;
+            HAS_PENDING = false;
+        });
+
+        // Free the present slot so the UI thread may submit the next frame.
+        let _ = slot_sem().release();
+
+    }
+}
+
+/// TCON vertical-blank interrupt handler. Installed on `TCON_INTERRUPT` and
+/// woken at the start of every vblank.
+///
+/// Part of the (currently dormant) async-present path: presenting is done
+/// synchronously on the UI thread, so this handler is not installed. Kept for
+/// when the present thread is restored. MUST stay minimal and do NO blocking I/O.
+pub fn vblank_isr(_vector: u32) {
+    // Acknowledge first so the INTC line de-asserts (otherwise it re-fires in a
+    // storm). Preserves the enable bit.
+    lcd::clear_vblank_irq();
+
+    // Only wake the present thread when it is actually waiting; otherwise the
+    // counting semaphore would grow unbounded across idle frames (the panel
+    // keeps blanking ~60×/s whether or not we are presenting).
+    if vsync_sem().waiter_count() > 0 {
+        vsync_sem().release_from_isr();
+    }
 }
 
 /// Return a new `DebeLcd` instance. Must call `init()` first.

@@ -1,0 +1,51 @@
+// anim.fl — Property animation constants
+// Usage: #include "anim.fl"
+//
+// Tween a widget's integer property from its current value to a target over
+// time. Animations are time-driven (millis), so they keep running regardless
+// of what loop() is doing.
+//
+//   animate(widget, prop, to, durationMs, easing)
+//   animate(widget, prop, to, durationMs, easing, @onEnd)
+//   stopAnim(widget)            — cancel all tweens on a widget
+//   stopAnimProp(widget, prop)  — cancel one property's tween
+//
+//   prop    — one of the PROP_* ids below
+//   easing  — an EASE_* curve, optionally OR'd with REPEAT_LOOP or REPEAT_YOYO
+//   @onEnd  — optional callback fn(widget, prop), fired when a one-shot tween
+//             completes (never fires for REPEAT_* tweens)
+//
+// Notes:
+//   - Starting a new tween on a property already animating replaces it.
+//   - Color props (BG/BORDER/TEXT/PRESS/GRADIENT) interpolate in RGB565.
+//   - Concurrent tweens are capped per board (P::ANIM_SLOTS); extra ones are
+//     dropped silently.
+//
+// Example:
+//   #include "anim.fl"
+//   animate(panel, PROP_LOC_X, 700, 300, EASE_OUT);
+//   animate(box, PROP_BG_COLOR, 0xF800, 1000, EASE_IN_OUT | REPEAT_YOYO);
+
+// Easing curves (low 4 bits of the easing argument)
+const EASE_LINEAR = 0;
+const EASE_IN     = 1;  // quadratic ease-in
+const EASE_OUT    = 2;  // quadratic ease-out
+const EASE_IN_OUT = 3;  // quadratic ease-in-out
+
+// Repeat modifiers — OR with an EASE_* curve (e.g. EASE_LINEAR | REPEAT_LOOP)
+const REPEAT_LOOP = 0x10;  // restart from the beginning forever
+const REPEAT_YOYO = 0x20;  // bounce back and forth forever
+
+// Animatable property ids (mirror of proto.rs PROP_*)
+const PROP_LOC_X          = 0x01;
+const PROP_LOC_Y          = 0x02;
+const PROP_SIZE_W         = 0x03;
+const PROP_SIZE_H         = 0x04;
+const PROP_BG_COLOR       = 0x08;
+const PROP_BORDER_COLOR   = 0x09;
+const PROP_TEXT_COLOR     = 0x0F;
+const PROP_PRESS_COLOR    = 0x1E;
+const PROP_BORDER_RADIUS  = 0x23;
+const PROP_VALUE          = 0x24;
+const PROP_GRADIENT_COLOR = 0x2B;
+const PROP_ALPHA          = 0x31;

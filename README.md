@@ -48,6 +48,7 @@ For some bricked Nextion displays :)
 - **Touch input** -- Debounced press/hold/release events, hit testing, on_click and on_tap callbacks, on-screen keyboard
 - **Scrollable containers** -- FLAG_CLIP_CHILDREN on any widget, scrollbar, virtual rendering (off-screen children skipped)
 - **Custom paint** -- on_paint callback for widget custom drawing
+- **Property animation** -- time-based `animate()` tweening of any scalar property (position, size, RGB565 colors, alpha, …) with easing curves, loop/yoyo repeat, and an optional completion callback
 - **Flash filesystem** -- TOC-based, named resources (fonts, images, programs, pages, files); XIP-embedded on ESP32
 - **Font rendering** -- Adafruit GFX compatible bitmap fonts (flash + embedded)
 - **Image format** -- Ferrite Image (FI): raw/RLE/indexed+RLE, streaming decode
@@ -298,7 +299,8 @@ ferrite-ui/
 │   └── ferrite_build.py JSON project builder (flash image)
 ├── lib/
 │   ├── core.fl          Ferrite language widget constants
-│   └── color.fl         RGB565 color constants
+│   ├── color.fl         RGB565 color constants
+│   └── anim.fl          Animation easing / repeat / PROP_* constants
 ├── examples/            Ferrite project examples (incl. epaper_clock)
 ├── docs/
 │   ├── ferrite-lang.md  Language reference (math functions, sprintf)

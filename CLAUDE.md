@@ -170,6 +170,19 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Constants:** `LONG_PRESS_FRAMES = 60`, `LONG_PRESS_MAX_MOVE_SQ = 400`, `SWIPE_MIN_DIST_SQ = 1600`, `SWIPE_AXIS_RATIO = 2`
 - **Language library:** `lib/touch.fl` — include in `.fl` programs to get named `SWIPE_*` constants
 
+### Property Animation
+- **Time-based tweening** of any scalar widget property via its integer `PROP_*` id. Reuses the `set_scalar_prop` → `mark_dirty` → dirty-render path — no separate render path.
+- **Opcodes:** `OP_ANIMATE` (0xAD), `OP_STOP_ANIM` (0xAE), `OP_STOP_ANIM_PROP` (0xAF) — all args on stack.
+- **VM builtins:**
+  - `animate(widget, prop, to, durationMs, easing [, @onEnd])` — tween from the property's *current* value to `to`. Starting a tween on an already-animating property replaces it.
+  - `stopAnim(widget)` / `stopAnimProp(widget, prop)` — cancel.
+- **easing byte** (`ctrl`): low 4 bits = curve (`EASE_LINEAR/IN/OUT/IN_OUT`); bit4 `REPEAT_LOOP`, bit5 `REPEAT_YOYO`. OR a repeat flag onto a curve.
+- **Color props** (BG/BORDER/TEXT/PRESS/GRADIENT) interpolate channel-wise via `lerp_rgb565`; others linearly.
+- **onAnimEnd:** optional `@func` (a func_id) fired with `(widget, prop)` via `enqueue_callback` when a *one-shot* tween completes (never for `REPEAT_*`).
+- **Tick:** `Vm::tick_animations()` runs once per main-loop iteration (in `runtime::run`, before render), independent of VM state, and only re-marks dirty when the integer value actually changes (avoids redundant redraws on the vsync-free device loop).
+- **Pool size:** `Platform::ANIM_SLOTS` const — default 8 (nextion, epaper), tdo_y13 = 32. Over-cap tweens are dropped.
+- **Language library:** `lib/anim.fl` — `EASE_*`, `REPEAT_*`, and animatable `PROP_*` constants. Opcode numbers are duplicated in `vm.rs`, `tools/ferrite_cc.py` (`Op`/`OP_NAMES`/`_NO_ARG_OPS`) — keep in sync.
+
 ### Recovery Mode
 - **Hold top-left corner for 3 seconds at boot** → recovery mode
 - Red progress bar fills to indicate progress, release to cancel

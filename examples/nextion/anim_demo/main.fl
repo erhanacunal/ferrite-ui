@@ -1,0 +1,89 @@
+// anim_demo.fl — Property animation showcase (800x480)
+//
+// Demonstrates the animate() builtin:
+//   - a panel that slides its X position on click (EASE_OUT, one-shot)
+//   - a box whose background color pulses forever (EASE_IN_OUT | REPEAT_YOYO)
+//   - an @onEnd callback that recolors the slider panel when its slide finishes
+//
+// No "device" base in project.json, so this runs in the simulator.
+
+#include "core.fl"
+#include "color.fl"
+#include "anim.fl"
+
+var slider;      // panel that slides on click
+var pulse;       // box that pulses color
+var status;      // label updated by the onEnd callback
+var slid_right;  // toggles slide direction
+
+// Fired when the slide tween completes — recolor the panel and update status.
+fn on_slide_end(widget, prop) {
+    target(slider);
+    animate(slider, PROP_BG_COLOR, TEAL, 250, EASE_OUT);
+    target(status);
+    set(text, "slide done -> onEnd fired");
+    dirty();
+}
+
+fn on_slider_click(widget_id) {
+    if (slid_right == 0) {
+        slid_right = 1;
+        animate(slider, PROP_LOC_X, 540, 400, EASE_OUT, @on_slide_end);
+    } else {
+        slid_right = 0;
+        animate(slider, PROP_LOC_X, 40, 400, EASE_IN_OUT, @on_slide_end);
+    }
+}
+
+fn setup() {
+    slid_right = 0;
+
+    // Title
+    var l = alloc(); target(l);
+    set(kind, KIND_LABEL);
+    set(size, 800, 30);
+    set(text_color, WHITE); set(text_align, ALIGN_CENTER);
+    set(text, "Animation Demo");
+    parent(0);
+
+    // Clickable panel that slides horizontally on tap.
+    slider = alloc(); target(slider);
+    set(location, 40, 90); set(size, 220, 90);
+    set(bg_color, NAVY); set(border_radius, 12);
+    set(border, 2, 2, 2, 2); set(border_color, CYAN);
+    set(clickable, ON); set(press_color, DARK_GRAY);
+    set(on_click, @on_slider_click);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 40, 188); set(size, 220, 16);
+    set(text_color, GRAY); set(text, "Tap to slide (EASE_OUT)");
+    parent(0);
+
+    // Box that pulses its background color forever.
+    pulse = alloc(); target(pulse);
+    set(location, 300, 90); set(size, 220, 90);
+    set(bg_color, RED); set(border_radius, 12);
+    parent(0);
+    l = alloc(); target(l); set(kind, KIND_LABEL);
+    set(location, 300, 188); set(size, 220, 16);
+    set(text_color, GRAY); set(text, "Pulsing (YOYO)");
+    parent(0);
+
+    // Status line updated by the onEnd callback.
+    status = alloc(); target(status); set(kind, KIND_LABEL);
+    set(location, 40, 260); set(size, 700, 20);
+    set(text_color, YELLOW); set(text, "Tap the navy panel...");
+    parent(0);
+
+    render();
+
+    // Kick off the forever-pulsing color tween once.
+    animate(pulse, PROP_BG_COLOR, BLUE, 900, EASE_IN_OUT | REPEAT_YOYO);
+
+    return 0;
+}
+
+fn loop() {
+    // Animations are driven by the runtime; loop() just idles.
+    delay(33);
+}

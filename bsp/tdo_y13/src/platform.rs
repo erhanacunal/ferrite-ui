@@ -38,13 +38,16 @@ impl Platform for TdoY13Platform {
     //   0x600000 - 0x600FFF  config store   4 KB, one sector
     //   0x601000 - 0xFFFFFF  resource FS    ~9.99 MB (writefs target)
     const CONFIG_BASE: u32 = 6 * 1024 * 1024; // 0x60_0000
-    const FS_BASE: u32 = 6 * 1024 * 1024 + 4 * 1024; // 0x60_1000            
+    const FS_BASE: u32 = 6 * 1024 * 1024 + 4 * 1024; // 0x60_1000
+
+    // F1C100s has ample SDRAM — allow richer multi-widget animated scenes.
+    const ANIM_SLOTS: usize = 32;
 }
 
 impl PlatformRuntime for TdoY13Platform {
     const BG_COLOR: u16 = COLOR_BLACK;
     const FG_COLOR: u16 = COLOR_WHITE;
-    const VM_STEPS_PER_TICK: u32 = 1;
+    const VM_STEPS_PER_TICK: u32 = 10;
     type Input = FullInput;
 
     fn reset() -> ! {
@@ -109,6 +112,18 @@ impl PlatformRuntime for TdoY13Platform {
 
     fn initial_render(_ctx: &mut Ctx<Self>, _vm: &Vm) {
         // Raster panel: first dirty frame handles the initial render.
+    }
+
+    fn present_buffered(ctx: &mut Ctx<Self>) {
+        // DIAGNOSTIC (bisection): present SYNCHRONOUSLY on the UI thread (the
+        // 2-thread arrangement the tear-free build used), instead of handing off
+        // to the present thread via `submit_present`. This isolates whether the
+        // idle hard-freeze is caused by the present thread / 3-thread scheduler
+        // change: if it still freezes here, the cause is pre-existing (scheduler
+        // / INTC / touch), not the threading. Restore `submit_present()` once
+        // decided. `end_frame` does the D-cache clean + DEBE buffer flip.
+        ctx.lcd.end_frame();
+        ctx.lcd.flush_dirty();
     }
 
     fn on_extra_rx(
