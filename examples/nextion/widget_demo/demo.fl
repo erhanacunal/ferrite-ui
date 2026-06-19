@@ -79,10 +79,9 @@ fn on_tab(wid) {
 
 fn on_count(wid) {
     counter = counter + 1;
-    target(counter_lbl);
-    var s = itos(counter);
-    var t = concat(str("Tapped: "), s);
-    set(text, t);
+    target(counter_lbl);    
+    var z: string = sprintf("Tapped: %d ", counter);
+    set(text, z);
     dirty();
     render();
     strClear();
@@ -114,8 +113,8 @@ fn on_color(wid) {
 
 fn on_s1(wid, val) {
     target(s1_lbl);
-    var s = itos(val);
-    var t = concat(str("Brightness: "), concat(s, str("%")));
+    var s: string = itos(val);
+    var t: string = concat(str("Brightness: "), concat(s, str("%")));
     set(text, t); dirty(); render();
     strClear();
     setBrightness(val);
@@ -123,8 +122,8 @@ fn on_s1(wid, val) {
 
 fn on_s2(wid, val) {
     target(s2_lbl);
-    var s = itos(val);
-    var t = concat(str("Volume: "), concat(s, str("%")));
+    var s:string = itos(val);
+    var t:string = concat(str("Volume: "), concat(s, str("%")));
     set(text, t); dirty(); render();
     strClear();
 }
@@ -135,7 +134,7 @@ fn on_check(wid) {
     target(cb1); var c1 = get(checked);
     target(cb2); var c2 = get(checked);
     target(cb3); var c3 = get(checked);
-    var m = str("");
+    var m: string = "";
     if (c1) { m = concat(m, str("WiFi ")); }
     if (c2) { m = concat(m, str("BT ")); }
     if (c3) { m = concat(m, str("Sound ")); }
@@ -147,7 +146,7 @@ fn on_check(wid) {
 fn on_radio(wid) {
     target(r1); var v1 = get(checked);
     target(r2); var v2 = get(checked);
-    var m = str("Theme: ");
+    var m: string = "Theme: ";
     if (v1) { m = concat(m, str("Light")); }
     if (v2) { m = concat(m, str("Dark")); }
     if (!v1 && !v2) { m = concat(m, str("Auto")); }

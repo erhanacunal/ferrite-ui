@@ -1,0 +1,219 @@
+// funny_face.fl — A goofy face built entirely from shape widgets, with
+// rolling googly eyes (tdo_y13, 480x480 round display).
+//
+// Shows off all five shape kinds:
+//   circle    — face, eyes, pupils, cheeks
+//   ellipse   — open mouth, tongue
+//   polygon   — nose (triangle)
+//   rectangle — teeth bar
+//   line      — eyebrows (each line is the diagonal of its box)
+//
+// The pupils orbit inside the eyes every frame. Each pupil is a CHILD of its
+// eye, so moving a pupil and marking only the eye dirty repaints the whole
+// eye (white iris + pupil on top) in a single render pass: the old pupil spot
+// is erased and the pupil is redrawn atomically — no trail, no flicker.
+//
+// Render mode is "buffered": every dirty frame is composited into the back
+// buffer and swapped in atomically, so updates are tear-free. The tdo_y13
+// flips between two DRAM buffers in hardware; the host simulator emulates the
+// same two-buffer flip, so this runs identically under sim.bat. (Switch
+// project.json to "dirty" for direct partial front-buffer redraws instead.)
+
+#include "shapes.fl"
+#include "color.fl"
+
+// Shape fills/strokes treat 0x0000 as "no paint", so pure BLACK is invisible.
+// Use a non-zero near-black for the eyes and pupils.
+const NEAR_BLACK = 0x0841;
+
+// Pupil orbit: how far the pupils swing from their centered rest position.
+const ORBIT = 16;
+
+// Pupils are children of their eye, so their location is relative to the eye's
+// content box (inside the 3px border). A 40px pupil centred in the 94px content
+// box rests at (94 - 40) / 2 = 27; the orbit offsets swing around that point.
+const PUPIL_REST = 27;
+
+// ── Globals the animation loop needs ──
+var leye;          // left eye white (repainted to erase the pupil's old spot)
+var reye;          // right eye white
+var lpup;          // left pupil widget id
+var rpup;          // right pupil widget id
+var phase;         // current orbit step (0..7)
+var last_step;     // millis() of the last pupil move
+var ox[8];         // orbit x offsets (8 points around a circle)
+var oy[8];         // orbit y offsets
+
+fn setup() {
+    init_orbit();
+    layout();
+    phase = 0;
+    last_step = 0;
+    render();
+    return 0;
+}
+
+fn loop() {
+    // Advance the pupils roughly every 90 ms (faster on hardware than in the
+    // instruction-paced simulator, but it rolls in both).
+    
+    var now = millis();
+    if (now - last_step >= 90) {
+        critical();
+        last_step = now;
+        phase = phase + 1;
+        if (phase >= 8) { phase = 0; }
+        roll_eyes();
+        render();
+        yield_op();
+    }
+}
+
+// Eight points around a circle of radius ORBIT (≈ cos/sin × 16).
+fn init_orbit() {
+    ox[0] = ORBIT;       oy[0] = 0;
+    ox[1] = 11;          oy[1] = 11;
+    ox[2] = 0;           oy[2] = ORBIT;
+    ox[3] = 0 - 11;      oy[3] = 11;
+    ox[4] = 0 - ORBIT;   oy[4] = 0;
+    ox[5] = 0 - 11;      oy[5] = 0 - 11;
+    ox[6] = 0;           oy[6] = 0 - ORBIT;
+    ox[7] = 11;          oy[7] = 0 - 11;
+}
+
+// Move each pupil to the current orbit point (relative to its eye's content
+// box), then mark only the EYE dirty. mark_dirty flags the whole subtree, so
+// the eye and its pupil child repaint together in one render pass: the white
+// iris erases the old pupil spot and the pupil is redrawn on top — atomic, no
+// trail, no flicker (even in the single-step simulator).
+fn roll_eyes() {    
+    target(lpup);
+    set(location, PUPIL_REST + ox[phase], PUPIL_REST + oy[phase]);
+    target(leye);
+    dirty();
+
+    target(rpup);
+    set(location, PUPIL_REST + ox[phase], PUPIL_REST + oy[phase]);
+    target(reye);
+    dirty();    
+}
+
+fn layout() {
+    // ── Face: big yellow disc with a brown outline ──
+    var face = alloc();
+    face.kind = KIND_CIRCLE;
+    face.location = [10, 10];
+    face.size = [460, 460];
+    face.bg_color = YELLOW;
+    face.border_color = BROWN;
+    face.border = [5, 5, 5, 5];
+    parent(0);
+
+    // ── Rosy cheeks ──
+    var lcheek = alloc();
+    lcheek.kind = KIND_CIRCLE;
+    lcheek.location = [80, 235];
+    lcheek.size = [60, 60];
+    lcheek.bg_color = PINK;
+    parent(0);
+
+    var rcheek = alloc();
+    rcheek.kind = KIND_CIRCLE;
+    rcheek.location = [340, 235];
+    rcheek.size = [60, 60];
+    rcheek.bg_color = PINK;
+    parent(0);
+
+    // ── Eyes: white circles with orbiting black pupils ──
+    leye = alloc();
+    leye.kind = KIND_CIRCLE;
+    leye.location = [120, 120];
+    leye.size = [100, 100];
+    leye.bg_color = WHITE;
+    leye.border_color = NEAR_BLACK;
+    leye.border = [3, 3, 3, 3];
+    parent(0);
+
+    reye = alloc();
+    reye.kind = KIND_CIRCLE;
+    reye.location = [260, 120];
+    reye.size = [100, 100];
+    reye.bg_color = WHITE;
+    reye.border_color = NEAR_BLACK;
+    reye.border = [3, 3, 3, 3];
+    parent(0);
+
+    // Pupils are CHILDREN of their eye, centred in the eye's content box; the
+    // loop rolls them around. Being children means one dirty() on the eye
+    // repaints eye + pupil atomically (no trail, no flicker).
+    lpup = alloc();
+    lpup.kind = KIND_CIRCLE;
+    lpup.location = [PUPIL_REST, PUPIL_REST];
+    lpup.size = [40, 40];
+    lpup.bg_color = NEAR_BLACK;
+    parent(leye);
+
+    rpup = alloc();
+    rpup.kind = KIND_CIRCLE;
+    rpup.location = [PUPIL_REST, PUPIL_REST];
+    rpup.size = [40, 40];
+    rpup.bg_color = NEAR_BLACK;
+    parent(reye);
+
+    // ── Eyebrows: two slanted lines (each = its box diagonal) ──
+    var lbrow = alloc();
+    lbrow.kind = KIND_LINE;
+    lbrow.location = [120, 92];
+    lbrow.size = [90, 18];
+    lbrow.border_color = BROWN;
+    lbrow.border = [5, 5, 5, 5];
+    parent(0);
+
+    var rbrow = alloc();
+    rbrow.kind = KIND_LINE;
+    rbrow.location = [270, 92];
+    rbrow.size = [90, 18];
+    rbrow.border_color = BROWN;
+    rbrow.border = [5, 5, 5, 5];
+    parent(0);
+
+    // ── Nose: downward orange triangle, tip just below face center ──
+    var nose = alloc();
+    nose.kind = KIND_POLYGON;
+    nose.location = [215, 205];
+    nose.size = [50, 45];
+    nose.text = "0,0 50,0 25,45";
+    nose.bg_color = ORANGE;
+    nose.border_color = BROWN;
+    nose.border = [2, 2, 2, 2];
+    parent(0);
+
+    // ── Mouth: wide open red ellipse ──
+    var mouth = alloc();
+    mouth.kind = KIND_ELLIPSE;
+    mouth.location = [140, 290];
+    mouth.size = [200, 120];
+    mouth.bg_color = RED;
+    mouth.border_color = DARK_RED;
+    mouth.border = [3, 3, 3, 3];
+    parent(0);
+
+    // teeth: white bar across the top of the mouth
+    var teeth = alloc();
+    teeth.kind = KIND_RECTANGLE;
+    teeth.location = [165, 320];
+    teeth.size = [150, 22];
+    teeth.bg_color = WHITE;
+    teeth.border_radius = 4;
+    parent(0);
+
+    // tongue: pink ellipse hanging at the bottom of the mouth
+    var tongue = alloc();
+    tongue.kind = KIND_ELLIPSE;
+    tongue.location = [195, 360];
+    tongue.size = [90, 50];
+    tongue.bg_color = PINK;
+    tongue.border_color = DARK_RED;
+    tongue.border = [2, 2, 2, 2];
+    parent(0);
+}

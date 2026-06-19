@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "device": "nextion",
+  "screen": [800, 400],
+  "render_mode": "buffered",
+  "include_dirs": ["../../../lib"],
+  "programs": [
+    {
+      "name": "main",
+      "source": "swipe_pages.fl",
+      "exec_mode": "flash"
+    }
+  ]
+}
