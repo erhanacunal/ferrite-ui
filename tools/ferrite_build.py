@@ -10,6 +10,8 @@ Flash FS layout (W25Q256):
 Usage:
   python ferrite_build.py project.json -o flash.bin
   python ferrite_build.py project.json --info
+  python ferrite_build.py project.json --expand   # print fully expanded source
+                                                   # (includes + dispatchers) and exit
 
 JSON format:
   {
@@ -388,6 +390,42 @@ def build_fs(project: dict, resources: list[tuple[str, int, bytes, int]],
     return bytes(binary)
 
 
+# --- Source expansion (debug aid) ---
+
+def dump_expanded(project_path: str):
+    """Print the fully expanded source for each program/page in the project —
+    `#include`s inlined and the generated widget-callback dispatchers
+    (`__on_click_dispatch`, …) appended — i.e. exactly what the compiler
+    tokenizes. Mirrors `build_image`'s preprocessing so include paths and
+    `set(on_click, @h)` / dot-syntax wiring resolve identically to a real build.
+    """
+    from ferrite_lang import preprocess, _generate_dispatchers
+    # Source files are UTF-8 (arrows like → in comments, accented text). Force
+    # UTF-8 on stdout so redirecting to a file on a non-UTF-8 console (e.g.
+    # Windows cp1254) doesn't raise UnicodeEncodeError.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+    project_dir = Path(project_path).parent
+    project = json.loads(Path(project_path).read_text(encoding="utf-8"))
+    include_dirs = [str(project_dir / d) for d in project.get("include_dirs", [])]
+
+    sources = [p["source"] for p in project.get("pages", [])
+               if isinstance(p, dict) and "source" in p]
+    sources += [p["source"] for p in project.get("programs", [])]
+
+    for rel in sources:
+        path = project_dir / rel
+        expanded = preprocess(path.read_text(encoding="utf-8"), str(path), include_dirs)
+        dispatchers = _generate_dispatchers(expanded)
+        if dispatchers:
+            expanded = expanded + "\n\n" + dispatchers
+        print(f"// ===== expanded source: {rel} =====")
+        print(expanded)
+        print()
+
+
 # --- Main build pipeline ---
 
 def build(project_path: str, output_path: str) -> dict:
@@ -640,6 +678,10 @@ def main():
 
     if "--info" in args:
         show_info(project_path)
+        return
+
+    if "--expand" in args or "-E" in args:
+        dump_expanded(project_path)
         return
 
     # Default output
