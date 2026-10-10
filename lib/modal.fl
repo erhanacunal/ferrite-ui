@@ -41,11 +41,14 @@ fn modalDefaultOverlayClick() {
 
 var __modal_title;
 var __modal_message;
+var __ok_btn;
+var __yes_btn;
+var __no_btn;
 
 // --- Click handlers ---
-fn __modalOk()  { setDialogResult(OK);  }
-fn __modalYes() { setDialogResult(YES); }
-fn __modalNo()  { setDialogResult(NO);  }
+fn __modalOk(widget_id)  { setDialogResult(OK);  }
+fn __modalYes(widget_id) { setDialogResult(YES); }
+fn __modalNo(widget_id)  { setDialogResult(NO);  }
 
 // --- Builder: alert dialog with single OK button ---
 fn __modalAlertBuilder() {
@@ -97,7 +100,7 @@ fn __modalAlertBuilder() {
     set(text_align, ALIGN_CENTER);
     set(text, __modal_message);
 
-    var ok_btn = alloc();
+    __ok_btn = alloc();
     parent(box);
     set(kind, KIND_LABEL);
     set(loc_x, 150);
@@ -162,7 +165,7 @@ fn __modalConfirmBuilder() {
     set(text_align, ALIGN_CENTER);
     set(text, __modal_message);
 
-    var yes_btn = alloc();
+    __yes_btn = alloc();
     parent(box);
     set(kind, KIND_LABEL);
     set(loc_x, 70);
@@ -178,7 +181,7 @@ fn __modalConfirmBuilder() {
     set(clickable, ON);
     set(on_click, @__modalYes);
 
-    var no_btn = alloc();
+    __no_btn = alloc();
     parent(box);
     set(kind, KIND_LABEL);
     set(loc_x, 220);

@@ -3223,16 +3223,75 @@ SYSTEM_CALLBACKS = {
 
 
 import re as _re
+import sys as _sys
 
 # Matches: identifier.(on_click|on_tap|on_paint|on_change) = @handler
 _CB_RE = _re.compile(r'(\w+)\.(on_click|on_tap|on_paint|on_change)\s*=\s*@(\w+)')
+
+# Matches a top-level `var NAME` declaration (depth checked separately).
+_VAR_DECL_RE = _re.compile(r'\bvar\s+(\w+)')
+# Ordered scan of the three events that move/observe the current target widget:
+#   [var ]NAME = alloc(   — NAME becomes the current target
+#   target(NAME)          — NAME becomes the current target
+#   set(on_event, @h)     — register handler h for the current target
+# A single finditer keeps these in source order regardless of layout (so an
+# alloc sharing a line with `fn setup(){` is still seen).
+_SCAN_RE = _re.compile(
+    r'(?:\bvar\s+)?(?P<alloc>\w+)\s*=\s*alloc\s*\('
+    r'|\btarget\s*\(\s*(?P<target>\w+)\s*\)'
+    r'|\bset\s*\(\s*(?P<event>on_click|on_tap|on_paint|on_change)\s*,\s*@(?P<handler>\w+)\s*\)'
+)
+
+
+def _global_widget_vars(source):
+    """Names declared with `var` at brace-depth 0 (file scope). The generated
+    dispatcher references the widget variable, so only file-scope vars can be
+    wired from `set(...)` syntax — a function-local `var b = alloc()` is not
+    visible to the top-level dispatcher function."""
+    globals_ = set()
+    for m in _VAR_DECL_RE.finditer(source):
+        head = source[:m.start()]
+        if head.count('{') - head.count('}') == 0:
+            globals_.add(m.group(1))
+    return globals_
+
+
+def _scan_set_callbacks(source, registry, seen):
+    """Augment `registry` with `set(on_event, @handler)` registrations, pairing
+    each with the current target widget (last `[var ]X = alloc()` / `target(X)`).
+    Only file-scope widget vars are wired; others get a warning since the
+    dispatcher cannot reference a function-local variable."""
+    file_globals = _global_widget_vars(source)
+    current = None
+    for m in _SCAN_RE.finditer(source):
+        if m.group('alloc') is not None:
+            current = m.group('alloc')
+        elif m.group('target') is not None:
+            current = m.group('target')
+        else:
+            event = m.group('event')
+            handler = m.group('handler')
+            event_key = 'on_tap' if event == 'on_change' else event
+            if current in file_globals:
+                key = (event_key, current, handler)
+                if key not in seen:
+                    seen.add(key)
+                    registry[event_key].append((current, handler))
+            elif current and not current.isdigit():
+                _sys.stderr.write(
+                    f"warning: set({event}, @{handler}) on '{current}': on_click/"
+                    f"on_tap via set() only fires for a file-scope (global) widget "
+                    f"variable; declare '{current}' at the top level to wire it.\n")
 
 
 def _generate_dispatchers(source):
     """Pre-scan preprocessed source for widget callback assignments and return
     generated dispatcher function source code to append before compilation.
 
-    Widget callback syntax:  widget_var.on_click = @handler_func
+    Widget callback syntax:  widget_var.on_click = @handler_func  (dot syntax)
+                             set(on_click, @handler_func)         (set syntax,
+                               wired to the current target widget; the widget
+                               variable must be file-scope/global)
     Supported events:        on_click, on_tap, on_paint, on_change (aliases on_tap)
 
     Returns an empty string when no registrations are found.
@@ -3247,6 +3306,8 @@ def _generate_dispatchers(source):
         if key not in seen:
             seen.add(key)
             registry[event_key].append((widget_var, handler))
+
+    _scan_set_callbacks(source, registry, seen)
 
     parts = []
 

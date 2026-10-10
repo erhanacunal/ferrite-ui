@@ -11,8 +11,12 @@
 #include "modal.fl"
 
 var status_lbl;
+var info_btn;
+var confirm_btn;
 
-fn on_confirm_click() {
+fn on_confirm_click(widget_id) {
+    var msg = str("hello");
+    sendUsart(msg);
     var r = showConfirmation(str("Are you sure?"),
                              str("This action cannot be undone."));
     if (r == YES) {
@@ -31,7 +35,7 @@ fn on_confirm_click() {
     render();
 }
 
-fn on_info_click() {
+fn on_info_click(widget_id) {
     showAlert(str("Information"),
               str("This is a sample alert dialog."));
     status_lbl.text = "Alert dismissed";
@@ -56,7 +60,7 @@ fn setup() {
     set(text_align, ALIGN_CENTER);
     set(text, "Modal dialog smoke test");
 
-    var confirm_btn = alloc();
+    confirm_btn = alloc();
     parent(0);
     set(kind, KIND_LABEL);
     set(loc_x, 220);
@@ -72,7 +76,7 @@ fn setup() {
     set(clickable, ON);
     set(on_click, @on_confirm_click);
 
-    var info_btn = alloc();
+    info_btn = alloc();
     parent(0);
     set(kind, KIND_LABEL);
     set(loc_x, 420);
