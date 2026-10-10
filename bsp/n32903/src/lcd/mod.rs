@@ -19,6 +19,9 @@ const WIDTH: usize = 800;
 const HEIGHT: usize = 480;
 const FB_PIXELS: usize = WIDTH * HEIGHT;
 
+/// Pixel clock. The Nextion firmware divides UPLL by 6 (CLKDIV1 N1 = 5).
+const PIXEL_CLOCK_KHZ: u32 = 16_000;
+
 /// Two RGB565 frame buffers, cache-line aligned.
 #[repr(C, align(64))]
 struct FrameBuffers([[u16; FB_PIXELS]; 2]);
@@ -212,7 +215,20 @@ pub unsafe fn init() {
         // The buffers are zero (.bss) — black. Make sure SDRAM has it before
         // the VPOST starts reading.
         cache::dcache_clean();
-        HAL = Some(Lcd::init(fb_ptr(0) as u32, &hal_lcd::NEXTION_800X480));
+        let timing = hal_lcd::PanelTiming {
+            pixel_clock_khz: PIXEL_CLOCK_KHZ,
+            ..hal_lcd::NEXTION_800X480
+        };
+        let lcd = Lcd::init(fb_ptr(0) as u32, &timing);
+        let upll = n32903_rs::clock::get_clock(n32903_rs::clock::ClockNode::UPll);
+        crate::usart::log_fmt(format_args!(
+            "lcd: UPLL {} kHz, pixel clock {} kHz, CLKDIV1 {:#010x}
+",
+            upll,
+            lcd.pixel_clock_khz(),
+            n32903_rs::registers::reg_read32(n32903_rs::registers::REG_CLKDIV1)
+        ));
+        HAL = Some(lcd);
     }
 }
 

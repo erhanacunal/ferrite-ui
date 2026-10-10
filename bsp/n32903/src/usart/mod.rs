@@ -142,3 +142,22 @@ pub fn log_bytes(data: &[u8]) {
         }
     }
 }
+
+/// Formatted diagnostic line to the console (stack buffer, truncates at 128 B).
+pub fn log_fmt(args: core::fmt::Arguments) {
+    struct Buf {
+        data: [u8; 128],
+        len: usize,
+    }
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.data.len() - self.len);
+            self.data[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.len += n;
+            Ok(())
+        }
+    }
+    let mut b = Buf { data: [0; 128], len: 0 };
+    let _ = core::fmt::write(&mut b, args);
+    log_bytes(&b.data[..b.len]);
+}

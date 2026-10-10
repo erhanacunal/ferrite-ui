@@ -28,7 +28,7 @@ impl Platform for N32903Platform {
     type FlashB = crate::flash::NandFlash;
     type TouchB = crate::touch::AdcTouch;
     type BacklightB = crate::backlight::PwmBl;
-    type RtcB = crate::rtc::StubRtc;
+    type RtcB = crate::rtc::At8563;
     type SdCardB = crate::sdcard::StubSd;
     type UsartB = crate::usart::HwUart;
     type SystickB = crate::systick::N32903Systick;

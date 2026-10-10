@@ -87,6 +87,7 @@ pub extern "C" fn rust_main() -> ! {
         backlight::init(); // GPD0/GPD1: JTAG is gone from here on
         lcd::init();
         touch::init();
+        rtc::init();
         flash::init();
     }
 
