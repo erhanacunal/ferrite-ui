@@ -1609,6 +1609,11 @@ fn loop() {
 |----|------|-----------|---------|
 | `0x00` | `SYS_UPTIME` | — | milliseconds |
 | `0x01` | `SYS_REBOOT` | — | does not return |
+| `0x02` | `SYS_REPAIR_SCREEN` | — | `0` |
+| `0x03` | `SYS_EPD_POWER_OFF` | — | `0` |
+| `0x04` | `SYS_EPD_POWER_ON` | — | `0` |
+| `0x05` | `SYS_BATTERY_VOLTAGE` | — | battery millivolts, or `-1` on error |
+| `0x06` | `SYS_DEEP_SLEEP` | `duration_ms: int` | does not return (chip resets on wake-up); `-1` if `duration_ms <= 0` |
 | `0x10` | `SYS_WIFI_CONNECT` | `ssid: str_id, pass: str_id` | `0`=ok, `-1`=error |
 | `0x11` | `SYS_WIFI_DISCONNECT` | — | `0` |
 | `0x12` | `SYS_WIFI_STATUS` | — | `0`=idle, `1`=connecting, `2`=connected, `3`=failed |

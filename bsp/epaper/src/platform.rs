@@ -12,6 +12,14 @@ use ferrite_core::types::{COLOR_BLACK, COLOR_WHITE};
 use ferrite_core::vm::{RenderMode, Vm};
 use ferrite_core::{render};
 
+use core::cell::RefCell;
+
+use critical_section::Mutex;
+use esp_hal::peripherals::LPWR;
+use esp_hal::rtc_cntl::Rtc;
+use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
+use core::time::Duration;
+
 use crate::{battery, lcd, systick};
 
 // === Ferrite syscall ids (see docs/ferrite-lang.md) ===
@@ -23,6 +31,37 @@ const SYS_REPAIR_SCREEN: u8 = 0x02; // () → 0
 const SYS_EPD_POWER_OFF: u8 = 0x03; // () → 0
 const SYS_EPD_POWER_ON: u8 = 0x04; // () → 0
 const SYS_BATTERY_VOLTAGE: u8 = 0x05; // () → battery millivolts (e.g. 3750)
+const SYS_DEEP_SLEEP: u8 = 0x06; // (duration_ms) → does not return; -1 if duration <= 0
+
+/// RTC controller handle, needed to enter deep sleep. Set once by `init_sleep`.
+static RTC_CNTL: Mutex<RefCell<Option<Rtc<'static>>>> = Mutex::new(RefCell::new(None));
+
+/// Take ownership of the LPWR (RTC_CNTL) peripheral so `SYS_DEEP_SLEEP` can
+/// drive the sleep controller. Called once from `main::init_gpio`.
+pub fn init_sleep(lpwr: LPWR<'static>) {
+    critical_section::with(|cs| {
+        RTC_CNTL.borrow_ref_mut(cs).replace(Rtc::new(lpwr));
+    });
+}
+
+/// Power down the panel and enter deep sleep for `duration_ms` milliseconds.
+/// The chip resets on wake-up (RAM is lost, `main` runs again), so this never
+/// returns on success. Returns `Some(-1)` when `duration_ms <= 0` or the RTC
+/// controller was never handed over via `init_sleep`.
+fn deep_sleep(duration_ms: i32) -> Option<i32> {
+    if duration_ms <= 0 {
+        return Some(-1);
+    }
+    let rtc = critical_section::with(|cs| RTC_CNTL.borrow_ref_mut(cs).take());
+    let Some(mut rtc) = rtc else {
+        return Some(-1);
+    };
+    // Cut the e-paper high-voltage rails first: the image is retained without
+    // power and the panel would otherwise keep drawing current while asleep.
+    lcd::epaper::power_off();
+    let timer = TimerWakeupSource::new(Duration::from_millis(duration_ms as u64));
+    rtc.sleep_deep(&[&timer])
+}
 
 /// Trigger an ESP32-S3 system reset via the RTC_CNTL_OPTIONS0 SW_SYS_RST bit.
 pub unsafe fn esp_restart() -> ! {
@@ -45,12 +84,14 @@ impl Platform for EpaperPlatform {
     type UsartB = crate::usart::epaper::EspUart;
     type SystickB = crate::systick::EpdSystick;
     type AudioB = ferrite_core::audio::NoAudio;
+    // E-paper is white when idle; anti-aliased text on transparent labels
+    // blends against this instead of the raster-board default (black).
+    const DEFAULT_BG_COLOR: u16 = COLOR_WHITE;
 }
 
 impl PlatformRuntime for EpaperPlatform {
     const BG_COLOR: u16 = COLOR_WHITE;
     const FG_COLOR: u16 = COLOR_BLACK;
-    const DEFAULT_BG_COLOR: u16 = COLOR_WHITE;
     // The e-paper panel only updates on explicit `render()` calls; force EPaper
     // mode regardless of the image header so the per-frame loop never drives it.
     const FORCED_RENDER_MODE: Option<RenderMode> = Some(RenderMode::EPaper);
@@ -78,6 +119,7 @@ impl PlatformRuntime for EpaperPlatform {
                 Some(0)
             }
             SYS_BATTERY_VOLTAGE => battery::read_mv().or(Some(-1)),
+            SYS_DEEP_SLEEP => deep_sleep(args.first().copied().unwrap_or(0)),
             _ => None, // unknown id → VM Error
         }
     }

@@ -58,8 +58,8 @@ struct EpaperPins {
     // GPIO14 and ADC2 are consumed by battery::init() — not stored here.
 }
 
-/// Bring up PSRAM, the ED047TC1 (I8080 + RMT + config SR), SYSTIMER, RTC and the
-/// battery ADC, then configure the SD-card / button GPIOs.
+/// Bring up PSRAM, the ED047TC1 (I8080 + RMT + config SR), SYSTIMER, RTC, the
+/// battery ADC and the sleep controller, then configure the SD-card / button GPIOs.
 fn init_gpio(peripherals: Peripherals) -> EpaperPins {
     // PSRAM heap — must be first so large allocations (framebuffer, LUT) land in
     // PSRAM (octal mode for the LilyGo T5 V2.3).
@@ -96,6 +96,8 @@ fn init_gpio(peripherals: Peripherals) -> EpaperPins {
     systick::init(peripherals.SYSTIMER);
     rtc::epaper::init(peripherals.I2C0, peripherals.GPIO17, peripherals.GPIO18);
     battery::init(peripherals.GPIO14, peripherals.ADC2);
+    // RTC_CNTL is only needed for the deep-sleep syscall.
+    platform::init_sleep(peripherals.LPWR);
 
     EpaperPins {
         _sd_sclk: Output::new(peripherals.GPIO11, Level::Low, output),

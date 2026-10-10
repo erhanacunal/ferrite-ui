@@ -14,6 +14,7 @@ const SYS_REPAIR_SCREEN = 0x02; // () → 0
 const SYS_EPD_POWER_OFF     = 0x03; // () → 0
 const SYS_EPD_POWER_ON      = 0x04; // () → 0
 const SYS_BATTERY_VOLTAGE   = 0x05; // () → battery voltage in millivolts (e.g. 3750 = 3.75 V), or -1 on error
+const SYS_DEEP_SLEEP        = 0x06; // (duration_ms: int) → does not return (chip resets on wake-up); -1 if duration_ms <= 0
 
 // --- WiFi (0x10–0x1F) ---
 const SYS_WIFI_CONNECT    = 0x10; // (ssid: str_id, pass: str_id) → 0=ok, -1=error
@@ -39,6 +40,14 @@ fn epd_power_off() {
 
 fn epd_power_on() {
     syscall(SYS_EPD_POWER_ON);
+}
+
+// Power off the panel and put the ESP32-S3 into deep sleep for duration_ms
+// milliseconds. The displayed image is retained. On wake-up the chip resets
+// and the program starts from scratch, so this call never returns on success.
+// Returns -1 (without sleeping) if duration_ms <= 0.
+fn deep_sleep(duration_ms) {
+    return syscall(SYS_DEEP_SLEEP, duration_ms);
 }
 
 // Returns battery voltage in millivolts (e.g. 3750 = 3.75 V), or -1 on error.
