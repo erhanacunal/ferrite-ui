@@ -1,3 +1,6 @@
 [submodule "vendor/f1c100s_rs"]
 	path = vendor/f1c100s_rs
 	url = https://github.com/erhanacunal/f1c100s_rs.git
+[submodule "vendor/n32903_rs"]
+	path = vendor/n32903_rs
+	url = https://github.com/erhanacunal/n32903_rs.git

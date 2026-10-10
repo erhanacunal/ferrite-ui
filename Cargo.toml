@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ferrite-core", "bsp/nextion", "bsp/epaper", "bsp/sim", "bsp/tdo_y13"]
+members = ["ferrite-core", "bsp/nextion", "bsp/epaper", "bsp/sim", "bsp/tdo_y13", "bsp/n32903"]
 
 # Shared release profile for every member (valid in a virtual workspace root).
 [profile.release]

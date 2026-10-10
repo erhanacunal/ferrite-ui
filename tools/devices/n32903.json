@@ -1,0 +1,13 @@
+{
+  "id": "n32903",
+  "name": "Nextion N32903 (Nuvoton N32903, 800x480)",
+  "bsp": "bsp/n32903",
+  "screen": { "width": 800, "height": 480, "shape": "rect" },
+  "flash": { "fs_base": "0x1000" },
+  "color": { "model": "RGB565", "count": 65536, "image_max_colors": 256 },
+  "render_modes": ["dirty", "buffered"],
+  "default_render_mode": "dirty",
+  "widgets": ["base", "label", "button", "progress", "slider", "checkbox", "radio", "input", "gauge", "dropdown", "image"],
+  "caps": { "alpha": true, "audio": false, "video": false, "image_alpha": true },
+  "defaults": { "root_bg": "0x0000", "text_color": "0xFFFF" }
+}

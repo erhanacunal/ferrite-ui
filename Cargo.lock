@@ -98,6 +98,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsp-n32903"
+version = "0.1.0"
+dependencies = [
+ "ferrite-core",
+ "n32903_rs",
+]
+
+[[package]]
 name = "bsp-nextion"
 version = "0.1.0"
 dependencies = [
@@ -1241,6 +1249,10 @@ dependencies = [
  "winapi",
  "x11-dl",
 ]
+
+[[package]]
+name = "n32903_rs"
+version = "0.1.0"
 
 [[package]]
 name = "nb"

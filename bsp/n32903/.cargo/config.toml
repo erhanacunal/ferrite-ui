@@ -1,0 +1,17 @@
+[target.'cfg(target_arch = "arm")']
+# The linker script and startup object are supplied by build.rs (with a
+# search path), so they resolve regardless of the linker's working directory.
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "panic=abort",
+]
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+# memcpy/memset/memcmp from compiler_builtins (no libc on this target).
+build-std-features = ["compiler-builtins-mem"]
+# Recent nightlies gate `.json` custom target specs behind this flag.
+json-target-spec = true
+
+[build]
+target = "arm926ej-s.json"

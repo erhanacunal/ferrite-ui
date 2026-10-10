@@ -1,0 +1,14 @@
+[package]
+name = "bsp-n32903"
+version = "0.1.0"
+edition = "2024"
+description = "BSP for Nextion N32903 boards — Nuvoton N32903 (W55FA93) + 800×480 RGB LCD"
+
+[[bin]]
+name = "ferrite-ui"
+path = "src/main.rs"
+
+[dependencies]
+ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "strpool_large"] }
+# HAL: default features off to drop its UART panic handler (this BSP has its own).
+n32903_rs = { path = "../../vendor/n32903_rs", default-features = false, features = ["heap"] }
