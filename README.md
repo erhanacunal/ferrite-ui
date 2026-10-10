@@ -1,6 +1,8 @@
 # ferrite-ui
 
-Bare-metal HMI framework written in Rust. Originally built for the Nextion NX8048K070 display (GD32F103 / Cortex-M3); now also supports e-paper displays on ESP32-S3.
+Bare-metal HMI framework written in Rust. Originally built for the Nextion NX8048K070 display (GD32F103 / Cortex-M3); now also runs on Nextion boards built on the Nuvoton N32903 (ARM926EJ-S), the TDO Y13 round display (Allwinner F1C100s) and e-paper displays on ESP32-S3.
+
+The framework is one device-agnostic library (`ferrite-core`); each board is a thin BSP crate under `bsp/`.
 
 For some bricked Nextion displays :)
 
@@ -16,6 +18,31 @@ For some bricked Nextion displays :)
 | Touch | XPT2046 | SPI, Z-pressure detection, median filter |
 | Flash | W25Q256JVFQ | 32MB SPI, stores fonts/images/bytecode |
 | RTC | AT8563T | I2C |
+
+### Nextion / N32903 target
+
+| Component | Part | Details |
+|-----------|------|---------|
+| CPU | Nuvoton N32903 (W55FA93) | ARM926EJ-S, 96MHz, MMU + I/D cache, 8MB SDRAM |
+| Display | 800x480 TFT LCD | Parallel RGB from the on-chip VPOST, 16MHz pixel clock |
+| Frame buffers | SDRAM | Two RGB565 buffers, vsync flip, alpha blending |
+| Touch | On-chip ADC | 4-wire resistive, 3-point calibration stored in config |
+| Flash | Winbond NAND (128MB) | 2MB resource region shadowed in SDRAM, BCH ECC, bad-block skipping |
+| RTC | AT8563 | Bit-banged I2C on GPB14 (SDA) / GPB13 (SCL) |
+| Boot | NAND loader | [n32903_nand_loader_rs](https://github.com/erhanacunal/n32903_nand_loader_rs) loads the app to SDRAM 0x0 |
+
+HAL: [n32903_rs](https://github.com/erhanacunal/n32903_rs) (git submodule `vendor/n32903_rs`).
+
+### TDO Y13 / F1C100s target
+
+| Component | Part | Details |
+|-----------|------|---------|
+| CPU | Allwinner F1C100s | ARM926EJ-S, 32MB DRAM |
+| Display | TL021WVC04 | 480x480 round LCD, DEBE framebuffer, alpha blending |
+| Touch | CST8xx | Capacitive, I2C |
+| Flash | BY25Q128AS | 16MB SPI NOR (firmware + config + resources) |
+
+HAL: [f1c100s_rs](https://github.com/erhanacunal/f1c100s_rs) (git submodule `vendor/f1c100s_rs`).
 
 ### E-paper / ESP32-S3 target
 
@@ -169,17 +196,46 @@ Requires Rust 1.85+ (2024 edition).
 
 ```bash
 rustup target add thumbv7m-none-eabi
-rustup component add llvm-tools-preview
-cargo install cargo-binutils
 
-cargo build --release --features firmware --target thumbv7m-none-eabi
-cargo objcopy --release --features firmware --target thumbv7m-none-eabi --bin ferrite-ui -- -O binary firmware.bin
+# from the workspace root (the default target is thumbv7m, linked with gd32-link.x)
+cargo build -p bsp-nextion --release
+arm-none-eabi-objcopy -O binary target/thumbv7m-none-eabi/release/ferrite-ui firmware.bin
 
 # flash to device
 st-flash.exe write .\firmware.bin 0x08000000
 ```
 
-Binary output: `target/thumbv7m-none-eabi/release/ferrite-ui`
+`build.bat` does the build + objcopy in one step.
+
+### N32903 (Nextion, NAND loader)
+
+Clone with submodules (`git clone --recursive`, or `git submodule update --init`). Needs the nightly toolchain with `rust-src` (pinned by `bsp/n32903/rust-toolchain.toml`) and the ARM GNU toolchain (`arm-none-eabi-gcc`) on `PATH` — it assembles the HAL's startup code and links.
+
+```powershell
+# Build -> target\arm926ej-s\release\ferrite-ui.bin (raw image)
+.\n32903.ps1
+
+# Write it to NAND with the loader's tool (reset the board when asked)
+python flash_tool.py COM10 writeapp target\arm926ej-s\release\ferrite-ui.bin --boot
+```
+
+`flash_tool.py` lives in [n32903_nand_loader_rs](https://github.com/erhanacunal/n32903_nand_loader_rs); the loader must already be on the board. Resources go over UART1 (115200) like on the other boards:
+
+```powershell
+python tools\ferrite_build.py examples\n32903\clock\project.json -o fs.bin
+python tools\ferrite_cli.py -p COM10 writefs fs.bin
+python tools\ferrite_cli.py -p COM10 settime      # RTC from the PC clock
+python tools\ferrite_cli.py -p COM10 calibrate    # touch calibration
+```
+
+The loader waits 3 s for a key after reset; any byte arriving then (e.g. a `ping`) stops it at its `n32903>` prompt — type `boot` to continue.
+
+### TDO Y13 (F1C100s)
+
+```powershell
+# Build -> bootable sunxi image (objcopy + mksunxi)
+.\tdo_y13.ps1
+```
 
 ### ESP32-S3 (e-paper)
 
@@ -239,84 +295,74 @@ cargo run --target x86_64-pc-windows-msvc --features host --bin sim -- --fsimage
 
 Exact firmware size changes as features are added; inspect the current build artifacts instead of relying on fixed README numbers.
 
-- MCU flash: 128 KB
-- MCU RAM: 20 KB
-- Heap allocator: 14 KB region in firmware RAM
-- Clip region pool: 32 rects, 256 B
-- USART RX ring buffer: 128 B
+| | Nextion GD32F103 | Nextion N32903 | TDO Y13 (F1C100s) |
+|---|---|---|---|
+| Code | 128 KB MCU flash | ~150 KB image in SDRAM | in DRAM, loaded from SPI NOR |
+| RAM | 20 KB | 8 MB SDRAM | 32 MB DRAM |
+| Heap | 14 KB (ferrite-core allocator) | ~3 MB free after frame buffers + NAND shadow (HAL allocator) | rest of DRAM (HAL allocator) |
+| Frame buffer | none in CPU RAM (FPGA) | 2 × 800×480 RGB565 in SDRAM | 3 × 480×480 ARGB8888 in DRAM |
+| String pool | 2 KB / 64 strings | 1 MB / 256 strings | 1 MB / 256 strings |
+| Resource storage | 32 MB SPI NOR | 2 MB NAND region, shadowed in SDRAM | SPI NOR after the firmware |
+| USART RX ring | 128 B | 4 KB | 4 KB |
 
-Heap-allocated: Ctx (WidgetTree + extensions, FontList, ImageList, StringPool), VM (stack-based locals, arrays, callback queue), fonts.
+Common: clip region pool 32 rects (256 B). Heap-allocated: Ctx (WidgetTree + extensions, FontList, ImageList, StringPool), VM (stack-based locals, arrays, callback queue), fonts.
 
 ## Project Structure
 
+Cargo virtual workspace: one framework library, one BSP crate per board.
+
 ```
 ferrite-ui/
-├── src/
-│   ├── main.rs          Entry point, startup, main loop (GD32 firmware)
-│   ├── epaper_main.rs   Entry point for ESP32-S3 / e-paper target
-│   ├── lib.rs           Host-simulator library exports
-│   ├── ctx.rs           Shared application context (Ctx struct)
-│   ├── vm.rs            Bytecode VM (stack frames, callbacks, arrays, f32, math)
-│   ├── widget.rs        Widget + WidgetExt split, tree, box model
-│   ├── render.rs        Painter's algorithm, dirty redraw, clip
-│   ├── clip.rs          Clip region (rect subtract algorithm)
-│   ├── font.rs          Adafruit GFX bitmap font renderer
-│   ├── image.rs         Ferrite Image (FI) decoder
-│   ├── fs.rs            Flash filesystem (TOC, named resources)
-│   ├── strpool.rs       Heap string pool (itos/ftos/concat/sprintf/GC)
-│   ├── heap.rs          Linked-list heap allocator (14KB)
-│   ├── protocol.rs      USART protobuf protocol
-│   ├── gpio.rs          GPIO, 16-bit data bus, clock
-│   ├── proto.rs         Protobuf encoding/decoding primitives
-│   ├── irq.rs           Interrupt vector table
-│   ├── panic.rs         Custom panic handler
-│   ├── keyboard.rs      On-screen keyboard for input widgets
-│   ├── watchdog.rs      Hardware watchdog (GD32 FWDGT)
-│   ├── fat.rs           FAT16/32 reader for SD boot path
-│   ├── embedded_font.rs Built-in FreeMono 9pt font
-│   ├── bin/sim.rs       Host simulator binary
-│   ├── lcd/             LCD backend abstraction
-│   │   ├── hw.rs        FPGA pixel bus (GD32)
-│   │   ├── sim.rs       minifb simulator
-│   │   ├── epaper.rs    ED047TC1 e-paper backend (ESP32-S3)
-│   │   ├── ed047tc1.rs  ED047TC1 low-level driver
-│   │   ├── display.rs   Display geometry constants
-│   │   └── rmt.rs       RMT-based pixel output (ESP32-S3)
-│   ├── flash/           W25Q256 / flash backend abstraction
-│   ├── touch/           XPT2046 / touch backend abstraction
-│   ├── usart/           USART backend abstraction
-│   ├── backlight/       Backlight backend abstraction
-│   ├── rtc/             RTC backend abstraction
-│   ├── systick/         SysTick / timing backend abstraction
-│   └── sdcard/          SD card backend abstraction
+├── ferrite-core/        Framework library (crate `ferrite_core`), generic over `P: Platform`
+│   └── src/
+│       ├── runtime.rs   Main loop (`run::<P>()`), PlatformRuntime hooks, input handling
+│       ├── platform.rs  Platform trait (backend types, flash layout, caps)
+│       ├── ctx.rs       Shared application context (Ctx<P>)
+│       ├── vm.rs        Bytecode VM (stack frames, callbacks, arrays, f32, math, animation)
+│       ├── widget.rs    Widget + WidgetExt split, tree, box model
+│       ├── render.rs    Painter's algorithm, dirty redraw, clip
+│       ├── clip.rs      Clip region (rect subtract algorithm)
+│       ├── font.rs      Sparse UTF-8 bitmap font renderer (+ embedded_font.rs)
+│       ├── image.rs     Ferrite Image (FI) decoder
+│       ├── fs.rs        Flash filesystem (TOC, named resources)
+│       ├── config.rs    Persistent config sector (touch calibration, ...)
+│       ├── strpool.rs   Heap string pool (itos/ftos/concat/sprintf/GC)
+│       ├── protocol.rs  USART protobuf protocol (+ proto.rs primitives)
+│       ├── keyboard.rs  On-screen keyboard for input widgets
+│       └── {lcd,flash,touch,usart,backlight,rtc,systick,sdcard,audio}.rs
+│                        Backend traits + generic wrappers
+├── bsp/
+│   ├── nextion/         GD32F103 + FPGA LCD (Cortex-M3)
+│   ├── n32903/          Nuvoton N32903 + VPOST LCD + NAND (ARM926EJ-S)
+│   ├── tdo_y13/         Allwinner F1C100s + 480x480 round LCD (ARM926EJ-S)
+│   ├── epaper/          ESP32-S3 + ED047TC1 e-paper
+│   └── sim/             Host simulator (minifb)
+├── vendor/              HAL submodules (f1c100s_rs, n32903_rs)
 ├── tools/
 │   ├── ferrite_lang.py  Language compiler (.fl -> bytecode + .dbg symbols)
 │   ├── ferrite_cc.py    Assembler / disassembler / compiler API
-│   ├── ferrite_cli.py   Serial communication tool
+│   ├── ferrite_build.py JSON project builder (flash image)
+│   ├── ferrite_cli.py   Serial communication tool (writefs, settime, calibrate, ...)
 │   ├── ferrite_img.py   PNG to Ferrite Image converter
 │   ├── ferrite_analyze.py  Bytecode memory/instruction profiler
-│   ├── ferrite_designer.py Visual designer (multi-device: Nextion / e-paper)
-│   └── ferrite_build.py JSON project builder (flash image)
-├── lib/
-│   ├── core.fl          Ferrite language widget constants
-│   ├── color.fl         RGB565 color constants
-│   └── anim.fl          Animation easing / repeat / PROP_* constants
-├── examples/            Ferrite project examples (incl. epaper_clock)
-├── docs/
-│   ├── ferrite-lang.md  Language reference (math functions, sprintf)
-│   ├── protocol.md      USART protocol reference
-│   └── bytecode.md      VM image/opcode reference
-├── gd32-memory.x        Linker script (128KB Flash, 20KB RAM) — GD32F103
-├── gd32-device.x        Interrupt vector definitions — GD32F103
+│   ├── ferrite_designer.py Visual designer (multi-device)
+│   └── devices/         Per-board specs (screen, fs_base, caps) for the tools
+├── lib/                 Ferrite language libraries (core, color, anim, shapes, touch, ...)
+├── examples/            Ferrite projects per board (nextion/, n32903/, tdo_y13/, lilygo-t5/)
+├── docs/                Language, protocol and bytecode references
+├── n32903.ps1, tdo_y13.ps1, epaper.ps1   Board build scripts
+├── gd32-{link,memory,device}.x  GD32F103 linker scripts (bsp/nextion)
 └── CLAUDE.md            Internal development notes
 ```
 
 ## Architecture
 
-- **Custom heap allocator** -- 14KB linked-list allocator, all large structures heap-allocated via Box/Vec
-- **No OS, no std firmware** -- `#![no_std]`, `#![no_main]`, `cortex-m-rt` (GD32) / `esp-hal` (ESP32-S3) entry point
-- **No frame buffer in CPU RAM** -- pixels are written directly to the FPGA over a 16-bit GPIO bus (GD32); e-paper path uses an RMT-driven framebuffer on ESP32-S3
-- **Double buffered** -- FPGA handles front/back buffer swap, tear-free rendering
+- **One framework, thin BSPs** -- `ferrite-core` is generic over a `Platform` trait (LCD, flash, touch, USART, backlight, RTC, systick, SD, audio backends); each board crate supplies the backends, entry point and panic handler and calls `ferrite_core::runtime::run::<P>()`
+- **Heap allocation** -- all large structures are heap-allocated via Box/Vec: a 14KB linked-list allocator on the GD32, the HAL's interrupt-safe allocator on the ARM926 boards (`external_alloc`)
+- **No OS, no std firmware** -- `#![no_std]`, `#![no_main]`; `cortex-m-rt` (GD32), `esp-hal` (ESP32-S3), HAL startup code + MMU/cache setup (N32903, F1C100s)
+- **Frame buffer per board** -- none in CPU RAM on the GD32 (pixels go straight to the FPGA over a 16-bit GPIO bus); SDRAM/DRAM frame buffers scanned out by the display controller on N32903 (VPOST) and F1C100s (DEBE), which also enables alpha blending; RMT-driven framebuffer on the ESP32-S3 e-paper
+- **Double buffered** -- front/back swap by the FPGA (GD32) or at vsync by the display controller (N32903, F1C100s), tear-free rendering
+- **Flash abstraction** -- NOR-style API (byte read, page program, 4KB sector erase); the N32903 maps it onto NAND through an SDRAM shadow with deferred block write-back
 - **Three render modes** -- `dirty` (partial update, front buffer), `buffered` (full double-buffered redraw), `epaper` (dirty + `flush_dirty()` to e-paper panel)
 - **Two-pass dirty redraw** -- erase hidden widgets first, then draw visible ones with clip-based painter's algorithm
 - **Split-struct widgets** -- 20B base (tree links, layout, colors) + 36B extension on demand (edges, text, callbacks, render bookkeeping)

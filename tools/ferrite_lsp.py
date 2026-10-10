@@ -518,6 +518,7 @@ BUILTIN_SIGNATURES = {
     'strClear':    {'sig': 'strClear()', 'desc': 'Clear all allocated strings.'},
     'strFree':     {'sig': 'strFree(str_id)', 'desc': 'Free a specific string.'},
     'arrFree':     {'sig': 'arrFree(arr_id)', 'desc': 'Free an array.'},
+    'arrLen':      {'sig': 'arrLen(arr_id) -> int', 'desc': 'Number of elements in an array.'},
     'arrToStr':    {'sig': 'arrToStr(arr, [len]) -> str_id', 'desc': 'Convert array bytes to string.'},
     'roundedRect': {'sig': 'roundedRect(x, y, w, h, r, color)', 'desc': 'Draw a rectangle with rounded corners.'},
     'fillRoundedRect': {'sig': 'fillRoundedRect(x, y, w, h, r, color)', 'desc': 'Draw a filled rounded rectangle.'},

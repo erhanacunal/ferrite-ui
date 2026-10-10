@@ -787,6 +787,16 @@ var h = time[2];
 arrFree(time);         // free immediately after use
 ```
 
+### arrLen(arr)
+
+Number of elements in an array.
+
+```c
+var time = rtcRead();
+var n = arrLen(time);  // 7
+arrFree(time);
+```
+
 ### setBrightness(percent) / brightness()
 
 Control LCD backlight (0-100%).

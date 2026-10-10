@@ -1,0 +1,14 @@
+{
+    "device": "n32903",
+    "screen_width": 800,
+    "screen_height": 480,
+    "include_dirs": ["../../../lib"],
+    "render_mode": "buffered",
+    "programs": [
+        {
+            "name": "main",
+            "source": "../../nextion/widget_demo/demo.fl",
+            "exec_mode": "flash"
+        }
+    ]
+}

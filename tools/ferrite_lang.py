@@ -1547,7 +1547,7 @@ class CodeGen:
         'ftoi', 'feq', 'fne', 'flt', 'fle', 'fgt', 'fge',
         'alloc', 'get', 'parseInt', 'strLen', 'strlen', 'strcmp',
         'millis', 'brightness',
-        'arrFree', 'strFree',
+        'arrFree', 'strFree', 'arrLen',
         'syscall',
     }
     # Builtins that return string IDs
@@ -1703,6 +1703,9 @@ class CodeGen:
             if pt == 'widget':
                 self.var_types[p] = self.T_INT   # widget IDs are ints at runtime
                 self.widget_ids[p] = -1          # mark as widget variable
+            elif pt == 'array':
+                self.var_types[p] = self.T_ARRAY
+                self.array_vars.add(p)           # `p[i]` indexing allowed
             else:
                 self.var_types[p] = pt
             param_slots.append(slot)
@@ -2692,6 +2695,18 @@ class CodeGen:
             self.asm.arr_free()
             return
 
+        if name == 'arrLen':
+            # arrLen(arr) → element count (ARR_LEN)
+            if len(node.args) != 1:
+                raise CompileError("arrLen() takes 1 argument: arr_id", node.line)
+            arg = node.args[0]
+            if isinstance(arg, VarRef) and arg.name in self.array_vars:
+                self.asm.load(self._var_slot(arg.name, node.line))
+            else:
+                self._gen_expr(arg)
+            self.asm.arr_len()
+            return
+
         if name == 'arrToStr':
             # arrToStr(arr) or arrToStr(arr, len) → str_id
             # Bytes are the low byte of each array element (arr[i] & 0xFF).
@@ -3253,7 +3268,7 @@ def _generate_dispatchers(source):
 
     if registry['on_paint']:
         lines = [
-            'fn __on_paint_dispatch(widgets) {',
+            'fn __on_paint_dispatch(widgets: array) {',
             '    var i = 0;',
             '    while (i < arrLen(widgets)) {',
             '        var widget_id = widgets[i];',
