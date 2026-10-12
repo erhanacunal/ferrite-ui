@@ -10,7 +10,7 @@
         {
             "name": "main",
             "source": "../../nextion/anim_demo/main.fl",
-            "exec_mode": "flash"
+            "exec_mode": "ram"
         }
     ]
 }

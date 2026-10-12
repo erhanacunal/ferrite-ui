@@ -8,7 +8,7 @@
         {
             "name": "main",
             "source": "../../nextion/widget_demo/demo.fl",
-            "exec_mode": "flash"
+            "exec_mode": "ram"
         }
     ]
 }

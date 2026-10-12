@@ -8,7 +8,7 @@
     {
       "name": "main",
       "source": "swipe_pages.fl",
-      "exec_mode": "flash"
+      "exec_mode": "ram"
     }
   ]
 }
