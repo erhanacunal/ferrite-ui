@@ -594,6 +594,9 @@ pub struct Vm {
     anims: Vec<Anim>,
     // Device-specific syscall handler. Called by OP_SYSCALL; returns None → VM Error.
     pub syscall_fn: Option<fn(id: u8, args: &[i32], strpool: &StringPool) -> Option<i32>>,
+    // True while `run_paint` executes on_paint: render() is then a no-op (the
+    // frame being painted is presented by run_paint's caller).
+    in_paint: bool,
 }
 
 impl Vm {
@@ -633,6 +636,7 @@ impl Vm {
             global_count: 0,
             render_mode: RenderMode::Dirty,
             forced_render_mode: None,
+            in_paint: false,
             widget_count: 0,
             ext_count: 0,
             open_files: [None, None],
@@ -811,6 +815,45 @@ impl Vm {
     /// Drain all queued callbacks, executing each to completion.
     pub fn drain_callbacks<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
         while self.run_next_callback(ctx) {}
+    }
+
+    /// Run the on_paint dispatcher now (not queued) for the widgets in
+    /// `paint` that are still visible. Called right after the render pass
+    /// that drew them, so the custom drawing lands in the same frame — and in
+    /// buffered mode the same back buffer, before the swap — as the widget's
+    /// background. Queueing it instead let it run after a callback queued
+    /// earlier had already hidden the widget (e.g. a tab switch), painting
+    /// over whatever replaced it.
+    pub fn run_paint<P: Platform>(&mut self, ctx: &mut Ctx<P>, paint: &render::PaintList) {
+        if self.in_paint || paint.is_empty() || self.state == VmState::Error {
+            return;
+        }
+        let offset = match self.find_by_kind(FunctionKind::OnPaint) {
+            Some(e) => e.offset as u16,
+            None => return,
+        };
+        let mut ids = [0i32; render::PAINT_MAX];
+        let mut n = 0;
+        for &id in paint.ids() {
+            if ctx.tree.is_tree_visible(id) {
+                ids[n] = id.0 as i32;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return;
+        }
+        let arr_id = self.alloc_array_from_i32s(&ids[..n]);
+        self.in_paint = true;
+        self.push_state(offset);
+        self.push_arg(arr_id);
+        self.run(ctx);
+        let failed = self.state == VmState::Error;
+        self.pop_state();
+        self.in_paint = false;
+        if failed {
+            self.state = VmState::Error;
+        }
     }
 
     /// Run a callback immediately (not queued). Used during startup
@@ -1349,14 +1392,25 @@ impl Vm {
                 }
             }
             OP_W_RENDER => match self.render_mode {
+                // render() from inside on_paint: the frame being painted is
+                // presented by run_paint's caller — don't nest a frame.
+                RenderMode::Buffered | RenderMode::Dirty if self.in_paint => {}
                 RenderMode::Buffered => {
                     if render::buffered_has_dirty(ctx) {
+                        ctx.lcd.begin_frame();
                         // Reborrow self as immutable while ctx stays mut —
                         // render reads array data via Vm::array_slice.
-                        render::render_buffered(ctx, &*self);
+                        let paint = render::render_buffered_content(ctx, &*self);
+                        self.run_paint(ctx, &paint);
+                        ctx.lcd.end_frame();
                     }
                 }
-                RenderMode::Dirty => render::render_dirty(ctx, &*self),
+                RenderMode::Dirty => {
+                    let mut paint = render::PaintList::new();
+                    render::collect_dirty_paint(ctx, &mut paint);
+                    render::render_dirty(ctx, &*self);
+                    self.run_paint(ctx, &paint);
+                }
                 RenderMode::EPaper => {
                     // Ghost-erase: drive all pixels to white so previous dark
                     // content doesn't bleed through the next render. No-op on

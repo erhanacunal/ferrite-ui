@@ -2,8 +2,11 @@
 //!
 //! Two 800×480 RGB565 frame buffers live in .bss. The VPOST shows the *front*
 //! buffer (`LCM_FSADDR`) while the CPU draws into the *back* one; `end_frame`
-//! writes the D-cache back, points FSADDR at the back buffer and waits for
-//! VSYNC (the new address is latched at the next frame).
+//! writes the D-cache back and points FSADDR at the back buffer. The new
+//! address is latched at the next VSYNC; rather than block for it there,
+//! `begin_frame` waits only if it would otherwise start drawing into the
+//! old front buffer before that VSYNC (which would tear). Frames are usually
+//! further apart than one refresh, so in practice nothing waits.
 //!
 //! In `dirty` render mode the framework never calls `begin_frame`/`end_frame`,
 //! so `BACK` stays equal to `FRONT` and drawing goes straight to the visible
@@ -13,7 +16,9 @@
 use ferrite_core::lcd::LcdBackend;
 use n32903_rs::cache;
 use n32903_rs::lcd::{self as hal_lcd, Lcd};
-use n32903_rs::registers::{REG_LCM_FSADDR, reg_write32};
+use n32903_rs::registers::{
+    LCDCInt_VINT, REG_LCM_FSADDR, REG_LCM_LCDCInt, reg_read32, reg_write32,
+};
 
 const WIDTH: usize = 800;
 const HEIGHT: usize = 480;
@@ -33,7 +38,21 @@ static mut FRONT: u8 = 0;
 /// Buffer every draw primitive writes to.
 static mut BACK: u8 = 0;
 
-/// The HAL LCD, kept for `wait_vsync`.
+/// `end_frame` pointed FSADDR at a new buffer and no VSYNC has been seen
+/// since: the previous front buffer may still be scanning out.
+static mut FLIP_PENDING: bool = false;
+
+/// Block until the VSYNC that latches the last `end_frame`'s buffer.
+fn wait_flip() {
+    unsafe {
+        if FLIP_PENDING {
+            while reg_read32(REG_LCM_LCDCInt) & LCDCInt_VINT == 0 {}
+            FLIP_PENDING = false;
+        }
+    }
+}
+
+/// The HAL LCD driver, kept for the lifetime of the program.
 static mut HAL: Option<Lcd> = None;
 
 #[inline]
@@ -95,6 +114,9 @@ impl LcdBackend for VpostLcd {
     const HAS_ALPHA: bool = true;
 
     fn begin_frame(&mut self) {
+        // The new back buffer is the old front one: don't draw into it while
+        // the VPOST may still be scanning it out.
+        wait_flip();
         unsafe { BACK = FRONT ^ 1 };
     }
 
@@ -102,9 +124,10 @@ impl LcdBackend for VpostLcd {
         unsafe {
             cache::dcache_clean();
             reg_write32(REG_LCM_FSADDR, fb_ptr(BACK) as u32);
-            if let Some(hal) = (&*(&raw const HAL)).as_ref() {
-                hal.wait_vsync();
-            }
+            // Start watching for the VSYNC that latches it (write-0 clears;
+            // a VSYNC racing this clear only costs one extra frame of wait).
+            reg_write32(REG_LCM_LCDCInt, reg_read32(REG_LCM_LCDCInt) & !LCDCInt_VINT);
+            FLIP_PENDING = true;
             FRONT = BACK;
         }
     }

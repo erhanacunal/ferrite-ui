@@ -46,7 +46,8 @@ pub const ERR_INSUFFICIENT_MEMORY: u8 = 7;
 /// Recovery mode — skip program load, suppress the error screen.
 pub const ERR_EMPTY_RUN: u8 = 0xFE;
 
-/// Maximum RAM-resident program image size.
+/// Default maximum RAM-resident program image size (see
+/// `PlatformRuntime::MAX_CODE_SIZE`).
 pub const MAX_CODE_SIZE: usize = 4096;
 
 // === Gesture tuning (shared with lib/touch.fl constants) ===
@@ -72,8 +73,11 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
 
     /// Maximum VM instructions to execute per main-loop iteration.
     ///
-    /// On-device BSPs leave this at 1: the main loop spins as fast as the CPU
-    /// (no frame pacing), so the VM still runs millions of instructions/sec.
+    /// The default of 1 suits a main loop whose other per-pass work is cheap
+    /// (it spins as fast as the CPU, so the VM still runs millions of
+    /// instructions/sec). Raise it when a pass carries fixed costs — e.g. a
+    /// touch controller read on every pass while pressed — or the VM starves
+    /// and `loop()` frames stretch while the screen is touched.
     /// The host simulator paces the loop to the display refresh (~60 Hz) and
     /// would otherwise execute only ~60 instructions/sec — far too slow for
     /// `millis()`-based animation. It raises this so each presented frame runs
@@ -81,6 +85,11 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
     /// YIELD / a blocking state, so a program that yields each frame is
     /// unaffected.
     const VM_STEPS_PER_TICK: u32 = 1;
+
+    /// Largest program image loaded into RAM (`exec_mode: "ram"`). A larger
+    /// image executes from flash instead. The default suits the 20 KB GD32;
+    /// SDRAM boards raise it (64 KB max — the VM program counter is `u16`).
+    const MAX_CODE_SIZE: usize = MAX_CODE_SIZE;
 
     /// Per-frame input handling strategy.
     type Input: InputHandler<Self>;
@@ -367,27 +376,15 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
             vm.tick_animations(&mut ctx, now);
         }
 
-        // --- Render + on_paint dispatch ---
+        // --- Render (on_paint runs inside, for the widgets it drew) ---
         if error_code == 0 {
-            let mut paint = PaintBuf::new();
-            collect_dirty_paint(&mut ctx, &mut paint);
-            render_phase(&mut ctx, &vm, &mut input);
-            enqueue_paint(&mut ctx, &mut vm, &paint);
+            render_phase(&mut ctx, &mut vm, &mut input);
         }
 
         // --- Drain callback queue, then re-render ---
         if error_code == 0 && vm.has_pending_callbacks() {
             vm.drain_callbacks(&mut ctx);
-            render_phase(&mut ctx, &vm, &mut input);
-
-            // Callbacks may have made on_paint widgets visible and already
-            // rendered them (clearing dirty). Fire on_paint for those now.
-            if vm.has_code() {
-                let mut paint = PaintBuf::new();
-                collect_visible_paint(&mut ctx, &mut paint);
-                enqueue_paint(&mut ctx, &mut vm, &paint);
-                vm.drain_callbacks(&mut ctx);
-            }
+            render_phase(&mut ctx, &mut vm, &mut input);
         }
 
         // --- End-of-frame hook (host window pump / present; no-op on device) ---
@@ -412,15 +409,18 @@ fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     };
 
     let mut err = 0;
-    if entry.flags & fs::RES_FLAG_FLASH_EXEC != 0 {
+    // A RAM image over the platform limit runs from flash rather than being
+    // truncated (which would cut off the functions at the end of the image).
+    let flash_exec =
+        entry.flags & fs::RES_FLAG_FLASH_EXEC != 0 || entry.size as usize > P::MAX_CODE_SIZE;
+    if flash_exec {
         // The VM keeps its own (cloned) flash handle for cache refills; the
         // backend is a stateless MMIO driver so the clone shares no state.
         if !vm.load_flash(ctx.flash.clone(), entry.offset, entry.size as usize) {
             err = ERR_PROGRAM_ERROR;
         }
     } else {
-        let img_len = entry.size.min(MAX_CODE_SIZE as u32) as usize;
-        let mut img = alloc::vec![0u8; img_len];
+        let mut img = alloc::vec![0u8; entry.size as usize];
         if let Some(fs) = ctx.fs.as_ref() {
             fs.read_resource(&ctx.flash, &entry, 0, &mut img);
         }
@@ -510,12 +510,14 @@ fn reload_program<P: PlatformRuntime>(
 //  Render phase
 // ============================================================================
 
-fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm, input: &mut P::Input) {
+fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, input: &mut P::Input) {
     match vm.render_mode {
         RenderMode::Buffered => {
             if render::buffered_has_dirty(ctx) {
                 ctx.lcd.begin_frame();
-                render::render_buffered_content(ctx, vm);
+                let paint = render::render_buffered_content(ctx, vm);
+                // on_paint into this back buffer, before the overlay + swap.
+                vm.run_paint(ctx, &paint);
                 input.draw_overlay(ctx, true);
                 // Rasterization is done (UI thread). Hand off the present
                 // (vsync wait + buffer flip) — synchronous by default, or
@@ -524,7 +526,10 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm, input: &mut P::In
             }
         }
         RenderMode::Dirty => {
+            let mut paint = render::PaintList::new();
+            render::collect_dirty_paint(ctx, &mut paint);
             render::render_dirty(ctx, vm);
+            vm.run_paint(ctx, &paint);
             input.draw_overlay(ctx, false);
             ctx.lcd.flush_dirty();
         }
@@ -532,65 +537,6 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm, input: &mut P::In
             // EPD updates are driven exclusively by OP_W_RENDER inside the
             // program; the per-frame loop does nothing here.
         }
-    }
-}
-
-/// Fixed-capacity scratch for the on_paint id collection (no heap per frame).
-struct PaintBuf {
-    ids: [i32; 64],
-    len: usize,
-}
-impl PaintBuf {
-    fn new() -> Self {
-        Self {
-            ids: [0; 64],
-            len: 0,
-        }
-    }
-    fn push(&mut self, id: i32) {
-        if self.len < self.ids.len() {
-            self.ids[self.len] = id;
-            self.len += 1;
-        }
-    }
-}
-
-/// Dirty widgets that registered on_paint — collected *before* render clears
-/// their dirty flags.
-fn collect_dirty_paint<P: PlatformRuntime>(ctx: &mut Ctx<P>, out: &mut PaintBuf) {
-    ctx.tree.ensure_dfs();
-    for i in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(i);
-        let w = ctx.tree.get(id);
-        if w.is_dirty() && w.flags & widget::FLAG_HAS_ON_PAINT != 0 {
-            out.push(id.0 as i32);
-        }
-    }
-}
-
-/// Widgets that became visible (and were already rendered, so are no longer
-/// dirty) — used after a callback drain.
-fn collect_visible_paint<P: PlatformRuntime>(ctx: &mut Ctx<P>, out: &mut PaintBuf) {
-    ctx.tree.ensure_dfs();
-    for i in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(i);
-        if ctx.tree.get(id).flags & widget::FLAG_HAS_ON_PAINT != 0
-            && ctx.tree.is_tree_visible(id)
-            && !ctx.tree.get(id).is_dirty()
-        {
-            out.push(id.0 as i32);
-        }
-    }
-}
-
-fn enqueue_paint<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, paint: &PaintBuf) {
-    if !vm.has_code() || paint.len == 0 {
-        return;
-    }
-    if let Some(offset) = vm.find_by_kind(FunctionKind::OnPaint).map(|e| e.offset as u16) {
-        let arr_id = vm.alloc_array_from_i32s(&paint.ids[..paint.len]);
-        vm.enqueue_callback(offset, &[arr_id]);
-        let _ = ctx; // arrays live in the VM; ctx unused but keeps the signature uniform
     }
 }
 

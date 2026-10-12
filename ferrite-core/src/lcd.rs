@@ -105,21 +105,27 @@ impl<B: LcdBackend> LcdImpl<B> {
 
     #[inline]
     pub fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
-        if let Some(c) = self.scissor.get() {
-            // Intersect the fill with the scissor rect (i32 math avoids u16
-            // wrap when the fill starts left/above the scissor).
-            let x0 = (x as i32).max(c.x as i32);
-            let y0 = (y as i32).max(c.y as i32);
-            let x1 = (x as i32 + w as i32).min(c.x as i32 + c.w as i32);
-            let y1 = (y as i32 + h as i32).min(c.y as i32 + c.h as i32);
-            if x1 <= x0 || y1 <= y0 {
-                return;
-            }
-            return self
-                .be
-                .fill_rect(x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16, color);
+        if let Some((x, y, w, h)) = self.scissored(x, y, w, h) {
+            self.be.fill_rect(x, y, w, h, color)
         }
-        self.be.fill_rect(x, y, w, h, color)
+    }
+
+    /// Intersect a rect with the scissor rect; `None` when nothing is left.
+    /// Without a scissor the rect passes through unchanged.
+    #[inline]
+    fn scissored(&self, x: u16, y: u16, w: u16, h: u16) -> Option<(u16, u16, u16, u16)> {
+        let Some(c) = self.scissor.get() else {
+            return Some((x, y, w, h));
+        };
+        // i32 math avoids u16 wrap when the rect starts left/above the scissor.
+        let x0 = (x as i32).max(c.x as i32);
+        let y0 = (y as i32).max(c.y as i32);
+        let x1 = (x as i32 + w as i32).min(c.x as i32 + c.w as i32);
+        let y1 = (y as i32 + h as i32).min(c.y as i32 + c.h as i32);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some((x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16))
     }
 
     #[inline]
@@ -134,18 +140,26 @@ impl<B: LcdBackend> LcdImpl<B> {
 
     #[inline]
     pub fn draw_pixel(&self, x: u16, y: u16, color: u16) {
-        if let Some(c) = self.scissor.get() {
-            let xi = x as i32;
-            let yi = y as i32;
-            if xi < c.x as i32
-                || yi < c.y as i32
-                || xi >= c.x as i32 + c.w as i32
-                || yi >= c.y as i32 + c.h as i32
-            {
-                return;
-            }
+        if self.scissored_out(x, y) {
+            return;
         }
         self.be.draw_pixel(x, y, color)
+    }
+
+    /// True when a scissor rect is set and (x, y) lies outside it.
+    #[inline]
+    fn scissored_out(&self, x: u16, y: u16) -> bool {
+        match self.scissor.get() {
+            Some(c) => {
+                let xi = x as i32;
+                let yi = y as i32;
+                xi < c.x as i32
+                    || yi < c.y as i32
+                    || xi >= c.x as i32 + c.w as i32
+                    || yi >= c.y as i32 + c.h as i32
+            }
+            None => false,
+        }
     }
 
     /// Whether the backend supports true alpha blending.
@@ -156,11 +170,16 @@ impl<B: LcdBackend> LcdImpl<B> {
 
     #[inline]
     pub fn blend_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16, alpha: u8) {
-        self.be.blend_rect(x, y, w, h, color, alpha)
+        if let Some((x, y, w, h)) = self.scissored(x, y, w, h) {
+            self.be.blend_rect(x, y, w, h, color, alpha)
+        }
     }
 
     #[inline]
     pub fn blend_pixel(&self, x: u16, y: u16, color: u16, alpha: u8) {
+        if self.scissored_out(x, y) {
+            return;
+        }
         self.be.blend_pixel(x, y, color, alpha)
     }
 
@@ -825,8 +844,17 @@ impl<B: LcdBackend> LcdImpl<B> {
     }
 
     /// Draw a horizontal gradient span, writing each pixel with its interpolated
-    /// color. Clips only to `x >= 0`; the caller bounds the right/top/bottom edges.
+    /// color. Clips to `x >= 0` and the scissor rect (the pixel stream bypasses
+    /// `fill_rect`); the caller bounds the right/top/bottom screen edges.
     fn hspan_gradient(&self, x0: i16, x1: i16, y: i16, full_x: i16, grad_w: u16, c1: u16, c2: u16) {
+        let (mut x0, mut x1) = (x0, x1);
+        if let Some(c) = self.scissor.get() {
+            if y < c.y || y >= c.y + c.h as i16 {
+                return;
+            }
+            x0 = x0.max(c.x);
+            x1 = x1.min(c.x + c.w as i16 - 1);
+        }
         let left = x0.max(0) as u16;
         let right = x1;
         if right < 0 || left > right as u16 {

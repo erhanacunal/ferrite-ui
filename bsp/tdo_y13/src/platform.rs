@@ -47,7 +47,13 @@ impl Platform for TdoY13Platform {
 impl PlatformRuntime for TdoY13Platform {
     const BG_COLOR: u16 = COLOR_BLACK;
     const FG_COLOR: u16 = COLOR_WHITE;
-    const VM_STEPS_PER_TICK: u32 = 10;
+    // A main-loop pass also polls touch (costly while pressed) and checks
+    // render state, so 10 steps a pass starved the VM: a ~3k-instruction game
+    // frame took hundreds of passes and slowed down whenever a finger was on
+    // the panel. The burst still ends at the program's yield/delay.
+    const VM_STEPS_PER_TICK: u32 = 10_000;
+    // Plenty of RAM: load any program image (u16 VM address space).
+    const MAX_CODE_SIZE: usize = 64 * 1024;
     type Input = FullInput;
 
     fn reset() -> ! {

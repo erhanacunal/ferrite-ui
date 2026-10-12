@@ -63,6 +63,8 @@ impl PlatformRuntime for SimPlatform {
     // intended rate instead of one instruction per frame. A program that yields
     // each frame stops the burst early, so this only speeds up busy loops.
     const VM_STEPS_PER_TICK: u32 = 50_000;
+    // Plenty of RAM: load any program image (u16 VM address space).
+    const MAX_CODE_SIZE: usize = 64 * 1024;
     type Input = FullInput;
 
     fn reset() -> ! {

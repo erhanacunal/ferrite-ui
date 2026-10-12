@@ -19,8 +19,13 @@ const I2C_ADDR: u8 = 0x51;
 const REG_CONTROL1: u8 = 0x00;
 const REG_SECONDS: u8 = 0x02;
 
-/// Half an SCL period (~5 µs at 96 MHz → ~100 kHz).
-const HALF_PERIOD_SPINS: u32 = 240;
+/// Delay-loop iterations for half an SCL period at a 96 MHz CPU clock
+/// (240 ≈ 5 µs → ~100 kHz).
+const HALF_PERIOD_SPINS_PER_96MHZ: u32 = 240;
+
+/// Half-period loop count for the running CPU clock; set by `init` (the NAND
+/// loader picks the clock, so it is read back rather than assumed).
+static mut HALF_PERIOD_SPINS: u32 = HALF_PERIOD_SPINS_PER_96MHZ;
 
 /// The two GPB pins in use; set by `init`.
 static mut SDA: u32 = 14;
@@ -135,11 +140,12 @@ fn scl() -> u32 {
 
 fn delay() {
     unsafe {
+        let spins = HALF_PERIOD_SPINS;
         core::arch::asm!(
             "1:",
             "subs {0}, {0}, #1",
             "bne 1b",
-            inout(reg) HALF_PERIOD_SPINS => _,
+            inout(reg) spins => _,
             options(nomem, nostack),
         );
     }
@@ -246,6 +252,8 @@ fn probe() -> bool {
 /// Call once at boot. Takes over GPB13/GPB14.
 pub unsafe fn init() {
     unsafe {
+        let cpu_khz = n32903_rs::clock::get_cpu_clock();
+        HALF_PERIOD_SPINS = (HALF_PERIOD_SPINS_PER_96MHZ * (cpu_khz / 1000) / 96).max(1);
         reg_write32(REG_GPBFUN, reg_read32(REG_GPBFUN) & !(MF_GPB13 | MF_GPB14));
         let pins = (1 << 13) | (1 << 14);
         reg_write32(REG_GPIOB_DOUT, reg_read32(REG_GPIOB_DOUT) & !pins); // low when driven

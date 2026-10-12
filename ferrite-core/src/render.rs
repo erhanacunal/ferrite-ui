@@ -7,7 +7,7 @@ use crate::lcd::{LcdBackend, LcdImpl};
 use crate::platform::Platform;
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
-    FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
+    FLAG_HAS_ON_PAINT, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
     KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_PROGRESS,
     KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
 };
@@ -34,17 +34,51 @@ pub fn buffered_has_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
     false
 }
 
-/// Full buffered-mode render: begin_frame + erase stale rects + draw dirty
-/// widgets + end_frame. Call this instead of the 3-step pattern. The inner
-/// `render_buffered_content` remains public for callers that need to interleave
-/// overlays (e.g. the keyboard) between widget draw and buffer swap.
-///
-/// `vm` is borrowed read-only so the renderer can resolve sample data for
-/// KIND_GRAPH widgets via `Vm::array_slice` without copying.
-pub fn render_buffered<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
-    ctx.lcd.begin_frame();
-    render_buffered_content(ctx, vm);
-    ctx.lcd.end_frame();
+/// Widgets whose `on_paint` must run right after the render pass that drew
+/// them (fixed capacity — no heap per frame). See `Vm::run_paint`.
+pub struct PaintList {
+    ids: [WidgetId; PAINT_MAX],
+    len: usize,
+}
+
+/// Capacity of a `PaintList` (on_paint widgets per frame).
+pub const PAINT_MAX: usize = 64;
+
+impl PaintList {
+    pub fn new() -> Self {
+        Self {
+            ids: [WidgetId::NONE; PAINT_MAX],
+            len: 0,
+        }
+    }
+
+    pub fn push(&mut self, id: WidgetId) {
+        if self.len < PAINT_MAX {
+            self.ids[self.len] = id;
+            self.len += 1;
+        }
+    }
+
+    pub fn ids(&self) -> &[WidgetId] {
+        &self.ids[..self.len]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Dirty-mode counterpart of the list `render_buffered_content` returns: the
+/// dirty on_paint widgets, collected *before* `render_dirty` clears the flags.
+pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
+    ctx.tree.ensure_dfs();
+    for i in 0..ctx.tree.dfs_len() {
+        let id = ctx.tree.dfs_at(i);
+        let w = ctx.tree.get(id);
+        if w.is_dirty() && w.flags & FLAG_HAS_ON_PAINT != 0 {
+            out.push(id);
+        }
+    }
 }
 
 /// Draw dirty widgets to the current back buffer. For each dirty widget, if
@@ -52,8 +86,12 @@ pub fn render_buffered<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
 /// the widgets behind it are redrawn clipped to the stale rect first — so
 /// moving widgets don't leave a trail. Per-buffer `prev_rect` tracking keeps
 /// the erase area bounded even under continuous motion.
-/// Caller must bracket with lcd.begin_frame() / lcd.end_frame().
-pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
+/// Caller must bracket with lcd.begin_frame() / lcd.end_frame(), and run
+/// `on_paint` for the returned widgets in between (`Vm::run_paint`): their
+/// custom drawing belongs to this back buffer, on top of the background just
+/// drawn — painting after the swap would reach only one of the two buffers.
+pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) -> PaintList {
+    let mut paint = PaintList::new();
     let buf = ctx.lcd.back_buf();
     ctx.tree.ensure_dfs();
     // Whole-screen clip for the unclipped Pass-2 draws (built once).
@@ -105,13 +143,17 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
             }
         }
 
-        // Translucent widgets must not blend over their own previous output
-        // in this buffer — restore what is behind them first.
-        if ctx.lcd.has_alpha() && ctx.tree.alpha(id) < 255 {
+        // Translucent widgets and transparent labels must not blend over
+        // their own previous output in this buffer — restore what is behind
+        // them first.
+        if ctx.lcd.has_alpha() && shows_behind(&ctx.tree, id) {
             redraw_behind(ctx, vm, i, abs);
         }
         draw_widget(ctx, vm, id, &abs, &full);
         ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
+        if ctx.tree.get(id).flags & FLAG_HAS_ON_PAINT != 0 {
+            paint.push(id);
+        }
     }
 
     // Draw scrollbars on top
@@ -139,6 +181,7 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
         }
         ctx.tree.get_mut(id).clear_dirty_buf(buf);
     }
+    paint
 }
 
 /// Read this widget's prev_rect for the given buffer index (0=A, 1=B).
@@ -414,9 +457,10 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
             }
 
             if !clip.is_empty() {
-                // Translucent widgets must not blend over their own previous
-                // output — restore what is behind them (same clip) first.
-                if ctx.lcd.has_alpha() && ctx.tree.alpha(sid) < 255 {
+                // Translucent widgets and transparent labels must not blend
+                // over their own previous output — restore what is behind
+                // them (same clip) first.
+                if ctx.lcd.has_alpha() && shows_behind(&ctx.tree, sid) {
                     redraw_behind_region(ctx, vm, si, &clip, &sabs);
                 }
                 draw_widget(ctx, vm, sid, &sabs, &clip);
@@ -438,16 +482,34 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
     clear_all_dirty(ctx);
 }
 
+/// True when what is behind `id` shows through it: a translucent
+/// background, or a label without a background of its own (its text is
+/// drawn straight over the content behind it on readback backends).
+fn shows_behind(tree: &WidgetTree, id: WidgetId) -> bool {
+    if tree.alpha(id) < 255 {
+        return true;
+    }
+    let w = tree.get(id);
+    w.kind == KIND_LABEL
+        && effective_bg(tree, w, tree.ext(id).unwrap_or(&WidgetExt::DEFAULT)) == 0
+}
+
 // --- Drawing ---
 
 /// Effective background color for a widget.
 /// If the widget is pressed and has press_color, returns press_color.
 /// If a parent is pressed and this widget shares the same background,
-/// inherits the parent's press_color.
+/// inherits the parent's press_color — unless it is transparent (a label or
+/// image without a background paints none): the pressed parent's fill, with
+/// its rounded corners, already shows through, and a filled copy would be a
+/// square box over it.
 fn effective_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
     // This widget is pressed and has a press_color
     if widget.flags & FLAG_PRESSED != 0 && ext.press_color != 0 {
         return ext.press_color;
+    }
+    if widget.background_color == 0 && (widget.kind == KIND_LABEL || widget.kind == KIND_IMAGE) {
+        return 0;
     }
 
     // Check ancestor
@@ -550,8 +612,13 @@ fn draw_widget<P: Platform>(
     };
 
     if r > 0 {
+        // The rounded primitives take no clip, so confine them to the clip
+        // region via the LCD scissor, once per (disjoint) clip rect. Without
+        // this, a clipped redraw — e.g. restoring what is behind a transparent
+        // label — repaints the whole widget over content drawn after it.
         let bw = b.top.max(b.bottom).max(b.left).max(b.right);
-        if bw > 0 {
+        for cr in clip.iter() {
+            ctx.lcd.set_scissor(Some(*cr));
             for i in 0..bw {
                 rounded_rect_screen(
                     &ctx.lcd,
@@ -565,21 +632,21 @@ fn draw_widget<P: Platform>(
                     widget.border_color,
                 );
             }
-        }
-        if draw_bg {
-            let bg = inner_rect(abs, &b);
-            if !bg.is_empty() {
-                let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
-                // Rounded rect clip is not applied (same as solid — too complex to clip a rounded fill).
-                if gdir != 0 {
-                    fill_gradient_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color, gcol, gdir);
-                } else if alpha < 255 {
-                    fill_rounded_rect_blend_screen(&ctx.lcd, bg, inner_r, bg_color, alpha);
-                } else {
-                    fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+            if draw_bg {
+                let bg = inner_rect(abs, &b);
+                if !bg.is_empty() {
+                    let inner_r = r.saturating_sub(b.top.max(b.left) as u16);
+                    if gdir != 0 {
+                        fill_gradient_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color, gcol, gdir);
+                    } else if alpha < 255 {
+                        fill_rounded_rect_blend_screen(&ctx.lcd, bg, inner_r, bg_color, alpha);
+                    } else {
+                        fill_rounded_rect_screen(&ctx.lcd, bg, inner_r, bg_color);
+                    }
                 }
             }
         }
+        ctx.lcd.set_scissor(None);
     } else {
         let border_rects = [
             Rect::new(abs.x, abs.y, abs.w, b.top as u16),
@@ -630,9 +697,22 @@ fn draw_widget<P: Platform>(
         draw_bg_image(ctx, ext.image_id, &bg);
     }
 
-    // Label text
+    // Label text. Readback backends draw it over whatever is already on
+    // screen (the label's own background, or what shows through a
+    // transparent one), confined to the clip: blending is not idempotent, so
+    // a pixel outside the clip must not be blended twice. Without readback,
+    // glyph cells are filled opaquely with the nearest solid background.
     if widget.kind == KIND_LABEL {
-        draw_label_text(ctx, widget, abs, ext);
+        if ctx.lcd.has_alpha() {
+            for cr in clip.iter() {
+                ctx.lcd.set_scissor(Some(*cr));
+                draw_label_text(ctx, widget, abs, ext, None);
+            }
+            ctx.lcd.set_scissor(None);
+        } else {
+            let bg = resolved_text_bg(&ctx.tree, widget, ext, P::DEFAULT_BG_COLOR);
+            draw_label_text(ctx, widget, abs, ext, Some(bg));
+        }
     }
 
     // Progress bar / slider fill
@@ -897,8 +977,15 @@ fn draw_widget_image<P: Platform>(ctx: &Ctx<P>, abs: &Rect, ext: &WidgetExt) {
     }
 }
 
-/// Draw label text in the content area.
-fn draw_label_text<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+/// Draw label text in the content area. `bg = None` draws only the glyph
+/// pixels (blended on anti-aliased fonts — readback backends only).
+fn draw_label_text<P: Platform>(
+    ctx: &Ctx<P>,
+    widget: &Widget,
+    abs: &Rect,
+    ext: &WidgetExt,
+    bg: Option<Color>,
+) {
     if ext.text_id == 0xFFFF || ext.font_id == 0xFF {
         return;
     }
@@ -927,13 +1014,6 @@ fn draw_label_text<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: 
     }
 
     let lh = font.line_height() as i16;
-
-    // Always pass a background color — required for correct anti-aliased
-    // blending.  resolved_text_bg walks up the tree, so even "transparent"
-    // labels (background_color=0) get the parent's actual fill color.
-    // Falls back to the platform's DEFAULT_BG_COLOR when no ancestor has one.
-    let bg_color = resolved_text_bg(&ctx.tree, widget, ext, P::DEFAULT_BG_COLOR);
-    let bg = Some(bg_color);
 
     // Multi-line mode: split on '\n', center block vertically
     if widget.flags & FLAG_MULTI_LINE != 0 {
@@ -1747,5 +1827,48 @@ fn clear_all_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     for i in 0..ctx.tree.dfs_len() {
         let id = ctx.tree.dfs_at(i);
         ctx.tree.get_mut(id).clear_dirty();
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
+mod tests {
+    use super::*;
+    use crate::widget::KIND_BASE;
+
+    /// Pressed, background-less rounded button ("Ghost") with a full-size
+    /// transparent label child.
+    fn ghost(tree: &mut WidgetTree) -> (WidgetId, WidgetId) {
+        let button = tree.alloc().unwrap();
+        tree.get_mut(button).kind = KIND_BASE;
+        tree.get_mut(button).flags |= FLAG_PRESSED;
+        tree.ensure_ext(button).unwrap().press_color = 0x2C9F;
+        let label = tree.alloc().unwrap();
+        tree.get_mut(label).kind = KIND_LABEL;
+        tree.add_child(button, label);
+        (button, label)
+    }
+
+    #[test]
+    fn transparent_label_does_not_inherit_press_color() {
+        let mut tree = WidgetTree::new();
+        let (button, label) = ghost(&mut tree);
+        let ext = tree.ext(label).unwrap_or(&WidgetExt::DEFAULT);
+        // No fill of its own: the button's rounded press fill shows through.
+        assert_eq!(effective_bg(&tree, tree.get(label), ext), 0);
+        // Text without readback still blends against the press color.
+        assert_eq!(resolved_text_bg(&tree, tree.get(label), ext, 0), 0x2C9F);
+        let bext = tree.ext(button).unwrap();
+        assert_eq!(effective_bg(&tree, tree.get(button), bext), 0x2C9F);
+    }
+
+    #[test]
+    fn same_bg_container_still_inherits_press_color() {
+        let mut tree = WidgetTree::new();
+        let (button, _) = ghost(&mut tree);
+        let inner = tree.alloc().unwrap();
+        tree.get_mut(inner).kind = KIND_BASE;
+        tree.add_child(button, inner);
+        let ext = tree.ext(inner).unwrap_or(&WidgetExt::DEFAULT);
+        assert_eq!(effective_bg(&tree, tree.get(inner), ext), 0x2C9F);
     }
 }

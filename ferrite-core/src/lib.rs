@@ -55,7 +55,9 @@ fn _mock_instantiation_guard() {
         keyboard::Keyboard::draw::<MockLcd, MockFlash>;
     let _: fn(&mut ctx::Ctx<M>, &vm::Vm) = render::render_dirty::<M>;
     let _: fn(&mut ctx::Ctx<M>, &vm::Vm) = render::render_all::<M>;
-    let _: fn(&mut ctx::Ctx<M>, &vm::Vm) = render::render_buffered::<M>;
+    let _: fn(&mut ctx::Ctx<M>, &vm::Vm) -> render::PaintList =
+        render::render_buffered_content::<M>;
+    let _: fn(&mut vm::Vm, &mut ctx::Ctx<M>, &render::PaintList) = vm::Vm::run_paint::<M>;
     let _: fn(&mut ctx::Ctx<M>) -> bool = render::buffered_has_dirty::<M>;
     let _: fn(&mut vm::Vm, &mut ctx::Ctx<M>) = vm::Vm::run::<M>;
     let _: fn(&mut vm::Vm, &mut ctx::Ctx<M>) = vm::Vm::step::<M>;

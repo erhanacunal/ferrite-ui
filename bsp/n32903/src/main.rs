@@ -1,8 +1,9 @@
 //! Nextion N32903 BSP — Nuvoton N32903 (W55FA93, ARM926EJ-S) + 800×480 RGB LCD.
 //!
 //! Booted by the NAND loader (`n32903_nand_loader_rs`): the loader copies this
-//! image from NAND block 4 to SDRAM 0x0 and jumps to it, so DDR and the 96 MHz
-//! system clock are already configured. Single-threaded, like the Nextion
+//! image from NAND block 4 to SDRAM 0x0 and jumps to it, so DDR and the
+//! system clock (200 MHz CPU, 100 MHz HCLK, 50 MHz APB) are already
+//! configured. Drivers read the clock back instead of assuming it. Single-threaded, like the Nextion
 //! GD32 target: two interrupts (1 ms tick, UART RX), everything else polled.
 //!
 //! Memory (8 MB SDRAM): image + .bss (two 800×480 RGB565 frame buffers) from

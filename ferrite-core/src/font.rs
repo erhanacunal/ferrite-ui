@@ -380,10 +380,26 @@ impl Font {
                     fg,
                 );
             }
+        } else if bg.is_none() && lcd.has_alpha() {
+            // 2bpp, transparent: blend each pixel's coverage into the
+            // existing framebuffer content (needs readback).
+            let total_pixels = width as u32 * height as u32;
+            let total_bytes = (total_pixels + 3) / 4;
+            self.draw_2bpp_blend(
+                lcd,
+                flash,
+                total_bytes,
+                bitmap_offset,
+                width,
+                height,
+                draw_x,
+                draw_y,
+                fg,
+            );
         } else {
             // 2bpp: always blend fg with bg via begin_pixels stream.
-            // bg=None falls back to black — callers should always pass a
-            // known background for correct anti-aliased rendering.
+            // bg=None without readback falls back to black — callers should
+            // pass a known background for correct anti-aliased rendering.
             let bg_color = bg.unwrap_or(0);
             let total_pixels = width as u32 * height as u32;
             let total_bytes = (total_pixels + 3) / 4;
@@ -502,7 +518,9 @@ impl Font {
                     if byte & (1 << bit) != 0 {
                         let px = draw_x + (bit_idx % w) as i16;
                         let py = draw_y + (bit_idx / w) as i16;
-                        lcd.fill_rect(px as u16, py as u16, 1, 1, fg);
+                        if px >= 0 && py >= 0 {
+                            lcd.fill_rect(px as u16, py as u16, 1, 1, fg);
+                        }
                     }
                     bit_idx += 1;
                 }
@@ -549,6 +567,53 @@ impl Font {
                     let alpha = (byte >> shift) & 0x03;
                     let color = lerp_rgb565(bg, fg, alpha as u16, 3);
                     lcd.write_pixel(color);
+                    pixel_idx += 1;
+                }
+            }
+
+            bytes_read += chunk as u32;
+        }
+    }
+
+    /// 2bpp glyph blended over the existing pixels (`LcdBackend::HAS_ALPHA`
+    /// backends only); zero-coverage pixels are left untouched.
+    fn draw_2bpp_blend<L: LcdBackend, F: FlashBackend>(
+        &self,
+        lcd: &LcdImpl<L>,
+        flash: &FlashImpl<F>,
+        total_bytes: u32,
+        bitmap_offset: u16,
+        width: u8,
+        height: u8,
+        draw_x: i16,
+        draw_y: i16,
+        fg: u16,
+    ) {
+        const ALPHA: [u8; 4] = [0, 85, 170, 255];
+        let w = width as u32;
+        let total_pixels = w * height as u32;
+        let mut pixel_idx: u32 = 0;
+        let mut bytes_read: u32 = 0;
+
+        while bytes_read < total_bytes {
+            let chunk = (total_bytes - bytes_read).min(BITMAP_BUF_SIZE as u32) as usize;
+            let mut buf = [0u8; BITMAP_BUF_SIZE];
+            self.read_bitmap(flash, bitmap_offset, bytes_read, &mut buf[..chunk]);
+
+            for i in 0..chunk {
+                let byte = buf[i];
+                for shift in [6u8, 4, 2, 0] {
+                    if pixel_idx >= total_pixels {
+                        return;
+                    }
+                    let alpha = ALPHA[((byte >> shift) & 0x03) as usize];
+                    if alpha != 0 {
+                        let px = draw_x + (pixel_idx % w) as i16;
+                        let py = draw_y + (pixel_idx / w) as i16;
+                        if px >= 0 && py >= 0 {
+                            lcd.blend_pixel(px as u16, py as u16, fg, alpha);
+                        }
+                    }
                     pixel_idx += 1;
                 }
             }
