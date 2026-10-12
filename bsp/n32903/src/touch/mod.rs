@@ -8,6 +8,8 @@
 //! The Nextion firmware uses screen X = ADC_YDATA, hence `xy_swap` in the
 //! defaults.
 
+use core::cell::Cell;
+
 use ferrite_core::touch::{CalParams, TouchBackend, TouchImpl};
 use n32903_rs::touch::{Calibration, Touch};
 
@@ -46,8 +48,59 @@ pub fn is_pressed() -> bool {
     hal().is_pressed()
 }
 
+/// Largest raw distance (per axis) between two consecutive readings that
+/// still counts as the same steady contact (~10 px on this panel).
+const STEADY_TOL: u16 = 12;
+
 /// Hardware backend.
-pub struct AdcTouch;
+///
+/// A resistive panel reads wrong while the contact pressure is low: the
+/// first reading of a touch and the last one before lift-off drift away
+/// from the real point. A bad press point hits the wrong widget; a bad
+/// release point drops the click or turns it into a swipe. So:
+/// - a touch is reported only once a second reading confirms the first;
+/// - after that, readings are reported one poll late, so the final one
+///   (taken while lifting off) is never reported;
+/// - a jump or an unstable reading while the pen is down repeats the last
+///   reported point instead of returning `None` (which would count
+///   towards a release in `TouchImpl`).
+pub struct AdcTouch {
+    /// Previous raw reading of the current contact (not yet reported).
+    prev: Cell<Option<(u16, u16)>>,
+    /// Last raw reading reported for the current contact.
+    last_out: Cell<Option<(u16, u16)>>,
+}
+
+impl AdcTouch {
+    fn filtered_raw(&self) -> Option<(u16, u16)> {
+        let Some(cur) = read_raw() else {
+            if !is_pressed() {
+                self.prev.set(None);
+                self.last_out.set(None);
+                return None;
+            }
+            // Pen down but the reading was unstable: start a new confirmation.
+            self.prev.set(None);
+            return self.last_out.get();
+        };
+
+        let out = match self.prev.replace(Some(cur)) {
+            Some(p) if is_near(p, cur) => {
+                // First report of a touch uses the newer (firmer) reading;
+                // later ones lag by one so the lift-off reading is dropped.
+                if self.last_out.get().is_none() { cur } else { p }
+            }
+            // First reading of a touch, or a jump: wait for confirmation.
+            _ => return self.last_out.get(),
+        };
+        self.last_out.set(Some(out));
+        Some(out)
+    }
+}
+
+fn is_near(a: (u16, u16), b: (u16, u16)) -> bool {
+    a.0.abs_diff(b.0) <= STEADY_TOL && a.1.abs_diff(b.1) <= STEADY_TOL
+}
 
 impl TouchBackend for AdcTouch {
     fn is_active(&self) -> bool {
@@ -55,7 +108,7 @@ impl TouchBackend for AdcTouch {
     }
 
     fn read_screen(&self, cal: &CalParams) -> Option<(u16, u16)> {
-        let (rx, ry) = read_raw()?;
+        let (rx, ry) = self.filtered_raw()?;
         Some(to_screen(rx, ry, cal))
     }
 }
@@ -161,24 +214,37 @@ fn wait_release() {
     delay_ms(200);
 }
 
-/// Average of 8 stable raw samples of one press.
+/// Average of 8 consecutive steady raw samples of one press, skipping the
+/// first few (low contact pressure reads off-point).
 fn wait_raw_touch() -> (u16, u16) {
+    const SETTLE_COUNT: u32 = 3;
     const STABLE_COUNT: u32 = 8;
     wait_release();
-    let (mut n, mut ax, mut ay) = (0u32, 0u32, 0u32);
+    let (mut seen, mut n, mut ax, mut ay) = (0u32, 0u32, 0u32, 0u32);
+    let mut first = (0u16, 0u16);
     loop {
         delay_ms(10);
         if !is_pressed() {
-            (n, ax, ay) = (0, 0, 0);
+            (seen, n, ax, ay) = (0, 0, 0, 0);
             continue;
         }
-        if let Some((rx, ry)) = read_raw() {
-            ax += rx as u32;
-            ay += ry as u32;
-            n += 1;
-            if n >= STABLE_COUNT {
-                return ((ax / n) as u16, (ay / n) as u16);
-            }
+        let Some(s) = read_raw() else { continue };
+        seen += 1;
+        if seen <= SETTLE_COUNT {
+            continue;
+        }
+        if n == 0 {
+            first = s;
+        } else if !is_near(first, s) {
+            // Finger moved: start over from this sample.
+            (n, ax, ay) = (0, 0, 0);
+            first = s;
+        }
+        ax += s.0 as u32;
+        ay += s.1 as u32;
+        n += 1;
+        if n >= STABLE_COUNT {
+            return ((ax / n) as u16, (ay / n) as u16);
         }
     }
 }
@@ -221,5 +287,8 @@ pub unsafe fn init() {
 
 /// Return a new `AdcTouch` instance. Must call `init()` first.
 pub fn new() -> AdcTouch {
-    AdcTouch
+    AdcTouch {
+        prev: Cell::new(None),
+        last_out: Cell::new(None),
+    }
 }
