@@ -980,10 +980,14 @@ impl FullInput {
                 if let Some(ext) = ctx.tree.ensure_ext(hit) {
                     ext.value = new_val;
                 }
+                // The click dispatcher takes exactly one argument, the widget
+                // id (a second one would be popped *as* the id); the new value
+                // is already stored, and the dispatcher passes it on to
+                // handlers declared as `fn h(wid, val)`.
                 if vm.has_code() && ctx.tree.get(hit).flags & widget::FLAG_HAS_ON_CLICK != 0 {
                     if let Some(off) = vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as u16)
                     {
-                        vm.enqueue_callback(off, &[hit.0 as i32, new_val as i32]);
+                        vm.enqueue_callback(off, &[hit.0 as i32]);
                     }
                 }
             }
@@ -1036,7 +1040,8 @@ impl FullInput {
                     if let Some(off) =
                         vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as u16)
                     {
-                        vm.enqueue_callback(off, &[id.0 as i32, new_val as i32]);
+                        // One argument — see the slider press path.
+                        vm.enqueue_callback(off, &[id.0 as i32]);
                     }
                 }
                 break;

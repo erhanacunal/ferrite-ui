@@ -43,7 +43,21 @@ struct Host {
     window: Window,
     fb: Framebuffer,
     mouse: MouseState,
+    taps: Vec<ScriptedTap>,
 }
+
+/// A scripted press (`--tap X,Y,MS`): the touch reads as held at (x, y) for
+/// `TAP_HOLD_MS` starting `at_ms` after launch. minifb samples the real mouse,
+/// so synthetic OS input cannot drive the sim — this lets tests click.
+#[derive(Clone, Copy)]
+pub struct ScriptedTap {
+    pub x: u16,
+    pub y: u16,
+    pub at_ms: u32,
+}
+
+/// How long a scripted tap holds the press (well under long-press timing).
+const TAP_HOLD_MS: u32 = 150;
 
 thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
@@ -51,8 +65,8 @@ thread_local! {
 
 /// Hand the window, framebuffer and mouse state to the runtime so `frame_end`
 /// can pump them. Call once, before `ferrite_core::run`.
-pub fn install_host(window: Window, fb: Framebuffer, mouse: MouseState) {
-    HOST.with(|h| *h.borrow_mut() = Some(Host { window, fb, mouse }));
+pub fn install_host(window: Window, fb: Framebuffer, mouse: MouseState, taps: Vec<ScriptedTap>) {
+    HOST.with(|h| *h.borrow_mut() = Some(Host { window, fb, mouse, taps }));
 }
 
 impl PlatformRuntime for SimPlatform {
@@ -100,7 +114,11 @@ impl PlatformRuntime for SimPlatform {
                 ),
                 None => (0, 0),
             };
-            host.mouse.update(mx, my, pressed && pos.is_some());
+            let now = systick::millis();
+            match host.taps.iter().find(|t| now >= t.at_ms && now < t.at_ms + TAP_HOLD_MS) {
+                Some(t) => host.mouse.update(t.x, t.y, true),
+                None => host.mouse.update(mx, my, pressed && pos.is_some()),
+            }
 
             // Present the front (displayed) buffer (blocks to the target FPS
             // for pacing). In buffered mode this is whichever buffer the last

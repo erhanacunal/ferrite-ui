@@ -31,7 +31,14 @@ var cb3;
 var r1;
 var r2;
 var chk_lbl;
-var color_btn;      // 25 globals
+var color_btn;
+// on_click registered with set(on_click, @fn) only reaches widgets held in
+// globals: the compiler builds the click dispatcher from global variables.
+var count_btn;
+var reset_btn;
+var slider1;
+var slider2;
+var r3;
 
 // ── Tab Switching ──
 
@@ -294,7 +301,7 @@ fn setup() {
     parent(panel1);
 
     // Counter button
-    var b = alloc(); target(b);
+    count_btn = alloc(); target(count_btn);
     set(location, 30, 45); set(size, 220, 65);
     set(bg_color, 0x2C9F); set(press_color, 0x1A5F);
     set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
@@ -303,7 +310,7 @@ fn setup() {
     l = alloc(); target(l); set(kind, KIND_LABEL);
     set(size, 220, 65); set(text_color, WHITE);
     set(text_align, ALIGN_CENTER); set(text, "TAP ME");
-    parent(b);
+    parent(count_btn);
 
     // Counter label
     counter_lbl = alloc(); target(counter_lbl); set(kind, KIND_LABEL);
@@ -313,7 +320,7 @@ fn setup() {
     parent(panel1);
 
     // Reset button
-    b = alloc(); target(b);
+    reset_btn = alloc(); target(reset_btn);
     set(location, 30, 130); set(size, 150, 45);
     set(bg_color, DARK_GRAY); set(press_color, 0x6B4D);
     set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
@@ -322,7 +329,7 @@ fn setup() {
     l = alloc(); target(l); set(kind, KIND_LABEL);
     set(size, 150, 45); set(text_color, WHITE);
     set(text_align, ALIGN_CENTER); set(text, "RESET");
-    parent(b);
+    parent(reset_btn);
 
     // Color cycle button
     color_btn = alloc(); target(color_btn);
@@ -349,7 +356,7 @@ fn setup() {
     parent(panel1);
 
     // Pill
-    b = alloc(); target(b);
+    var b = alloc(); target(b);
     set(location, 30, 275); set(size, 140, 38);
     set(bg_color, GREEN); set(press_color, DARK_GREEN);
     set(border, 2, 2, 2, 2); set(border_color, 0x5ACB);
@@ -479,7 +486,7 @@ fn setup() {
     set(location, 30, 265); set(size, 250, 22);
     set(text_color, WHITE); set(text, "Brightness: 100%");
     parent(panel2);
-    var s = alloc(); target(s);
+    slider1 = alloc(); target(slider1);
     set(kind, KIND_SLIDER); set(location, 30, 295); set(size, 350, 28);
     set(bg_color, 0x2104); set(press_color, 0x2C9F);
     set(border_color, WHITE); set(border_radius, 8);
@@ -490,7 +497,7 @@ fn setup() {
     set(location, 30, 340); set(size, 250, 22);
     set(text_color, WHITE); set(text, "Volume: 50%");
     parent(panel2);
-    s = alloc(); target(s);
+    slider2 = alloc(); target(slider2);
     set(kind, KIND_SLIDER); set(location, 30, 370); set(size, 350, 28);
     set(bg_color, 0x2104); set(press_color, GREEN);
     set(border_color, WHITE); set(border_radius, 8);
@@ -519,7 +526,7 @@ fn setup() {
     set(location, 470, 150); set(size, 300, 25);
     set(text_color, LIGHT_GRAY); set(text, "Large Slider");
     parent(panel2);
-    s = alloc(); target(s);
+    var s = alloc(); target(s);
     set(kind, KIND_SLIDER); set(location, 470, 185); set(size, 300, 45);
     set(bg_color, 0x2104); set(press_color, PURPLE);
     set(border_color, MAGENTA); set(border, 2, 2, 2, 2);
@@ -630,7 +637,7 @@ fn setup() {
     b = alloc(); target(b);
     set(location, 0, 90); set(size, 300, 35);
     parent(b);
-    l = alloc(); target(l);
+    r3 = alloc(); target(r3);
     set(kind, KIND_RADIO); set(location, 0, 2); set(size, 28, 28);
     set(bg_color, 0x2104); set(text_color, WHITE);
     set(press_color, 0x2C9F);

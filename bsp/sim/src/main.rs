@@ -38,7 +38,7 @@ use touch::sim::MouseState;
 use touch::CalParams;
 
 fn main() {
-    let fsimage_path = parse_args();
+    let (fsimage_path, taps) = parse_args();
 
     systick::init();
 
@@ -98,19 +98,31 @@ fn main() {
         cursor_visible: false,
     });
 
-    platform::install_host(window, fb.clone(), mouse.clone());
+    platform::install_host(window, fb.clone(), mouse.clone(), taps);
 
     ferrite_core::runtime::run::<SimPlatform>(ctx, touch)
 }
 
-fn parse_args() -> Option<String> {
+/// `--fsimage <path>` and any number of `--tap X,Y,MS` (scripted presses).
+fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>) {
+    let mut fsimage = None;
+    let mut taps = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
-        if a == "--fsimage" {
-            return args.next();
+        match a.as_str() {
+            "--fsimage" => fsimage = args.next(),
+            "--tap" => {
+                let spec = args.next().unwrap_or_default();
+                let parts: Vec<u32> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                match parts[..] {
+                    [x, y, at_ms] => taps.push(platform::ScriptedTap { x: x as u16, y: y as u16, at_ms }),
+                    _ => eprintln!("ignoring --tap {spec:?}: expected X,Y,MS"),
+                }
+            }
+            _ => {}
         }
     }
-    None
+    (fsimage, taps)
 }
 
 fn load_flash(path: Option<&str>) -> Result<flash::Flash, String> {

@@ -3284,6 +3284,19 @@ def _scan_set_callbacks(source, registry, seen):
                     f"variable; declare '{current}' at the top level to wire it.\n")
 
 
+# Matches a function header: fn NAME(params)
+_FN_DECL_RE = _re.compile(r'\bfn\s+(\w+)\s*\(([^)]*)\)')
+
+
+def _function_arities(source):
+    """Parameter count of each `fn NAME(...)` in the source."""
+    arities = {}
+    for m in _FN_DECL_RE.finditer(source):
+        params = m.group(2).strip()
+        arities[m.group(1)] = len(params.split(',')) if params else 0
+    return arities
+
+
 def _generate_dispatchers(source):
     """Pre-scan preprocessed source for widget callback assignments and return
     generated dispatcher function source code to append before compilation.
@@ -3312,9 +3325,17 @@ def _generate_dispatchers(source):
     parts = []
 
     if registry['on_click']:
-        lines = ['fn __on_click_dispatch(widget_id) {']
+        # The runtime calls the dispatcher with the widget id only. Value
+        # widgets (sliders) store their new value before the click fires, so
+        # a handler declared `fn h(wid, val)` gets it read back from the widget.
+        arity = _function_arities(source)
+        lines = ['fn __on_click_dispatch(widget_id: widget) {']
         for var_name, handler in registry['on_click']:
-            lines.append(f'    if (widget_id == {var_name}) {{ {handler}(widget_id); }}')
+            if arity.get(handler) == 2:
+                call = f'target(widget_id); {handler}(widget_id, get(value));'
+            else:
+                call = f'{handler}(widget_id);'
+            lines.append(f'    if (widget_id == {var_name}) {{ {call} }}')
         lines.append('}')
         parts.append('\n'.join(lines))
 
