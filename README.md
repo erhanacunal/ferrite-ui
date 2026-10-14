@@ -209,6 +209,8 @@ st-flash.exe write .\firmware.bin 0x08000000
 
 ### N32903 (Nextion, NAND loader)
 
+First time on a board? [N32903_Flashing.md](N32903_Flashing.md) walks through putting the NAND loader on it over JTAG (Raspberry Pi Pico + Free-DAP) and then flashing ferrite-ui. The tools and binaries it uses are in [files/](files/).
+
 Clone with submodules (`git clone --recursive`, or `git submodule update --init`). Needs the nightly toolchain with `rust-src` (pinned by `bsp/n32903/rust-toolchain.toml`) and the ARM GNU toolchain (`arm-none-eabi-gcc`) on `PATH` — it assembles the HAL's startup code and links.
 
 ```powershell
@@ -219,7 +221,7 @@ Clone with submodules (`git clone --recursive`, or `git submodule update --init`
 python flash_tool.py COM10 writeapp target\arm926ej-s\release\ferrite-ui.bin --boot
 ```
 
-`flash_tool.py` lives in [n32903_nand_loader_rs](https://github.com/erhanacunal/n32903_nand_loader_rs); the loader must already be on the board. Resources go over UART1 (115200) like on the other boards:
+`flash_tool.py` lives in [n32903_nand_loader_rs](https://github.com/erhanacunal/n32903_nand_loader_rs) (a copy is in [files/](files/)); the loader must already be on the board. Resources go over UART1 (115200) like on the other boards:
 
 ```powershell
 python tools\ferrite_build.py examples\n32903\clock\project.json -o fs.bin
@@ -350,6 +352,7 @@ ferrite-ui/
 ├── lib/                 Ferrite language libraries (core, color, anim, shapes, touch, ...)
 ├── examples/            Ferrite projects per board (nextion/, n32903/, tdo_y13/, lilygo-t5/)
 ├── docs/                Language, protocol and bytecode references
+├── files/               N32903 flashing kit: OpenOCD, JTAG script, NAND loader, flash_tool.py
 ├── n32903.ps1, tdo_y13.ps1, epaper.ps1   Board build scripts
 ├── gd32-{link,memory,device}.x  GD32F103 linker scripts (bsp/nextion)
 └── CLAUDE.md            Internal development notes
