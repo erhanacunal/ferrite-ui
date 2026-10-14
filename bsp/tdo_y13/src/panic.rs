@@ -206,6 +206,9 @@ fn panic(info: &PanicInfo) -> ! {
     let hw = text_width(hint);
     draw_str(hint, bx as i16 + (bw as i16 - hw) / 2, by as i16 + 170, 0x8410, Some(COLOR_BLACK));
 
+    // The framebuffer is write-back cacheable: push the panic screen to DRAM.
+    crate::lcd::flush_cache();
+
     // ARMv5TE has no `wfi` mnemonic — HAL issues the CP15 wait-for-interrupt.
     loop { f1c100s::cpu::wfi(); }
 }

@@ -70,4 +70,10 @@ pub trait Platform {
     /// per board to its RAM budget — bigger boards animate richer scenes. The
     /// default suits the small RAM boards (Nextion, epaper); tdo_y13 raises it.
     const ANIM_SLOTS: usize = 8;
+
+    /// Copy each font's glyph bitmaps into RAM when the font is loaded, so
+    /// text rendering does not read the resource flash per glyph. Worth it
+    /// where that flash is slow to reach (SPI NOR: a command + address per
+    /// read) and RAM is plentiful; off on the small RAM boards.
+    const CACHE_FONT_BITMAPS: bool = false;
 }

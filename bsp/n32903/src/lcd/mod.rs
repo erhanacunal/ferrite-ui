@@ -13,6 +13,7 @@
 //! buffer. The buffers are cacheable, so the platform's `frame_end` cleans the
 //! D-cache every loop iteration to make those writes visible to the VPOST.
 
+use ferrite_core::fb;
 use ferrite_core::lcd::LcdBackend;
 use n32903_rs::cache;
 use n32903_rs::lcd::{self as hal_lcd, Lcd};
@@ -65,41 +66,14 @@ fn back() -> *mut u16 {
     fb_ptr(unsafe { BACK })
 }
 
-/// Blend RGB565 `src` over `dst` per channel: `out = (src*a + dst*(255-a)) / 255`.
+/// `w` pixels of row `y` starting at column `x` in frame buffer `fb`.
+///
+/// # Safety
+/// `x + w <= WIDTH`, `y < HEIGHT`, `fb` from `fb_ptr`; no other live
+/// reference to those pixels.
 #[inline]
-fn blend_rgb565(dst: u16, src: u16, alpha: u8) -> u16 {
-    let a = alpha as u32;
-    let na = 255 - a;
-    let ch = |shift: u32, mask: u32| {
-        let s = (src as u32 >> shift) & mask;
-        let d = (dst as u32 >> shift) & mask;
-        ((s * a + d * na + 127) / 255) << shift
-    };
-    (ch(11, 0x1F) | ch(5, 0x3F) | ch(0, 0x1F)) as u16
-}
-
-/// Fill `n` pixels from `p` with `color`, two pixels per word store where
-/// the alignment allows.
-#[inline]
-unsafe fn fill_span(p: *mut u16, n: usize, color: u16) {
-    unsafe {
-        let mut p = p;
-        let mut n = n;
-        if n > 0 && (p as usize) & 2 != 0 {
-            *p = color;
-            p = p.add(1);
-            n -= 1;
-        }
-        let pair = (color as u32) | ((color as u32) << 16);
-        let mut w = p as *mut u32;
-        for _ in 0..n / 2 {
-            *w = pair;
-            w = w.add(1);
-        }
-        if n & 1 != 0 {
-            *(w as *mut u16) = color;
-        }
-    }
+unsafe fn row_slice<'a>(fb: *mut u16, x: usize, y: usize, w: usize) -> &'a mut [u16] {
+    unsafe { core::slice::from_raw_parts_mut(fb.add(y * WIDTH + x), w) }
 }
 
 /// Hardware backend: draws into the back frame buffer.
@@ -145,30 +119,43 @@ impl LcdBackend for VpostLcd {
         let h = (h as usize).min(HEIGHT - y);
         let fb = back();
         for row in y..y + h {
-            unsafe { fill_span(fb.add(row * WIDTH + x), w, color) };
+            // SAFETY: (x, row, w) was clipped to the panel above.
+            fb::fill_u16(unsafe { row_slice(fb, x, row, w) }, color);
         }
     }
 
     fn begin_pixels(&self, x: u16, y: u16, w: u16, _h: u16) {
         unsafe {
-            PIXEL_X = x;
-            PIXEL_Y = y;
-            PIXEL_START_X = x;
-            PIXEL_W = w;
+            (*(&raw mut PIXEL)).begin(x, y, w);
             PIXEL_FB = back();
         }
     }
 
     fn write_pixel(&self, color: u16) {
         unsafe {
-            if (PIXEL_X as usize) < WIDTH && (PIXEL_Y as usize) < HEIGHT {
-                *PIXEL_FB.add(PIXEL_Y as usize * WIDTH + PIXEL_X as usize) = color;
+            if let Some((x, y)) = (*(&raw mut PIXEL)).step(WIDTH, HEIGHT) {
+                *PIXEL_FB.add(y * WIDTH + x) = color;
             }
-            PIXEL_X += 1;
-            if PIXEL_X >= PIXEL_START_X + PIXEL_W {
-                PIXEL_X = PIXEL_START_X;
-                PIXEL_Y += 1;
-            }
+        }
+    }
+
+    fn write_pixels(&self, colors: &[u16]) {
+        unsafe {
+            let fb = PIXEL_FB;
+            (*(&raw mut PIXEL)).advance(colors.len(), WIDTH, HEIGHT, |x, y, len, skip| {
+                // SAFETY: the cursor only reports on-panel spans.
+                row_slice(fb, x, y, len).copy_from_slice(&colors[skip..skip + len]);
+            });
+        }
+    }
+
+    fn write_run(&self, color: u16, n: usize) {
+        unsafe {
+            let fb = PIXEL_FB;
+            (*(&raw mut PIXEL)).advance(n, WIDTH, HEIGHT, |x, y, len, _| {
+                // SAFETY: the cursor only reports on-panel spans.
+                fb::fill_u16(row_slice(fb, x, y, len), color);
+            });
         }
     }
 
@@ -200,13 +187,12 @@ impl LcdBackend for VpostLcd {
         }
         let w = (w as usize).min(WIDTH - x);
         let h = (h as usize).min(HEIGHT - y);
+        let a = fb::alpha5(alpha);
         let fb = back();
         for row in y..y + h {
-            for col in x..x + w {
-                unsafe {
-                    let p = fb.add(row * WIDTH + col);
-                    *p = blend_rgb565(*p, color, alpha);
-                }
+            // SAFETY: (x, row, w) was clipped to the panel above.
+            for p in unsafe { row_slice(fb, x, row, w) } {
+                *p = fb::blend_rgb565(*p, color, a);
             }
         }
     }
@@ -217,16 +203,13 @@ impl LcdBackend for VpostLcd {
         }
         unsafe {
             let p = back().add(y as usize * WIDTH + x as usize);
-            *p = if alpha == 255 { color } else { blend_rgb565(*p, color, alpha) };
+            *p = if alpha == 255 { color } else { fb::blend_rgb565(*p, color, fb::alpha5(alpha)) };
         }
     }
 }
 
-// Per-pixel write state for begin_pixels/write_pixel (single-threaded).
-static mut PIXEL_X: u16 = 0;
-static mut PIXEL_Y: u16 = 0;
-static mut PIXEL_START_X: u16 = 0;
-static mut PIXEL_W: u16 = 0;
+// Pixel-stream state for begin_pixels/write_pixel (single-threaded).
+static mut PIXEL: fb::StreamCursor = fb::StreamCursor::new();
 static mut PIXEL_FB: *mut u16 = core::ptr::null_mut();
 
 /// Start the VPOST on buffer 0 (800×480 timing from the Nextion firmware).

@@ -1597,7 +1597,7 @@ impl Vm {
                     self.set_scalar_prop(ctx, prop_id, val);
                     if prop_id == PROP_FONT_ID {
                         if let Some(fs) = ctx.fs.as_ref() {
-                            ctx.fonts.find_or_load(val as u8, fs, &ctx.flash);
+                            ctx.fonts.find_or_load(val as u8, fs, &ctx.flash, P::CACHE_FONT_BITMAPS);
                         }
                     }
                     if prop_id == PROP_IMAGE_ID {

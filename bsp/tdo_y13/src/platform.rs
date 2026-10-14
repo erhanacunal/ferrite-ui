@@ -42,6 +42,10 @@ impl Platform for TdoY13Platform {
 
     // F1C100s has ample SDRAM — allow richer multi-widget animated scenes.
     const ANIM_SLOTS: usize = 32;
+
+    // Resources live on SPI NOR (one SPI transaction per read): keep glyph
+    // bitmaps in SDRAM instead of reading them for every glyph drawn.
+    const CACHE_FONT_BITMAPS: bool = true;
 }
 
 impl PlatformRuntime for TdoY13Platform {
@@ -130,6 +134,13 @@ impl PlatformRuntime for TdoY13Platform {
         // decided. `end_frame` does the D-cache clean + DEBE buffer flip.
         ctx.lcd.end_frame();
         ctx.lcd.flush_dirty();
+    }
+
+    fn frame_end(_ctx: &mut Ctx<Self>) {
+        // The framebuffers are write-back cacheable. Dirty mode draws straight
+        // into the visible buffer, so write those pixels back for the DEBE.
+        // Cheap when nothing was drawn (cost = dirty cache lines).
+        crate::lcd::flush_cache();
     }
 
     fn on_extra_rx(

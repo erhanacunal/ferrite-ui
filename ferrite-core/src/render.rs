@@ -7,7 +7,7 @@ use crate::lcd::{LcdBackend, LcdImpl};
 use crate::platform::Platform;
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
-    FLAG_HAS_ON_PAINT, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
+    FLAG_HAS_ON_PAINT, FLAG_PAINTED, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
     KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_PROGRESS,
     KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
 };
@@ -121,6 +121,7 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) -> PaintL
     }
 
     // Pass 2: draw dirty visible widgets at their current rect
+    clear_painted(&mut ctx.tree);
     for i in 0..ctx.tree.dfs_len() {
         let id = ctx.tree.dfs_at(i);
         let w = ctx.tree.get(id);
@@ -145,12 +146,13 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) -> PaintL
 
         // Translucent widgets and transparent labels must not blend over
         // their own previous output in this buffer — restore what is behind
-        // them first.
-        if ctx.lcd.has_alpha() && shows_behind(&ctx.tree, id) {
+        // them first, unless this pass already repainted all of it.
+        if ctx.lcd.has_alpha() && shows_behind(&ctx.tree, id) && !behind_is_fresh(&ctx.tree, 0, i, &abs)
+        {
             redraw_behind(ctx, vm, i, abs);
         }
         draw_widget(ctx, vm, id, &abs, &full);
-        ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
+        ctx.tree.get_mut(id).flags |= FLAG_RENDERED | FLAG_PAINTED;
         if ctx.tree.get(id).flags & FLAG_HAS_ON_PAINT != 0 {
             paint.push(id);
         }
@@ -167,6 +169,8 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) -> PaintL
             draw_scrollbar(ctx, id, &abs);
         }
     }
+
+    clear_painted(&mut ctx.tree);
 
     // Record this buffer's state and clear its dirty flag for each widget.
     for i in 0..ctx.tree.dfs_len() {
@@ -394,14 +398,18 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
         redraw_behind(ctx, vm, di, stale);
     }
 
-    // Pass 2: draw dirty visible widgets with clipping
-    for di in 0..ctx.tree.dfs_len() {
+    // Pass 2: draw dirty visible widgets with clipping. A dirty widget is
+    // drawn together with its whole subtree, after which the loop resumes past
+    // that subtree: `mark_dirty` marks every descendant too, so visiting them
+    // again would redraw each nested level once more (a label three levels
+    // deep was drawn four times).
+    clear_painted(&mut ctx.tree);
+    let mut di = 0;
+    while di < ctx.tree.dfs_len() {
         let id = ctx.tree.dfs_at(di);
 
-        if !ctx.tree.get(id).is_dirty() {
-            continue;
-        }
-        if !ctx.tree.is_tree_visible(id) {
+        if !ctx.tree.get(id).is_dirty() || !ctx.tree.is_tree_visible(id) {
+            di += 1;
             continue;
         }
 
@@ -459,15 +467,23 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
             if !clip.is_empty() {
                 // Translucent widgets and transparent labels must not blend
                 // over their own previous output — restore what is behind
-                // them (same clip) first.
-                if ctx.lcd.has_alpha() && shows_behind(&ctx.tree, sid) {
+                // them (same clip) first, unless this subtree's pass already
+                // repainted all of it. Only widgets of this subtree count:
+                // they share its occluder list, so they were painted
+                // everywhere this widget's clip reaches.
+                if ctx.lcd.has_alpha()
+                    && shows_behind(&ctx.tree, sid)
+                    && !behind_is_fresh(&ctx.tree, di, si, &sabs)
+                {
                     redraw_behind_region(ctx, vm, si, &clip, &sabs);
                 }
                 draw_widget(ctx, vm, sid, &sabs, &clip);
-                ctx.tree.get_mut(sid).flags |= FLAG_RENDERED;
+                ctx.tree.get_mut(sid).flags |= FLAG_RENDERED | FLAG_PAINTED;
             }
         }
+        di = sub_end;
     }
+    clear_painted(&mut ctx.tree);
 
     // Draw scrollbars on top of all children (only for dirty scroll containers)
     for di in 0..ctx.tree.dfs_len() {
@@ -480,6 +496,58 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
     }
 
     clear_all_dirty(ctx);
+}
+
+/// Clear the per-pass `FLAG_PAINTED` marks.
+fn clear_painted(tree: &mut WidgetTree) {
+    for i in 0..tree.dfs_len() {
+        let id = tree.dfs_at(i);
+        tree.get_mut(id).flags &= !FLAG_PAINTED;
+    }
+}
+
+/// True when the pixels behind `rect` (what DFS positions before `idx`
+/// show there) were all repainted earlier in this pass, so restoring them
+/// for a see-through widget at `idx` would only draw the same pixels again.
+///
+/// Walks back from `idx` (down to `lo`) over the visible widgets that touch
+/// `rect`: every one must be `FLAG_PAINTED`, until one is found that paints
+/// all of `rect` opaquely — nothing behind that one can show through.
+fn behind_is_fresh(tree: &WidgetTree, lo: usize, idx: usize, rect: &Rect) -> bool {
+    for k in (lo..idx).rev() {
+        let id = tree.dfs_at(k);
+        if !tree.is_tree_visible(id) {
+            continue;
+        }
+        let abs = tree.absolute_rect(id);
+        if !abs.intersects(rect) {
+            continue;
+        }
+        if tree.get(id).flags & FLAG_PAINTED == 0 {
+            return false;
+        }
+        if covers_opaquely(tree, id, &abs, rect) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does `draw_widget` paint every pixel of `rect` opaquely for `id` (whose
+/// absolute rect is `abs`)? True for a solid, square-cornered widget with a
+/// background: its border strips plus background fill tile its whole rect.
+fn covers_opaquely(tree: &WidgetTree, id: WidgetId, abs: &Rect, rect: &Rect) -> bool {
+    let w = tree.get(id);
+    let ext = tree.ext(id).unwrap_or(&WidgetExt::DEFAULT);
+    if is_freeform_shape(w.kind) || ext.border_radius != 0 || ext.alpha < 255 {
+        return false;
+    }
+    // Same condition as `draw_bg` in `draw_widget`.
+    let bg = effective_bg(tree, w, ext);
+    if bg == 0 && (w.kind == KIND_LABEL || w.kind == KIND_IMAGE) {
+        return false;
+    }
+    rect.x >= abs.x && rect.y >= abs.y && rect.right() <= abs.right() && rect.bottom() <= abs.bottom()
 }
 
 /// True when what is behind `id` shows through it: a translucent
@@ -692,9 +760,16 @@ fn draw_widget<P: Platform>(
 
     // Background image. KIND_GRAPH repurposes ext.image_id as graph flags,
     // so skip the image lookup for graphs.
+    // Image draws honor the scissor (see `Image::draw`): set it per clip
+    // rect so a partial redraw decodes only the exposed part instead of the
+    // whole image, and does not paint over widgets in front of it.
     if ext.image_id != 0 && widget.kind != KIND_GRAPH {
         let bg = inner_rect(abs, &b);
-        draw_bg_image(ctx, ext.image_id, &bg);
+        for cr in clip.iter() {
+            ctx.lcd.set_scissor(Some(*cr));
+            draw_bg_image(ctx, ext.image_id, &bg);
+        }
+        ctx.lcd.set_scissor(None);
     }
 
     // Label text. Readback backends draw it over whatever is already on
@@ -752,7 +827,11 @@ fn draw_widget<P: Platform>(
 
     // Image widget — draw image centered in content area
     if widget.kind == KIND_IMAGE {
-        draw_widget_image(ctx, abs, ext);
+        for cr in clip.iter() {
+            ctx.lcd.set_scissor(Some(*cr));
+            draw_widget_image(ctx, abs, ext);
+        }
+        ctx.lcd.set_scissor(None);
     }
 
     // Shape widgets — fill = bg_color, stroke = border_color (thickness from
@@ -812,13 +891,7 @@ fn draw_circle_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rec
     }
     if widget.border_color != 0 {
         let t = shape_stroke(ext) as i16;
-        let mut rr = r;
-        let mut drawn = 0;
-        while drawn < t && rr > 0 {
-            lcd.draw_circle(cx, cy, rr, widget.border_color);
-            rr -= 1;
-            drawn += 1;
-        }
+        lcd.stroke_ellipse(cx, cy, r, r, t, widget.border_color);
     }
 }
 
@@ -837,11 +910,7 @@ fn draw_ellipse_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Re
     }
     if widget.border_color != 0 {
         let t = shape_stroke(ext) as i16;
-        let mut i = 0;
-        while i < t && rx - i > 0 && ry - i > 0 {
-            lcd.draw_ellipse(cx, cy, rx - i, ry - i, widget.border_color);
-            i += 1;
-        }
+        lcd.stroke_ellipse(cx, cy, rx, ry, t, widget.border_color);
     }
 }
 

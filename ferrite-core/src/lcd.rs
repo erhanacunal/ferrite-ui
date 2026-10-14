@@ -29,6 +29,23 @@ pub trait LcdBackend {
     fn begin_pixels(&self, x: u16, y: u16, w: u16, h: u16);
     fn write_pixel(&self, color: u16);
 
+    /// Stream `colors` into the `begin_pixels` window — same as calling
+    /// `write_pixel` for each. Frame-buffer backends override this to clip
+    /// once per row and copy straight into memory.
+    fn write_pixels(&self, colors: &[u16]) {
+        for &c in colors {
+            self.write_pixel(c);
+        }
+    }
+
+    /// Stream `n` pixels of one `color` into the `begin_pixels` window (RLE
+    /// runs) — same as `n` calls to `write_pixel`.
+    fn write_run(&self, color: u16, n: usize) {
+        for _ in 0..n {
+            self.write_pixel(color);
+        }
+    }
+
     fn send_command(&self, cmd: u16);
     fn send_data(&self, data: u16);
 
@@ -91,6 +108,18 @@ impl<B: LcdBackend> LcdImpl<B> {
         self.scissor.set(rect);
     }
 
+    /// The wrapped backend (tests read recorded pixels through it).
+    #[cfg(test)]
+    pub(crate) fn backend(&self) -> &B {
+        &self.be
+    }
+
+    /// Current scissor rect (`None` = unclipped).
+    #[inline]
+    pub fn scissor(&self) -> Option<Rect> {
+        self.scissor.get()
+    }
+
     // --- Primitives (pass-through to backend) ---
 
     pub fn begin_frame(&mut self) {
@@ -136,6 +165,16 @@ impl<B: LcdBackend> LcdImpl<B> {
     #[inline(always)]
     pub fn write_pixel(&self, color: u16) {
         self.be.write_pixel(color)
+    }
+
+    #[inline]
+    pub fn write_pixels(&self, colors: &[u16]) {
+        self.be.write_pixels(colors)
+    }
+
+    #[inline]
+    pub fn write_run(&self, color: u16, n: usize) {
+        self.be.write_run(color, n)
     }
 
     #[inline]
@@ -370,10 +409,10 @@ impl<B: LcdBackend> LcdImpl<B> {
         if r <= 0 {
             return;
         }
-        let rr = r as i32 * r as i32;
+        // Same per-row extent as `fill_ellipse`/`stroke_ellipse`, so a circle
+        // shape's fill and stroke line up.
         for dy in -r..=r {
-            let yy = dy as i32 * dy as i32;
-            let dx = isqrt(rr - yy) as i16;
+            let dx = ellipse_half_width(r, r, dy);
             self.hline_clipped(cx - dx, cx + dx, cy + dy, color);
         }
     }
@@ -384,13 +423,33 @@ impl<B: LcdBackend> LcdImpl<B> {
         if rx <= 0 || ry <= 0 {
             return;
         }
-        let rx2 = rx as i64 * rx as i64;
-        let ryi = ry as i64;
-        let ry2 = ryi * ryi;
-        for dy in -ryi..=ryi {
-            // dx = rx * sqrt(ry² - dy²) / ry — kept in range for isqrt(i32).
-            let dx = isqrt((rx2 * (ry2 - dy * dy) / ry2) as i32) as i16;
-            self.hline_clipped(cx - dx, cx + dx, cy + dy as i16, color);
+        for dy in -ry..=ry {
+            let dx = ellipse_half_width(rx, ry, dy);
+            self.hline_clipped(cx - dx, cx + dx, cy + dy, color);
+        }
+    }
+
+    /// Ellipse outline `thickness` px wide, inward from radii `rx`/`ry`: the
+    /// ring between the outer ellipse and one shrunk by `thickness`, filled
+    /// one row at a time. Unlike stacking 1px outlines (whose rasterizations
+    /// leave pinholes between neighbouring radii) the ring is solid, and it
+    /// uses the same per-row extent as `fill_ellipse`/`fill_circle`, so it
+    /// meets their fill exactly.
+    pub fn stroke_ellipse(&self, cx: i16, cy: i16, rx: i16, ry: i16, thickness: i16, color: u16) {
+        if rx <= 0 || ry <= 0 || thickness <= 0 {
+            return;
+        }
+        let (irx, iry) = (rx - thickness, ry - thickness);
+        for dy in -ry..=ry {
+            let xo = ellipse_half_width(rx, ry, dy);
+            let y = cy + dy;
+            if irx > 0 && iry > 0 && dy.abs() <= iry {
+                let xi = ellipse_half_width(irx, iry, dy);
+                self.hline_clipped(cx - xo, cx - xi - 1, y, color);
+                self.hline_clipped(cx + xi + 1, cx + xo, y, color);
+            } else {
+                self.hline_clipped(cx - xo, cx + xo, y, color);
+            }
         }
     }
 
@@ -678,8 +737,9 @@ impl<B: LcdBackend> LcdImpl<B> {
         let w = right as u16 - left + 1;
         let x_base = left.saturating_sub(full_x.max(0) as u16);
         self.begin_pixels(left as u16, y as u16, w, 1);
-        for col in 0..w {
-            self.write_pixel(lerp_rgb565(c1, c2, x_base + col, grad_w));
+        let mut grad = GradientStep::new(c1, c2, x_base, grad_w);
+        for _ in 0..w {
+            self.write_pixel(grad.next());
         }
     }
 
@@ -734,8 +794,9 @@ impl<B: LcdBackend> LcdImpl<B> {
                 let grad_w = full_w.saturating_sub(1);
                 self.begin_pixels(x, y, w, h);
                 for _row in 0..h {
-                    for col in 0..w {
-                        self.write_pixel(lerp_rgb565(c1, c2, x_off + col, grad_w));
+                    let mut grad = GradientStep::new(c1, c2, x_off, grad_w);
+                    for _ in 0..w {
+                        self.write_pixel(grad.next());
                     }
                 }
             }
@@ -863,8 +924,9 @@ impl<B: LcdBackend> LcdImpl<B> {
         let w = right as u16 - left + 1;
         let x_base = left.saturating_sub(full_x.max(0) as u16);
         self.begin_pixels(left, y as u16, w, 1);
-        for col in 0..w {
-            self.write_pixel(lerp_rgb565(c1, c2, x_base + col, grad_w));
+        let mut grad = GradientStep::new(c1, c2, x_base, grad_w);
+        for _ in 0..w {
+            self.write_pixel(grad.next());
         }
     }
 }
@@ -878,13 +940,70 @@ pub fn lerp_rgb565(c1: u16, c2: u16, t: u16, n: u16) -> u16 {
     if n == 0 {
         return c1;
     }
+    lerp_t8(c1, c2, (t.min(n) as u32 * 256) / n as u32)
+}
+
+/// Steps `lerp_rgb565(c1, c2, t, n)` for t = t0, t0+1, … without a divide
+/// per pixel (ARMv5 has no divide instruction). Keeps the exact quotient
+/// `t * 256 / n` as quotient + remainder, so every value matches
+/// `lerp_rgb565` bit for bit.
+struct GradientStep {
+    c1: u16,
+    c2: u16,
+    /// `min(t, n) * 256 / n` and its remainder.
+    t8: u32,
+    rem: u32,
+    /// Per-step increment of the quotient/remainder (`256 / n`, `256 % n`).
+    dq: u32,
+    dr: u32,
+    n: u32,
+    /// Steps left before `t` reaches `n` (then `t8` stays at 256).
+    left: u32,
+}
+
+impl GradientStep {
+    fn new(c1: u16, c2: u16, t0: u16, n: u16) -> Self {
+        let n32 = n.max(1) as u32;
+        let t = t0.min(n) as u32;
+        let num = t * 256;
+        Self {
+            c1,
+            c2,
+            t8: num / n32,
+            rem: num % n32,
+            dq: 256 / n32,
+            dr: 256 % n32,
+            n: n32,
+            left: (n as u32).saturating_sub(t),
+        }
+    }
+
+    /// Color at the current `t`, then advance `t` by one.
+    #[inline]
+    fn next(&mut self) -> u16 {
+        let color = lerp_t8(self.c1, self.c2, self.t8);
+        if self.left > 0 {
+            self.left -= 1;
+            self.t8 += self.dq;
+            self.rem += self.dr;
+            if self.rem >= self.n {
+                self.rem -= self.n;
+                self.t8 += 1;
+            }
+        }
+        color
+    }
+}
+
+/// `lerp_rgb565` with the 0..=256 weight already computed.
+#[inline]
+fn lerp_t8(c1: u16, c2: u16, t8: u32) -> u16 {
     let r1 = (c1 >> 11) as u32;
     let g1 = ((c1 >> 5) & 0x3F) as u32;
     let b1 = (c1 & 0x1F) as u32;
     let r2 = (c2 >> 11) as u32;
     let g2 = ((c2 >> 5) & 0x3F) as u32;
     let b2 = (c2 & 0x1F) as u32;
-    let t8 = (t.min(n) as u32 * 256) / n as u32;
     let nt8 = 256 - t8;
     let r = (r1 * nt8 + r2 * t8) >> 8;
     let g = (g1 * nt8 + g2 * t8) >> 8;
@@ -923,6 +1042,20 @@ pub fn sin_cos_deg(deg: i16) -> (i16, i16) {
     (sin_val, cos_val)
 }
 
+/// Half-width of the ellipse with radii `rx`/`ry` on row `dy` (|dy| <= ry).
+///
+/// Measured against radii + ½ (pixel centres), in doubled units to stay in
+/// integers: `X = 2rx+1`, `Y = 2ry+1`, `D = 2dy`, half-width =
+/// `X·sqrt(Y² − D²) / Y / 2`. With the bare radii the top/bottom rows
+/// shrink to a single-pixel nub and the widest row sticks out by one — a
+/// stroke in a contrasting color shows them as ticks at the four extremes.
+fn ellipse_half_width(rx: i16, ry: i16, dy: i16) -> i16 {
+    let x2 = (2 * rx as i64 + 1).pow(2);
+    let y2 = (2 * ry as i64 + 1).pow(2);
+    let d2 = (2 * dy as i64).pow(2);
+    (isqrt((x2 * (y2 - d2) / y2) as i32) / 2) as i16
+}
+
 // === Integer sqrt ===
 
 fn isqrt(n: i32) -> u16 {
@@ -949,3 +1082,89 @@ fn isqrt(n: i32) -> u16 {
 
 #[cfg(feature = "mock")]
 pub type Lcd = LcdImpl<crate::mock::MockLcd>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::cell::RefCell;
+    use std::vec::Vec;
+
+    const N: usize = 64;
+
+    /// Records which pixels `fill_rect` touched (N×N grid).
+    struct Grid(RefCell<Vec<u8>>);
+    impl LcdBackend for Grid {
+        const WIDTH: u16 = N as u16;
+        const HEIGHT: u16 = N as u16;
+        fn begin_frame(&mut self) {}
+        fn end_frame(&mut self) {}
+        fn back_buf(&self) -> u8 {
+            0
+        }
+        fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
+            for yy in y as usize..(y as usize + h as usize).min(N) {
+                for xx in x as usize..(x as usize + w as usize).min(N) {
+                    self.0.borrow_mut()[yy * N + xx] = color as u8;
+                }
+            }
+        }
+        fn begin_pixels(&self, _: u16, _: u16, _: u16, _: u16) {}
+        fn write_pixel(&self, _: u16) {}
+        fn send_command(&self, _: u16) {}
+        fn send_data(&self, _: u16) {}
+    }
+
+    fn grid() -> LcdImpl<Grid> {
+        LcdImpl::with_backend(Grid(RefCell::new(vec![0; N * N])))
+    }
+
+    #[test]
+    fn fill_circle_matches_fill_ellipse() {
+        for r in [1i16, 2, 5, 17, 30] {
+            let (c, e) = (grid(), grid());
+            c.fill_circle(32, 32, r, 1);
+            e.fill_ellipse(32, 32, r, r, 1);
+            assert!(*c.backend().0.borrow() == *e.backend().0.borrow(), "r={r}");
+        }
+    }
+
+    #[test]
+    fn stroke_ring_is_solid_and_meets_the_fill() {
+        for (rx, ry) in [(30i16, 30i16), (25, 25), (30, 18), (12, 29), (5, 5), (2, 7)] {
+            for t in [1i16, 2, 3, 5, 8, 40] {
+                // Reference: the outer ellipse filled.
+                let full = grid();
+                full.fill_ellipse(32, 32, rx, ry, 1);
+                // Ring + inner fill must give exactly the same pixel set,
+                // and the ring must not overlap the inner fill.
+                let ring = grid();
+                ring.stroke_ellipse(32, 32, rx, ry, t, 2);
+                let inner = grid();
+                if rx - t > 0 && ry - t > 0 {
+                    inner.fill_ellipse(32, 32, rx - t, ry - t, 1);
+                }
+                let (f, r, i) = (full.backend().0.borrow(), ring.backend().0.borrow(), inner.backend().0.borrow());
+                for p in 0..N * N {
+                    assert!(!(r[p] != 0 && i[p] != 0), "overlap rx={rx} ry={ry} t={t} p={p}");
+                    assert_eq!(f[p] != 0, r[p] != 0 || i[p] != 0, "gap/excess rx={rx} ry={ry} t={t} p={p}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gradient_step_matches_lerp() {
+        let pairs = [(0x0000u16, 0xFFFFu16), (0xF800, 0x07E0), (0x1234, 0xABCD), (0xFFFF, 0x0000)];
+        for &(c1, c2) in &pairs {
+            for n in [0u16, 1, 2, 3, 7, 99, 255, 256, 257, 479, 799] {
+                for t0 in [0u16, 1, 5, n / 2, n] {
+                    let mut g = GradientStep::new(c1, c2, t0, n);
+                    // Walk past `n` too: the weight must saturate like `t.min(n)`.
+                    for t in t0..t0.saturating_add(n + 20) {
+                        assert_eq!(g.next(), lerp_rgb565(c1, c2, t, n), "c1={c1:#x} c2={c2:#x} n={n} t={t}");
+                    }
+                }
+            }
+        }
+    }
+}

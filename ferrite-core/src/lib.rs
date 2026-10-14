@@ -25,6 +25,7 @@ pub mod usart;
 
 pub mod clip;
 pub mod config;
+pub mod fb;
 pub mod ctx;
 pub mod embedded_font;
 pub mod font;

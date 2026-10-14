@@ -34,6 +34,7 @@ use crate::fs::{Fs, RES_FONT};
 use alloc::vec::Vec;
 use crate::flash::{FlashBackend, FlashImpl};
 use crate::lcd::{LcdBackend, LcdImpl, lerp_rgb565};
+use crate::types::Rect;
 
 // Re-exported from ferrite-core — the framework's canonical glyph type.
 pub use crate::gfx_glyph::GfxGlyph;
@@ -81,8 +82,14 @@ pub struct Font {
     glyphs: GlyphData,
     /// Absolute flash address of bitmap data
     bitmap_addr: u32,
-    /// Embedded bitmap data pointer (ROM). Null means flash is used.
+    /// Bitmap data in memory: ROM (embedded font) or `bitmap_ram`. Null
+    /// means bitmaps are read from flash.
     embedded_bitmap: *const u8,
+    /// RAM copy of the bitmap data (`Platform::CACHE_FONT_BITMAPS`);
+    /// `embedded_bitmap` points into it. Empty when not cached. Only held
+    /// to own the buffer, never read directly.
+    #[allow(dead_code)]
+    bitmap_ram: Vec<u8>,
 }
 
 // Font only holds a const pointer — Send/Sync safe (single core, no ISR access)
@@ -101,19 +108,23 @@ impl Font {
             },
             bitmap_addr: 0,
             embedded_bitmap: core::ptr::null(),
+            bitmap_ram: Vec::new(),
         }
     }
 
     /// Load font from flash by resource name.
     pub fn load<F: FlashBackend>(fs: &Fs, flash: &FlashImpl<F>, name: &[u8]) -> Option<Self> {
         let entry = fs.find(flash, name)?;
-        Self::load_from_entry(flash, &entry)
+        Self::load_from_entry(flash, &entry, false)
     }
 
-    /// Load font from a ResourceEntry (detects V1/V2 format).
+    /// Load font from a ResourceEntry (detects V1/V2 format). With
+    /// `cache_bitmap` the glyph bitmaps are copied into RAM too (skipped,
+    /// falling back to flash reads, if the allocation fails).
     pub fn load_from_entry<F: FlashBackend>(
         flash: &FlashImpl<F>,
         entry: &crate::fs::ResourceEntry,
+        cache_bitmap: bool,
     ) -> Option<Self> {
         if entry.size < 4 {
             return None;
@@ -145,30 +156,59 @@ impl Font {
             return None;
         }
 
+        // Tables are read in chunks — one flash read per entry is one SPI
+        // transaction each on SPI-NOR boards.
+        const TABLE_CHUNK: usize = 10; // entries per read (70 B of glyphs)
+
         let cp_base = entry.offset + hdr_len;
         let mut codepoints = Vec::with_capacity(num_glyphs);
-        for i in 0..num_glyphs {
-            let mut buf = [0u8; 2];
-            flash.read(cp_base + (i as u32 * 2), &mut buf);
-            codepoints.push(u16::from_le_bytes(buf));
+        let mut buf = [0u8; TABLE_CHUNK * 7];
+        let mut i = 0;
+        while i < num_glyphs {
+            let n = (num_glyphs - i).min(TABLE_CHUNK);
+            flash.read(cp_base + i as u32 * 2, &mut buf[..n * 2]);
+            for c in buf[..n * 2].chunks_exact(2) {
+                codepoints.push(u16::from_le_bytes([c[0], c[1]]));
+            }
+            i += n;
         }
 
         let gl_base = cp_base + cp_bytes;
         let mut glyphs = Vec::with_capacity(num_glyphs);
-        for i in 0..num_glyphs {
-            let mut g = [0u8; 7];
-            flash.read(gl_base + (i as u32 * 7), &mut g);
-            glyphs.push(GfxGlyph {
-                bitmap_offset: u16::from_le_bytes([g[0], g[1]]),
-                width: g[2],
-                height: g[3],
-                x_advance: g[4],
-                x_offset: g[5] as i8,
-                y_offset: g[6] as i8,
-            });
+        let mut i = 0;
+        while i < num_glyphs {
+            let n = (num_glyphs - i).min(TABLE_CHUNK);
+            flash.read(gl_base + i as u32 * 7, &mut buf[..n * 7]);
+            for g in buf[..n * 7].chunks_exact(7) {
+                glyphs.push(GfxGlyph {
+                    bitmap_offset: u16::from_le_bytes([g[0], g[1]]),
+                    width: g[2],
+                    height: g[3],
+                    x_advance: g[4],
+                    x_offset: g[5] as i8,
+                    y_offset: g[6] as i8,
+                });
+            }
+            i += n;
         }
 
         let bitmap_addr = gl_base + gl_bytes;
+
+        let mut bitmap_ram = Vec::new();
+        if cache_bitmap {
+            let len = (entry.offset + entry.size - bitmap_addr) as usize;
+            if bitmap_ram.try_reserve_exact(len).is_ok() {
+                bitmap_ram.resize(len, 0);
+                flash.read(bitmap_addr, &mut bitmap_ram);
+            }
+        }
+        // The Vec's heap buffer does not move with the Font, so the pointer
+        // stays valid for the Font's lifetime.
+        let embedded_bitmap = if bitmap_ram.is_empty() {
+            core::ptr::null()
+        } else {
+            bitmap_ram.as_ptr()
+        };
 
         Some(Font {
             font_id,
@@ -176,13 +216,19 @@ impl Font {
             y_advance,
             glyphs: GlyphData::Heap { glyphs, codepoints },
             bitmap_addr,
-            embedded_bitmap: core::ptr::null(),
+            embedded_bitmap,
+            bitmap_ram,
         })
     }
 
     /// Search flash for a font with the given font_id and load it.
     /// Returns None if font_id is 0 (embedded) or not found in flash.
-    pub fn load_by_id<F: FlashBackend>(fs: &Fs, flash: &FlashImpl<F>, font_id: u8) -> Option<Self> {
+    pub fn load_by_id<F: FlashBackend>(
+        fs: &Fs,
+        flash: &FlashImpl<F>,
+        font_id: u8,
+        cache_bitmap: bool,
+    ) -> Option<Self> {
         if font_id == EMBEDDED_FONT_ID {
             return None;
         }
@@ -202,7 +248,7 @@ impl Font {
                     hdr[3] // V1: font_id at byte 3
                 };
                 if id == font_id {
-                    return Self::load_from_entry(flash, &entry);
+                    return Self::load_from_entry(flash, &entry, cache_bitmap);
                 }
             }
         }
@@ -225,6 +271,7 @@ impl Font {
             glyphs: GlyphData::Static { glyphs, codepoints },
             bitmap_addr: 0,
             embedded_bitmap: bitmap.as_ptr(),
+            bitmap_ram: Vec::new(),
         }
     }
 
@@ -341,6 +388,16 @@ impl Font {
             || draw_y >= L::HEIGHT as i16
         {
             return glyph.x_advance;
+        }
+        // Also cull against the scissor: labels on readback backends are drawn
+        // once per clip rect, so most glyphs of each pass fall outside it —
+        // skip them before their bitmap is read (an SPI transfer on some
+        // boards) and walked pixel by pixel.
+        if let Some(c) = lcd.scissor() {
+            let glyph_rect = Rect::new(draw_x, draw_y, glyph.width as u16, glyph.height as u16);
+            if !glyph_rect.intersects(&c) {
+                return glyph.x_advance;
+            }
         }
 
         let bitmap_offset = glyph.bitmap_offset;
@@ -503,6 +560,10 @@ impl Font {
         let total_bits = w * height as u32;
         let mut bit_idx: u32 = 0;
         let mut bytes_read: u32 = 0;
+        // Row/column counters instead of `bit_idx % w` / `bit_idx / w`:
+        // ARMv5 has no divide instruction (each one is a library call).
+        let mut col: i16 = 0;
+        let mut py = draw_y;
 
         while bytes_read < total_bytes {
             let chunk = (total_bytes - bytes_read).min(BITMAP_BUF_SIZE as u32) as usize;
@@ -516,13 +577,17 @@ impl Font {
                         return;
                     }
                     if byte & (1 << bit) != 0 {
-                        let px = draw_x + (bit_idx % w) as i16;
-                        let py = draw_y + (bit_idx / w) as i16;
+                        let px = draw_x + col;
                         if px >= 0 && py >= 0 {
-                            lcd.fill_rect(px as u16, py as u16, 1, 1, fg);
+                            lcd.draw_pixel(px as u16, py as u16, fg);
                         }
                     }
                     bit_idx += 1;
+                    col += 1;
+                    if col == width as i16 {
+                        col = 0;
+                        py += 1;
+                    }
                 }
             }
 
@@ -546,6 +611,14 @@ impl Font {
         bg: u16,
     ) {
         let total_pixels = width as u32 * height as u32;
+        // The 4 coverage levels, blended once per glyph instead of per pixel
+        // (`lerp_rgb565` divides — a library call on ARMv5).
+        let palette = [
+            bg,
+            lerp_rgb565(bg, fg, 1, 3),
+            lerp_rgb565(bg, fg, 2, 3),
+            fg,
+        ];
 
         lcd.begin_pixels(draw_x as u16, draw_y as u16, width as u16, height as u16);
 
@@ -564,9 +637,7 @@ impl Font {
                     if pixel_idx >= total_pixels {
                         return;
                     }
-                    let alpha = (byte >> shift) & 0x03;
-                    let color = lerp_rgb565(bg, fg, alpha as u16, 3);
-                    lcd.write_pixel(color);
+                    lcd.write_pixel(palette[((byte >> shift) & 0x03) as usize]);
                     pixel_idx += 1;
                 }
             }
@@ -594,6 +665,9 @@ impl Font {
         let total_pixels = w * height as u32;
         let mut pixel_idx: u32 = 0;
         let mut bytes_read: u32 = 0;
+        // Row/column counters — no per-pixel divide (see draw_transparent).
+        let mut col: i16 = 0;
+        let mut py = draw_y;
 
         while bytes_read < total_bytes {
             let chunk = (total_bytes - bytes_read).min(BITMAP_BUF_SIZE as u32) as usize;
@@ -608,13 +682,17 @@ impl Font {
                     }
                     let alpha = ALPHA[((byte >> shift) & 0x03) as usize];
                     if alpha != 0 {
-                        let px = draw_x + (pixel_idx % w) as i16;
-                        let py = draw_y + (pixel_idx / w) as i16;
+                        let px = draw_x + col;
                         if px >= 0 && py >= 0 {
                             lcd.blend_pixel(px as u16, py as u16, fg, alpha);
                         }
                     }
                     pixel_idx += 1;
+                    col += 1;
+                    if col == width as i16 {
+                        col = 0;
+                        py += 1;
+                    }
                 }
             }
 
@@ -712,11 +790,12 @@ impl FontList {
         font_id: u8,
         fs: &Fs,
         flash: &FlashImpl<F>,
+        cache_bitmap: bool,
     ) -> bool {
         if self.find(font_id).is_some() {
             return true;
         }
-        if let Some(font) = Font::load_by_id(fs, flash, font_id) {
+        if let Some(font) = Font::load_by_id(fs, flash, font_id, cache_bitmap) {
             return self.add(font);
         }
         false

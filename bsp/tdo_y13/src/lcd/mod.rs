@@ -10,6 +10,7 @@
 //! vertical blanking (via `lcd::wait_for_vsync`) — otherwise it tears the frame
 //! mid-scanout.
 
+use ferrite_core::fb;
 use ferrite_core::lcd::LcdBackend;
 use f1c100s::lcd::{self, ColorMode, Panel};
 use f1c100s::panels;
@@ -21,7 +22,6 @@ use f1c100s::ipc::{Semaphore, critical};
 
 // 480×480 pixels, one ARGB8888 word per pixel (DEBE converts down to the 18-bit bus).
 const FB_PIXELS: usize = 480 * 480;
-const FB_SIZE: usize = FB_PIXELS * 4;
 
 /// Number of framebuffers. Triple-buffering decouples the UI thread from the
 /// present thread: while the present thread waits for vblank to flip frame N,
@@ -111,16 +111,27 @@ pub fn rgb565_to_argb8888(color: u16) -> u32 {
     (0xFF << 24) | (r << 19) | (g << 10) | (b << 3)
 }
 
-/// Blend `src` (ARGB8888, opaque) over `dst` per 8-bit channel:
-/// `out = (src*a + dst*(255-a) + 127) / 255`.
+/// Clip a rect to the panel. `None` when nothing is on screen — a rect that
+/// starts past the right/bottom edge (e.g. a negative `i16` cast to `u16`)
+/// must be dropped, not clamped onto the last column/row.
 #[inline]
-fn blend_argb8888(dst: u32, src: u32, alpha: u8) -> u32 {
-    let a = alpha as u32;
-    let na = 255 - a;
-    let r = (((src >> 16) & 0xFF) * a + ((dst >> 16) & 0xFF) * na + 127) / 255;
-    let g = (((src >> 8) & 0xFF) * a + ((dst >> 8) & 0xFF) * na + 127) / 255;
-    let b = ((src & 0xFF) * a + (dst & 0xFF) * na + 127) / 255;
-    0xFF00_0000 | (r << 16) | (g << 8) | b
+fn clip_to_screen(x: u16, y: u16, w: u16, h: u16) -> Option<(usize, usize, usize, usize)> {
+    let (x, y) = (x as usize, y as usize);
+    let (sw, sh) = (DebeLcd::WIDTH as usize, DebeLcd::HEIGHT as usize);
+    if w == 0 || h == 0 || x >= sw || y >= sh {
+        return None;
+    }
+    Some((x, y, (w as usize).min(sw - x), (h as usize).min(sh - y)))
+}
+
+/// `w` pixels of row `y` starting at column `x` in framebuffer `fb`.
+///
+/// # Safety
+/// `x + w <= 480`, `y < 480`, `fb` from `fb_ptr`; no other live reference
+/// to those pixels.
+#[inline]
+unsafe fn row_slice<'a>(fb: *mut u32, x: usize, y: usize, w: usize) -> &'a mut [u32] {
+    unsafe { core::slice::from_raw_parts_mut(fb.add(y * FB_STRIDE as usize + x), w) }
 }
 
 /// Hardware backend: writes to the DEBE framebuffer.
@@ -157,10 +168,7 @@ impl LcdBackend for DebeLcd {
         // via `submit_present`, so this path is NOT taken in normal operation —
         // it is kept correct as a single-threaded fallback.
         unsafe {
-            cpu::dsb();
-            if mmu::dcache_status() {
-                mmu::clean_dcache(fb_ptr(BACK) as u32, FB_SIZE as u32);
-            }
+            flush_cache();
             lcd::wait_for_vsync();
             lcd::debe_layer_disable(FRONT);
             lcd::debe_layer_enable(BACK);
@@ -173,51 +181,62 @@ impl LcdBackend for DebeLcd {
     }
 
     fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
-        if w == 0 || h == 0 {
+        let Some((x, y, w, h)) = clip_to_screen(x, y, w, h) else {
             return;
-        }
-        let x = x.min(Self::WIDTH - 1);
-        let y = y.min(Self::HEIGHT - 1);
-        let max_w = (Self::WIDTH - x).min(w);
-        let max_h = (Self::HEIGHT - y).min(h);
-
+        };
         let argb = rgb565_to_argb8888(color);
-        let fb = unsafe { &mut *(fb_ptr(BACK) as *mut [u32; FB_PIXELS]) };
+        let fb = fb_ptr(unsafe { BACK });
+        for row in y..y + h {
+            // SAFETY: (x, row, w) was clipped to the panel above.
+            fb::fill_u32(unsafe { row_slice(fb, x, row, w) }, argb);
+        }
+    }
 
-        for row in 0..max_h {
-            let base = (y + row) as usize * FB_STRIDE as usize + x as usize;
-            for col in 0..max_w {
-                fb[base + col as usize] = argb;
-            }
+    fn draw_pixel(&self, x: u16, y: u16, color: u16) {
+        if x < Self::WIDTH && y < Self::HEIGHT {
+            let i = y as usize * FB_STRIDE as usize + x as usize;
+            unsafe { *fb_ptr(BACK).add(i) = rgb565_to_argb8888(color) };
         }
     }
 
     fn begin_pixels(&self, x: u16, y: u16, w: u16, _h: u16) {
-        // Store write position + the back-buffer base in statics for write_pixel
-        // to use. Capturing the base here avoids re-reading `BACK` per pixel;
-        // `BACK` cannot change between begin_pixels and the pixel run.
-        // Single-threaded (UI thread only): safe.
+        // Capture the back-buffer base with the cursor so the pixel run does
+        // not re-read `BACK`; it cannot change mid-run. UI thread only.
         unsafe {
-            PIXEL_X = x;
-            PIXEL_Y = y;
-            PIXEL_START_X = x;
-            PIXEL_W = w;
+            (*(&raw mut PIXEL)).begin(x, y, w);
             PIXEL_FB = fb_ptr(BACK);
         }
     }
 
     fn write_pixel(&self, color: u16) {
         unsafe {
-            if PIXEL_X < Self::WIDTH && PIXEL_Y < Self::HEIGHT {
-                let fb = &mut *(PIXEL_FB as *mut [u32; FB_PIXELS]);
-                fb[PIXEL_Y as usize * FB_STRIDE as usize + PIXEL_X as usize] =
-                    rgb565_to_argb8888(color);
+            if let Some((x, y)) = (*(&raw mut PIXEL)).step(Self::WIDTH as usize, Self::HEIGHT as usize) {
+                *PIXEL_FB.add(y * FB_STRIDE as usize + x) = rgb565_to_argb8888(color);
             }
-            PIXEL_X += 1;
-            if PIXEL_X >= PIXEL_START_X + PIXEL_W {
-                PIXEL_X = PIXEL_START_X;
-                PIXEL_Y += 1;
-            }
+        }
+    }
+
+    fn write_pixels(&self, colors: &[u16]) {
+        unsafe {
+            let fb = PIXEL_FB;
+            (*(&raw mut PIXEL)).advance(colors.len(), Self::WIDTH as usize, Self::HEIGHT as usize, |x, y, len, skip| {
+                // SAFETY: the cursor only reports on-panel spans.
+                let row = row_slice(fb, x, y, len);
+                for (d, &c) in row.iter_mut().zip(&colors[skip..skip + len]) {
+                    *d = rgb565_to_argb8888(c);
+                }
+            });
+        }
+    }
+
+    fn write_run(&self, color: u16, n: usize) {
+        let argb = rgb565_to_argb8888(color);
+        unsafe {
+            let fb = PIXEL_FB;
+            (*(&raw mut PIXEL)).advance(n, Self::WIDTH as usize, Self::HEIGHT as usize, |x, y, len, _| {
+                // SAFETY: the cursor only reports on-panel spans.
+                fb::fill_u32(row_slice(fb, x, y, len), argb);
+            });
         }
     }
 
@@ -237,23 +256,16 @@ impl LcdBackend for DebeLcd {
             self.fill_rect(x, y, w, h, color);
             return;
         }
-        if w == 0 || h == 0 {
+        let Some((x, y, w, h)) = clip_to_screen(x, y, w, h) else {
             return;
-        }
-        // Same clipping as fill_rect.
-        let x = x.min(Self::WIDTH - 1);
-        let y = y.min(Self::HEIGHT - 1);
-        let max_w = (Self::WIDTH - x).min(w);
-        let max_h = (Self::HEIGHT - y).min(h);
-
+        };
         let src = rgb565_to_argb8888(color);
-        let fb = unsafe { &mut *(fb_ptr(BACK) as *mut [u32; FB_PIXELS]) };
-
-        for row in 0..max_h {
-            let base = (y + row) as usize * FB_STRIDE as usize + x as usize;
-            for col in 0..max_w {
-                let i = base + col as usize;
-                fb[i] = blend_argb8888(fb[i], src, alpha);
+        let a = fb::alpha8(alpha);
+        let fb = fb_ptr(unsafe { BACK });
+        for row in y..y + h {
+            // SAFETY: (x, row, w) was clipped to the panel above.
+            for p in unsafe { row_slice(fb, x, row, w) } {
+                *p = fb::blend_argb8888(*p, src, a);
             }
         }
     }
@@ -268,16 +280,13 @@ impl LcdBackend for DebeLcd {
         fb[i] = if alpha == 255 {
             src
         } else {
-            blend_argb8888(fb[i], src, alpha)
+            fb::blend_argb8888(fb[i], src, fb::alpha8(alpha))
         };
     }
 }
 
-// Per-pixel write state (single-threaded: UI thread only).
-static mut PIXEL_X: u16 = 0;
-static mut PIXEL_Y: u16 = 0;
-static mut PIXEL_START_X: u16 = 0;
-static mut PIXEL_W: u16 = 0;
+// Pixel-stream state (single-threaded: UI thread only).
+static mut PIXEL: fb::StreamCursor = fb::StreamCursor::new();
 /// Back-buffer base captured at `begin_pixels` (avoids re-reading `BACK` per pixel).
 static mut PIXEL_FB: *mut u32 = core::ptr::null_mut();
 
@@ -422,10 +431,7 @@ pub fn present_thread_body() -> ! {
 
         // Publish the pixels: drain the write buffer and write the D-cache back
         // so the DEBE (which scans DRAM directly) sees the new frame.
-        cpu::dsb();
-        if mmu::dcache_status() {
-            mmu::clean_dcache(fb_ptr(buf) as u32, FB_SIZE as u32);
-        }
+        flush_cache();
 
         // Wait for the next vblank edge before swapping layers, so the DEBE
         // register writes land inside the blanking gap (a mid-scanout swap
@@ -472,6 +478,31 @@ pub fn vblank_isr(_vector: u32) {
     // keeps blanking ~60×/s whether or not we are presenting).
     if vsync_sem().waiter_count() > 0 {
         vsync_sem().release_from_isr();
+    }
+}
+
+/// Write every dirty D-cache line back to DRAM so the DEBE (which scans DRAM
+/// directly) sees the pixels, then drain the write buffer.
+///
+/// Uses the ARM926 "test and clean" loop: cost scales with the number of
+/// dirty lines (at most 512 for the 16 KB D-cache), not with the 900 KB
+/// framebuffer — a by-address clean of one buffer is 28,800 MCRs. Cheap when
+/// nothing was drawn, so it can run every main-loop iteration.
+pub fn flush_cache() {
+    if !mmu::dcache_status() {
+        cpu::dsb();
+        return;
+    }
+    unsafe {
+        core::arch::asm!(
+            "1:",
+            "mrc p15, 0, APSR_nzcv, c7, c10, 3",
+            "bne 1b",
+            "mov {tmp}, #0",
+            "mcr p15, 0, {tmp}, c7, c10, 4",
+            tmp = out(reg) _,
+            options(nostack),
+        );
     }
 }
 

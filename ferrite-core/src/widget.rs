@@ -38,6 +38,10 @@ pub const FLAG_HAS_ON_CLICK: u16 = 1 << 12;
 pub const FLAG_HAS_ON_TAP: u16 = 1 << 13;
 /// Widget has at least one compile-time on_paint registration.
 pub const FLAG_HAS_ON_PAINT: u16 = 1 << 14;
+/// Render-pass scratch: the widget was painted earlier in the current render
+/// pass. Set and cleared by the render functions only — always clear outside
+/// a pass.
+pub const FLAG_PAINTED: u16 = 1 << 15;
 
 // --- Widget Kind ---
 
