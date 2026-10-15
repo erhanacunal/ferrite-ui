@@ -164,10 +164,10 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Swipe (OnSwipe = 10):** fires on release when displacement ≥ 40 px and dominant axis ≥ 2× minor; args: `(direction, widget_id, dominant_delta)`
   - Directions: 0=left, 1=right, 2=up, 3=down (use `lib/touch.fl` constants `SWIPE_LEFT`…`SWIPE_DOWN`)
   - Mutually exclusive with `on_click` — a touch that becomes a swipe never fires `on_click`
-- **Long press (OnLongPress = 11):** fires once after ~60 hold frames while finger stays within 20 px of press origin; args: `(widget_id, x, y)`
+- **Long press (OnLongPress = 11):** fires once after 500 ms of holding while finger stays within 20 px of press origin; args: `(widget_id, x, y)`
   - Suppresses `on_click` on the subsequent release
-- **Gesture state** tracked in main loop locals: `gesture_start_x/y`, `hold_count`, `long_press_fired`
-- **Constants:** `LONG_PRESS_FRAMES = 60`, `LONG_PRESS_MAX_MOVE_SQ = 400`, `SWIPE_MIN_DIST_SQ = 1600`, `SWIPE_AXIS_RATIO = 2`
+- **Gesture state** tracked in main loop locals: `gesture_start_x/y`, `press_ms`, `long_press_fired`
+- **Constants:** `LONG_PRESS_MS = 500`, `LONG_PRESS_MAX_MOVE_SQ = 400`, `SWIPE_MIN_DIST_SQ = 1600`, `SWIPE_AXIS_RATIO = 2`
 - **Language library:** `lib/touch.fl` — include in `.fl` programs to get named `SWIPE_*` constants
 
 ### Property Animation

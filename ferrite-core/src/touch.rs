@@ -62,11 +62,17 @@ pub trait TouchBackend {
 
     /// Read a screen-space (x, y) sample if currently pressed.
     fn read_screen(&self, cal: &CalParams) -> Option<(u16, u16)>;
+
+    /// Consecutive `None` samples that end a press. Backends that debounce
+    /// lift-off themselves (e.g. in an interrupt) can return 1.
+    fn release_debounce(&self) -> u8 {
+        RELEASE_DEBOUNCE
+    }
 }
 
 // === Touch state machine ===
 
-const RELEASE_DEBOUNCE: u8 = 5;
+pub const RELEASE_DEBOUNCE: u8 = 5;
 
 #[derive(Clone, Copy, PartialEq)]
 enum TouchState {
@@ -146,7 +152,7 @@ impl<B: TouchBackend> TouchImpl<B> {
                     })
                 } else {
                     self.fail_count += 1;
-                    if self.fail_count >= RELEASE_DEBOUNCE {
+                    if self.fail_count >= self.be.release_debounce() {
                         self.state = TouchState::Idle;
                         self.fail_count = 0;
                         Some(TouchEvent {

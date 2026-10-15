@@ -52,7 +52,10 @@ pub const MAX_CODE_SIZE: usize = 4096;
 
 // === Gesture tuning (shared with lib/touch.fl constants) ===
 
-const LONG_PRESS_FRAMES: u16 = 60;
+/// Hold time before a long press. Time-based, not frame-based: the main loop
+/// is unpaced, so a frame count would fire within milliseconds on a board
+/// whose loop does little work per pass (and then suppress every swipe).
+const LONG_PRESS_MS: u32 = 500;
 const LONG_PRESS_MAX_MOVE_SQ: i32 = 20 * 20;
 const SWIPE_MIN_DIST_SQ: i32 = 40 * 40;
 const SWIPE_AXIS_RATIO: i32 = 2;
@@ -855,7 +858,10 @@ pub struct FullInput {
     scroll_active: bool,
     gesture_start_x: u16,
     gesture_start_y: u16,
-    hold_count: u16,
+    /// `millis()` at the press.
+    press_ms: u32,
+    /// The long-press check ran for this contact (it runs once).
+    long_press_checked: bool,
     long_press_fired: bool,
 }
 
@@ -867,7 +873,8 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
             scroll_active: false,
             gesture_start_x: 0,
             gesture_start_y: 0,
-            hold_count: 0,
+            press_ms: 0,
+            long_press_checked: false,
             long_press_fired: false,
         }
     }
@@ -937,7 +944,8 @@ impl FullInput {
         self.scroll_active = false;
         self.gesture_start_x = x;
         self.gesture_start_y = y;
-        self.hold_count = 0;
+        self.press_ms = ctx.systick.millis();
+        self.long_press_checked = false;
         self.long_press_fired = false;
 
         // Scrollbar hit-test.
@@ -1049,8 +1057,10 @@ impl FullInput {
         }
 
         // Long press.
-        self.hold_count = self.hold_count.saturating_add(1);
-        if self.hold_count == LONG_PRESS_FRAMES && !self.long_press_fired {
+        if !self.long_press_checked
+            && ctx.systick.millis().wrapping_sub(self.press_ms) >= LONG_PRESS_MS
+        {
+            self.long_press_checked = true;
             let dx = x as i32 - self.gesture_start_x as i32;
             let dy = y as i32 - self.gesture_start_y as i32;
             if dx * dx + dy * dy <= LONG_PRESS_MAX_MOVE_SQ {

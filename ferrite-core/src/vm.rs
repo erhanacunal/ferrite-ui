@@ -163,7 +163,7 @@ pub enum FunctionKind {
     OnTouchMove = 9,
     /// Swipe gesture detected on release. Args: direction (0=left 1=right 2=up 3=down), widget_id, dominant_delta.
     OnSwipe = 10,
-    /// Long press detected after holding still for ~60 frames. Args: widget_id, x, y.
+    /// Long press detected after holding still for 500 ms. Args: widget_id, x, y.
     OnLongPress = 11,
     /// Compile-time generated click dispatcher. Args: widget_id (plus optional extra args for sliders).
     OnClick = 12,
