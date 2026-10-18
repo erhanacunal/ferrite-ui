@@ -113,6 +113,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Property R/W:** scalar (W_SET wt=0, single value from stack) and compound (W_SET wt=2, LEN payload with multiple zigzag varints)
 - **Builder:** builds bytecode in RAM, forward jump patching, writes to `&mut [u8]` buffer
 - **Execution:** `vm.run(&code[..len], &mut tree, &mut lcd, &flash)` — F_READ/F_WRITE operate via flash
+- **Fault codes:** every `VmState::Error` goes through `Vm::fail(fault::X)` — `vm.fault()` (u8, `vm::fault::*`) + `vm.fault_pc()` (start of the faulting instruction; first fault wins). Shown on the Code 6 error screen as `VM n: <name>` + PC, and sent over USART as a 4-byte error payload `[code, fault, pc_lo, pc_hi]` (`ferrite_cli.py` `VM_FAULT_NAMES` — keep in sync)
 - **Control flow:** if/while/for — via JZ/JNZ/JMP combinations
 - **Image header v3:** version(u8=3) + func_count(u16) + global_count(u16) + flags(u16) + func_table
   - flags bit 0: render_mode (0=dirty, 1=buffered)

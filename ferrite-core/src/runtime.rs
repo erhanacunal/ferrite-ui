@@ -281,8 +281,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                     }
                     if vm.state == VmState::Error {
                         error_code = ERR_PROGRAM_ERROR;
-                        let pc = vm.pc();
-                        show_error(&mut ctx, error_code, Some(pc));
+                        show_error(&mut ctx, error_code, Some((vm.fault(), vm.fault_pc())));
                     }
                 }
                 VmState::Waiting => {
@@ -547,7 +546,8 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, input: &mut P
 //  Error screen
 // ============================================================================
 
-pub fn show_error<P: PlatformRuntime>(ctx: &mut Ctx<P>, code: u8, vm_pc: Option<u16>) {
+/// `vm_fault` = `(fault code, faulting PC)` for VM runtime errors.
+pub fn show_error<P: PlatformRuntime>(ctx: &mut Ctx<P>, code: u8, vm_fault: Option<(u8, u16)>) {
     let sw = P::LcdB::WIDTH;
     let sh = P::LcdB::HEIGHT;
     let bg = P::BG_COLOR;
@@ -602,7 +602,41 @@ pub fn show_error<P: PlatformRuntime>(ctx: &mut Ctx<P>, code: u8, vm_pc: Option<
         Some(bg),
     );
 
-    if let Some(pc) = vm_pc {
+    if let Some((fault, pc)) = vm_fault {
+        // "VM 9: invalid array"
+        let mut fault_line = [0u8; 40];
+        let mut n = 0;
+        for &b in b"VM " {
+            fault_line[n] = b;
+            n += 1;
+        }
+        if fault >= 100 {
+            fault_line[n] = b'0' + fault / 100;
+            n += 1;
+        }
+        if fault >= 10 {
+            fault_line[n] = b'0' + (fault / 10) % 10;
+            n += 1;
+        }
+        fault_line[n] = b'0' + fault % 10;
+        n += 1;
+        fault_line[n] = b':';
+        fault_line[n + 1] = b' ';
+        n += 2;
+        let name = crate::vm::fault::name(fault);
+        let take = name.len().min(fault_line.len() - n);
+        fault_line[n..n + take].copy_from_slice(&name[..take]);
+        n += take;
+        font.draw_str(
+            &ctx.lcd,
+            &ctx.flash,
+            &fault_line[..n],
+            center(font.text_width(&fault_line[..n]) as usize),
+            ty + 90,
+            fg,
+            Some(bg),
+        );
+
         let mut pc_buf = [0u8; 12];
         let pc_len = format_hex_u16(b"PC: 0x", pc, &mut pc_buf);
         font.draw_str(
@@ -610,7 +644,7 @@ pub fn show_error<P: PlatformRuntime>(ctx: &mut Ctx<P>, code: u8, vm_pc: Option<
             &ctx.flash,
             &pc_buf[..pc_len],
             center(font.text_width(&pc_buf[..pc_len]) as usize),
-            ty + 90,
+            ty + 120,
             fg,
             Some(bg),
         );
@@ -619,7 +653,10 @@ pub fn show_error<P: PlatformRuntime>(ctx: &mut Ctx<P>, code: u8, vm_pc: Option<
     ctx.lcd.end_frame();
     ctx.lcd.flush_dirty();
 
-    protocol::send_error(&ctx.usart, code);
+    match vm_fault {
+        Some((fault, pc)) => protocol::send_vm_error(&ctx.usart, code, fault, pc),
+        None => protocol::send_error(&ctx.usart, code),
+    }
 }
 
 fn error_description(code: u8) -> &'static [u8] {
@@ -1420,6 +1457,6 @@ mod mock_runtime {
     pub fn _guard() {
         let _: fn(Box<Ctx<MockPlatform>>, TouchImpl<crate::mock::MockTouch>) -> ! =
             run::<MockPlatform>;
-        let _: fn(&mut Ctx<MockPlatform>, u8, Option<u16>) = show_error::<MockPlatform>;
+        let _: fn(&mut Ctx<MockPlatform>, u8, Option<(u8, u16)>) = show_error::<MockPlatform>;
     }
 }

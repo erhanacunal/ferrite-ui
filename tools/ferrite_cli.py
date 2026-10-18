@@ -59,6 +59,23 @@ ERROR_DESCRIPTIONS = {
     7: "insufficient memory",
 }
 
+# VM fault codes (error 6 detail) — keep in sync with `vm::fault` in vm.rs
+VM_FAULT_NAMES = {
+    1: "code out of bounds",
+    2: "bad opcode",
+    3: "stack overflow",
+    4: "stack underflow",
+    5: "call stack overflow",
+    6: "ret without call",
+    7: "widget pool full",
+    8: "string pool full",
+    9: "invalid array",
+    10: "array index out of range",
+    11: "invalid file handle",
+    12: "syscall failed",
+    13: "bad operand",
+}
+
 
 def encode_varint(value: int) -> bytes:
     """Encode an unsigned integer as a protobuf varint."""
@@ -191,6 +208,11 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             if len(payload) < length:
                 return ("timeout", None)
             if tag == TAG_ERROR:
+                if len(payload) >= 4:
+                    fault = payload[1]
+                    pc = int.from_bytes(payload[2:4], "little")
+                    name = VM_FAULT_NAMES.get(fault, "unknown")
+                    print(f"VM fault {fault} ({name}) at PC 0x{pc:04X}", flush=True)
                 return ("error", payload[0])
             return ("touchcal", payload)
 

@@ -374,6 +374,60 @@ const OP_FATAN2: u8 = 0xD1; // pop x, pop y → push atan2(y,x)
 const OP_FFLOOR: u8 = 0xD2;
 const OP_FCEIL: u8 = 0xD3;
 
+// --- VM fault codes ---
+
+/// Why the VM entered `VmState::Error`. Read with `Vm::fault()`; the matching
+/// bytecode address is `Vm::fault_pc()` (start of the faulting instruction).
+pub mod fault {
+    pub const NONE: u8 = 0;
+    /// Bytecode read past the end of the program (truncated operand / bad jump).
+    pub const CODE_OOB: u8 = 1;
+    /// Unknown opcode.
+    pub const BAD_OPCODE: u8 = 2;
+    /// Eval stack overflow (more than 16 values).
+    pub const STACK_OVERFLOW: u8 = 3;
+    /// Eval stack underflow (pop from empty stack).
+    pub const STACK_UNDERFLOW: u8 = 4;
+    /// Call stack overflow (call depth > 8, e.g. runaway recursion).
+    pub const CALL_OVERFLOW: u8 = 5;
+    /// RET with an empty call stack outside a callback.
+    pub const RET_EMPTY: u8 = 6;
+    /// Widget pool exhausted (W_ALLOC / W_ALLTAR).
+    pub const WIDGET_ALLOC: u8 = 7;
+    /// String pool full.
+    pub const STR_ALLOC: u8 = 8;
+    /// Unknown array id (never allocated or already freed).
+    pub const BAD_ARRAY: u8 = 9;
+    /// Array index out of range.
+    pub const ARRAY_INDEX: u8 = 10;
+    /// Invalid or unopened file handle.
+    pub const BAD_FILE: u8 = 11;
+    /// Syscall failed or no syscall handler installed.
+    pub const SYSCALL: u8 = 12;
+    /// Invalid operand value (array too short / too long for the operation).
+    pub const BAD_OPERAND: u8 = 13;
+
+    /// Short human-readable name for the error screen.
+    pub fn name(code: u8) -> &'static [u8] {
+        match code {
+            CODE_OOB => b"code out of bounds",
+            BAD_OPCODE => b"bad opcode",
+            STACK_OVERFLOW => b"stack overflow",
+            STACK_UNDERFLOW => b"stack underflow",
+            CALL_OVERFLOW => b"call stack overflow",
+            RET_EMPTY => b"ret without call",
+            WIDGET_ALLOC => b"widget pool full",
+            STR_ALLOC => b"string pool full",
+            BAD_ARRAY => b"invalid array",
+            ARRAY_INDEX => b"array index range",
+            BAD_FILE => b"invalid file handle",
+            SYSCALL => b"syscall failed",
+            BAD_OPERAND => b"bad operand",
+            _ => b"unknown fault",
+        }
+    }
+}
+
 // --- VM State ---
 
 #[derive(Clone, Copy, PartialEq)]
@@ -553,6 +607,12 @@ pub struct Vm {
     call_sp: u8,
     target: WidgetId,
     pub state: VmState,
+    /// Fault code (`fault::*`) of the most recent error; valid while `state == Error`.
+    fault: u8,
+    /// Address of the instruction that raised `fault`.
+    fault_pc: u16,
+    /// Start address of the instruction currently executing.
+    op_pc: u16,
     arrays: Vec<VmArray>,
     next_arr_id: u16,
     pub wait_until: u32,
@@ -620,6 +680,9 @@ impl Vm {
             call_sp: 0,
             target: WidgetId::NONE,
             state: VmState::Ready,
+            fault: fault::NONE,
+            fault_pc: 0,
+            op_pc: 0,
             arrays: Vec::new(),
             next_arr_id: 0,
             wait_until: 0,
@@ -893,7 +956,7 @@ impl Vm {
         };
 
         if (self.call_sp as usize) >= CALL_STACK_SIZE {
-            self.state = VmState::Error;
+            self.fail(fault::CALL_OVERFLOW);
             return;
         }
 
@@ -1097,6 +1160,30 @@ impl Vm {
         self.pc
     }
 
+    /// Fault code (`fault::*`) of the most recent VM error.
+    pub fn fault(&self) -> u8 {
+        self.fault
+    }
+
+    /// Address of the instruction that raised the most recent VM error.
+    /// Unlike `pc()`, this stays correct after a failed callback restores
+    /// the interrupted state.
+    pub fn fault_pc(&self) -> u16 {
+        self.fault_pc
+    }
+
+    /// Enter `VmState::Error` with a reason. The first fault wins: follow-on
+    /// failures within the same instruction (e.g. a push after a failed pop)
+    /// don't overwrite the root cause.
+    #[cold]
+    fn fail(&mut self, code: u8) {
+        if self.state != VmState::Error {
+            self.fault = code;
+            self.fault_pc = self.op_pc;
+        }
+        self.state = VmState::Error;
+    }
+
     pub fn is_critical(&self) -> bool {
         self.critical
     }
@@ -1123,6 +1210,7 @@ impl Vm {
         self.call_sp = 0;
         self.target = WidgetId::NONE;
         self.state = VmState::Ready;
+        self.fault = fault::NONE;
         self.vars.clear();
         self.arrays.clear();
         self.next_arr_id = 0;
@@ -1195,7 +1283,7 @@ impl Vm {
             self.pc += 1;
             self.code.byte_at(pos)
         } else {
-            self.state = VmState::Error;
+            self.fail(fault::CODE_OOB);
             0
         }
     }
@@ -1214,7 +1302,7 @@ impl Vm {
             self.code.read_bytes(pos, &mut buf);
             u16::from_le_bytes(buf)
         } else {
-            self.state = VmState::Error;
+            self.fail(fault::CODE_OOB);
             0
         }
     }
@@ -1233,7 +1321,7 @@ impl Vm {
             self.code.read_bytes(pos, &mut buf);
             i32::from_le_bytes(buf)
         } else {
-            self.state = VmState::Error;
+            self.fail(fault::CODE_OOB);
             0
         }
     }
@@ -1246,6 +1334,7 @@ impl Vm {
     // --- Execute a single instruction ---
 
     pub fn step<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
+        self.op_pc = self.pc;
         let op = self.read_u8();
         if self.state == VmState::Error {
             return;
@@ -1267,7 +1356,7 @@ impl Vm {
                     let j = (self.sp - 2) as usize;
                     self.stack.swap(i, j);
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::STACK_UNDERFLOW);
                 }
             }
             OP_ADD => {
@@ -1379,7 +1468,7 @@ impl Vm {
                     // Callback complete — halt cleanly
                     self.state = VmState::Halted;
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::RET_EMPTY);
                 }
             }
             OP_YIELD => {
@@ -1440,7 +1529,7 @@ impl Vm {
                 if let Some(id) = ctx.tree.alloc() {
                     self.push(id.0 as i32);
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::WIDGET_ALLOC);
                 }
             }
             OP_W_ALLTAR => {
@@ -1451,7 +1540,7 @@ impl Vm {
                     self.var_set(slot, id.0 as i32);
                     self.target = id;
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::WIDGET_ALLOC);
                 }
             }
             OP_FRAME => {
@@ -1575,7 +1664,7 @@ impl Vm {
                     self.frame_size = 0; // callee's FRAME will set this
                     self.pc = target;
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::CALL_OVERFLOW);
                 }
             }
             OP_W_TARGET => {
@@ -1655,7 +1744,7 @@ impl Vm {
                         }
                     }
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::CODE_OOB);
                 }
             }
             OP_ARR_ALLOC => {
@@ -1679,14 +1768,14 @@ impl Vm {
                     self.next_arr_id = self.next_arr_id.wrapping_add(1);
                     self.push(id as i32);
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::CODE_OOB);
                 }
             }
             OP_F_READ => {
                 let addr = self.read_u32();
                 let len = self.read_u16() as usize;
                 if len > (STACK_SIZE - self.sp as usize) {
-                    self.state = VmState::Error;
+                    self.fail(fault::STACK_OVERFLOW);
                     return;
                 }
                 let mut buf = [0u8; STACK_SIZE];
@@ -1709,7 +1798,7 @@ impl Vm {
                         ctx.flash.write(addr, &buf[..n]);
                     }
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::CODE_OOB);
                 }
             }
 
@@ -1778,7 +1867,7 @@ impl Vm {
                         );
                     }
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::CODE_OOB);
                 }
             }
             OP_DELAY => {
@@ -1797,24 +1886,24 @@ impl Vm {
                     self.pc = (start + len) as u16;
                     match ctx.strpool.alloc(&buf[..n]) {
                         Some(id) => self.push(id as i32),
-                        None => self.state = VmState::Error,
+                        None => self.fail(fault::STR_ALLOC),
                     }
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::CODE_OOB);
                 }
             }
             OP_ITOS => {
                 let val = self.pop();
                 match strpool::itos(&mut ctx.strpool, val) {
                     Some(id) => self.push(id as i32),
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::STR_ALLOC),
                 }
             }
             OP_FTOS => {
                 let bits = self.pop() as u32;
                 match strpool::ftos(&mut ctx.strpool, bits) {
                     Some(id) => self.push(id as i32),
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::STR_ALLOC),
                 }
             }
             OP_CONCAT => {
@@ -1822,7 +1911,7 @@ impl Vm {
                 let a = self.pop() as u16;
                 match ctx.strpool.concat(a, b) {
                     Some(id) => self.push(id as i32),
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::STR_ALLOC),
                 }
             }
             OP_PARSE_INT => {
@@ -1952,10 +2041,10 @@ impl Vm {
                             };
                             ctx.rtc.set_time(&dt);
                         } else {
-                            self.state = VmState::Error;
+                            self.fail(fault::BAD_OPERAND);
                         }
                     }
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::BAD_ARRAY),
                 }
             }
 
@@ -2029,21 +2118,21 @@ impl Vm {
                             self.push(buf[0] as i32);
                         }
                     }
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::BAD_FILE),
                 }
             }
             OP_FILE_SIZE => {
                 let handle = self.pop();
                 match self.file_slot(handle) {
                     Some(f) => self.push(f.size as i32),
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::BAD_FILE),
                 }
             }
             OP_FILE_CLOSE => {
                 let handle = self.pop();
                 match self.file_slot_index(handle) {
                     Some(idx) => self.open_files[idx] = None,
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::BAD_FILE),
                 }
             }
             OP_FILE_SEEK => {
@@ -2051,7 +2140,7 @@ impl Vm {
                 let handle = self.pop();
                 match self.file_slot_mut(handle) {
                     Some(f) => f.pos = (pos.max(0) as u32).min(f.size),
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::BAD_FILE),
                 }
             }
             OP_SHOW_MODAL => {
@@ -2079,18 +2168,18 @@ impl Vm {
                         };
                         let mut buf = [0u8; 256];
                         if take > buf.len() {
-                            self.state = VmState::Error;
+                            self.fail(fault::BAD_OPERAND);
                         } else {
                             for i in 0..take {
                                 buf[i] = data[i] as u8;
                             }
                             match ctx.strpool.alloc(&buf[..take]) {
                                 Some(id) => self.push(id as i32),
-                                None => self.state = VmState::Error,
+                                None => self.fail(fault::STR_ALLOC),
                             }
                         }
                     }
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::BAD_ARRAY),
                 }
             }
 
@@ -2111,7 +2200,7 @@ impl Vm {
                 };
                 match strpool::sprintf(&mut ctx.strpool, &fmt_buf[..fmt_len], &args[..actual]) {
                     Some(id) => self.push(id as i32),
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::STR_ALLOC),
                 }
             }
 
@@ -2126,9 +2215,9 @@ impl Vm {
                 match self.syscall_fn {
                     Some(f) => match f(syscall_id, &args[..actual], &ctx.strpool) {
                         Some(v) => self.push(v),
-                        None => self.state = VmState::Error,
+                        None => self.fail(fault::SYSCALL),
                     },
-                    None => self.state = VmState::Error,
+                    None => self.fail(fault::SYSCALL),
                 }
             }
 
@@ -2227,7 +2316,7 @@ impl Vm {
                 self.push(libm::ceilf(v).to_bits() as i32);
             }
 
-            _ => self.state = VmState::Error,
+            _ => self.fail(fault::BAD_OPCODE),
         }
     }
 
@@ -2238,7 +2327,7 @@ impl Vm {
             self.stack[self.sp as usize] = val;
             self.sp += 1;
         } else {
-            self.state = VmState::Error;
+            self.fail(fault::STACK_OVERFLOW);
         }
     }
 
@@ -2247,7 +2336,7 @@ impl Vm {
             self.sp -= 1;
             self.stack[self.sp as usize]
         } else {
-            self.state = VmState::Error;
+            self.fail(fault::STACK_UNDERFLOW);
             0
         }
     }
@@ -2658,7 +2747,7 @@ impl Vm {
                         ext.text_id = str_id;
                     }
                 } else {
-                    self.state = VmState::Error;
+                    self.fail(fault::STR_ALLOC);
                 }
             }
             return;
@@ -2739,13 +2828,13 @@ impl Vm {
             Some(pos) => {
                 let arr = &self.arrays[pos];
                 if idx < 0 || idx as usize >= arr.data.len() {
-                    self.state = VmState::Error;
+                    self.fail(fault::ARRAY_INDEX);
                     return;
                 }
                 let val = arr.data[idx as usize];
                 self.push(val);
             }
-            None => self.state = VmState::Error,
+            None => self.fail(fault::BAD_ARRAY),
         }
     }
 
@@ -2754,19 +2843,19 @@ impl Vm {
             Some(pos) => {
                 let arr = &mut self.arrays[pos];
                 if idx < 0 || idx as usize >= arr.data.len() {
-                    self.state = VmState::Error;
+                    self.fail(fault::ARRAY_INDEX);
                     return;
                 }
                 arr.data[idx as usize] = val;
             }
-            None => self.state = VmState::Error,
+            None => self.fail(fault::BAD_ARRAY),
         }
     }
 
     fn arr_len(&mut self, arr_id: i32) {
         match self.find_array(arr_id) {
             Some(pos) => self.push(self.arrays[pos].data.len() as i32),
-            None => self.state = VmState::Error,
+            None => self.fail(fault::BAD_ARRAY),
         }
     }
 
@@ -3136,5 +3225,37 @@ mod anim_tests {
         }
         assert_eq!(vm.anims.len(), MockPlatform::ANIM_SLOTS);
         assert_eq!(MockPlatform::ANIM_SLOTS, 8);
+    }
+
+    fn run_code(code: &[u8]) -> Vm {
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        vm.code = VmCode::Ram(code.to_vec());
+        vm.run(&mut ctx);
+        vm
+    }
+
+    #[test]
+    fn fault_reports_reason_and_instruction_pc() {
+        // DUP, POP, POP → underflow raised by the instruction at pc 2.
+        let vm = run_code(&[OP_DUP, OP_POP, OP_POP]);
+        assert!(vm.state == VmState::Error);
+        assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
+        assert_eq!(vm.fault_pc(), 2);
+    }
+
+    #[test]
+    fn fault_bad_opcode() {
+        let vm = run_code(&[0xFF]);
+        assert_eq!(vm.fault(), fault::BAD_OPCODE);
+        assert_eq!(vm.fault_pc(), 0);
+    }
+
+    #[test]
+    fn first_fault_wins_within_instruction() {
+        // ADD on an empty stack: two failed pops, then the push succeeds —
+        // the recorded cause must stay STACK_UNDERFLOW.
+        let vm = run_code(&[OP_ADD]);
+        assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
     }
 }

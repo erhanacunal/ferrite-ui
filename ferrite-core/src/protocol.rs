@@ -465,6 +465,14 @@ pub fn send_error<U: UsartBackend>(usart: &UsartImpl<U>, code: u8) {
     usart.write(&[0x0A, 0x01, code]);
 }
 
+/// Send VM error: Field 1, Payload type — tag + length(4) + error_code +
+/// vm fault code (`vm::fault::*`) + faulting PC (u16 LE). Hosts that only
+/// read `payload[0]` keep working.
+pub fn send_vm_error<U: UsartBackend>(usart: &UsartImpl<U>, code: u8, fault: u8, pc: u16) {
+    let [lo, hi] = pc.to_le_bytes();
+    usart.write(&[0x0A, 0x04, code, fault, lo, hi]);
+}
+
 /// Send pong: Field 2, Varint type — tag byte only
 pub fn send_pong<U: UsartBackend>(usart: &UsartImpl<U>) {
     // tag = (2 << 3) | 0 = 0x10
