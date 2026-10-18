@@ -251,10 +251,22 @@ fn init_ports() {
     }
 }
 
+// Linker-provided heap bounds (see memory.x).
+unsafe extern "C" {
+    static mut __sheap: u8;
+    pub(crate) static _heap_end: u8;
+}
+
 #[entry]
 fn main() -> ! {
     system_init();
-    heap::init();
+    // Heap = all RAM between the end of .bss and the stack reserve
+    // (`__sheap` / `_heap_end`, from cortex-m-rt's link.x and memory.x).
+    unsafe {
+        let start = &raw mut __sheap;
+        let end = &raw const _heap_end;
+        heap::init(start, end as usize - start as usize);
+    }
     systick::init();
     init_ports();
 

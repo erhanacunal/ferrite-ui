@@ -99,9 +99,14 @@ impl PlatformRuntime for NextionPlatform {
     fn stack_info() -> (u32, u32) {
         let sp: u32;
         unsafe { core::arch::asm!("mov {}, sp", out(reg) sp) };
-        const RAM_END: u32 = 0x2000_5000;
-        let used = RAM_END.saturating_sub(sp);
-        let free = sp.saturating_sub(0x2000_0000);
+        // Stack runs from `_stack_start` (top of RAM) down to `_heap_end`.
+        unsafe extern "C" {
+            static _stack_start: u8;
+        }
+        let top = (&raw const _stack_start) as u32;
+        let bottom = (&raw const crate::_heap_end) as u32;
+        let used = top.saturating_sub(sp);
+        let free = sp.saturating_sub(bottom);
         (used, free)
     }
 
