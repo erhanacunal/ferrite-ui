@@ -94,6 +94,7 @@ impl Fs {
     /// Flash'taki dosya sistemini mount et.
     /// Header'ı okur, magic'i doğrular, metadata'yı cache'ler.
     /// `base` is the flash address of the FS header (see `Platform::FS_BASE`).
+    #[inline(never)]
     pub fn mount<F: FlashBackend>(flash: &FlashImpl<F>, base: u32) -> Result<Self, FsError> {
         let mut buf = [0u8; 16];
         flash.read(base, &mut buf);

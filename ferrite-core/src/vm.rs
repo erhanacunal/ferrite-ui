@@ -921,6 +921,7 @@ impl Vm {
     }
 
     /// Drain all queued callbacks, executing each to completion.
+    #[inline(never)]
     pub fn drain_callbacks<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
         while self.run_next_callback(ctx) {}
     }
@@ -1090,6 +1091,7 @@ impl Vm {
         })
     }
 
+    #[inline(never)]
     pub fn try_resume_modal<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
         if !matches!(self.state, VmState::AwaitingModal) {
             return;
@@ -2744,6 +2746,7 @@ impl Vm {
     /// avoids redundant redraws. Repeating tweens restart (loop) or reverse
     /// (yoyo); one-shot tweens deactivate and fire their `on_end` callback.
     /// Called every main-loop iteration regardless of `self.state`.
+    #[inline(never)]
     pub fn tick_animations<P: Platform>(&mut self, ctx: &mut Ctx<P>, now: u32) {
         let mut any_done = false;
         let n = self.anims.len();

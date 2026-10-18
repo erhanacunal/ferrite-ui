@@ -108,6 +108,7 @@ impl PlatformRuntime for NextionPlatform {
         crate::stack::peak()
     }
 
+    #[inline(never)]
     fn boot(ctx: &mut Ctx<Self>, touch: &mut TouchImpl<Self::TouchB>) -> u8 {
         // Load saved touch calibration from config (flash sector 0).
         let cfg = config::ConfigStore::mount_or_format(&ctx.flash, Self::CONFIG_BASE);

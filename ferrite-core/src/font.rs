@@ -257,6 +257,7 @@ impl Font {
 
     /// Create an embedded (ROM) font. Always gets font_id = 0.
     /// Glyphs and codepoints reference ROM directly — zero RAM cost.
+    #[inline(never)]
     pub fn from_embedded(
         glyphs: &'static [GfxGlyph],
         codepoints: &'static [u16],

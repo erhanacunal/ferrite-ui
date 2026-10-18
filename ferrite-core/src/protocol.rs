@@ -252,6 +252,7 @@ impl Protocol {
     }
 
     /// Process a single received byte. Returns an event if a complete message was received.
+    #[inline(never)]
     pub fn feed<B: FlashBackend>(&mut self, byte: u8, flash: &FlashImpl<B>) -> RxEvent {
         match self.state {
             RxState::Idle => {

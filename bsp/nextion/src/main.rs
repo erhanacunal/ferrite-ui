@@ -273,10 +273,18 @@ fn main() -> ! {
     systick::init();
     init_ports();
 
-    let gpio = Gpio::init();
+    let ctx = build_ctx(Gpio::init());
+    let touch = touch::init();
 
-    // Build the application context on the heap (too large for the stack).
-    let ctx = Box::new(Ctx::<NextionPlatform> {
+    ferrite_core::runtime::run::<NextionPlatform>(ctx, touch)
+}
+
+/// Build the application context on the heap (too large for the stack).
+/// Kept out of line: `main` never returns, so anything inlined here would
+/// stay on the stack for the whole program.
+#[inline(never)]
+fn build_ctx(gpio: Gpio) -> Box<Ctx<NextionPlatform>> {
+    Box::new(Ctx::<NextionPlatform> {
         lcd: lcd::new(gpio),
         flash: flash::init(),
         tree: WidgetTree::new(),
@@ -290,9 +298,5 @@ fn main() -> ! {
         systick: systick::Systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
         cursor_visible: false,
-    });
-
-    let touch = touch::init();
-
-    ferrite_core::runtime::run::<NextionPlatform>(ctx, touch)
+    })
 }

@@ -415,6 +415,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
 /// Apply the image's RES_SYSCFG: resize the USART RX ring, string pool and
 /// VM stacks, and set the widget / animation caps. No entry → all defaults.
 /// Runs once at boot (filesystem writes reboot), before the program loads.
+#[inline(never)]
 fn apply_syscfg<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     let Some(fs) = ctx.fs.as_ref() else {
         return 0;
@@ -439,6 +440,7 @@ fn apply_syscfg<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     if ok { 0 } else { ERR_INSUFFICIENT_MEMORY }
 }
 
+#[inline(never)]
 fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     let entry = match ctx.fs.as_ref().and_then(|fs| fs.find(&ctx.flash, b"main")) {
         Some(e) => e,
@@ -496,6 +498,7 @@ fn reserve_tree<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) {
     ctx.tree.reserve(wc, ec);
 }
 
+#[inline(never)]
 fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     if let Some(offset) = vm.find_by_kind(FunctionKind::Setup).map(|e| e.offset as u16) {
         vm.run_callback(offset, ctx);
@@ -517,6 +520,7 @@ fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
 }
 
 /// Runtime program reload (USART `ProgramReady`). Returns the new error code.
+#[inline(never)]
 fn reload_program<P: PlatformRuntime>(
     ctx: &mut Ctx<P>,
     vm: &mut Vm,
@@ -594,6 +598,7 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, input: &mut P
 // ============================================================================
 
 /// `vm_fault` = `(fault code, faulting PC)` for VM runtime errors.
+#[inline(never)]
 pub fn show_error<P: PlatformRuntime>(ctx: &mut Ctx<P>, code: u8, vm_fault: Option<(u8, u16)>) {
     let sw = P::LcdB::WIDTH;
     let sh = P::LcdB::HEIGHT;
@@ -885,6 +890,7 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
         BasicInput
     }
 
+    #[inline(never)]
     fn handle(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, touch: &mut TouchImpl<P::TouchB>) {
         let event = match touch.poll() {
             Some(e) => e,
@@ -964,6 +970,7 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
         }
     }
 
+    #[inline(never)]
     fn handle(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, touch: &mut TouchImpl<P::TouchB>) {
         let event = match touch.poll() {
             Some(e) => e,
@@ -976,6 +983,7 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
         }
     }
 
+    #[inline(never)]
     fn tick(&mut self, ctx: &mut Ctx<P>) {
         if self.kb.visible && self.kb.focused.is_some() {
             let now = ctx.systick.millis();
