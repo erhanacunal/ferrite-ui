@@ -9,6 +9,10 @@
 ///
 /// RX interrupt: RBNE → ring buffer'a yazar, `rx_has_data()` flag set eder.
 /// Main loop'ta `rx_read_byte()` ile okunur.
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -34,15 +38,45 @@ const CTL0_RE: u32 = 1 << 2;
 const CTL0_RBNEIE: u32 = 1 << 5;
 
 // --- RX Ring Buffer ---
-// ISR yazar (head), main okur (tail). SPSC — lock gerekmez.
+// ISR writes (head), main loop reads (tail). SPSC — no lock needed.
+// The ring lives on the heap: allocated with the default size in `Hw::init`,
+// resized once at boot by `set_rx_capacity` (RES_SYSCFG `uart_rx_bytes`).
+// The size is a power of two so wrap-around is a mask; u16 indices allow
+// up to 32 KB.
 
-const RX_BUF_SIZE: usize = 128;
-const RX_BUF_MASK: u8 = (RX_BUF_SIZE - 1) as u8;
+const RX_BUF_DEFAULT: usize = 128;
+const RX_BUF_MIN: usize = 16;
+const RX_BUF_MAX: usize = 32 * 1024;
 
-static mut RX_BUF: [u8; RX_BUF_SIZE] = [0; RX_BUF_SIZE];
-static mut RX_HEAD: u8 = 0;
-static mut RX_TAIL: u8 = 0;
+static mut RX_BUF: *mut u8 = core::ptr::null_mut();
+static mut RX_MASK: u16 = 0;
+static mut RX_HEAD: u16 = 0;
+static mut RX_TAIL: u16 = 0;
 static RX_READY: AtomicBool = AtomicBool::new(false);
+
+/// Install a new ring of `size` bytes (power of two), returning the old one
+/// (null if none) so the caller can free it. Runs with interrupts masked so
+/// the ISR never sees a half-swapped buffer. Pending bytes are discarded.
+fn swap_rx_buf(buf: *mut u8, size: usize) -> (*mut u8, usize) {
+    cortex_m::interrupt::free(|_| unsafe {
+        let old = (RX_BUF, if RX_BUF.is_null() { 0 } else { RX_MASK as usize + 1 });
+        RX_BUF = buf;
+        RX_MASK = (size - 1) as u16;
+        RX_HEAD = 0;
+        RX_TAIL = 0;
+        RX_READY.store(false, Ordering::Release);
+        old
+    })
+}
+
+/// Allocate a zeroed ring of `size` bytes, leaking it as a raw pointer owned
+/// by `RX_BUF`. `None` if the heap cannot hold it.
+fn alloc_rx_buf(size: usize) -> Option<*mut u8> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(size).ok()?;
+    v.resize(size, 0u8);
+    Some(Box::into_raw(v.into_boxed_slice()).cast::<u8>())
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn USART0() {
@@ -50,17 +84,23 @@ pub unsafe extern "C" fn USART0() {
         let stat = read_volatile(USART_STAT as *const u32);
 
         if stat & STAT_RBNE != 0 {
+            // Reading DATA clears RBNE even when the byte is dropped below.
             let byte = read_volatile(USART_DATA as *const u32) as u8;
+            let buf = read_volatile(&raw const RX_BUF);
+            if buf.is_null() {
+                return;
+            }
+            let mask = read_volatile(&raw const RX_MASK);
 
             let head = read_volatile(&raw const RX_HEAD);
-            write_volatile(&raw mut RX_BUF[head as usize], byte);
+            write_volatile(buf.add(head as usize), byte);
 
-            let new_head = (head.wrapping_add(1)) & RX_BUF_MASK;
+            let new_head = (head.wrapping_add(1)) & mask;
             write_volatile(&raw mut RX_HEAD, new_head);
 
             let tail = read_volatile(&raw const RX_TAIL);
             if new_head == tail {
-                write_volatile(&raw mut RX_TAIL, (tail.wrapping_add(1)) & RX_BUF_MASK);
+                write_volatile(&raw mut RX_TAIL, (tail.wrapping_add(1)) & mask);
             }
 
             RX_READY.store(true, Ordering::Release);
@@ -74,6 +114,9 @@ pub struct Hw {
 
 impl Hw {
     pub fn init() -> Self {
+        if let Some(buf) = alloc_rx_buf(RX_BUF_DEFAULT) {
+            swap_rx_buf(buf, RX_BUF_DEFAULT);
+        }
         unsafe {
             write_volatile(USART_CTL0 as *mut u32, 0);
             write_volatile(USART_BAUD as *mut u32, 0x3AA);
@@ -107,6 +150,26 @@ impl UsartBackend for Hw {
     fn rx_read_byte(&self) -> Option<u8> {
         rx_read_byte()
     }
+
+    fn set_rx_capacity(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let size = bytes.clamp(RX_BUF_MIN, RX_BUF_MAX).next_power_of_two();
+        if unsafe { !RX_BUF.is_null() && RX_MASK as usize + 1 == size } {
+            return true;
+        }
+        let Some(buf) = alloc_rx_buf(size) else {
+            return false;
+        };
+        let (old, old_len) = swap_rx_buf(buf, size);
+        if !old.is_null() {
+            // SAFETY: `old` came from `alloc_rx_buf(old_len)` and the ISR no
+            // longer references it after the swap.
+            drop(unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(old, old_len)) });
+        }
+        true
+    }
 }
 
 // --- RX public API (free fns) ---
@@ -125,8 +188,8 @@ pub fn rx_read_byte() -> Option<u8> {
             return None;
         }
 
-        let byte = read_volatile(&raw const RX_BUF[tail as usize]);
-        let new_tail = (tail.wrapping_add(1)) & RX_BUF_MASK;
+        let byte = read_volatile(read_volatile(&raw const RX_BUF).add(tail as usize));
+        let new_tail = (tail.wrapping_add(1)) & read_volatile(&raw const RX_MASK);
         write_volatile(&raw mut RX_TAIL, new_tail);
 
         if new_tail == read_volatile(&raw const RX_HEAD) {
@@ -137,11 +200,11 @@ pub fn rx_read_byte() -> Option<u8> {
     }
 }
 
-pub fn rx_len() -> u8 {
+pub fn rx_len() -> u16 {
     unsafe {
         let head = read_volatile(&raw const RX_HEAD);
         let tail = read_volatile(&raw const RX_TAIL);
-        (head.wrapping_sub(tail)) & RX_BUF_MASK
+        (head.wrapping_sub(tail)) & read_volatile(&raw const RX_MASK)
     }
 }
 

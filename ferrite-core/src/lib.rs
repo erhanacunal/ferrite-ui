@@ -38,6 +38,7 @@ pub mod protocol;
 pub mod render;
 pub mod runtime;
 pub mod strpool;
+pub mod syscfg;
 pub mod types;
 pub mod vm;
 pub mod widget;

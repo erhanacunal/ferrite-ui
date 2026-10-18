@@ -24,6 +24,7 @@ use crate::touch::{TouchEventKind, TouchImpl};
 
 use crate::ctx::Ctx;
 use crate::strpool::StringPool;
+use crate::syscfg::SysCfg;
 use crate::types::{COLOR_RED, Size};
 use crate::vm::{FunctionKind, RenderMode, Vm, VmState};
 use crate::{font, fs, heap, keyboard, protocol, render, widget};
@@ -43,6 +44,8 @@ pub const ERR_FONT_NOT_FOUND: u8 = 4;
 pub const ERR_NO_FILESYSTEM: u8 = 5;
 pub const ERR_PROGRAM_ERROR: u8 = 6;
 pub const ERR_INSUFFICIENT_MEMORY: u8 = 7;
+/// The image's RES_SYSCFG entry is malformed (bad kind/size/magic/version).
+pub const ERR_BAD_SYSCFG: u8 = 8;
 /// Recovery mode — skip program load, suppress the error screen.
 pub const ERR_EMPTY_RUN: u8 = 0xFE;
 
@@ -231,6 +234,11 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
     vm.syscall_fn = Some(P::syscall);
     vm.forced_render_mode = P::FORCED_RENDER_MODE;
 
+    // --- Size the runtime pools from the image's RES_SYSCFG (if any) ---
+    if error_code == 0 {
+        error_code = apply_syscfg(&mut ctx, &mut vm);
+    }
+
     // --- Load main program ---
     if error_code == 0 {
         error_code = load_main(&mut ctx, &mut vm);
@@ -398,6 +406,33 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
 //  Startup helpers
 // ============================================================================
 
+/// Apply the image's RES_SYSCFG: resize the USART RX ring, string pool and
+/// VM stacks, and set the widget / animation caps. No entry → all defaults.
+/// Runs once at boot (filesystem writes reboot), before the program loads.
+fn apply_syscfg<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
+    let Some(fs) = ctx.fs.as_ref() else {
+        return 0;
+    };
+    let cfg = match SysCfg::load(fs, &ctx.flash) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => return 0,
+        Err(_) => return ERR_BAD_SYSCFG,
+    };
+    let mut ok = ctx.usart.set_rx_capacity(cfg.uart_rx_bytes as usize);
+    ok &= ctx
+        .strpool
+        .configure(cfg.strpool_bytes as usize, cfg.max_strings as usize);
+    ctx.tree
+        .set_limits(cfg.max_widgets as usize, cfg.max_ext as usize);
+    ok &= vm.configure(
+        cfg.eval_stack as usize,
+        cfg.call_stack as usize,
+        cfg.cb_queue as usize,
+        cfg.anim_slots as usize,
+    );
+    if ok { 0 } else { ERR_INSUFFICIENT_MEMORY }
+}
+
 fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     let entry = match ctx.fs.as_ref().and_then(|fs| fs.find(&ctx.flash, b"main")) {
         Some(e) => e,
@@ -434,8 +469,14 @@ fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     err
 }
 
-/// Pre-allocate tree capacity from v4 header counts (one allocation per Vec).
+/// Pre-allocate tree capacity (one allocation per Vec): the RES_SYSCFG caps
+/// when set, else the v4 header counts, else a fallback.
 fn reserve_tree<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) {
+    let (max_w, max_e) = ctx.tree.limits();
+    if max_w < widget::MAX_WIDGETS || max_e < widget::MAX_EXTENSIONS {
+        ctx.tree.reserve(max_w, max_e);
+        return;
+    }
     let wc = if vm.widget_count > 0 {
         vm.widget_count as usize
     } else {
@@ -668,6 +709,7 @@ fn error_description(code: u8) -> &'static [u8] {
         5 => b"no file system in flash",
         6 => b"program execution error",
         7 => b"insufficient memory",
+        8 => b"invalid system config",
         _ => b"error",
     }
 }

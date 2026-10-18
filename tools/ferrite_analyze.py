@@ -282,6 +282,7 @@ RES_IMAGE = 1
 RES_PROGRAM = 2
 RES_PAGE = 3
 RES_FILE = 4
+RES_SYSCFG = 5
 
 _RES_TYPE_NAMES = {
     RES_FONT: "Font",
@@ -289,6 +290,7 @@ _RES_TYPE_NAMES = {
     RES_PROGRAM: "Program",
     RES_PAGE: "Page",
     RES_FILE: "File",
+    RES_SYSCFG: "SysCfg",
 }
 
 # Resource flags

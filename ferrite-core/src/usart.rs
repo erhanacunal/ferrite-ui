@@ -10,6 +10,15 @@ pub trait UsartBackend {
     fn rx_read_byte(&self) -> Option<u8> {
         None
     }
+
+    /// Resize the RX ring to `bytes` (0 = keep the current size). Called once
+    /// at boot from RES_SYSCFG. Returns false if the buffer could not be
+    /// allocated (the old one stays in use). Backends with a fixed or
+    /// host-side buffer keep the default, which ignores the request.
+    fn set_rx_capacity(&self, bytes: usize) -> bool {
+        let _ = bytes;
+        true
+    }
 }
 
 pub struct UsartImpl<B: UsartBackend> {
@@ -40,6 +49,11 @@ impl<B: UsartBackend> UsartImpl<B> {
     #[inline]
     pub fn rx_read_byte(&self) -> Option<u8> {
         self.be.rx_read_byte()
+    }
+
+    #[inline]
+    pub fn set_rx_capacity(&self, bytes: usize) -> bool {
+        self.be.set_rx_capacity(bytes)
     }
 }
 

@@ -22,7 +22,10 @@ use crate::widget::{
     FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_HAS_ON_CLICK,
     FLAG_HAS_ON_PAINT, FLAG_HAS_ON_TAP, FLAG_MULTI_LINE, FLAG_VISIBLE, WidgetId,
 };
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+
+use crate::syscfg::try_alloc_slice;
 
 // === Code source — owned by VM ===
 
@@ -454,6 +457,7 @@ pub enum VmMode {
 
 // --- VM ---
 
+/// Default evaluation stack depth (overridable via RES_SYSCFG `eval_stack`).
 const STACK_SIZE: usize = 16;
 const MAX_SYSCALL_ARGS: usize = 16;
 /// Variable entry — sparse mapping from slot ID to value.
@@ -461,6 +465,7 @@ struct VmVar {
     id: u16,
     val: i32,
 }
+/// Default call stack depth (overridable via RES_SYSCFG `call_stack`).
 const CALL_STACK_SIZE: usize = 8;
 
 /// Internal heap-allocated VM array.
@@ -477,13 +482,13 @@ struct CallFrame {
     frame_size: u8,
 }
 
-/// Saved VM state for callback push/pop.
+/// Saved VM state for callback push/pop. Only the live part of each stack is
+/// kept (`stack[..sp]`, `call_stack[..call_sp]`), so a callback taken at a
+/// YIELD with an empty eval stack allocates nothing for it.
 struct VmSnapshot {
     pc: u16,
-    sp: u8,
-    stack: [i32; STACK_SIZE],
-    call_sp: u8,
-    call_stack: [CallFrame; CALL_STACK_SIZE],
+    stack: Vec<i32>,
+    call_stack: Vec<CallFrame>,
     target: WidgetId,
     state: VmState,
     wait_until: u32,
@@ -494,7 +499,7 @@ struct VmSnapshot {
 
 /// Maximum number of arguments per queued callback.
 const CB_MAX_ARGS: usize = 3;
-/// Maximum number of queued callbacks.
+/// Default callback queue length (overridable via RES_SYSCFG `cb_queue`).
 const CB_QUEUE_SIZE: usize = 8;
 
 /// A queued callback request.
@@ -600,10 +605,12 @@ struct Anim {
 
 pub struct Vm {
     pc: u16,
-    stack: [i32; STACK_SIZE],
+    // Eval / call stacks and the callback queue are heap slices sized by
+    // `configure` (RES_SYSCFG); each is at most 255 deep (u8 indices).
+    stack: Box<[i32]>,
     sp: u8,
     vars: Vec<VmVar>,
-    call_stack: [CallFrame; CALL_STACK_SIZE],
+    call_stack: Box<[CallFrame]>,
     call_sp: u8,
     target: WidgetId,
     pub state: VmState,
@@ -628,7 +635,7 @@ pub struct Vm {
     // modal closes — see try_resume_modal.
     saved: Vec<VmSnapshot>,
     // Callback queue — FIFO ring buffer
-    cb_queue: [CbRequest; CB_QUEUE_SIZE],
+    cb_queue: Box<[CbRequest]>,
     cb_head: u8,
     cb_tail: u8,
     // Critical section — when true, VM runs until next YIELD without returning to main loop
@@ -649,9 +656,11 @@ pub struct Vm {
     open_files: [Option<OpenFile>; 2],
     // Open modal dialogs (innermost = last). Empty when no dialog is showing.
     modal_stack: Vec<ModalFrame>,
-    // Active property tweens, capped at P::ANIM_SLOTS on insert. Ticked once
-    // per main-loop iteration by tick_animations, independent of VM state.
+    // Active property tweens, capped at `anim_slots` (0 = P::ANIM_SLOTS) on
+    // insert. Ticked once per main-loop iteration by tick_animations,
+    // independent of VM state.
     anims: Vec<Anim>,
+    anim_slots: u8,
     // Device-specific syscall handler. Called by OP_SYSCALL; returns None → VM Error.
     pub syscall_fn: Option<fn(id: u8, args: &[i32], strpool: &StringPool) -> Option<i32>>,
     // True while `run_paint` executes on_paint: render() is then a no-op (the
@@ -659,24 +668,25 @@ pub struct Vm {
     in_paint: bool,
 }
 
+const EMPTY_CB: CbRequest = CbRequest {
+    offset: 0,
+    arg_count: 0,
+    args: [0; CB_MAX_ARGS],
+};
+const EMPTY_FRAME: CallFrame = CallFrame {
+    ret_addr: 0,
+    frame_base: 0,
+    frame_size: 0,
+};
+
 impl Vm {
     pub fn new() -> Self {
-        const EMPTY_CB: CbRequest = CbRequest {
-            offset: 0,
-            arg_count: 0,
-            args: [0; CB_MAX_ARGS],
-        };
-        const EMPTY_FRAME: CallFrame = CallFrame {
-            ret_addr: 0,
-            frame_base: 0,
-            frame_size: 0,
-        };
         Self {
             pc: 0,
-            stack: [0; STACK_SIZE],
+            stack: alloc::vec![0; STACK_SIZE].into_boxed_slice(),
             sp: 0,
             vars: Vec::new(),
-            call_stack: [EMPTY_FRAME; CALL_STACK_SIZE],
+            call_stack: alloc::vec![EMPTY_FRAME; CALL_STACK_SIZE].into_boxed_slice(),
             call_sp: 0,
             target: WidgetId::NONE,
             state: VmState::Ready,
@@ -690,7 +700,7 @@ impl Vm {
             functions: Vec::new(),
             mode: VmMode::Normal,
             saved: Vec::new(),
-            cb_queue: [EMPTY_CB; CB_QUEUE_SIZE],
+            cb_queue: alloc::vec![EMPTY_CB; CB_QUEUE_SIZE].into_boxed_slice(),
             cb_head: 0,
             cb_tail: 0,
             critical: false,
@@ -705,8 +715,43 @@ impl Vm {
             open_files: [None, None],
             modal_stack: Vec::new(),
             anims: Vec::new(),
+            anim_slots: 0,
             syscall_fn: None,
         }
+    }
+
+    /// Resize the eval stack, call stack and callback queue and set the
+    /// animation slot cap (0 in any argument = built-in default). Depths are
+    /// clamped to what the u8 indices address (eval >= 4, queue >= 2). Meant
+    /// for boot, before any code runs — resets the VM. Returns false if the
+    /// heap cannot hold a requested size (that pool keeps its old size).
+    pub fn configure(&mut self, eval: usize, call: usize, cb_queue: usize, anim_slots: usize) -> bool {
+        let depth = |v: usize, def: usize, min: usize| if v == 0 { def } else { v.clamp(min, 255) };
+        self.reset();
+        let mut ok = true;
+        match try_alloc_slice(depth(eval, STACK_SIZE, 4), 0) {
+            Some(b) => self.stack = b,
+            None => ok = false,
+        }
+        match try_alloc_slice(depth(call, CALL_STACK_SIZE, 1), EMPTY_FRAME) {
+            Some(b) => self.call_stack = b,
+            None => ok = false,
+        }
+        match try_alloc_slice(depth(cb_queue, CB_QUEUE_SIZE, 2), EMPTY_CB) {
+            Some(b) => self.cb_queue = b,
+            None => ok = false,
+        }
+        self.anim_slots = anim_slots.min(255) as u8;
+        self.anims = Vec::new();
+        if self.anim_slots > 0 && self.anims.try_reserve_exact(self.anim_slots as usize).is_err() {
+            ok = false;
+        }
+        ok
+    }
+
+    /// Current `(eval_stack, call_stack, cb_queue)` depths.
+    pub fn limits(&self) -> (usize, usize, usize) {
+        (self.stack.len(), self.call_stack.len(), self.cb_queue.len())
     }
 
     // === Variable access (sparse map) ===
@@ -826,7 +871,7 @@ impl Vm {
     /// Enqueue a callback to be executed later via drain_callbacks().
     /// Dropped silently if the queue is full.
     pub fn enqueue_callback(&mut self, offset: u16, args: &[i32]) {
-        let next_tail = (self.cb_tail + 1) % CB_QUEUE_SIZE as u8;
+        let next_tail = (self.cb_tail + 1) % self.cb_queue.len() as u8;
         if next_tail == self.cb_head {
             return; // queue full — drop
         }
@@ -859,7 +904,7 @@ impl Vm {
             return false;
         }
         let req = self.cb_queue[self.cb_head as usize];
-        self.cb_head = (self.cb_head + 1) % CB_QUEUE_SIZE as u8;
+        self.cb_head = (self.cb_head + 1) % self.cb_queue.len() as u8;
 
         self.push_state(req.offset);
         for i in 0..req.arg_count as usize {
@@ -955,7 +1000,7 @@ impl Vm {
             }
         };
 
-        if (self.call_sp as usize) >= CALL_STACK_SIZE {
+        if (self.call_sp as usize) >= self.call_stack.len() {
             self.fail(fault::CALL_OVERFLOW);
             return;
         }
@@ -1090,10 +1135,8 @@ impl Vm {
     fn push_state(&mut self, offset: u16) {
         let snapshot = VmSnapshot {
             pc: self.pc,
-            sp: self.sp,
-            stack: self.stack,
-            call_sp: self.call_sp,
-            call_stack: self.call_stack,
+            stack: self.stack[..self.sp as usize].to_vec(),
+            call_stack: self.call_stack[..self.call_sp as usize].to_vec(),
             target: self.target,
             state: self.state,
             wait_until: self.wait_until,
@@ -1126,10 +1169,10 @@ impl Vm {
     fn pop_state(&mut self) {
         if let Some(snap) = self.saved.pop() {
             self.pc = snap.pc;
-            self.sp = snap.sp;
-            self.stack = snap.stack;
-            self.call_sp = snap.call_sp;
-            self.call_stack = snap.call_stack;
+            self.sp = snap.stack.len() as u8;
+            self.stack[..snap.stack.len()].copy_from_slice(&snap.stack);
+            self.call_sp = snap.call_stack.len() as u8;
+            self.call_stack[..snap.call_stack.len()].copy_from_slice(&snap.call_stack);
             self.target = snap.target;
             self.state = snap.state;
             self.wait_until = snap.wait_until;
@@ -1198,7 +1241,7 @@ impl Vm {
     }
 
     pub fn push_arg(&mut self, val: i32) {
-        if (self.sp as usize) < STACK_SIZE {
+        if (self.sp as usize) < self.stack.len() {
             self.stack[self.sp as usize] = val;
             self.sp += 1;
         }
@@ -1652,7 +1695,7 @@ impl Vm {
             }
             OP_CALL => {
                 let target = self.read_u16();
-                if (self.call_sp as usize) < CALL_STACK_SIZE {
+                if (self.call_sp as usize) < self.call_stack.len() {
                     self.call_stack[self.call_sp as usize] = CallFrame {
                         ret_addr: self.pc,
                         frame_base: self.frame_base,
@@ -1774,15 +1817,20 @@ impl Vm {
             OP_F_READ => {
                 let addr = self.read_u32();
                 let len = self.read_u16() as usize;
-                if len > (STACK_SIZE - self.sp as usize) {
+                if len > (self.stack.len() - self.sp as usize) {
                     self.fail(fault::STACK_OVERFLOW);
                     return;
                 }
-                let mut buf = [0u8; STACK_SIZE];
-                let read_len = if len > STACK_SIZE { STACK_SIZE } else { len };
-                ctx.flash.read(addr, &mut buf[..read_len]);
-                for i in 0..read_len {
-                    self.push(buf[i] as i32);
+                // Read in fixed chunks: the stack depth is a runtime value.
+                let mut buf = [0u8; 16];
+                let mut done = 0;
+                while done < len {
+                    let n = (len - done).min(buf.len());
+                    ctx.flash.read(addr + done as u32, &mut buf[..n]);
+                    for &b in &buf[..n] {
+                        self.push(b as i32);
+                    }
+                    done += n;
                 }
             }
             OP_F_WRITE => {
@@ -2323,7 +2371,7 @@ impl Vm {
     // --- Stack operations ---
 
     fn push(&mut self, val: i32) {
-        if (self.sp as usize) < STACK_SIZE {
+        if (self.sp as usize) < self.stack.len() {
             self.stack[self.sp as usize] = val;
             self.sp += 1;
         } else {
@@ -2618,10 +2666,19 @@ impl Vm {
 
     // === Animation engine ===
 
+    /// Animation slot cap: RES_SYSCFG `anim_slots`, else the BSP's `P::ANIM_SLOTS`.
+    fn anim_cap<P: Platform>(&self) -> usize {
+        if self.anim_slots > 0 {
+            self.anim_slots as usize
+        } else {
+            P::ANIM_SLOTS
+        }
+    }
+
     /// Begin (or replace) a tween on `target`'s `prop_id`. The starting value
     /// is the property's current value (sampled now). A tween already running
     /// on the same (target, prop) is overwritten so the newest call wins.
-    /// Silently dropped when the per-BSP pool (`P::ANIM_SLOTS`) is full.
+    /// Silently dropped when the pool (`anim_cap`) is full.
     fn start_anim<P: Platform>(
         &mut self,
         ctx: &Ctx<P>,
@@ -2657,7 +2714,7 @@ impl Vm {
         // Reuse a finished slot, else append while under the per-BSP cap.
         if let Some(slot) = self.anims.iter_mut().find(|a| !a.active) {
             *slot = anim;
-        } else if self.anims.len() < P::ANIM_SLOTS {
+        } else if self.anims.len() < self.anim_cap::<P>() {
             self.anims.push(anim);
         }
     }
@@ -3225,6 +3282,79 @@ mod anim_tests {
         }
         assert_eq!(vm.anims.len(), MockPlatform::ANIM_SLOTS);
         assert_eq!(MockPlatform::ANIM_SLOTS, 8);
+    }
+
+    #[test]
+    fn configured_anim_cap_overrides_platform() {
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        assert!(vm.configure(0, 0, 0, 3));
+        let props = [PROP_LOC_X, PROP_LOC_Y, PROP_SIZE_W, PROP_SIZE_H, PROP_BG_COLOR];
+        for &p in &props {
+            let id = one_widget(&mut ctx);
+            vm.start_anim(&ctx, id, p, 10, 100, 0, 0, 0);
+        }
+        assert_eq!(vm.anims.len(), 3);
+    }
+
+    #[test]
+    fn configure_zero_keeps_defaults() {
+        let mut vm = Vm::new();
+        assert!(vm.configure(0, 0, 0, 0));
+        assert_eq!(vm.limits(), (STACK_SIZE, CALL_STACK_SIZE, CB_QUEUE_SIZE));
+    }
+
+    #[test]
+    fn configured_eval_stack_sets_overflow_depth() {
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        assert!(vm.configure(4, 0, 0, 0));
+        vm.code = VmCode::Ram(alloc::vec![OP_PUSH_1; 5]);
+        vm.run(&mut ctx);
+        assert_eq!(vm.fault(), fault::STACK_OVERFLOW);
+        assert_eq!(vm.fault_pc(), 4, "5th push overflows a 4-deep stack");
+
+        // Deeper than the default 16: 20 pushes then HALT run cleanly.
+        let mut vm = Vm::new();
+        assert!(vm.configure(32, 0, 0, 0));
+        let mut code = alloc::vec![OP_PUSH_1; 20];
+        code.push(OP_HALT);
+        vm.code = VmCode::Ram(code);
+        vm.run(&mut ctx);
+        assert!(vm.state != VmState::Error);
+        assert_eq!(vm.sp, 20);
+    }
+
+    #[test]
+    fn callback_snapshot_restores_live_stack() {
+        let mut vm = Vm::new();
+        assert!(vm.configure(8, 4, 0, 0));
+        vm.push_arg(7);
+        vm.push_arg(9);
+        vm.push_state(0);
+        assert_eq!(vm.sp, 0, "callback starts on an empty eval stack");
+        vm.push_arg(1);
+        vm.push_arg(2);
+        vm.push_arg(3);
+        vm.pop_state();
+        assert_eq!(vm.sp, 2);
+        assert_eq!(&vm.stack[..2], &[7, 9]);
+    }
+
+    #[test]
+    fn configured_cb_queue_capacity() {
+        let mut vm = Vm::new();
+        assert!(vm.configure(0, 0, 3, 0));
+        for i in 0..5 {
+            vm.enqueue_callback(i, &[]);
+        }
+        // A ring of N slots holds N-1 entries.
+        let mut n = 0;
+        while vm.cb_head != vm.cb_tail {
+            vm.cb_head = (vm.cb_head + 1) % vm.cb_queue.len() as u8;
+            n += 1;
+        }
+        assert_eq!(n, 2);
     }
 
     fn run_code(code: &[u8]) -> Vm {

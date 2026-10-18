@@ -281,6 +281,9 @@ pub struct WidgetTree {
     widget_free: Vec<WidgetId>,
     /// Same idea for ext slots, so destroyed widget extensions don't leak.
     ext_free: Vec<u16>,
+    /// Runtime caps (≤ MAX_WIDGETS / MAX_EXTENSIONS), set from RES_SYSCFG.
+    max_widgets: u16,
+    max_ext: u16,
 }
 
 impl WidgetTree {
@@ -293,13 +296,31 @@ impl WidgetTree {
             dfs_valid: false,
             widget_free: Vec::new(),
             ext_free: Vec::new(),
+            max_widgets: MAX_WIDGETS as u16,
+            max_ext: MAX_EXTENSIONS as u16,
         }
+    }
+
+    /// Cap live widgets / extensions (0 = compile-time maximum). Values above
+    /// `MAX_WIDGETS` / `MAX_EXTENSIONS` are clamped. Does not shrink an
+    /// existing tree; applied at boot, before the program allocates.
+    pub fn set_limits(&mut self, widgets: usize, exts: usize) {
+        let cap = |v: usize, max: usize| if v == 0 { max } else { v.min(max) } as u16;
+        self.max_widgets = cap(widgets, MAX_WIDGETS);
+        self.max_ext = cap(exts, MAX_EXTENSIONS);
+    }
+
+    /// Current `(widgets, extensions)` caps.
+    pub fn limits(&self) -> (usize, usize) {
+        (self.max_widgets as usize, self.max_ext as usize)
     }
 
     /// Pre-allocate capacity for widget_count user widgets and ext_count extensions.
     /// Called once after image header is parsed, before any alloc() calls run.
     /// This prevents heap fragmentation from interleaved Vec doublings.
     pub fn reserve(&mut self, widget_count: usize, ext_count: usize) {
+        let widget_count = widget_count.min(self.max_widgets as usize);
+        let ext_count = ext_count.min(self.max_ext as usize);
         self.widgets.reserve(widget_count);
         self.extensions.reserve(ext_count);
         self.dfs_cache.reserve(widget_count + 1);
@@ -317,7 +338,7 @@ impl WidgetTree {
     }
 
     /// Allocate a new widget. Reuses slots freed via `destroy_subtree` (FIFO)
-    /// before growing the Vec. Returns None if `MAX_WIDGETS` exhausted.
+    /// before growing the Vec. Returns None if the widget cap is exhausted.
     pub fn alloc(&mut self) -> Option<WidgetId> {
         if !self.widget_free.is_empty() {
             let id = self.widget_free.remove(0);
@@ -327,7 +348,7 @@ impl WidgetTree {
             self.dfs_valid = false;
             return Some(id);
         }
-        if self.widgets.len() >= MAX_WIDGETS {
+        if self.widgets.len() >= self.max_widgets as usize {
             return None;
         }
         let id = WidgetId(self.widgets.len() as u16);
@@ -391,7 +412,7 @@ impl WidgetTree {
             self.widgets[id.index()].ext = reused;
             return Some(&mut self.extensions[reused as usize]);
         }
-        if self.extensions.len() >= MAX_EXTENSIONS {
+        if self.extensions.len() >= self.max_ext as usize {
             return None;
         }
         let new_idx = self.extensions.len() as u16;
@@ -810,5 +831,26 @@ impl WidgetTree {
     /// Only valid after ensure_dfs() and until the next structural mutation.
     pub fn dfs_at(&self, i: usize) -> WidgetId {
         self.dfs_cache[i]
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn set_limits_caps_alloc_and_ext() {
+        let mut tree = WidgetTree::new();
+        tree.set_limits(2, 1);
+        assert_eq!(tree.limits(), (2, 1));
+        let a = tree.alloc().unwrap();
+        let b = tree.alloc().unwrap();
+        assert!(tree.alloc().is_none());
+        assert!(tree.ensure_ext(a).is_some());
+        assert!(tree.ensure_ext(b).is_none());
+
+        // 0 = compile-time maximum; oversized values clamp to it.
+        tree.set_limits(0, 5000);
+        assert_eq!(tree.limits(), (MAX_WIDGETS, MAX_EXTENSIONS));
     }
 }

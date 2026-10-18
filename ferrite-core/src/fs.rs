@@ -9,7 +9,7 @@
 ///   immediately after  : Resource data (packed)
 ///
 /// Resources are accessed by name (null-terminated ASCII, max 15 chars).
-/// Kind: Font=0, Image=1, Program=2, Page=3, File=4
+/// Kind: Font=0, Image=1, Program=2, Page=3, File=4, SysCfg=5
 use crate::flash::{FlashBackend, FlashImpl};
 
 // --- Layout constants ---
@@ -44,6 +44,8 @@ pub const RES_IMAGE: u8 = 1;
 pub const RES_PROGRAM: u8 = 2;
 pub const RES_PAGE: u8 = 3;
 pub const RES_FILE: u8 = 4;
+/// System configuration record (pool sizes) — see [`crate::syscfg`].
+pub const RES_SYSCFG: u8 = 5;
 
 // --- Header (flash'tan okunan, RAM'de cache) ---
 

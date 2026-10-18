@@ -134,9 +134,16 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - `0x001010 - 0x001FFF`: Resource Table (max 127 entries × 32B)
   - `0x002000+`: Resource data (packed)
 - **Entry format (32B):** name[16] + kind(1) + pad(3) + offset(4) + size(4) + reserved(4)
-- **Resource types:** Font=0, Image=1, Program=2, Page=3, File=4
+- **Resource types:** Font=0, Image=1, Program=2, Page=3, File=4, SysCfg=5
 - **API:** `mount()`, `find(name)`, `read_resource()`, `count_by_kind()`, `find_nth_by_kind()`, `verify_checksum()`
 - **RAM cost:** 12 bytes (header cache only — table stays in flash)
+
+### System Config (RES_SYSCFG)
+- **Purpose:** Per-image sizing of the runtime pools, applied once at boot right after `Fs::mount` (FS writes reboot, so pools never resize under a running program). No heap-size field — the heap is linker-sized (`__sheap`..`_heap_end`, `_stack_size` in `memory.x`), and every configurable pool is allocated from it.
+- **Embedding:** `project.json` → `"memory": {"strpool_bytes", "max_strings", "uart_rx_bytes", "max_widgets", "max_ext", "eval_stack", "call_stack", "cb_queue", "anim_slots"}` → 32-byte entry named `"sys"`. Omitted key / 0 = firmware default; no `"memory"` block = no entry = all defaults.
+- **Record (LE):** magic `"SC"` u16, version u8 (=1), rsvd u8, strpool_bytes u32, max_strings u16, uart_rx_bytes u16, max_widgets u16, max_ext u16, eval_stack u8, call_stack u8, cb_queue u8, anim_slots u8, 12 B reserved. Layout duplicated in `syscfg.rs` and `tools/ferrite_build.py` (`SYSCFG_FIELDS`) — keep in sync.
+- **Apply (`runtime::apply_syscfg`):** `usart.set_rx_capacity` (`UsartBackend` hook; nextion: heap ring, power of two 16 B–32 KB; other BSPs ignore it), `strpool.configure`, `tree.set_limits` (+ `reserve_tree` preallocates to the caps), `vm.configure` (eval/call ≤ 255, queue ≥ 2; snapshots save only the live stack prefix).
+- **Errors:** malformed entry → Code 8 (invalid system config); a pool the heap can't hold → Code 7 (insufficient memory).
 
 ### User Files (RES_FILE)
 - **Purpose:** Arbitrary user data accessible from ferrite programs — config, level data, raw tables.
@@ -289,7 +296,8 @@ ferrite-ui/                  (workspace root — virtual manifest + shared relea
 - [x] Embedded font (FreeMono9pt7b, in ROM, no flash required)
 - [x] USART protobuf protocol (ping/pong, execute, restart, fs write, meminfo, stackinfo)
 - [x] Startup sequence (backlight → display → recovery check → font → fs → vm)
-- [x] Error protocol (display + USART, 7 error codes)
+- [x] Error protocol (display + USART, 8 error codes)
+- [x] RES_SYSCFG — per-image pool sizes (UART RX, strpool, VM stacks, anim/widget caps), heap-allocated at boot
 - [x] Touch event → VM callback (on_click, on_tap, on_paint, on_touch_down/up/move)
 - [x] Touch gestures (swipe left/right/up/down, long press — global callbacks OnSwipe=10, OnLongPress=11)
 - [x] Iterative render (flat DFS instead of recursive, DFS cache)

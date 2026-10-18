@@ -57,6 +57,7 @@ ERROR_DESCRIPTIONS = {
     5: "no file system in flash",
     6: "program execution error",
     7: "insufficient memory",
+    8: "invalid system config",
 }
 
 # VM fault codes (error 6 detail) — keep in sync with `vm::fault` in vm.rs

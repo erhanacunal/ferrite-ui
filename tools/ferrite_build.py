@@ -57,8 +57,18 @@ JSON format:
     ],
     "files": [
       {"name": "config", "source": "data/config.bin"}
-    ]
+    ],
+    "memory": {
+      "strpool_bytes": 4096, "max_strings": 96, "uart_rx_bytes": 512,
+      "max_widgets": 200, "max_ext": 150,
+      "eval_stack": 32, "call_stack": 12, "cb_queue": 16, "anim_slots": 8
+    }
   }
+
+  "memory" is optional; it becomes the RES_SYSCFG entry "sys" that sizes the
+  runtime pools at boot (see ferrite-core/src/syscfg.rs). Omitted keys keep
+  the firmware default. All pools come out of the heap, so an oversized
+  request fails at boot with error 7 (insufficient memory).
 """
 
 import json
@@ -86,6 +96,7 @@ RES_IMAGE = 1
 RES_PROGRAM = 2
 RES_PAGE = 3
 RES_FILE = 4
+RES_SYSCFG = 5
 
 # Resource flags (stored in entry reserved[0], byte 28)
 RES_FLAG_FLASH_EXEC = 0x01
@@ -325,6 +336,44 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty") ->
 
 
 # --- Flash filesystem builder ---
+
+# RES_SYSCFG record — keep in sync with ferrite-core/src/syscfg.rs.
+SYSCFG_NAME = "sys"
+SYSCFG_MAGIC = 0x4353  # "SC" LE
+SYSCFG_VERSION = 1
+# key -> (struct offset, struct format, max value)
+SYSCFG_FIELDS = {
+    "strpool_bytes": (4, "<I", 0xFFFFFFFF),
+    "max_strings": (8, "<H", 0xFFFE),
+    "uart_rx_bytes": (10, "<H", 32 * 1024),
+    "max_widgets": (12, "<H", 1024),
+    "max_ext": (14, "<H", 1024),
+    "eval_stack": (16, "<B", 255),
+    "call_stack": (17, "<B", 255),
+    "cb_queue": (18, "<B", 255),
+    "anim_slots": (19, "<B", 255),
+}
+
+
+def build_syscfg(memory: dict) -> bytes:
+    """project.json "memory" block -> 32-byte RES_SYSCFG record."""
+    unknown = set(memory) - set(SYSCFG_FIELDS)
+    if unknown:
+        raise ValueError(f"memory: unknown key(s) {', '.join(sorted(unknown))} "
+                         f"(valid: {', '.join(SYSCFG_FIELDS)})")
+    rec = bytearray(32)
+    struct.pack_into("<HB", rec, 0, SYSCFG_MAGIC, SYSCFG_VERSION)
+    for key, value in memory.items():
+        offset, fmt, max_value = SYSCFG_FIELDS[key]
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= max_value:
+            raise ValueError(f"memory.{key}: expected an integer 0..{max_value}, got {value!r}")
+        if key == "uart_rx_bytes" and value & (value - 1):
+            rounded = 1 << value.bit_length()
+            print(f"warning: memory.uart_rx_bytes {value} is not a power of two — "
+                  f"firmware rounds it up to {rounded}", file=sys.stderr)
+        struct.pack_into(fmt, rec, offset, value)
+    return bytes(rec)
+
 
 def build_fs(project: dict, resources: list[tuple[str, int, bytes, int]],
              fs_base: int = FS_BASE) -> bytes:
@@ -605,7 +654,14 @@ def build(project_path: str, output_path: str) -> dict:
         data = source.read_bytes()
         resources.append((name, RES_FILE, data, 0))
 
-    # 6. Build flash binary
+    # 6. System configuration — optional "memory" block sizes the runtime pools.
+    memory = project.get("memory")
+    if memory is not None:
+        if not isinstance(memory, dict):
+            raise ValueError('"memory" must be an object')
+        resources.append((SYSCFG_NAME, RES_SYSCFG, build_syscfg(memory), 0))
+
+    # 7. Build flash binary
     fs_binary = build_fs(project, resources, fs_base)
     Path(output_path).write_bytes(fs_binary)
     if fs_base != FS_BASE:
@@ -710,7 +766,8 @@ def main():
     print(f"  Widgets:   {wc_label}")
     print()
 
-    KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE", RES_FILE: "FILE"}
+    KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE",
+                  RES_FILE: "FILE", RES_SYSCFG: "SYSCFG"}
     for name, kind, size in stats["details"]:
         print(f"  {KIND_NAMES.get(kind, '?'):>7s}  {name:<16s}  {size:>6d} bytes")
 

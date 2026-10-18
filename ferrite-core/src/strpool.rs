@@ -1,30 +1,38 @@
-/// Static string pool for VM string operations.
+/// String pool for VM string operations.
 ///
-/// Buffer lives in BSS (static RAM) — zero heap allocations, no fragmentation.
-/// Metadata (offsets, lengths) lives in StringPool struct inside Ctx (heap via Box<Ctx>).
+/// The buffer, the string metadata and the `smart_clear` scratch table are
+/// heap slices allocated once — at construction with the default capacity,
+/// then again by [`StringPool::configure`] when the image's `RES_SYSCFG`
+/// requests a different size. Strings never allocate individually, so the
+/// pool causes no fragmentation at runtime.
 /// Compacting smart_clear preserves widget text while reclaiming temporaries.
 ///
-/// Capacity is selected at compile time. The default (2 KB buffer / 64 strings)
-/// suits small RAM targets; BSPs with plenty of RAM enable the `strpool_large`
-/// feature for a 1 MB buffer / 256 strings. The string-metadata word width (`Off`)
+/// The default capacity is selected at compile time (2 KB buffer / 64 strings)
+/// and suits small RAM targets; BSPs with plenty of RAM enable the
+/// `strpool_large` feature for a 1 MB buffer / 256 strings. The string-metadata word width (`Off`)
 /// follows the capacity: `u16` (4-byte `StrMeta`) on the small profile, `u32`
 /// (8-byte `StrMeta`, strings/buffer past 64 KB) on the large profile.
 ///
-/// RAM cost: `POOL_SIZE` bytes BSS (pool buffer) + `MAX_STRINGS` × size_of::<StrMeta>.
+/// RAM cost (heap): pool bytes + slots × (size_of::<StrMeta>() + 2).
+extern crate alloc;
+
+use alloc::boxed::Box;
+
+use crate::syscfg::try_alloc_slice;
 use crate::widget::{WidgetId, WidgetTree};
 
 #[cfg(not(feature = "strpool_large"))]
-const POOL_SIZE: usize = 2048;
+const DEFAULT_POOL_SIZE: usize = 2048;
 #[cfg(not(feature = "strpool_large"))]
-const MAX_STRINGS: usize = 64;
+const DEFAULT_MAX_STRINGS: usize = 64;
 /// Offset/length word for the small profile — buffer ≤ 64 KB.
 #[cfg(not(feature = "strpool_large"))]
 type Off = u16;
 
 #[cfg(feature = "strpool_large")]
-const POOL_SIZE: usize = 1024 * 1024;
+const DEFAULT_POOL_SIZE: usize = 1024 * 1024;
 #[cfg(feature = "strpool_large")]
-const MAX_STRINGS: usize = 256;
+const DEFAULT_MAX_STRINGS: usize = 256;
 /// Offset/length word for the large profile — buffer past 64 KB.
 #[cfg(feature = "strpool_large")]
 type Off = u32;
@@ -32,13 +40,10 @@ type Off = u32;
 const STR_NONE: u16 = 0xFFFF;
 const FMT_BUF_SIZE: usize = 32;
 
-/// Pool buffer in BSS — static RAM, not heap. Single-threaded bare-metal.
-static mut POOL_BUF: [u8; POOL_SIZE] = [0u8; POOL_SIZE];
-
-#[inline]
-fn pool_buf() -> &'static mut [u8; POOL_SIZE] {
-    unsafe { &mut *core::ptr::addr_of_mut!(POOL_BUF) }
-}
+/// Largest pool buffer the metadata word can address.
+const MAX_POOL_SIZE: usize = Off::MAX as usize;
+/// Largest slot count: ids are `u16` and `STR_NONE` is reserved.
+const MAX_SLOTS: usize = STR_NONE as usize;
 
 #[derive(Clone, Copy)]
 struct StrMeta {
@@ -53,27 +58,84 @@ impl StrMeta {
 }
 
 pub struct StringPool {
-    meta: [StrMeta; MAX_STRINGS],
+    buf: Box<[u8]>,
+    meta: Box<[StrMeta]>,
+    /// smart_clear scratch: keep marker + old→new id remap, one per slot.
+    remap: Box<[u16]>,
     count: u16,
     next: Off,
 }
 
 impl StringPool {
+    /// Pool with the compile-time default capacity.
     pub fn new() -> Self {
+        let mut pool = Self::empty();
+        // Boot-time allocation on an empty heap; failing here is fatal anyway.
+        assert!(pool.alloc_storage(DEFAULT_POOL_SIZE, DEFAULT_MAX_STRINGS));
+        pool
+    }
+
+    fn empty() -> Self {
         Self {
-            meta: [StrMeta::empty(); MAX_STRINGS],
+            buf: Box::new([]),
+            meta: Box::new([]),
+            remap: Box::new([]),
             count: 0,
             next: 0,
         }
     }
 
+    /// Resize the pool to `bytes` / `strings` (0 = compile-time default),
+    /// clamped to what the metadata width can address. Clears all strings.
+    /// Returns false if the heap cannot hold the requested size; the pool then
+    /// falls back to the default capacity (or stays empty if even that fails).
+    pub fn configure(&mut self, bytes: usize, strings: usize) -> bool {
+        let bytes = if bytes == 0 { DEFAULT_POOL_SIZE } else { bytes.min(MAX_POOL_SIZE) };
+        let strings = if strings == 0 { DEFAULT_MAX_STRINGS } else { strings.min(MAX_SLOTS) };
+        self.clear();
+        if bytes == self.buf.len() && strings == self.meta.len() {
+            return true;
+        }
+        // Release the old storage first so the allocator can reuse it.
+        *self = Self::empty();
+        if self.alloc_storage(bytes, strings) {
+            return true;
+        }
+        self.alloc_storage(DEFAULT_POOL_SIZE, DEFAULT_MAX_STRINGS);
+        false
+    }
+
+    fn alloc_storage(&mut self, bytes: usize, strings: usize) -> bool {
+        let (Some(buf), Some(meta), Some(remap)) = (
+            try_alloc_slice(bytes, 0u8),
+            try_alloc_slice(strings, StrMeta::empty()),
+            try_alloc_slice(strings, STR_NONE),
+        ) else {
+            return false;
+        };
+        self.buf = buf;
+        self.meta = meta;
+        self.remap = remap;
+        true
+    }
+
+    /// Pool buffer size in bytes.
+    pub fn capacity_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Maximum number of live strings.
+    pub fn capacity_strings(&self) -> usize {
+        self.meta.len()
+    }
+
     /// Allocate a string from a byte slice. Returns string ID (u16) or None if full.
     pub fn alloc(&mut self, data: &[u8]) -> Option<u16> {
         let len = data.len();
-        if self.count as usize >= MAX_STRINGS || self.next as usize + len > POOL_SIZE {
+        if self.count as usize >= self.meta.len() || self.next as usize + len > self.buf.len() {
             return None;
         }
-        let buf = pool_buf();
+        let buf = &mut self.buf;
         let id = self.count;
         let offset = self.next;
         buf[offset as usize..offset as usize + len].copy_from_slice(data);
@@ -99,7 +161,7 @@ impl StringPool {
             return &[];
         }
         let m = &self.meta[id as usize];
-        let buf = pool_buf();
+        let buf = &self.buf;
         &buf[m.offset as usize..m.offset as usize + m.len as usize]
     }
 
@@ -131,10 +193,10 @@ impl StringPool {
         let a_meta = self.meta[a as usize];
         let b_meta = self.meta[b as usize];
         let total = a_meta.len as usize + b_meta.len as usize;
-        if self.count as usize >= MAX_STRINGS || self.next as usize + total > POOL_SIZE {
+        if self.count as usize >= self.meta.len() || self.next as usize + total > self.buf.len() {
             return None;
         }
-        let buf = pool_buf();
+        let buf = &mut self.buf;
         let id = self.count;
         let offset = self.next as usize;
         // Copy a (byte-by-byte — src and dst in the same buffer)
@@ -178,10 +240,10 @@ impl StringPool {
         }
         let pos = pos.min(old_len);
         let new_len = old_len + 1;
-        if self.next as usize + new_len > POOL_SIZE {
+        if self.next as usize + new_len > self.buf.len() {
             return false;
         }
-        let buf = pool_buf();
+        let buf = &mut self.buf;
         let src = m.offset as usize;
         let dst = self.next as usize;
         // Copy bytes before pos
@@ -218,10 +280,10 @@ impl StringPool {
             self.meta[id as usize].len = 0;
             return true;
         }
-        if self.next as usize + new_len > POOL_SIZE {
+        if self.next as usize + new_len > self.buf.len() {
             return false;
         }
-        let buf = pool_buf();
+        let buf = &mut self.buf;
         let src = m.offset as usize;
         let dst = self.next as usize;
         // Copy bytes before pos
@@ -242,7 +304,7 @@ impl StringPool {
 
     /// Smart clear: keep strings referenced by widget text_id fields,
     /// compact survivors to the front, remap widget references.
-    /// Zero heap allocations — uses u32 bitmask + iterates widget array directly.
+    /// Zero heap allocations — uses the preallocated `remap` scratch table.
     pub fn smart_clear(&mut self, tree: &mut WidgetTree) {
         if self.count == 0 {
             return;
@@ -251,40 +313,46 @@ impl StringPool {
         let wcount = tree.count();
 
         // Phase 1: Build keep set from widget text_ids. Skip destroyed
-        // widgets — their text references are about to be reclaimed. A flat
-        // bool array scales to any MAX_STRINGS (no 64-bit bitmask limit) and
-        // still allocates nothing on the heap.
-        let mut keep = [false; MAX_STRINGS];
+        // widgets — their text references are about to be reclaimed.
+        // `remap[id] == KEEP` marks a survivor; everything else is STR_NONE.
+        const KEEP: u16 = 0;
+        let old_count = self.count as usize;
+        let remap = &mut self.remap;
+        remap[..old_count].fill(STR_NONE);
+        let mut any_kept = false;
         for i in 0..wcount {
             let wid = WidgetId(i as u16);
             if !tree.is_live(wid) {
                 continue;
             }
             let text_id = tree.text_id(wid);
-            if text_id != STR_NONE && (text_id as usize) < MAX_STRINGS {
-                keep[text_id as usize] = true;
+            if text_id != STR_NONE && (text_id as usize) < old_count {
+                remap[text_id as usize] = KEEP;
+                any_kept = true;
             }
         }
 
         // If nothing to keep, just clear
-        if !keep.iter().any(|&k| k) {
-            self.clear();
+        if !any_kept {
+            self.count = 0;
+            self.next = 0;
             return;
         }
 
-        // Phase 2: Compact survivors to front with new sequential IDs
-        let buf = pool_buf();
-        let old_count = self.count as usize;
-        let mut remap = [STR_NONE; MAX_STRINGS];
+        // Phase 2: Compact survivors to front with new sequential IDs.
+        // A survivor's remap entry is overwritten with its new id; dropped
+        // strings (and empty survivors) go back to STR_NONE.
+        let buf = &mut self.buf;
         let mut new_id: u16 = 0;
         let mut write_pos: Off = 0;
 
         for old_id in 0..old_count {
-            if !keep[old_id] {
+            if remap[old_id] != KEEP {
                 continue;
             }
             let m = self.meta[old_id];
             if m.len == 0 {
+                remap[old_id] = STR_NONE;
                 continue;
             }
             let src = m.offset as usize;
@@ -316,7 +384,7 @@ impl StringPool {
             }
             let text_id = tree.text_id(wid);
             if text_id != STR_NONE && (text_id as usize) < old_count {
-                let new = remap[text_id as usize];
+                let new = self.remap[text_id as usize];
                 if let Some(ext) = tree.ext_mut(wid) {
                     ext.text_id = new;
                 }
@@ -791,4 +859,51 @@ pub fn parse_float(pool: &StringPool, id: u16) -> u32 {
         result = -result;
     }
     result.to_bits()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configure_sets_capacity_and_limits_alloc() {
+        let mut pool = StringPool::new();
+        assert_eq!(pool.capacity_bytes(), DEFAULT_POOL_SIZE);
+        assert_eq!(pool.capacity_strings(), DEFAULT_MAX_STRINGS);
+
+        assert!(pool.configure(8, 2));
+        assert_eq!((pool.capacity_bytes(), pool.capacity_strings()), (8, 2));
+        assert!(pool.alloc(b"abcd").is_some());
+        assert!(pool.alloc(b"efghi").is_none(), "exceeds 8-byte buffer");
+        assert!(pool.alloc(b"efgh").is_some());
+        assert!(pool.alloc(b"").is_none(), "only 2 slots");
+
+        // 0 = back to the defaults.
+        assert!(pool.configure(0, 0));
+        assert_eq!(pool.capacity_bytes(), DEFAULT_POOL_SIZE);
+        assert_eq!(pool.capacity_strings(), DEFAULT_MAX_STRINGS);
+    }
+
+    #[test]
+    fn smart_clear_keeps_and_remaps_widget_text() {
+        let mut pool = StringPool::new();
+        assert!(pool.configure(64, 4));
+        let mut tree = WidgetTree::new();
+        let w = tree.alloc().unwrap();
+
+        let tmp = pool.alloc(b"temp").unwrap();
+        let kept = pool.alloc(b"label").unwrap();
+        assert_eq!((tmp, kept), (0, 1));
+        tree.ensure_ext(w).unwrap().text_id = kept;
+
+        pool.smart_clear(&mut tree);
+        let new_id = tree.text_id(w);
+        assert_eq!(new_id, 0, "survivor compacted to the front");
+        assert_eq!(pool.get(new_id), b"label");
+        // Freed capacity is reusable up to the configured slot count.
+        assert!(pool.alloc(b"a").is_some());
+        assert!(pool.alloc(b"b").is_some());
+        assert!(pool.alloc(b"c").is_some());
+        assert!(pool.alloc(b"d").is_none());
+    }
 }
