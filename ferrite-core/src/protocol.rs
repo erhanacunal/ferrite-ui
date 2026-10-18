@@ -499,12 +499,15 @@ pub fn send_meminfo<U: UsartBackend>(usart: &UsartImpl<U>, free_bytes: u32) {
 }
 
 /// Send stack info: Field 5, Payload type — tag + length(8) + used(u32 LE) + free(u32 LE)
-pub fn send_stackinfo<U: UsartBackend>(usart: &UsartImpl<U>, used: u32, free: u32) {
-    // tag = (5 << 3) | 2 = 0x2A, length = 8
+/// Payload: used u32 + free u32 (current SP) + peak u32 (high-water mark, 0 =
+/// not measured) = 12 bytes.
+pub fn send_stackinfo<U: UsartBackend>(usart: &UsartImpl<U>, used: u32, free: u32, peak: u32) {
+    // tag = (5 << 3) | 2 = 0x2A, length = 12
     usart.write_byte(0x2A);
-    usart.write_byte(8);
+    usart.write_byte(12);
     usart.write(&used.to_le_bytes());
     usart.write(&free.to_le_bytes());
+    usart.write(&peak.to_le_bytes());
 }
 
 /// Send touch calibration result: Field 4, Payload type

@@ -72,6 +72,6 @@ fn _mock_instantiation_guard() {
     let _: fn(&usart::Usart, u8) = protocol::send_error;
     let _: fn(&usart::Usart) = protocol::send_pong;
     let _: fn(&usart::Usart, u32) = protocol::send_meminfo;
-    let _: fn(&usart::Usart, u32, u32) = protocol::send_stackinfo;
+    let _: fn(&usart::Usart, u32, u32, u32) = protocol::send_stackinfo;
     let _: fn(&usart::Usart, &touch::CalParams) = protocol::send_touch_cal;
 }

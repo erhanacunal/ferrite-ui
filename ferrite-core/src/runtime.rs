@@ -114,6 +114,12 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
         (0, 0)
     }
 
+    /// Deepest stack usage since boot in bytes (high-water mark), reported by
+    /// the `StackInfo` command alongside `stack_info`. 0 = not measured.
+    fn stack_peak() -> u32 {
+        0
+    }
+
     /// `(free_bytes, largest_free_block)` reported by the `MemInfo` USART
     /// command. Defaults to the lib's static heap; BSPs that supply their own
     /// global allocator (feature `external_alloc`) override this to report
@@ -320,7 +326,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                 }
                 RxEvent::StackInfo => {
                     let (used, free) = P::stack_info();
-                    protocol::send_stackinfo(&ctx.usart, used, free);
+                    protocol::send_stackinfo(&ctx.usart, used, free, P::stack_peak());
                 }
                 RxEvent::SetDateTime => {
                     let dt = protocol.datetime();

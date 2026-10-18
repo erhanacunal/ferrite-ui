@@ -27,6 +27,7 @@ mod flash;
 mod lcd;
 mod rtc;
 mod sdcard;
+mod stack;
 mod systick;
 mod touch;
 mod usart;
@@ -259,6 +260,8 @@ unsafe extern "C" {
 
 #[entry]
 fn main() -> ! {
+    // First: paint the unused stack so StackInfo can report the peak.
+    stack::paint();
     system_init();
     // Heap = all RAM between the end of .bss and the stack reserve
     // (`__sheap` / `_heap_end`, from cortex-m-rt's link.x and memory.x).

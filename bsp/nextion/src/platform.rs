@@ -97,17 +97,15 @@ impl PlatformRuntime for NextionPlatform {
     }
 
     fn stack_info() -> (u32, u32) {
-        let sp: u32;
-        unsafe { core::arch::asm!("mov {}, sp", out(reg) sp) };
         // Stack runs from `_stack_start` (top of RAM) down to `_heap_end`.
-        unsafe extern "C" {
-            static _stack_start: u8;
-        }
-        let top = (&raw const _stack_start) as u32;
-        let bottom = (&raw const crate::_heap_end) as u32;
-        let used = top.saturating_sub(sp);
-        let free = sp.saturating_sub(bottom);
+        let sp = crate::stack::current_sp();
+        let used = crate::stack::top().saturating_sub(sp);
+        let free = sp.saturating_sub(crate::stack::bottom());
         (used, free)
+    }
+
+    fn stack_peak() -> u32 {
+        crate::stack::peak()
     }
 
     fn boot(ctx: &mut Ctx<Self>, touch: &mut TouchImpl<Self::TouchB>) -> u8 {

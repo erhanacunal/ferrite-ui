@@ -44,7 +44,7 @@ TAG_ERROR    = (1 << 3) | 2   # 0x0A, payload
 TAG_PONG     = (2 << 3) | 0   # 0x10, varint
 TAG_MEMINFO_RESP = (3 << 3) | 0  # 0x18, varint (free heap bytes)
 TAG_TOUCHCAL_RESP = (4 << 3) | 2  # 0x22, payload (calibration result, 9 bytes)
-TAG_STACKINFO_RESP = (5 << 3) | 2  # 0x2A, payload (stack used + free, 8 bytes)
+TAG_STACKINFO_RESP = (5 << 3) | 2  # 0x2A, payload (used + free [+ peak], 8 or 12 bytes)
 
 BAUD_RATE = 115200
 DEFAULT_TIMEOUT = 5.0  # seconds
@@ -172,7 +172,8 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             return ("meminfo", free_bytes)
 
         if tag == TAG_STACKINFO_RESP:
-            # Payload type — read length + 8 bytes (used u32 LE + free u32 LE)
+            # Payload type — read length + used u32 LE + free u32 LE
+            # [+ peak u32 LE: high-water mark, 0 = not measured; older firmware omits it]
             length_bytes = bytearray()
             while True:
                 b = ser.read(1)
@@ -189,7 +190,8 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
                 return ("timeout", None)
             used = int.from_bytes(payload[0:4], "little")
             free = int.from_bytes(payload[4:8], "little")
-            return ("stackinfo", (used, free))
+            peak = int.from_bytes(payload[8:12], "little") if length >= 12 else 0
+            return ("stackinfo", (used, free, peak))
 
         if tag == TAG_ERROR or tag == TAG_TOUCHCAL_RESP:
             # Read length varint
@@ -277,11 +279,14 @@ def cmd_stackinfo(ser: serial.Serial) -> bool:
 
     resp_type, resp_val = read_response(ser)
     if resp_type == "stackinfo":
-        used, free = resp_val
+        used, free, peak = resp_val
         total = used + free
         print(f"stack used: {used} bytes ({used / 1024:.1f} KB)")
         print(f"stack free: {free} bytes ({free / 1024:.1f} KB)")
         print(f"stack total: {total} bytes ({total / 1024:.1f} KB)")
+        if peak:
+            print(f"stack peak: {peak} bytes ({peak / 1024:.1f} KB, "
+                  f"{100 * peak / total:.0f}% of total, {total - peak} bytes never touched)")
         return True
     elif resp_type == "error":
         desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
