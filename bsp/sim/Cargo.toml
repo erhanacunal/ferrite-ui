@@ -7,6 +7,11 @@ edition = "2024"
 name = "sim"
 path = "src/main.rs"
 
+[features]
+# Render like the write-only Nextion: no alpha blending, anti-aliasing mixed
+# against renderer-known underlay colours (LcdBackend::AA_UNDERLAY).
+no-readback = []
+
 [dependencies]
 ferrite-core = { path = "../../ferrite-core", features = ["host", "wide_code"] }
 minifb = "0.27"

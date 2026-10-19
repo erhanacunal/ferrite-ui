@@ -25,6 +25,13 @@ pub trait LcdBackend {
     /// (`caps.alpha` / `caps.image_alpha`).
     const HAS_ALPHA: bool = false;
 
+    /// Anti-alias circles, rings, arcs, rounded rects and lines without
+    /// readback: edge pixels are mixed against the colour the renderer says
+    /// lies underneath (`LcdImpl::set_underlay`) and written opaque. For
+    /// write-only panels (Nextion). Integer-only — ellipses and polygon fills
+    /// stay aliased. Irrelevant when `HAS_ALPHA` is set.
+    const AA_UNDERLAY: bool = false;
+
     fn begin_frame(&mut self);
     fn end_frame(&mut self);
     fn back_buf(&self) -> u8;
@@ -95,6 +102,27 @@ pub struct LcdImpl<B: LcdBackend> {
     /// geometry-drawing shape primitives, which take no clip of their own.
     /// `None` (the normal case) is a single branch with no other cost.
     scissor: Cell<Option<Rect>>,
+    /// What lies under the shape being drawn, for `AA_UNDERLAY` backends;
+    /// `None` = unknown, draw aliased.
+    underlay: Cell<Option<Underlay>>,
+}
+
+/// Colours known to lie under a shape, for anti-aliasing without readback
+/// (`LcdBackend::AA_UNDERLAY`): `outer` behind its outer edge, `inner` in a
+/// ring's hole (e.g. a border drawn over its widget's fill), `sweep` past an
+/// arc's ends (e.g. a gauge value arc over its track).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Underlay {
+    pub outer: u16,
+    pub inner: u16,
+    pub sweep: u16,
+}
+
+impl Underlay {
+    /// One colour under every edge.
+    pub const fn solid(c: u16) -> Self {
+        Underlay { outer: c, inner: c, sweep: c }
+    }
 }
 
 impl<B: LcdBackend> LcdImpl<B> {
@@ -102,6 +130,50 @@ impl<B: LcdBackend> LcdImpl<B> {
         Self {
             be,
             scissor: Cell::new(None),
+            underlay: Cell::new(None),
+        }
+    }
+
+    /// Whether lines/circles/arcs/rounded rects are drawn anti-aliased
+    /// (`smooth.rs`) right now: always on readback backends; on
+    /// `AA_UNDERLAY` ones while an underlay is set.
+    #[inline]
+    pub fn smooth(&self) -> bool {
+        B::HAS_ALPHA || (B::AA_UNDERLAY && self.underlay.get().is_some())
+    }
+
+    /// `smooth()` for an ellipse primitive: without readback only circles
+    /// (`round`) are anti-aliased.
+    #[inline]
+    fn smooth_round(&self, round: bool) -> bool {
+        B::HAS_ALPHA || (B::AA_UNDERLAY && round && self.underlay.get().is_some())
+    }
+
+    /// Set what lies under the next shapes (`AA_UNDERLAY` backends; the
+    /// renderer sets it per widget). `None` = unknown: those backends then
+    /// draw aliased (e.g. VM `on_paint` drawing).
+    #[inline]
+    pub fn set_underlay(&self, u: Option<Underlay>) {
+        self.underlay.set(u);
+    }
+
+    #[inline]
+    pub fn underlay(&self) -> Option<Underlay> {
+        self.underlay.get()
+    }
+
+    /// Whether the renderer should supply underlays (`AA_UNDERLAY` without
+    /// readback).
+    #[inline]
+    pub fn wants_underlay(&self) -> bool {
+        B::AA_UNDERLAY && !B::HAS_ALPHA
+    }
+
+    /// Replace the underlay's colours if one is set (keeps "unknown" as is).
+    #[inline]
+    pub fn update_underlay(&self, f: impl FnOnce(Underlay) -> Underlay) {
+        if let Some(u) = self.underlay.get() {
+            self.underlay.set(Some(f(u)));
         }
     }
 
@@ -265,7 +337,7 @@ impl<B: LcdBackend> LcdImpl<B> {
     }
 
     pub fn draw_line(&self, x0: i16, y0: i16, x1: i16, y1: i16, color: u16) {
-        if B::HAS_ALPHA {
+        if self.smooth() {
             self.smooth_line(x0, y0, x1, y1, 128, color);
             return;
         }
@@ -300,7 +372,7 @@ impl<B: LcdBackend> LcdImpl<B> {
     /// Blend-capable backends draw one anti-aliased round-capped stroke.
     pub fn draw_line_thick(&self, x0: i16, y0: i16, x1: i16, y1: i16, color: u16, thickness: u16) {
         let t = thickness.max(1);
-        if B::HAS_ALPHA {
+        if self.smooth() {
             self.smooth_line(x0, y0, x1, y1, t as i32 * 128, color);
             return;
         }
@@ -329,6 +401,17 @@ impl<B: LcdBackend> LcdImpl<B> {
         if points.len() < 2 {
             return;
         }
+        if self.smooth() {
+            // One anti-aliased path: each pixel shared by neighbouring
+            // segments is drawn once, by the segment covering it most.
+            let n = if closed && points.len() > 2 { points.len() } else { points.len() - 1 };
+            let seg = |j: usize| (points[j], points[(j + 1) % points.len()]);
+            let hw = thickness.max(1) as i32 * 128;
+            for k in 0..n {
+                self.smooth_path_segment(k, n, closed && n > 2, hw, color, seg);
+            }
+            return;
+        }
         for i in 0..points.len() - 1 {
             let a = points[i];
             let b = points[i + 1];
@@ -338,6 +421,44 @@ impl<B: LcdBackend> LcdImpl<B> {
             let a = points[points.len() - 1];
             let b = points[0];
             self.draw_line_thick(a.x, a.y, b.x, b.y, color, thickness);
+        }
+    }
+
+    /// `draw_polyline` without anti-aliasing (e.g. a polygon outline over an
+    /// aliased fill on a write-only backend, where a soft inner edge would
+    /// mix toward the wrong colour).
+    pub fn draw_polyline_hard(&self, points: &[Offset], color: u16, closed: bool, thickness: u16) {
+        // Without an underlay only readback backends stay smooth.
+        let u = self.underlay.take();
+        self.draw_polyline(points, color, closed, thickness);
+        self.underlay.set(u);
+    }
+
+    /// Tapered stroke from `a` (radius `ra_q8`, 1/256 px) to `b` (radius
+    /// `rb_q8`) with round ends — e.g. a gauge needle including its hub.
+    /// Anti-aliased when `smooth()`; otherwise a straight line as thick as
+    /// the average diameter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_wedge(&self, ax: i16, ay: i16, bx: i16, by: i16, ra_q8: i32, rb_q8: i32, color: u16) {
+        if self.smooth() {
+            self.smooth_wedge(ax, ay, bx, by, ra_q8, rb_q8, color);
+        } else {
+            let t = ((ra_q8 + rb_q8) / 256).max(1) as u16;
+            self.draw_line_thick(ax, ay, bx, by, color, t);
+        }
+    }
+
+    /// A pen for long polylines built point by point (graph curves), so the
+    /// caller needn't buffer them: anti-aliased like `draw_polyline` when
+    /// `smooth()`, else plain `draw_line` segments.
+    pub fn pen(&self, color: u16, thickness: u16) -> LinePen<'_, B> {
+        LinePen {
+            lcd: self,
+            smooth: self.smooth(),
+            color,
+            hw: thickness.max(1) as i32 * 128,
+            win: [Offset { x: 0, y: 0 }; PEN_WINDOW],
+            count: 0,
         }
     }
 
@@ -407,7 +528,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if r <= 0 {
             return;
         }
-        if B::HAS_ALPHA {
+        if self.smooth() {
             self.smooth_ring(cx, cy, r, r, r, r, None, color, 255);
             return;
         }
@@ -431,7 +552,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if r <= 0 {
             return;
         }
-        if B::HAS_ALPHA {
+        if self.smooth() {
             self.smooth_ring(cx, cy, r, r, 0, 0, None, color, 255);
             return;
         }
@@ -449,7 +570,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if rx <= 0 || ry <= 0 {
             return;
         }
-        if B::HAS_ALPHA {
+        if self.smooth_round(rx == ry) {
             self.smooth_ring(cx, cy, rx, ry, 0, 0, None, color, 255);
             return;
         }
@@ -469,7 +590,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if rx <= 0 || ry <= 0 || thickness <= 0 {
             return;
         }
-        if B::HAS_ALPHA {
+        if self.smooth_round(rx == ry) {
             // Inner edge at (r - t) + ½, the same ring the spans below fill.
             let (irx, iry) = (rx - thickness + 1, ry - thickness + 1);
             self.smooth_ring(cx, cy, rx, ry, irx, iry, None, color, 255);
@@ -495,7 +616,7 @@ impl<B: LcdBackend> LcdImpl<B> {
     /// the soft fringe stays inside the box; others use the centre/radius
     /// primitives at `(x + w/2, y + h/2)`, radii `w/2`, `h/2`.
     pub fn draw_oval(&self, x: i16, y: i16, w: u16, h: u16, t: u16, color: u16) {
-        if B::HAS_ALPHA {
+        if self.smooth_round(w == h) {
             self.smooth_oval(x, y, w, h, t, color);
             return;
         }
@@ -512,7 +633,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if rx <= 0 || ry <= 0 {
             return;
         }
-        if B::HAS_ALPHA {
+        if self.smooth_round(rx == ry) {
             self.smooth_ring(cx, cy, rx, ry, rx, ry, None, color, 255);
             return;
         }
@@ -604,7 +725,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if w == 0 || h == 0 {
             return;
         }
-        if B::HAS_ALPHA && r > 0 {
+        if self.smooth() && r > 0 {
             self.smooth_round_rect(x as i16, y as i16, w, h, r, 1, color, 255);
             return;
         }
@@ -665,7 +786,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if t == 0 || w == 0 || h == 0 {
             return;
         }
-        if B::HAS_ALPHA && r > 0 {
+        if self.smooth() && r > 0 {
             self.smooth_round_rect(x, y, w, h, r, t, color, 255);
             return;
         }
@@ -686,7 +807,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if w == 0 || h == 0 {
             return;
         }
-        if B::HAS_ALPHA && r > 0 {
+        if self.smooth() && r > 0 {
             self.smooth_round_rect(x as i16, y as i16, w, h, r, 0, color, 255);
             return;
         }
@@ -737,7 +858,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if w == 0 || h == 0 {
             return;
         }
-        if B::HAS_ALPHA && r > 0 {
+        if self.smooth() && r > 0 {
             self.smooth_round_rect(x as i16, y as i16, w, h, r, 0, color, alpha);
             return;
         }
@@ -842,7 +963,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if r <= 0 {
             return;
         }
-        if B::HAS_ALPHA {
+        if self.smooth() {
             self.smooth_ring(cx, cy, r, r, r, r, Some((start, end)), color, 255);
             return;
         }
@@ -874,7 +995,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         if r <= 0 {
             return;
         }
-        if B::HAS_ALPHA {
+        if self.smooth() {
             self.smooth_ring(cx, cy, r, r, ir, ir, Some((start, end)), color, 255);
             return;
         }
@@ -944,6 +1065,8 @@ impl<B: LcdBackend> LcdImpl<B> {
         if w == 0 || h == 0 {
             return;
         }
+        // Readback backends only: on write-only ones the gradient variant of
+        // the rasterizer would cost ~2.5 KB of flash for corner pixels.
         if B::HAS_ALPHA && r > 0 {
             self.smooth_gradient_round_rect(x as i16, y as i16, w, h, r, c1, c2, dir);
             return;
@@ -1048,6 +1171,78 @@ impl<B: LcdBackend> LcdImpl<B> {
         for _ in 0..w {
             self.write_pixel(grad.next());
         }
+    }
+}
+
+/// Points a `LinePen` keeps: a segment is drawn once `smooth::PATH_WINDOW`
+/// segments after it are known (it needs them to share pixels).
+const PEN_WINDOW: usize = 2 * smooth::PATH_WINDOW + 2;
+
+/// Streaming polyline (see `LcdImpl::pen`). Call `to` for each point, then
+/// `finish` (also run on drop).
+pub struct LinePen<'a, B: LcdBackend> {
+    lcd: &'a LcdImpl<B>,
+    smooth: bool,
+    color: u16,
+    hw: i32,
+    /// The last `PEN_WINDOW` points; point `i` is at `win[i % PEN_WINDOW]`.
+    win: [Offset; PEN_WINDOW],
+    /// Points received.
+    count: usize,
+}
+
+impl<B: LcdBackend> LinePen<'_, B> {
+    pub fn to(&mut self, x: i16, y: i16) {
+        let p = Offset { x, y };
+        if !self.smooth {
+            if self.count > 0 {
+                let q = self.win[0];
+                self.lcd.draw_line(q.x, q.y, x, y, self.color);
+            }
+            self.win[0] = p;
+            self.count += 1;
+            return;
+        }
+        self.win[self.count % PEN_WINDOW] = p;
+        self.count += 1;
+        // Segment k = count - W - 2 now has its W following segments.
+        if self.count >= smooth::PATH_WINDOW + 2 {
+            self.segment(self.count - smooth::PATH_WINDOW - 2, usize::MAX);
+        }
+    }
+
+    /// Draw the segments still waiting for followers.
+    pub fn finish(&mut self) {
+        if !self.smooth || self.count < 2 {
+            self.count = 0;
+            return;
+        }
+        let first = self.count.saturating_sub(smooth::PATH_WINDOW + 1);
+        for k in first..self.count - 1 {
+            self.segment(k, self.count - 1);
+        }
+        self.count = 0;
+    }
+
+    /// Draw segment `k` of a path with `n` segments (`usize::MAX` = more
+    /// to come; only segments within the window are consulted either way).
+    fn segment(&self, k: usize, n: usize) {
+        let known = self.count - 1;
+        let lo = k.saturating_sub(smooth::PATH_WINDOW);
+        let win = &self.win;
+        // Re-index the window so the path helper sees segments lo.. as 0..
+        let seg = |j: usize| {
+            let i = j + lo;
+            (win[i % PEN_WINDOW], win[(i + 1) % PEN_WINDOW])
+        };
+        let n = n.min(known) - lo;
+        self.lcd.smooth_path_segment(k - lo, n, false, self.hw, self.color, seg);
+    }
+}
+
+impl<B: LcdBackend> Drop for LinePen<'_, B> {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 

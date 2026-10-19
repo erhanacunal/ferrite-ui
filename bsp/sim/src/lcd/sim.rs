@@ -129,8 +129,10 @@ impl LcdBackend for SimLcd {
 
     // The sim deliberately supports alpha even though nextion.json says
     // caps.alpha = false: it is the host test vehicle for the tdo_y13
-    // framebuffer path. Non-alpha behavior is covered by the defaults.
-    const HAS_ALPHA: bool = true;
+    // framebuffer path. Build with `--features no-readback` to render like
+    // the Nextion instead (no blending; underlay anti-aliasing).
+    const HAS_ALPHA: bool = !cfg!(feature = "no-readback");
+    const AA_UNDERLAY: bool = cfg!(feature = "no-readback");
     fn begin_frame(&mut self) {
         self.fb.begin();
     }

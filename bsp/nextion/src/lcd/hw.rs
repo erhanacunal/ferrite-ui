@@ -48,6 +48,8 @@ impl FpgaLcd {
 impl LcdBackend for FpgaLcd {
     const WIDTH: u16 = 800;
     const HEIGHT: u16 = 480;
+    // No readback on the FPGA bus: anti-alias against renderer-known colours.
+    const AA_UNDERLAY: bool = true;
     fn begin_frame(&mut self) {
         if self.lcd4 == self.lcd5 {
             self.lcd5 ^= 1;

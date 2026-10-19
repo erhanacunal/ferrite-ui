@@ -1,9 +1,11 @@
-//! Anti-aliased ("smooth") primitives for blend-capable backends
-//! (`LcdBackend::HAS_ALPHA`). The public `LcdImpl` primitives route here when
-//! the backend can blend, so the Nextion/e-paper builds compile all of this
-//! out. Edge pixels get a coverage value and go through `blend_pixel`; solid
-//! interiors stay as `fill_rect` spans, so filled shapes cost about the same
-//! as their aliased versions.
+//! Anti-aliased ("smooth") primitives. The public `LcdImpl` primitives route
+//! here on blend-capable backends (`LcdBackend::HAS_ALPHA`), where edge pixels
+//! go through `blend_pixel`, and — for the integer-only subset (circles,
+//! rings, arcs, rounded rects, lines) — on write-only backends that opt into
+//! `LcdBackend::AA_UNDERLAY`, where each edge pixel is mixed against the
+//! colour the renderer says lies underneath (`LcdImpl::set_underlay`) and
+//! written opaque. Solid interiors stay as `fill_rect` spans either way, so
+//! filled shapes cost about the same as their aliased versions.
 //!
 //! Coverage conventions follow TFT_eSPI's smooth graphics, which this module
 //! adapts (integer-only — the ARM926 targets have no FPU, except the ellipse
@@ -56,7 +58,7 @@
 //! either expressed or implied, of the FreeBSD Project.
 //! ---------------------------------------------------------------------------
 
-use super::{LcdBackend, LcdImpl, isqrt, lerp_rgb565, sin_cos_deg};
+use super::{LcdBackend, LcdImpl, Underlay, isqrt, lerp_rgb565, sin_cos_deg};
 use crate::types::Offset;
 use alloc::vec::Vec;
 
@@ -109,6 +111,32 @@ fn mul8(a: u8, b: u8) -> u8 {
     ((p + (p >> 8)) >> 8) as u8
 }
 
+/// Coverage of one pixel by a shape's edges: the outer edge `o`, a ring's
+/// hole edge `i` and an arc's end edge `a` (255 = not on that edge). The
+/// pixel's coverage is their product; without readback, each partial edge
+/// mixes against its own underlay colour (`Underlay`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Cov {
+    o: u8,
+    i: u8,
+    a: u8,
+}
+
+impl Cov {
+    const ZERO: Cov = Cov { o: 0, i: 255, a: 255 };
+
+    /// Coverage by a single (outer) edge.
+    #[inline]
+    const fn edge(o: u8) -> Self {
+        Cov { o, i: 255, a: 255 }
+    }
+
+    #[inline]
+    fn total(self) -> u8 {
+        mul8(mul8(self.o, self.i), self.a)
+    }
+}
+
 /// Largest `dx >= 0` with `dx² + dy² < limit²` (`-1` when none).
 #[inline]
 fn ext_lt(limit: i32, dy: i32) -> i32 {
@@ -154,7 +182,9 @@ fn ramp(v: f32) -> u8 {
 /// pixel coordinate `c2 / 2` (odd = between two pixels), solid out to radius
 /// `r2 / 2` and 50 % at `r2 / 2 + ½`, the hole's edge 50 % at `ir2 / 2 − ½`
 /// (`ir2 <= 2` = no hole). Circles take the integer `sqrt_fraction` path,
-/// ellipses a float distance estimate.
+/// ellipses a float distance estimate — only when the caller passes
+/// `float = true` (blend-capable backends), so write-only builds carry no
+/// float code; they only ever draw circles.
 struct Ring {
     rx2: i32,
     ry2: i32,
@@ -199,9 +229,10 @@ impl Ring {
         if self.circle { self.ry2 + 2 } else { self.ry2 + 4 }
     }
 
-    fn row(&self, dy2: i32) -> Option<RingRow> {
+    #[inline(always)]
+    fn row(&self, dy2: i32, float: bool) -> Option<RingRow> {
         let dy2 = dy2.abs();
-        if self.circle {
+        if self.circle || !float {
             let r2 = self.rx2;
             let outer = ext_lt(r2 + 2, dy2);
             if outer < 0 {
@@ -246,8 +277,9 @@ impl Ring {
     }
 
     /// Ring coverage of the pixel at doubled offset `(dx2, dy2)`.
-    fn cov(&self, dx2: i32, dy2: i32) -> u8 {
-        if self.circle {
+    #[inline(always)]
+    fn cov(&self, dx2: i32, dy2: i32, float: bool) -> Cov {
+        if self.circle || !float {
             // n = (2d)²; outer ramp = r + 1 − d, inner = d − ir + 1 (TFT_eSPI's
             // `~sqrt_fraction(d²)` / `sqrt_fraction(d²)` at whole-pixel centres).
             let n = (dx2 * dx2 + dy2 * dy2) as u32;
@@ -260,7 +292,7 @@ impl Ring {
                 ((((r2 + 2) << 8) as i32 - sqrt_q8(n)) / 2).clamp(0, 255) as u8
             };
             if !self.hole || co == 0 {
-                return co;
+                return Cov::edge(co);
             }
             let ir2 = self.irx2 as u32;
             let ci = if n >= ir2 * ir2 {
@@ -270,21 +302,21 @@ impl Ring {
             } else {
                 ((sqrt_q8(n) - ((ir2 - 2) << 8) as i32) / 2).clamp(0, 255) as u8
             };
-            mul8(co, ci)
+            Cov { o: co, i: ci, a: 255 }
         } else {
             // The estimate drifts near the tips of thin ellipses; nothing at
             // or past the ramp's bounding box can be covered.
             if dx2.abs() >= self.rx2 + 2 || dy2.abs() >= self.ry2 + 2 {
-                return 0;
+                return Cov::ZERO;
             }
             let (fx, fy) = (dx2 as f32 * 0.5, dy2 as f32 * 0.5);
             let (a, b) = ((self.rx2 + 1) as f32 * 0.5, (self.ry2 + 1) as f32 * 0.5);
             let co = ramp(0.5 - ellipse_sd(fx, fy, a, b));
             if !self.hole || co == 0 {
-                return co;
+                return Cov::edge(co);
             }
             let (ia, ib) = ((self.irx2 - 1) as f32 * 0.5, (self.iry2 - 1) as f32 * 0.5);
-            mul8(co, ramp(0.5 + ellipse_sd(fx, fy, ia, ib)))
+            Cov { o: co, i: ramp(0.5 + ellipse_sd(fx, fy, ia, ib)), a: 255 }
         }
     }
 }
@@ -360,21 +392,55 @@ enum Seg {
 }
 
 impl<B: LcdBackend> LcdImpl<B> {
+    /// Draw an edge pixel with coverage `c` (and widget `alpha`): blended
+    /// over the frame buffer on readback backends, else mixed against the
+    /// underlay of the edge that is partial and written opaque.
+    fn aa_cov(&self, x: i32, y: i32, color: u16, c: Cov, alpha: u8) {
+        if B::HAS_ALPHA {
+            let a = mul8(c.total(), alpha);
+            if a != 0 {
+                self.blend_pixel(x as u16, y as u16, color, a);
+            }
+            return;
+        }
+        let total = c.total();
+        if total == 0 {
+            return;
+        }
+        // What shows through is behind the partial edge. Where several
+        // edges are partial at once (thin rings, arc corners) it is a mix;
+        // the outer underlay is the closest single colour.
+        let u = self.underlay.get().unwrap_or(Underlay::solid(0));
+        let partial = (c.o < 255) as u8 + (c.i < 255) as u8 + (c.a < 255) as u8;
+        let back = if partial > 1 || c.o < 255 {
+            u.outer
+        } else if c.i < 255 {
+            u.inner
+        } else {
+            u.sweep
+        };
+        let total = mul8(total, alpha);
+        self.draw_pixel(x as u16, y as u16, lerp_rgb565(back, color, total as u16, 255));
+    }
+
     #[inline]
     fn aa_px(&self, x: i32, y: i32, color: u16, a: u8) {
-        if a != 0 {
-            self.blend_pixel(x as u16, y as u16, color, a);
-        }
+        self.aa_cov(x, y, color, Cov::edge(a), 255);
     }
 
     fn aa_span(&self, x0: i32, x1: i32, y: i32, color: u16, alpha: u8) {
+        let l = x0.max(0);
+        if x1 < l {
+            return;
+        }
         if alpha == 255 {
             self.hline_clipped(x0 as i16, x1 as i16, y as i16, color);
+        } else if B::HAS_ALPHA {
+            self.blend_rect(l as u16, y as u16, (x1 - l + 1) as u16, 1, color, alpha);
         } else {
-            let l = x0.max(0);
-            if x1 >= l {
-                self.blend_rect(l as u16, y as u16, (x1 - l + 1) as u16, 1, color, alpha);
-            }
+            let back = self.underlay.get().map_or(0, |u| u.outer);
+            let c = lerp_rgb565(back, color, alpha as u16, 255);
+            self.hline_clipped(x0 as i16, x1 as i16, y as i16, c);
         }
     }
 
@@ -402,7 +468,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         paint: Paint,
         alpha: u8,
         seg: impl Fn(i32) -> Seg,
-        cov: impl Fn(i32) -> u8,
+        cov: impl Fn(i32) -> Cov,
     ) {
         let xm = s.div_euclid(2);
         let flush = |a: i32, b: i32| {
@@ -425,16 +491,15 @@ impl<B: LcdBackend> LcdImpl<B> {
                 }
                 Seg::Eval => {
                     let c = cov(px);
-                    if c == 255 {
+                    if c.total() == 255 {
                         run.get_or_insert(px);
                     } else {
                         if let Some(a) = run.take() {
                             flush(a, px - 1);
                         }
-                        let c = mul8(c, alpha);
-                        self.aa_px(px, y, paint.at(px), c);
+                        self.aa_cov(px, y, paint.at(px), c, alpha);
                         if s - px != px {
-                            self.aa_px(s - px, y, paint.at(s - px), c);
+                            self.aa_cov(s - px, y, paint.at(s - px), c, alpha);
                         }
                     }
                     px += 1;
@@ -449,6 +514,7 @@ impl<B: LcdBackend> LcdImpl<B> {
     /// Anti-aliased elliptical ring (sector), centred on pixel `(cx, cy)`,
     /// in the integer-radius convention of the aliased primitives:
     /// `irx`/`iry <= 1` fills the whole ellipse; `arc` limits it to a sweep.
+    /// Write-only backends may only pass circles (`rx == ry`, `irx == iry`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn smooth_ring(
         &self,
@@ -473,6 +539,7 @@ impl<B: LcdBackend> LcdImpl<B> {
     /// Anti-aliased ellipse inscribed in the `w`×`h` box at `(x, y)`: its
     /// edge (50 % coverage) runs along the box border, so the soft fringe
     /// stays inside the box. `t > 0` draws a ring `t` px wide instead.
+    /// Write-only backends may only pass squares.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn smooth_oval(&self, x: i16, y: i16, w: u16, h: u16, t: u16, color: u16) {
         if w == 0 || h == 0 {
@@ -485,11 +552,13 @@ impl<B: LcdBackend> LcdImpl<B> {
     }
 
     fn smooth_ring2(&self, cx2: i32, cy2: i32, ring: &Ring, arc: Option<(i16, i16)>, color: u16, alpha: u8) {
+        debug_assert!(B::HAS_ALPHA || ring.circle, "ellipses need a blend-capable backend");
+        let float = B::HAS_ALPHA;
         let sector = arc.and_then(|(s, e)| Sector::new(s, e));
         let reach = ring.reach();
         for y in (cy2 - reach).div_euclid(2)..=(cy2 + reach + 1).div_euclid(2) {
             let dy2 = 2 * y - cy2;
-            let Some(row) = ring.row(dy2) else { continue };
+            let Some(row) = ring.row(dy2, float) else { continue };
             // Left-most pixel with |dx2| <= outer.
             let x0 = (cx2 - row.outer + 1).div_euclid(2);
             match &sector {
@@ -509,7 +578,7 @@ impl<B: LcdBackend> LcdImpl<B> {
                             Seg::Eval
                         }
                     },
-                    |px| ring.cov(2 * px - cx2, dy2),
+                    |px| ring.cov(2 * px - cx2, dy2, float),
                 ),
                 Some(sec) => {
                     // Not mirror-symmetric: evaluate every ring pixel.
@@ -518,10 +587,10 @@ impl<B: LcdBackend> LcdImpl<B> {
                         if dx2.abs() <= row.hole {
                             continue;
                         }
-                        let c = ring.cov(dx2, dy2);
-                        if c != 0 {
-                            let c = mul8(mul8(c, sec.cov(dx2, dy2)), alpha);
-                            self.aa_px(px, y, color, c);
+                        let c = ring.cov(dx2, dy2, float);
+                        if c.o != 0 {
+                            let c = Cov { a: sec.cov(dx2, dy2), ..c };
+                            self.aa_cov(px, y, color, c, alpha);
                         }
                     }
                 }
@@ -605,10 +674,8 @@ impl<B: LcdBackend> LcdImpl<B> {
         let t = t as i32;
         let inner = t > 0 && w > 2 * t && h > 2 * t;
         if let (0, 0, Paint::Solid(color)) = (t, r, paint(y)) {
-            if alpha == 255 {
-                self.fill_rect(x as u16, y as u16, w as u16, h as u16, color);
-            } else {
-                self.blend_rect(x as u16, y as u16, w as u16, h as u16, color, alpha);
+            for row in y..y + h {
+                self.aa_span(x, x + w - 1, row, color, alpha);
             }
             return;
         }
@@ -626,15 +693,16 @@ impl<B: LcdBackend> LcdImpl<B> {
                 let dyi = (cyti - row).max(row - cybi).max(0);
                 (dyi, cxli - ext_lt(ri + 1, dyi), cxli - ext_le(ri, dyi))
             });
-            let cov = |px: i32| -> u8 {
+            let cov = |px: i32| -> Cov {
                 let dx = (cxl - px).max(0);
                 let co = disk_cov((dx * dx + dy * dy) as u32, r as u32);
                 match irow {
                     Some((dyi, _, _)) if co != 0 => {
                         let dxi = (cxli - px).max(0);
-                        mul8(co, !disk_cov((dxi * dxi + dyi * dyi) as u32, ri as u32))
+                        let ci = !disk_cov((dxi * dxi + dyi * dyi) as u32, ri as u32);
+                        Cov { o: co, i: ci, a: 255 }
                     }
-                    _ => co,
+                    _ => Cov::edge(co),
                 }
             };
             self.sym_row(
@@ -661,42 +729,31 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
     }
 
-    /// Anti-aliased line with round caps, `hw_q8` = half-width in 1/256 px
-    /// (128 = a 1 px line). TFT_eSPI `drawWedgeLine` with equal end radii,
-    /// in integer fixed point: coverage = `hw + ½ − distance to segment`.
-    /// Rows are scanned outward from the leftmost cap; the shape is convex,
+    /// Anti-aliased stroke (see `Stroke`), skipping pixels that a
+    /// neighbouring stroke of the same path covers more — that one draws
+    /// them (ties go to the earlier stroke) — so every pixel of a path is
+    /// written once, with the coverage of its strongest stroke.
+    /// Rows are scanned outward from the leftmost end; a stroke is convex,
     /// so each row's first covered pixel is never left of the previous one's.
-    pub(super) fn smooth_line(&self, ax: i16, ay: i16, bx: i16, by: i16, hw_q8: i32, color: u16) {
-        // Q16 distance² must fit isqrt's i32: cap the half-width at 150 px.
-        let reach_q8 = hw_q8.clamp(0, 150 << 8) + 128;
-        let reach = (reach_q8 + 255) >> 8;
-        let (ax, ay, bx, by) = (ax as i32, ay as i32, bx as i32, by as i32);
+    fn smooth_stroke(&self, main: &Stroke, nbrs: &[(Stroke, bool)], color: u16) {
+        let reach = (main.ra.max(main.ra + main.dr) + 128 + 255) >> 8;
+        let (ax, ay) = (main.ax, main.ay);
+        let (bx, by) = (ax + main.ux, ay + main.uy);
         let (x0, x1) = (ax.min(bx) - reach, ax.max(bx) + reach);
         let (y0, y1) = (ay.min(by) - reach, ay.max(by) + reach);
-        let (ux, uy) = ((bx - ax) as i64, (by - ay) as i64);
-        let l2 = ux * ux + uy * uy;
-        let lim2 = (reach_q8 as i64) * (reach_q8 as i64);
-
-        // 0..=256 coverage of pixel (px, py).
-        let cov = |px: i32, py: i32| -> i32 {
-            let (qx, qy) = ((px - ax) as i64, (py - ay) as i64);
-            let h = if l2 == 0 { 0 } else { (((qx * ux + qy * uy) << 16) / l2).clamp(0, 1 << 16) };
-            let ex = ((qx << 16) - ux * h) >> 8; // Q8
-            let ey = ((qy << 16) - uy * h) >> 8;
-            let d2 = ex * ex + ey * ey; // Q16
-            if d2 >= lim2 {
-                return 0;
-            }
-            (reach_q8 - isqrt(d2 as i32) as i32).min(256)
+        let ys = if ax * 256 - main.ra <= bx * 256 - (main.ra + main.dr) { ay } else { by };
+        let owned = |px: i32, py: i32, c: i32| {
+            nbrs.iter().all(|(n, before)| {
+                let cn = n.cov(px, py);
+                cn < c || (cn == c && !before)
+            })
         };
-
-        let ys = if ax <= bx { ay } else { by };
         let scan = |py: i32, xs: &mut i32| {
             let mut run: Option<i32> = None;
             let mut first = None;
             let mut px = (*xs - 1).max(x0);
             while px <= x1 {
-                let c = cov(px, py);
+                let c = main.cov(px, py);
                 if c <= 0 {
                     if first.is_some() {
                         break;
@@ -705,7 +762,11 @@ impl<B: LcdBackend> LcdImpl<B> {
                     continue;
                 }
                 first.get_or_insert(px);
-                if c >= 256 {
+                if !owned(px, py, c) {
+                    if let Some(a) = run.take() {
+                        self.aa_span(a, px - 1, py, color, 255);
+                    }
+                } else if c >= 256 {
                     run.get_or_insert(px);
                 } else {
                     if let Some(a) = run.take() {
@@ -730,6 +791,108 @@ impl<B: LcdBackend> LcdImpl<B> {
         for py in (y0..ys).rev() {
             scan(py, &mut xs);
         }
+    }
+
+    /// Anti-aliased line with round caps, `hw_q8` = half-width in 1/256 px
+    /// (128 = a 1 px line).
+    pub(super) fn smooth_line(&self, ax: i16, ay: i16, bx: i16, by: i16, hw_q8: i32, color: u16) {
+        let s = Stroke::new(Offset { x: ax, y: ay }, Offset { x: bx, y: by }, hw_q8, hw_q8);
+        self.smooth_stroke(&s, &[], color);
+    }
+
+    /// Anti-aliased tapered stroke: radius `ra_q8` at `a`, `rb_q8` at `b`
+    /// (1/256 px), round ends (TFT_eSPI `drawWedgeLine`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn smooth_wedge(&self, ax: i16, ay: i16, bx: i16, by: i16, ra_q8: i32, rb_q8: i32, color: u16) {
+        let s = Stroke::new(Offset { x: ax, y: ay }, Offset { x: bx, y: by }, ra_q8, rb_q8);
+        self.smooth_stroke(&s, &[], color);
+    }
+
+    /// Stroke segment `k` of a path whose segments `seg(j)` exist for
+    /// `j in 0..n` (wrapping when `closed`), owning shared pixels against
+    /// up to `PATH_WINDOW` segments either side.
+    pub(super) fn smooth_path_segment(
+        &self,
+        k: usize,
+        n: usize,
+        closed: bool,
+        hw_q8: i32,
+        color: u16,
+        seg: impl Fn(usize) -> (Offset, Offset),
+    ) {
+        let (a, b) = seg(k);
+        let main = Stroke::new(a, b, hw_q8, hw_q8);
+        let mut nbrs = [(main, false); 2 * PATH_WINDOW];
+        let mut m = 0;
+        for d in 1..=PATH_WINDOW.min(n.saturating_sub(1)) as isize {
+            for j in [k as isize - d, k as isize + d] {
+                let j = if closed {
+                    j.rem_euclid(n as isize)
+                } else if j < 0 || j >= n as isize {
+                    continue;
+                } else {
+                    j
+                } as usize;
+                if j == k || nbrs[..m].iter().any(|(s, _)| s.id == j as u32) {
+                    continue;
+                }
+                let (na, nb) = seg(j);
+                let mut s = Stroke::new(na, nb, hw_q8, hw_q8);
+                s.id = j as u32;
+                // Ties go to the lower index — the same rule from either
+                // side, so exactly one segment owns a tied pixel.
+                nbrs[m] = (s, j < k);
+                m += 1;
+            }
+        }
+        self.smooth_stroke(&main, &nbrs[..m], color);
+    }
+}
+
+/// Segments either side of a path segment that it shares pixels with.
+/// Covers 1 px spline steps under a few-pixel-wide line.
+pub(super) const PATH_WINDOW: usize = 3;
+
+/// A tapered round-capped stroke from `a` to `a + u`: radius `ra` (Q8 px)
+/// at `a`, `ra + dr` at the other end. Coverage = radius + ½ − distance to
+/// the segment, with the radius interpolated along it (TFT_eSPI
+/// `drawWedgeLine`, in integer fixed point).
+/// Kept small (i32 fields, widened in `cov`): paths hold a window of
+/// neighbours on the stack.
+#[derive(Clone, Copy)]
+struct Stroke {
+    ax: i32,
+    ay: i32,
+    ux: i32,
+    uy: i32,
+    ra: i32,
+    dr: i32,
+    /// Index within its path (for de-duplicating neighbours).
+    id: u32,
+}
+
+impl Stroke {
+    fn new(a: Offset, b: Offset, ra_q8: i32, rb_q8: i32) -> Self {
+        // Q16 distance² must fit isqrt's i32: cap radii at 150 px.
+        let (ra, rb) = (ra_q8.clamp(0, 150 << 8), rb_q8.clamp(0, 150 << 8));
+        let (ux, uy) = (b.x as i32 - a.x as i32, b.y as i32 - a.y as i32);
+        Stroke { ax: a.x as i32, ay: a.y as i32, ux, uy, ra, dr: rb - ra, id: u32::MAX }
+    }
+
+    /// 0..=256 coverage of pixel `(px, py)`.
+    fn cov(&self, px: i32, py: i32) -> i32 {
+        let (qx, qy) = ((px - self.ax) as i64, (py - self.ay) as i64);
+        let (ux, uy) = (self.ux as i64, self.uy as i64);
+        let l2 = ux * ux + uy * uy;
+        let h = if l2 == 0 { 0 } else { (((qx * ux + qy * uy) << 16) / l2).clamp(0, 1 << 16) };
+        let ex = ((qx << 16) - ux * h) >> 8; // Q8
+        let ey = ((qy << 16) - uy * h) >> 8;
+        let d2 = ex * ex + ey * ey; // Q16
+        let reach = (self.ra as i64 + ((self.dr as i64 * h) >> 16) + 128) as i32;
+        if d2 >= (reach as i64) * (reach as i64) {
+            return 0;
+        }
+        (reach - isqrt(d2 as i32) as i32).min(256)
     }
 }
 
@@ -1200,6 +1363,151 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Write-only grid (`AA_UNDERLAY`): records each pixel's colour and
+    /// write count. Blends are not available, so nothing may call them.
+    struct UlGrid {
+        color: RefCell<Vec<u16>>,
+        hits: RefCell<Vec<u8>>,
+    }
+    impl LcdBackend for UlGrid {
+        const WIDTH: u16 = N as u16;
+        const HEIGHT: u16 = N as u16;
+        const AA_UNDERLAY: bool = true;
+        fn begin_frame(&mut self) {}
+        fn end_frame(&mut self) {}
+        fn back_buf(&self) -> u8 {
+            0
+        }
+        fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, c: u16) {
+            for yy in y as usize..(y as usize + h as usize).min(N) {
+                for xx in x as usize..(x as usize + w as usize).min(N) {
+                    self.color.borrow_mut()[yy * N + xx] = c;
+                    self.hits.borrow_mut()[yy * N + xx] += 1;
+                }
+            }
+        }
+        fn blend_rect(&self, _: u16, _: u16, _: u16, _: u16, _: u16, _: u8) {
+            panic!("blend on a write-only backend");
+        }
+        fn blend_pixel(&self, _: u16, _: u16, _: u16, _: u8) {
+            panic!("blend on a write-only backend");
+        }
+        fn begin_pixels(&self, _: u16, _: u16, _: u16, _: u16) {}
+        fn write_pixel(&self, _: u16) {}
+        fn send_command(&self, _: u16) {}
+        fn send_data(&self, _: u16) {}
+    }
+
+    /// Draw on a fresh write-only grid pre-filled with `under`; returns
+    /// (colour, write counts).
+    fn draw_ul(under: Option<Underlay>, f: impl Fn(&LcdImpl<UlGrid>)) -> (Vec<u16>, Vec<u8>) {
+        let fill = under.map_or(0, |u| u.outer);
+        let lcd = LcdImpl::with_backend(UlGrid {
+            color: RefCell::new(alloc::vec![fill; N * N]),
+            hits: RefCell::new(alloc::vec![0; N * N]),
+        });
+        lcd.set_underlay(under);
+        f(&lcd);
+        let be = lcd.backend();
+        (be.color.borrow().clone(), be.hits.borrow().clone())
+    }
+
+    #[test]
+    fn underlay_edges_are_mixes_of_the_alpha_coverage() {
+        // Same shape on a blending grid gives the coverage; without readback
+        // each pixel must be exactly underlay ⊕ colour at that coverage.
+        let (under, ink) = (0x18E3u16, 0xFD20u16);
+        let cases: [(&str, fn(&LcdImpl<AlphaGrid>), fn(&LcdImpl<UlGrid>)); 4] = [
+            ("circle", |l| l.fill_circle(48, 48, 30, 0xFD20), |l| l.fill_circle(48, 48, 30, 0xFD20)),
+            ("rrect", |l| l.fill_rounded_rect(10, 20, 70, 40, 15, 0xFD20), |l| l.fill_rounded_rect(10, 20, 70, 40, 15, 0xFD20)),
+            ("line", |l| l.draw_line_thick(5, 10, 90, 70, 0xFD20, 3), |l| l.draw_line_thick(5, 10, 90, 70, 0xFD20, 3)),
+            ("arc", |l| l.fill_arc(48, 48, 40, 30, 135, 45, 0xFD20), |l| l.fill_arc(48, 48, 40, 30, 135, 45, 0xFD20)),
+        ];
+        for (what, fa, fu) in cases {
+            let (cov, _) = draw(|l| fa(l));
+            let (col, hits) = draw_ul(Some(Underlay::solid(under)), |l| fu(l));
+            assert_single_hits(&hits, what);
+            for p in 0..N * N {
+                let want = if cov[p] == 0 { under } else { lerp_rgb565(under, ink, cov[p] as u16, 255) };
+                assert_eq!(col[p], want, "{what}: pixel ({}, {})", p % N, p / N);
+            }
+        }
+    }
+
+    #[test]
+    fn ring_hole_edge_mixes_with_the_inner_underlay() {
+        // White fill inside, black outside, blue ring: inner-edge pixels are
+        // white⊕blue (R = G/2 > 0 or pure blue), outer-edge black⊕blue (R = G = 0).
+        let u = Underlay { outer: 0x0000, inner: 0xFFFF, sweep: 0x0000 };
+        let (col, hits) = draw_ul(Some(u), |l| l.stroke_ellipse(48, 48, 40, 40, 6, 0x001F));
+        for y in 0..N {
+            for x in 0..N {
+                if hits[y * N + x] == 0 {
+                    continue;
+                }
+                let c = col[y * N + x];
+                let d = libm::sqrt(((x as f64 - 48.0).powi(2) + (y as f64 - 48.0).powi(2)) as f64);
+                let (r, g) = (c >> 11, (c >> 5) & 0x3F);
+                if d > 30.0 && d < 37.5 && c != 0x001F {
+                    assert!(r > 0 && (g as i32 / 2 - r as i32).abs() <= 1, "({x},{y}) d={d:.1}: {c:#06x} not white⊕blue");
+                }
+                if d > 38.0 && d < 42.0 {
+                    assert!(r == 0 && g == 0, "({x},{y}) d={d:.1}: {c:#06x} not black⊕blue");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_underlay_draws_aliased() {
+        let (col, _) = draw_ul(None, |l| l.fill_circle(48, 48, 30, 0xFD20));
+        assert!(col.iter().all(|&c| c == 0 || c == 0xFD20), "mixed pixel without an underlay");
+    }
+
+    #[test]
+    fn paths_take_max_coverage_and_write_each_pixel_once() {
+        // A zig-zag of short segments (graph-like) plus a sharp V.
+        let zig: Vec<Offset> = (0..40).map(|i| Offset { x: 8 + 2 * i, y: 48 + if i % 2 == 0 { -3 } else { 3 } }).collect();
+        let vee = pts(&[(10, 10), (48, 80), (86, 10)]);
+        for (what, p, t) in [("zigzag", &zig, 1u16), ("vee", &vee, 4)] {
+            let (cov, hits) = draw(|l| l.draw_polyline(p, 1, false, t));
+            assert_single_hits(&hits, what);
+            // Max over the segments drawn on their own.
+            let mut want = alloc::vec![0u8; N * N];
+            for w in p.windows(2) {
+                let (c, _) = draw(|l| l.draw_line_thick(w[0].x, w[0].y, w[1].x, w[1].y, 1, t));
+                for i in 0..N * N {
+                    want[i] = want[i].max(c[i]);
+                }
+            }
+            for i in 0..N * N {
+                assert_eq!(cov[i], want[i], "{what}: pixel ({}, {})", i % N, i / N);
+            }
+        }
+    }
+
+    #[test]
+    fn pen_matches_polyline() {
+        let curve: Vec<Offset> = (0..60).map(|i| Offset { x: 5 + i, y: (48.0 + 30.0 * libm::sin(i as f64 / 7.0)) as i16 }).collect();
+        let (want, _) = draw(|l| l.draw_polyline(&curve, 1, false, 1));
+        let (got, hits) = draw(|l| {
+            let mut pen = l.pen(1, 1);
+            for p in &curve {
+                pen.to(p.x, p.y);
+            }
+        });
+        assert_single_hits(&hits, "pen");
+        assert!(got == want, "pen output differs from draw_polyline");
+    }
+
+    #[test]
+    fn wedge_writes_each_pixel_once() {
+        let (cov, hits) = draw(|l| l.draw_wedge(48, 48, 85, 20, 3 * 256 + 128, 256, 1));
+        assert_single_hits(&hits, "wedge");
+        assert_eq!(cov[48 * N + 48], 255);
+        assert!(cov[48 * N + 51] > 0, "hub radius missing");
     }
 
     #[test]
