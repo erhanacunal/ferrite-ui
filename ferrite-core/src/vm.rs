@@ -2689,6 +2689,8 @@ impl Vm {
             PROP_PADDING_R => ctx.tree.padding(target).right as i32,
             PROP_PADDING_B => ctx.tree.padding(target).bottom as i32,
             PROP_PADDING_L => ctx.tree.padding(target).left as i32,
+            // String id of the widget's text (0xFFFF = none → reads as "").
+            PROP_TEXT => ctx.tree.text_id(target) as i32,
             PROP_TEXT_COLOR => ctx.tree.text_color(target) as i32,
             PROP_FONT_ID => ctx.tree.font_id(target) as i32,
             PROP_TEXT_ALIGN => ctx.tree.text_align(target) as i32,
@@ -3276,6 +3278,27 @@ mod anim_tests {
     // Allocate one widget and return its id.
     fn one_widget(ctx: &mut Ctx<MockPlatform>) -> WidgetId {
         ctx.tree.alloc().expect("alloc")
+    }
+
+    #[test]
+    fn get_text_reads_the_widgets_own_string() {
+        // text_input demo: get(text) on an input after strClear() returned
+        // string 0 (the title) because PROP_TEXT had no getter.
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        let title = one_widget(&mut ctx);
+        let input = one_widget(&mut ctx);
+        let empty = one_widget(&mut ctx);
+        vm.target = title;
+        vm.set_compound_prop(PROP_TEXT, b"Text Input Demo", &mut ctx);
+        vm.target = input;
+        vm.set_compound_prop(PROP_TEXT, b"erhan", &mut ctx);
+        ctx.strpool.smart_clear(&mut ctx.tree);
+
+        let id = Vm::get_scalar_prop_on(&ctx, input, PROP_TEXT);
+        assert_eq!(ctx.strpool.get(id as u16), b"erhan");
+        let none = Vm::get_scalar_prop_on(&ctx, empty, PROP_TEXT);
+        assert_eq!(ctx.strpool.get(none as u16), b"", "no text reads as empty");
     }
 
     #[test]
