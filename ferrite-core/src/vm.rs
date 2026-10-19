@@ -228,6 +228,17 @@ const IMAGE_HEADER_SIZE_V3: usize = 7;
 const IMAGE_HEADER_SIZE_V4: usize = 9;
 /// Each function entry: func_id(2) + kind(1) + pad(1) + offset(4) + length(4) = 12 bytes.
 const FUNC_ENTRY_SIZE: usize = 12;
+/// Image header flags bit 2: JMP/JZ/JNZ/CALL targets are u32 LE instead of u16.
+/// Set by the compiler when the bytecode exceeds 64 KB. (Bit 1 = e-paper mode.)
+const IMAGE_FLAG_WIDE_ADDR: u16 = 0x04;
+
+/// Bytecode address: pc, return addresses, callback entry points. `u32` with
+/// the `wide_code` feature (RAM-rich BSPs), `u16` otherwise so the GD32 build
+/// keeps call frames and queued callbacks small.
+#[cfg(feature = "wide_code")]
+pub type CodeAddr = u32;
+#[cfg(not(feature = "wide_code"))]
+pub type CodeAddr = u16;
 
 // --- 1-byte opcode map (IL-style) ---
 
@@ -287,10 +298,10 @@ const OP_PUSH_I16: u8 = 0x31; // + i16 LE
 const OP_PUSH_I32: u8 = 0x32; // + i32 LE
 const OP_LOAD: u8 = 0x33; // + u8 slot
 const OP_STORE: u8 = 0x34; // + u8 slot
-const OP_JMP: u8 = 0x35; // + u16 target
-const OP_JZ: u8 = 0x36; // + u16 target
-const OP_JNZ: u8 = 0x37; // + u16 target
-const OP_CALL: u8 = 0x38; // + u16 target
+const OP_JMP: u8 = 0x35; // + u16 target (u32 in wide-address images)
+const OP_JZ: u8 = 0x36; // + u16 target (u32 in wide-address images)
+const OP_JNZ: u8 = 0x37; // + u16 target (u32 in wide-address images)
+const OP_CALL: u8 = 0x38; // + u16 target (u32 in wide-address images)
 const OP_W_TARGET: u8 = 0x39; // + u8 widget_id
 const OP_W_SET: u8 = 0x3A; // + u8 prop_id (value from stack)
 const OP_W_GET: u8 = 0x3B; // + u8 prop_id
@@ -477,7 +488,7 @@ struct VmArray {
 /// Call stack frame: return address + saved frame state.
 #[derive(Clone, Copy)]
 struct CallFrame {
-    ret_addr: u16,
+    ret_addr: CodeAddr,
     frame_base: u8,
     frame_size: u8,
 }
@@ -486,7 +497,7 @@ struct CallFrame {
 /// kept (`stack[..sp]`, `call_stack[..call_sp]`), so a callback taken at a
 /// YIELD with an empty eval stack allocates nothing for it.
 struct VmSnapshot {
-    pc: u16,
+    pc: CodeAddr,
     stack: Vec<i32>,
     call_stack: Vec<CallFrame>,
     target: WidgetId,
@@ -505,7 +516,7 @@ const CB_QUEUE_SIZE: usize = 8;
 /// A queued callback request.
 #[derive(Clone, Copy)]
 struct CbRequest {
-    offset: u16,
+    offset: CodeAddr,
     arg_count: u8,
     args: [i32; CB_MAX_ARGS],
 }
@@ -604,7 +615,7 @@ struct Anim {
 }
 
 pub struct Vm {
-    pc: u16,
+    pc: CodeAddr,
     // Eval / call stacks and the callback queue are heap slices sized by
     // `configure` (RES_SYSCFG); each is at most 255 deep (u8 indices).
     stack: Box<[i32]>,
@@ -617,9 +628,9 @@ pub struct Vm {
     /// Fault code (`fault::*`) of the most recent error; valid while `state == Error`.
     fault: u8,
     /// Address of the instruction that raised `fault`.
-    fault_pc: u16,
+    fault_pc: CodeAddr,
     /// Start address of the instruction currently executing.
-    op_pc: u16,
+    op_pc: CodeAddr,
     arrays: Vec<VmArray>,
     next_arr_id: u16,
     pub wait_until: u32,
@@ -644,6 +655,8 @@ pub struct Vm {
     frame_base: u8,
     frame_size: u8,
     global_count: u8,
+    // Jump/call operands are u32 (image header IMAGE_FLAG_WIDE_ADDR).
+    wide_addr: bool,
     // Render mode from image header
     pub render_mode: RenderMode,
     // Platform policy override: when set, replaces the header's render mode after
@@ -707,6 +720,7 @@ impl Vm {
             frame_base: 0,
             frame_size: 0,
             global_count: 0,
+            wide_addr: false,
             render_mode: RenderMode::Dirty,
             forced_render_mode: None,
             in_paint: false,
@@ -791,8 +805,12 @@ impl Vm {
     /// Load a VM image from RAM bytes. Parses the image header and keeps
     /// opcodes in a Vec<u8>. Returns false if the header is invalid.
     pub fn load_ram(&mut self, image: &[u8]) -> bool {
-        if let Some((funcs, opcode_start, gc, rm, wc, ec)) = parse_image_header(image) {
+        if let Some((funcs, opcode_start, gc, rm, wc, ec, wide)) = parse_image_header(image) {
+            if !code_addressable(wide, image.len() - opcode_start) {
+                return false;
+            }
             let opcodes = image[opcode_start..].to_vec();
+            self.wide_addr = wide;
             self.code = VmCode::Ram(opcodes);
             self.functions = funcs;
             self.global_count = gc;
@@ -821,11 +839,15 @@ impl Vm {
         let mut hdr_buf = [0u8; IMAGE_HEADER_SIZE_V4 + FUNC_ENTRY_SIZE * 64]; // 777 bytes on stack
         flash.read(base, &mut hdr_buf[..read_len]);
 
-        if let Some((funcs, opcode_start, gc, rm, wc, ec)) =
+        if let Some((funcs, opcode_start, gc, rm, wc, ec, wide)) =
             parse_image_header(&hdr_buf[..read_len])
         {
             let opcode_base = base + opcode_start as u32;
             let opcode_len = total_len.saturating_sub(opcode_start);
+            if !code_addressable(wide, opcode_len) {
+                return false;
+            }
+            self.wide_addr = wide;
             // Move the caller's flash handle into the code source (no singleton).
             self.code = VmCode::Flash {
                 flash: alloc::boxed::Box::new(flash.into_backend()),
@@ -851,6 +873,7 @@ impl Vm {
     /// Load raw bytecode (no image header). Used for page bytecode.
     pub fn load_raw(&mut self, data: &[u8]) {
         self.code = VmCode::Ram(data.to_vec());
+        self.wide_addr = false;
         self.functions.clear();
     }
 
@@ -870,7 +893,7 @@ impl Vm {
 
     /// Enqueue a callback to be executed later via drain_callbacks().
     /// Dropped silently if the queue is full.
-    pub fn enqueue_callback(&mut self, offset: u16, args: &[i32]) {
+    pub fn enqueue_callback(&mut self, offset: CodeAddr, args: &[i32]) {
         let next_tail = (self.cb_tail + 1) % self.cb_queue.len() as u8;
         if next_tail == self.cb_head {
             return; // queue full — drop
@@ -938,7 +961,7 @@ impl Vm {
             return;
         }
         let offset = match self.find_by_kind(FunctionKind::OnPaint) {
-            Some(e) => e.offset as u16,
+            Some(e) => e.offset as CodeAddr,
             None => return,
         };
         let mut ids = [0i32; render::PAINT_MAX];
@@ -967,7 +990,7 @@ impl Vm {
 
     /// Run a callback immediately (not queued). Used during startup
     /// when the main loop is not yet running.
-    pub fn run_callback<P: Platform>(&mut self, offset: u16, ctx: &mut Ctx<P>) {
+    pub fn run_callback<P: Platform>(&mut self, offset: CodeAddr, ctx: &mut Ctx<P>) {
         self.push_state(offset);
         self.run(ctx);
         self.pop_state();
@@ -992,7 +1015,7 @@ impl Vm {
 
         // Resolve builder function id → entry offset.
         let builder_offset = match self.find_func(builder_fn) {
-            Some(f) => f.offset as u16,
+            Some(f) => f.offset as CodeAddr,
             None => {
                 // Bad fn id; emulate Cancel rather than VM error so the user
                 // program keeps running.
@@ -1134,7 +1157,7 @@ impl Vm {
 
     // --- Internal: save/restore VM state for callback execution ---
 
-    fn push_state(&mut self, offset: u16) {
+    fn push_state(&mut self, offset: CodeAddr) {
         let snapshot = VmSnapshot {
             pc: self.pc,
             stack: self.stack[..self.sp as usize].to_vec(),
@@ -1197,11 +1220,11 @@ impl Vm {
         self.target = id;
     }
 
-    pub fn set_pc(&mut self, pc: u16) {
+    pub fn set_pc(&mut self, pc: CodeAddr) {
         self.pc = pc;
     }
 
-    pub fn pc(&self) -> u16 {
+    pub fn pc(&self) -> CodeAddr {
         self.pc
     }
 
@@ -1213,7 +1236,7 @@ impl Vm {
     /// Address of the instruction that raised the most recent VM error.
     /// Unlike `pc()`, this stays correct after a failed callback restores
     /// the interrupted state.
-    pub fn fault_pc(&self) -> u16 {
+    pub fn fault_pc(&self) -> CodeAddr {
         self.fault_pc
     }
 
@@ -1374,6 +1397,18 @@ impl Vm {
     #[inline]
     fn read_u32(&mut self) -> u32 {
         self.read_i32() as u32
+    }
+
+    /// JMP/JZ/JNZ/CALL target: u16, or u32 in wide-address images (only
+    /// loadable with the `wide_code` feature, so the cast never truncates;
+    /// narrow builds compile the u32 path out).
+    #[inline]
+    fn read_addr(&mut self) -> CodeAddr {
+        if cfg!(feature = "wide_code") && self.wide_addr {
+            self.read_u32() as CodeAddr
+        } else {
+            self.read_u16() as CodeAddr
+        }
     }
 
     // --- Execute a single instruction ---
@@ -1680,23 +1715,23 @@ impl Vm {
                 self.var_set(slot, v);
             }
             OP_JMP => {
-                let target = self.read_u16();
+                let target = self.read_addr();
                 self.pc = target;
             }
             OP_JZ => {
-                let target = self.read_u16();
+                let target = self.read_addr();
                 if self.pop() == 0 {
                     self.pc = target;
                 }
             }
             OP_JNZ => {
-                let target = self.read_u16();
+                let target = self.read_addr();
                 if self.pop() != 0 {
                     self.pc = target;
                 }
             }
             OP_CALL => {
-                let target = self.read_u16();
+                let target = self.read_addr();
                 if (self.call_sp as usize) < self.call_stack.len() {
                     self.call_stack[self.call_sp as usize] = CallFrame {
                         ret_addr: self.pc,
@@ -1781,7 +1816,7 @@ impl Vm {
                     let mut buf = [0u8; 32];
                     let n = len.min(buf.len());
                     self.code.read_bytes(start, &mut buf[..n]);
-                    self.pc = end as u16;
+                    self.pc = end as CodeAddr;
                     if self.target.is_some() {
                         self.set_compound_prop(prop_id, &buf[..n], ctx);
                         if prop_is_visual(prop_id) {
@@ -1807,7 +1842,7 @@ impl Vm {
                         self.code.read_bytes(start + i * 4, &mut tmp);
                         values.push(i32::from_le_bytes(tmp));
                     }
-                    self.pc = (start + byte_len) as u16;
+                    self.pc = (start + byte_len) as CodeAddr;
                     let id = self.next_arr_id;
                     self.arrays.push(VmArray { id, data: values });
                     self.next_arr_id = self.next_arr_id.wrapping_add(1);
@@ -1843,7 +1878,7 @@ impl Vm {
                     let mut buf = [0u8; 64];
                     let n = len.min(buf.len());
                     self.code.read_bytes(start, &mut buf[..n]);
-                    self.pc = (start + len) as u16;
+                    self.pc = (start + len) as CodeAddr;
                     if n > 0 {
                         ctx.flash.write(addr, &buf[..n]);
                     }
@@ -1899,7 +1934,7 @@ impl Vm {
                     let mut buf = [0u8; 64];
                     let n = len.min(buf.len());
                     self.code.read_bytes(start, &mut buf[..n]);
-                    self.pc = (start + len) as u16;
+                    self.pc = (start + len) as CodeAddr;
                     let colors = self.pop();
                     let (fg, bg) = unpack_pair(colors);
                     let font_id = self.pop() as u8;
@@ -1933,7 +1968,7 @@ impl Vm {
                     let mut buf = [0u8; 64];
                     let n = len.min(buf.len());
                     self.code.read_bytes(start, &mut buf[..n]);
-                    self.pc = (start + len) as u16;
+                    self.pc = (start + len) as CodeAddr;
                     match ctx.strpool.alloc(&buf[..n]) {
                         Some(id) => self.push(id as i32),
                         None => self.fail(fault::STR_ALLOC),
@@ -2786,7 +2821,7 @@ impl Vm {
                     // the widget-callback path. Scope the immutable borrow so
                     // the mutable enqueue can follow.
                     if a.on_end != 0 {
-                        let off = self.find_func(a.on_end).map(|f| f.offset as u16);
+                        let off = self.find_func(a.on_end).map(|f| f.offset as CodeAddr);
                         if let Some(off) = off {
                             self.enqueue_callback(off, &[a.target.0 as i32, a.prop_id as i32]);
                         }
@@ -2989,7 +3024,7 @@ impl Vm {
 // === Image header parser ===
 
 /// Parse VM image header. Returns (function table, opcode start, global_count, render_mode,
-/// widget_count, ext_count). widget_count/ext_count are 0 for v1-v3 images.
+/// widget_count, ext_count, wide_addr). widget_count/ext_count are 0 for v1-v3 images.
 ///
 /// Format v1/v2:
 ///   version(u8) + function_count(u16 LE) + global_count(u16 LE)
@@ -3000,7 +3035,11 @@ impl Vm {
 /// Format v4 (adds widget/ext counts):
 ///   v3 header + widget_count(u8) + ext_count(u8) + [...]
 ///   flags bit 0: render_mode (0=dirty, 1=buffered)
-fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderMode, u8, u8)> {
+///   flags bit 2: wide_addr (jump/call targets are u32)
+#[allow(clippy::type_complexity)]
+fn parse_image_header(
+    data: &[u8],
+) -> Option<(Vec<FuncEntry>, usize, u8, RenderMode, u8, u8, bool)> {
     if data.len() < IMAGE_HEADER_SIZE_V2 {
         return None;
     }
@@ -3019,7 +3058,7 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderM
     };
 
     // v3+: flags field after global_count
-    let (header_size, render_mode, widget_count, ext_count) = if version >= 4 {
+    let (header_size, render_mode, widget_count, ext_count, wide) = if version >= 4 {
         if data.len() < IMAGE_HEADER_SIZE_V4 {
             return None;
         }
@@ -3029,7 +3068,8 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderM
         } else {
             RenderMode::Dirty
         };
-        (IMAGE_HEADER_SIZE_V4, rm, data[7], data[8])
+        let wide = flags & IMAGE_FLAG_WIDE_ADDR != 0;
+        (IMAGE_HEADER_SIZE_V4, rm, data[7], data[8], wide)
     } else if version >= 3 {
         if data.len() < IMAGE_HEADER_SIZE_V3 {
             return None;
@@ -3040,9 +3080,10 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderM
         } else {
             RenderMode::Dirty
         };
-        (IMAGE_HEADER_SIZE_V3, rm, 0u8, 0u8)
+        let wide = flags & IMAGE_FLAG_WIDE_ADDR != 0;
+        (IMAGE_HEADER_SIZE_V3, rm, 0u8, 0u8, wide)
     } else {
-        (IMAGE_HEADER_SIZE_V2, RenderMode::Dirty, 0u8, 0u8)
+        (IMAGE_HEADER_SIZE_V2, RenderMode::Dirty, 0u8, 0u8, false)
     };
 
     let table_size = func_count * FUNC_ENTRY_SIZE;
@@ -3088,7 +3129,15 @@ fn parse_image_header(data: &[u8]) -> Option<(Vec<FuncEntry>, usize, u8, RenderM
         render_mode,
         widget_count,
         ext_count,
+        wide,
     ))
+}
+
+/// Whether this build can address an image's bytecode: every offset in
+/// `code_len` must fit `CodeAddr`, and wide (u32-operand) images need the
+/// `wide_code` feature to decode at all.
+fn code_addressable(wide: bool, code_len: usize) -> bool {
+    (cfg!(feature = "wide_code") || !wide) && code_len <= CodeAddr::MAX as usize
 }
 
 // --- Packed u32 helper ---
@@ -3390,5 +3439,48 @@ mod anim_tests {
         // the recorded cause must stay STACK_UNDERFLOW.
         let vm = run_code(&[OP_ADD]);
         assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
+    }
+
+    /// v4 image with no functions: header flags + opcodes.
+    fn image(flags: u16, code: &[u8]) -> Vec<u8> {
+        let [f0, f1] = flags.to_le_bytes();
+        let mut img = alloc::vec![4, 0, 0, 0, 0, f0, f1, 0, 0];
+        img.extend_from_slice(code);
+        img
+    }
+
+    #[test]
+    fn wide_image_needs_wide_code() {
+        let mut vm = Vm::new();
+        let ok = vm.load_ram(&image(IMAGE_FLAG_WIDE_ADDR, &[OP_HALT]));
+        assert_eq!(ok, cfg!(feature = "wide_code"));
+    }
+
+    #[test]
+    fn narrow_build_rejects_code_past_64k() {
+        let mut vm = Vm::new();
+        let ok = vm.load_ram(&image(0, &alloc::vec![OP_HALT; 0x1_0001]));
+        assert_eq!(ok, cfg!(feature = "wide_code"));
+    }
+
+    #[cfg(feature = "wide_code")]
+    #[test]
+    fn wide_jump_and_call_past_64k() {
+        // 0x00000: JMP 0x10000
+        // 0x10000: CALL 0x10010   → ret_addr 0x10005 must survive as u32
+        // 0x10005: <bad opcode>   ← RET lands here
+        // 0x10010: RET
+        let mut code = alloc::vec![OP_HALT; 0x1_0011];
+        code[..5].copy_from_slice(&[OP_JMP, 0x00, 0x00, 0x01, 0x00]);
+        code[0x1_0000..0x1_0005].copy_from_slice(&[OP_CALL, 0x10, 0x00, 0x01, 0x00]);
+        code[0x1_0005] = 0xFF;
+        code[0x1_0010] = OP_RET;
+
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        assert!(vm.load_ram(&image(IMAGE_FLAG_WIDE_ADDR, &code)));
+        vm.run(&mut ctx);
+        assert_eq!(vm.fault(), fault::BAD_OPCODE);
+        assert_eq!(vm.fault_pc(), 0x1_0005);
     }
 }

@@ -30,6 +30,12 @@ external_alloc = []
 # Larger VM string pool for RAM-rich targets: 1 MB buffer / 256 strings instead
 # of the default 2 KB / 64. Enabled by BSPs like `bsp-tdo-y13` (32 MB DRAM).
 strpool_large = []
+# 32-bit VM code addresses (`vm::CodeAddr = u32`): pc, call frames and callback
+# offsets widen so programs past 64 KB of bytecode run. Required to load images
+# with the wide-address header flag (32-bit jump/call targets). Costs ~4 B per
+# call frame / queued callback, so the GD32 build leaves it off. Enabled by the
+# RAM-rich BSPs (`bsp-tdo-y13`, `bsp-n32903`) and the sim.
+wide_code = []
 
 [dependencies]
 libm = "0.2"

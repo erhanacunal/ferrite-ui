@@ -26,7 +26,7 @@ use crate::ctx::Ctx;
 use crate::strpool::StringPool;
 use crate::syscfg::SysCfg;
 use crate::types::{COLOR_RED, Size};
-use crate::vm::{FunctionKind, RenderMode, Vm, VmState};
+use crate::vm::{CodeAddr, FunctionKind, RenderMode, Vm, VmState};
 use crate::{font, fs, heap, keyboard, protocol, render, widget};
 
 use crate::protocol::{Protocol, RxEvent};
@@ -363,7 +363,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                 RxEvent::UserMessage => {
                     if vm.has_code() {
                         if let Some(offset) =
-                            vm.find_by_kind(FunctionKind::OnUserMessage).map(|e| e.offset as u16)
+                            vm.find_by_kind(FunctionKind::OnUserMessage).map(|e| e.offset as CodeAddr)
                         {
                             let msg = protocol.user_message();
                             if let Some(arr_id) = vm.alloc_array_from(msg) {
@@ -500,7 +500,7 @@ fn reserve_tree<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) {
 
 #[inline(never)]
 fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
-    if let Some(offset) = vm.find_by_kind(FunctionKind::Setup).map(|e| e.offset as u16) {
+    if let Some(offset) = vm.find_by_kind(FunctionKind::Setup).map(|e| e.offset as CodeAddr) {
         vm.run_callback(offset, ctx);
         if vm.pop_result() != 0 {
             return ERR_PROGRAM_ERROR;
@@ -508,11 +508,11 @@ fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     }
     if let Some(offset) = vm
         .find_by_kind(FunctionKind::OnProgramStart)
-        .map(|e| e.offset as u16)
+        .map(|e| e.offset as CodeAddr)
     {
         vm.run_callback(offset, ctx);
     }
-    if let Some(offset) = vm.find_by_kind(FunctionKind::Loop).map(|e| e.offset as u16) {
+    if let Some(offset) = vm.find_by_kind(FunctionKind::Loop).map(|e| e.offset as CodeAddr) {
         vm.set_pc(offset);
         vm.state = VmState::Running;
     }
@@ -599,7 +599,11 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, input: &mut P
 
 /// `vm_fault` = `(fault code, faulting PC)` for VM runtime errors.
 #[inline(never)]
-pub fn show_error<P: PlatformRuntime>(ctx: &mut Ctx<P>, code: u8, vm_fault: Option<(u8, u16)>) {
+pub fn show_error<P: PlatformRuntime>(
+    ctx: &mut Ctx<P>,
+    code: u8,
+    vm_fault: Option<(u8, CodeAddr)>,
+) {
     let sw = P::LcdB::WIDTH;
     let sh = P::LcdB::HEIGHT;
     let bg = P::BG_COLOR;
@@ -689,8 +693,8 @@ pub fn show_error<P: PlatformRuntime>(ctx: &mut Ctx<P>, code: u8, vm_fault: Opti
             Some(bg),
         );
 
-        let mut pc_buf = [0u8; 12];
-        let pc_len = format_hex_u16(b"PC: 0x", pc, &mut pc_buf);
+        let mut pc_buf = [0u8; 14];
+        let pc_len = format_hex_pc(b"PC: 0x", pc as u32, &mut pc_buf);
         font.draw_str(
             &ctx.lcd,
             &ctx.flash,
@@ -706,7 +710,7 @@ pub fn show_error<P: PlatformRuntime>(ctx: &mut Ctx<P>, code: u8, vm_fault: Opti
     ctx.lcd.flush_dirty();
 
     match vm_fault {
-        Some((fault, pc)) => protocol::send_vm_error(&ctx.usart, code, fault, pc),
+        Some((fault, pc)) => protocol::send_vm_error(&ctx.usart, code, fault, pc as u32),
         None => protocol::send_error(&ctx.usart, code),
     }
 }
@@ -737,15 +741,17 @@ fn format_error_code(code: u8, buf: &mut [u8; 16]) -> usize {
     }
 }
 
-fn format_hex_u16(prefix: &[u8], val: u16, buf: &mut [u8; 12]) -> usize {
+/// Hex PC: 4 digits, or 8 once it no longer fits 16 bits (wide images).
+fn format_hex_pc(prefix: &[u8], val: u32, buf: &mut [u8; 14]) -> usize {
     let plen = prefix.len().min(6);
     buf[..plen].copy_from_slice(&prefix[..plen]);
     let hex = b"0123456789ABCDEF";
-    buf[plen] = hex[((val >> 12) & 0xF) as usize];
-    buf[plen + 1] = hex[((val >> 8) & 0xF) as usize];
-    buf[plen + 2] = hex[((val >> 4) & 0xF) as usize];
-    buf[plen + 3] = hex[(val & 0xF) as usize];
-    plen + 4
+    let digits = if val > 0xFFFF { 8 } else { 4 };
+    for i in 0..digits {
+        let shift = (digits - 1 - i) * 4;
+        buf[plen + i] = hex[((val >> shift) & 0xF) as usize];
+    }
+    plen + digits
 }
 
 // ============================================================================
@@ -916,11 +922,11 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
                 }
                 if ctx.tree.get(hit).flags & widget::FLAG_HAS_ON_CLICK != 0 {
                     if let Some(click_fn) = vm.modal_overlay_click_fn(hit) {
-                        if let Some(off) = vm.find_func(click_fn).map(|e| e.offset as u16) {
+                        if let Some(off) = vm.find_func(click_fn).map(|e| e.offset as CodeAddr) {
                             vm.enqueue_callback(off, &[hit.0 as i32]);
                         }
                     } else if let Some(off) =
-                        vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as u16)
+                        vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as CodeAddr)
                     {
                         vm.enqueue_callback(off, &[hit.0 as i32]);
                     }
@@ -928,7 +934,7 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
                 if ctx.tree.get(hit).flags & widget::FLAG_HAS_ON_TAP != 0
                     && ctx.tree.get(hit).kind != widget::KIND_INPUT
                 {
-                    if let Some(off) = vm.find_by_kind(FunctionKind::OnTap).map(|e| e.offset as u16) {
+                    if let Some(off) = vm.find_by_kind(FunctionKind::OnTap).map(|e| e.offset as CodeAddr) {
                         let packed = ((event.x as u32) << 16 | event.y as u32) as i32;
                         vm.enqueue_callback(off, &[hit.0 as i32, packed]);
                     }
@@ -1086,7 +1092,7 @@ impl FullInput {
                 // is already stored, and the dispatcher passes it on to
                 // handlers declared as `fn h(wid, val)`.
                 if vm.has_code() && ctx.tree.get(hit).flags & widget::FLAG_HAS_ON_CLICK != 0 {
-                    if let Some(off) = vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as u16)
+                    if let Some(off) = vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as CodeAddr)
                     {
                         vm.enqueue_callback(off, &[hit.0 as i32]);
                     }
@@ -1102,7 +1108,7 @@ impl FullInput {
         if vm.has_code() {
             if let Some(off) = vm
                 .find_by_kind(FunctionKind::OnTouchDown)
-                .map(|e| e.offset as u16)
+                .map(|e| e.offset as CodeAddr)
             {
                 vm.enqueue_callback(off, &[x as i32, y as i32]);
             }
@@ -1139,7 +1145,7 @@ impl FullInput {
                 }
                 if vm.has_code() && ctx.tree.get(id).flags & widget::FLAG_HAS_ON_CLICK != 0 {
                     if let Some(off) =
-                        vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as u16)
+                        vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as CodeAddr)
                     {
                         // One argument — see the slider press path.
                         vm.enqueue_callback(off, &[id.0 as i32]);
@@ -1168,7 +1174,7 @@ impl FullInput {
                 if vm.has_code() {
                     if let Some(off) = vm
                         .find_by_kind(FunctionKind::OnLongPress)
-                        .map(|e| e.offset as u16)
+                        .map(|e| e.offset as CodeAddr)
                     {
                         vm.enqueue_callback(off, &[pressed_id.0 as i32, x as i32, y as i32]);
                     }
@@ -1180,7 +1186,7 @@ impl FullInput {
         if vm.has_code() {
             if let Some(off) = vm
                 .find_by_kind(FunctionKind::OnTouchMove)
-                .map(|e| e.offset as u16)
+                .map(|e| e.offset as CodeAddr)
             {
                 vm.enqueue_callback(off, &[x as i32, y as i32]);
             }
@@ -1289,7 +1295,7 @@ impl FullInput {
                 -1
             };
             if direction >= 0 {
-                if let Some(off) = vm.find_by_kind(FunctionKind::OnSwipe).map(|e| e.offset as u16) {
+                if let Some(off) = vm.find_by_kind(FunctionKind::OnSwipe).map(|e| e.offset as CodeAddr) {
                     let dominant = if direction <= 1 { dx } else { dy };
                     vm.enqueue_callback(off, &[direction, swipe_widget_id.0 as i32, dominant]);
                 }
@@ -1302,10 +1308,10 @@ impl FullInput {
             && ctx.tree.get(clicked_id).flags & widget::FLAG_HAS_ON_CLICK != 0
         {
             if let Some(click_fn) = vm.modal_overlay_click_fn(clicked_id) {
-                if let Some(off) = vm.find_func(click_fn).map(|e| e.offset as u16) {
+                if let Some(off) = vm.find_func(click_fn).map(|e| e.offset as CodeAddr) {
                     vm.enqueue_callback(off, &[clicked_id.0 as i32]);
                 }
-            } else if let Some(off) = vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as u16)
+            } else if let Some(off) = vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as CodeAddr)
             {
                 vm.enqueue_callback(off, &[clicked_id.0 as i32]);
             }
@@ -1317,7 +1323,7 @@ impl FullInput {
             && ctx.tree.get(clicked_id).kind != widget::KIND_INPUT
             && ctx.tree.get(clicked_id).flags & widget::FLAG_HAS_ON_TAP != 0
         {
-            if let Some(off) = vm.find_by_kind(FunctionKind::OnTap).map(|e| e.offset as u16) {
+            if let Some(off) = vm.find_by_kind(FunctionKind::OnTap).map(|e| e.offset as CodeAddr) {
                 let packed = ((x as u32) << 16 | y as u32) as i32;
                 vm.enqueue_callback(off, &[clicked_id.0 as i32, packed]);
             }
@@ -1326,7 +1332,7 @@ impl FullInput {
         if vm.has_code() {
             if let Some(off) = vm
                 .find_by_kind(FunctionKind::OnTouchUp)
-                .map(|e| e.offset as u16)
+                .map(|e| e.offset as CodeAddr)
             {
                 vm.enqueue_callback(off, &[]);
             }
@@ -1484,7 +1490,7 @@ impl FullInput {
         if !vm.has_code() || ctx.tree.get(id).flags & widget::FLAG_HAS_ON_TAP == 0 {
             return;
         }
-        if let Some(off) = vm.find_by_kind(FunctionKind::OnTap).map(|e| e.offset as u16) {
+        if let Some(off) = vm.find_by_kind(FunctionKind::OnTap).map(|e| e.offset as CodeAddr) {
             vm.enqueue_callback(off, &[id.0 as i32, 0]);
         }
     }
@@ -1513,6 +1519,6 @@ mod mock_runtime {
     pub fn _guard() {
         let _: fn(Box<Ctx<MockPlatform>>, TouchImpl<crate::mock::MockTouch>) -> ! =
             run::<MockPlatform>;
-        let _: fn(&mut Ctx<MockPlatform>, u8, Option<(u8, u16)>) = show_error::<MockPlatform>;
+        let _: fn(&mut Ctx<MockPlatform>, u8, Option<(u8, CodeAddr)>) = show_error::<MockPlatform>;
     }
 }

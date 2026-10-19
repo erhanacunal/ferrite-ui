@@ -24,7 +24,7 @@ import os
 # Add tools directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ferrite_cc import Op, OP_NAMES, PROP_NAMES, _NO_ARG_OPS
+from ferrite_cc import Op, OP_NAMES, PROP_NAMES, _NO_ARG_OPS, IMAGE_FLAG_WIDE_ADDR
 
 
 # ============================================================
@@ -514,8 +514,10 @@ def analyze_flash_image(data, base=DEFAULT_FS_BASE, exec_mode=None):
 # Bytecode walker --decode instructions without full disassembly
 # ============================================================
 
-def walk_bytecode(data, start=0, end=None):
+def walk_bytecode(data, start=0, end=None, wide=False):
     """Walk bytecode and yield (offset, opcode, size) tuples.
+
+    wide: jump/call targets are u32 (IMAGE_FLAG_WIDE_ADDR images).
 
     size = total instruction size in bytes (opcode + args).
     """
@@ -556,8 +558,9 @@ def walk_bytecode(data, start=0, end=None):
             yield addr, op, 2
 
         elif op in (Op.JMP, Op.JZ, Op.JNZ, Op.CALL):
-            pos += 2  # u16 target
-            yield addr, op, 3
+            n = 4 if wide else 2  # u32 / u16 target
+            pos += n
+            yield addr, op, 1 + n
 
         elif op in (Op.W_TARGET, Op.W_PARENT):
             pos += 1  # u8 id
@@ -719,12 +722,12 @@ _EXT_COMPOUND_PROPS = {
 }
 
 
-def analyze_bytecode(data, opcode_start=0, opcode_end=None):
+def analyze_bytecode(data, opcode_start=0, opcode_end=None, wide=False):
     """Analyze raw bytecode. Returns AnalysisResult."""
     result = AnalysisResult()
     current_target = -1  # track W_TARGET for ext estimation
 
-    for addr, op, size in walk_bytecode(data, opcode_start, opcode_end):
+    for addr, op, size in walk_bytecode(data, opcode_start, opcode_end, wide):
         result.total_instructions += 1
 
         # Opcode frequency
@@ -820,7 +823,8 @@ def analyze_image(data, exec_mode=None):
     functions, opcode_start, global_count, widget_count, ext_count, header_flags = \
         parse_image_header(data)
 
-    result = analyze_bytecode(data, opcode_start, len(data))
+    wide = bool(header_flags & IMAGE_FLAG_WIDE_ADDR)
+    result = analyze_bytecode(data, opcode_start, len(data), wide)
     result.image_size = len(data)
     result.header_size = opcode_start
     result.opcode_size = len(data) - opcode_start
@@ -857,7 +861,7 @@ def analyze_image(data, exec_mode=None):
             'local_frame': 0,
         }
 
-        for addr, op, size in walk_bytecode(data, func_start, func_end):
+        for addr, op, size in walk_bytecode(data, func_start, func_end, wide):
             fstats['instructions'] += 1
             cat = OPCODE_CATEGORIES.get(op, 'unknown')
             fstats['categories'][cat] = fstats['categories'].get(cat, 0) + 1

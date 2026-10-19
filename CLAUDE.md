@@ -117,7 +117,9 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Control flow:** if/while/for — via JZ/JNZ/JMP combinations
 - **Image header v3:** version(u8=3) + func_count(u16) + global_count(u16) + flags(u16) + func_table
   - flags bit 0: render_mode (0=dirty, 1=buffered)
+  - flags bit 2: wide_addr — JMP/JZ/JNZ/CALL targets are u32 instead of u16. The compiler sets it automatically only when bytecode exceeds 64 KB (smaller images are byte-identical to before).
   - Backward compatible: v1/v2 images parsed with 5-byte header, v3 with 7-byte header
+- **Code addresses (`vm::CodeAddr`):** `u16` by default; `u32` with the ferrite-core `wide_code` feature (enabled by tdo_y13, n32903, sim). Widens pc, call frames, callback queue, snapshots. A narrow build (nextion, epaper) rejects wide images and >64 KB code at load → Code 6. VM error USART payload carries a u32 PC (6 bytes) once PC > 0xFFFF.
 
 ### External Flash (W25Q256, 32MB)
 - **Pin assignment:** PA4=CS, PA5=CLK, PA6=MISO, PA7=MOSI (bit-bang SPI)

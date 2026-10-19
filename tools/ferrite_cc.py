@@ -84,10 +84,10 @@ class Op:
     PUSH_I32   = 0x32  # + i32 (4 bytes LE signed)
     LOAD       = 0x33  # + u8 slot
     STORE      = 0x34  # + u8 slot
-    JMP        = 0x35  # + u16 target
-    JZ         = 0x36  # + u16 target
-    JNZ        = 0x37  # + u16 target
-    CALL       = 0x38  # + u16 target
+    JMP        = 0x35  # + u16 target (u32 in wide-address images)
+    JZ         = 0x36  # + u16 target (u32 in wide-address images)
+    JNZ        = 0x37  # + u16 target (u32 in wide-address images)
+    CALL       = 0x38  # + u16 target (u32 in wide-address images)
     W_TARGET   = 0x39  # + u8 widget_id
     W_SET      = 0x3A  # + u8 prop_id (value from stack)
     W_GET      = 0x3B  # + u8 prop_id (pushes to stack)
@@ -375,8 +375,22 @@ def pack_pair(high, low):
 # ============================================================
 
 
+# Image header flags bit 2: JMP/JZ/JNZ/CALL targets are u32 LE (bytecode
+# past 64 KB). Keep in sync with IMAGE_FLAG_WIDE_ADDR in ferrite-core/src/vm.rs.
+IMAGE_FLAG_WIDE_ADDR = 0x04
+# Largest bytecode a narrow (u16-target) image can address.
+NARROW_CODE_MAX = 0xFFFF
+
+
+class AddrOverflow(Exception):
+    """A jump/call target doesn't fit a narrow (u16) operand."""
+
+
 class Asm:
     """Low-level bytecode assembler. 1-byte opcode instruction set.
+
+    wide=True emits u32 jump/call targets (IMAGE_FLAG_WIDE_ADDR images);
+    the default u16 form raises AddrOverflow past NARROW_CODE_MAX.
 
     Example:
         a = Asm()
@@ -390,8 +404,9 @@ class Asm:
         code = a.build()
     """
 
-    def __init__(self):
+    def __init__(self, wide=False):
         self._buf = bytearray()
+        self.wide = wide
 
     @property
     def pos(self):
@@ -420,6 +435,17 @@ class Asm:
 
     def _emit_i32(self, val):
         self._buf.extend(struct.pack('<i', val))
+
+    def _addr_bytes(self, target):
+        if self.wide:
+            return struct.pack('<I', target)
+        if not 0 <= target <= NARROW_CODE_MAX:
+            raise AddrOverflow(f"code address 0x{target:X} exceeds 64 KB")
+        return struct.pack('<H', target)
+
+    def _emit_addr(self, target):
+        """Jump/call target operand: u16, or u32 when wide."""
+        self._buf.extend(self._addr_bytes(target))
 
     # --- No-arg instructions (single byte) ---
 
@@ -568,23 +594,23 @@ class Asm:
         self._emit(Op.FRAME)
         self._emit_u8(local_count)
 
-    # --- Jump/call -- opcode + u16 LE target ---
+    # --- Jump/call -- opcode + u16 LE target (u32 when wide) ---
 
     def jmp(self, target):
         self._emit(Op.JMP)
-        self._emit_u16(target)
+        self._emit_addr(target)
 
     def jz(self, target):
         self._emit(Op.JZ)
-        self._emit_u16(target)
+        self._emit_addr(target)
 
     def jnz(self, target):
         self._emit(Op.JNZ)
-        self._emit_u16(target)
+        self._emit_addr(target)
 
     def call(self, target):
         self._emit(Op.CALL)
-        self._emit_u16(target)
+        self._emit_addr(target)
 
     # --- Forward jump helpers ---
 
@@ -592,35 +618,36 @@ class Asm:
         """JMP placeholder. Returns patch position for later patching."""
         self._emit(Op.JMP)
         pos = self.pos
-        self._emit_u16(0)
+        self._emit_addr(0)
         return pos
 
     def jz_fwd(self):
         """JZ placeholder. Returns patch position."""
         self._emit(Op.JZ)
         pos = self.pos
-        self._emit_u16(0)
+        self._emit_addr(0)
         return pos
 
     def jnz_fwd(self):
         """JNZ placeholder. Returns patch position."""
         self._emit(Op.JNZ)
         pos = self.pos
-        self._emit_u16(0)
+        self._emit_addr(0)
         return pos
 
     def call_fwd(self):
         """CALL placeholder. Returns patch position."""
         self._emit(Op.CALL)
         pos = self.pos
-        self._emit_u16(0)
+        self._emit_addr(0)
         return pos
 
     def patch(self, patch_pos, target=None):
         """Patch a forward jump. Default target = current position."""
         if target is None:
             target = self.pos
-        struct.pack_into('<H', self._buf, patch_pos, target & 0xFFFF)
+        data = self._addr_bytes(target)
+        self._buf[patch_pos:patch_pos + len(data)] = data
 
     # --- Widget ops ---
 
@@ -1082,8 +1109,10 @@ def _slot_name(slot, symbols=None, addr=None):
     return f'G{slot}'
 
 
-def disassemble(data, labels=None, symbols=None):
+def disassemble(data, labels=None, symbols=None, wide=False):
     """Disassemble bytecode to human-readable text.
+
+    wide: jump/call targets are u32 (IMAGE_FLAG_WIDE_ADDR images).
 
     labels: optional dict {offset: "label"} — inserts '; --- label ---'
             comment lines before the instruction at that offset.
@@ -1144,10 +1173,14 @@ def disassemble(data, labels=None, symbols=None):
             slot = data[pos]; pos += 1
             lines.append(f'{addr:04X}: STORE {_slot_name(slot, symbols, addr)}')
 
-        # JMP/JZ/JNZ/CALL with u16 target
+        # JMP/JZ/JNZ/CALL with u16 target (u32 when wide)
         elif op in (Op.JMP, Op.JZ, Op.JNZ, Op.CALL):
-            target = struct.unpack_from('<H', data, pos)[0]
-            pos += 2
+            if wide:
+                target = struct.unpack_from('<I', data, pos)[0]
+                pos += 4
+            else:
+                target = struct.unpack_from('<H', data, pos)[0]
+                pos += 2
             lines.append(f'{addr:04X}: {name} @{target:04X}')
 
         # W_ALLTAR with u8 var slot
@@ -1597,6 +1630,7 @@ class Compiler:
 
         Flags:
           bit 0: render_mode (0=dirty, 1=buffered)
+          bit 2: wide_addr (JMP/JZ/JNZ/CALL targets are u32)
 
         widget_count: number of alloc() call sites (used by firmware for Vec pre-allocation).
         ext_count: number of widgets expected to need WidgetExt (conservative = widget_count).

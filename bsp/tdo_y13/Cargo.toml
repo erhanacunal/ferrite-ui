@@ -9,6 +9,6 @@ name = "ferrite-ui"
 path = "src/main.rs"
 
 [dependencies]
-ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "strpool_large"] }
+ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "strpool_large", "wide_code"] }
 f1c100s = { path = "../../vendor/f1c100s_rs" }
 libm = "0.2"

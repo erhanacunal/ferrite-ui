@@ -8,5 +8,5 @@ name = "sim"
 path = "src/main.rs"
 
 [dependencies]
-ferrite-core = { path = "../../ferrite-core", features = ["host"] }
+ferrite-core = { path = "../../ferrite-core", features = ["host", "wide_code"] }
 minifb = "0.27"

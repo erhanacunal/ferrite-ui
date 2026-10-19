@@ -213,7 +213,9 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             if tag == TAG_ERROR:
                 if len(payload) >= 4:
                     fault = payload[1]
-                    pc = int.from_bytes(payload[2:4], "little")
+                    # PC is u16 LE, or u32 LE (6-byte payload) past 64 KB.
+                    pc = int.from_bytes(payload[2:6] if len(payload) >= 6 else payload[2:4],
+                                        "little")
                     name = VM_FAULT_NAMES.get(fault, "unknown")
                     print(f"VM fault {fault} ({name}) at PC 0x{pc:04X}", flush=True)
                 return ("error", payload[0])

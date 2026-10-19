@@ -19,6 +19,7 @@ import sys
 import struct
 import json
 from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
+                        AddrOverflow, IMAGE_FLAG_WIDE_ADDR, NARROW_CODE_MAX,
                         FunctionKind as CcFunctionKind,
                         SYSTEM_CALLBACK_KINDS,
                         disassemble, encode_svarint,
@@ -998,8 +999,8 @@ class CodeGen:
     # opt into strict checking.
     T_ANY = "any"
 
-    def __init__(self):
-        self.asm = Asm()
+    def __init__(self, wide=False):
+        self.asm = Asm(wide=wide)
         self.vars = {}          # name -> slot
         self.var_types = {}     # name -> T_INT | T_FLOAT
         self.global_vars = {}   # name -> slot (global variables visible to all functions)
@@ -3023,7 +3024,7 @@ class CodeGen:
         else:
             self.asm._emit(Op.CALL)
             info['patches'].append(self.asm.pos)
-            self.asm._emit(b'\x00\x00')
+            self.asm._emit_addr(0)
         # User function may change target
         self._current_target = None
 
@@ -3387,6 +3388,8 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
       + opcodes...
 
     Flags bit 0: render_mode (0=dirty, 1=buffered, 2=epaper)
+    Flags bit 2: wide_addr — set when the bytecode outgrows 64 KB; jump/call
+      targets are then u32 and the image needs a `wide_code` firmware build.
     widget_count: number of alloc() call sites for firmware Vec pre-allocation.
 
     Requires fn setup() and fn loop() in the source.
@@ -3405,21 +3408,30 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         if dispatchers:
             source = source + '\n\n' + dispatchers
 
-        tokens = tokenize(source)
-        parser = Parser(tokens)
-        program = parser.parse()
+        def parse_program():
+            program = Parser(tokenize(source)).parse()
+            # Validate system callback arg counts
+            for fn in program.functions:
+                if fn.name in SYSTEM_CALLBACKS:
+                    expected = SYSTEM_CALLBACKS[fn.name]
+                    if len(fn.params) != expected:
+                        raise CompileError(
+                            f"{fn.name}() expects {expected} parameter(s), got {len(fn.params)}",
+                            fn.line if hasattr(fn, 'line') else 0)
+            return program
 
-        # Validate system callback arg counts
-        for fn in program.functions:
-            if fn.name in SYSTEM_CALLBACKS:
-                expected = SYSTEM_CALLBACKS[fn.name]
-                if len(fn.params) != expected:
-                    raise CompileError(
-                        f"{fn.name}() expects {expected} parameter(s), got {len(fn.params)}",
-                        fn.line if hasattr(fn, 'line') else 0)
-
+        # Compact u16 jump targets unless the bytecode outgrows 64 KB; then
+        # regenerate from a fresh parse with u32 targets (wide-address image).
+        wide = False
         codegen = CodeGen()
-        bytecode = codegen.generate_image(program)
+        try:
+            bytecode = codegen.generate_image(parse_program())
+            wide = len(bytecode) > NARROW_CODE_MAX
+        except AddrOverflow:
+            wide = True
+        if wide:
+            codegen = CodeGen(wide=True)
+            bytecode = codegen.generate_image(parse_program())
         debug_symbols = codegen.debug_info(filename)
 
         # Build the image header with function table
@@ -3436,6 +3448,8 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         if render_mode not in ("dirty", "buffered", "epaper"):
             raise CompileError(f"invalid render mode: {render_mode}")        
         flags = 0x01 if render_mode == "buffered" else 0x02 if render_mode == "epaper" else 0x00
+        if wide:
+            flags |= IMAGE_FLAG_WIDE_ADDR
         # Use #hint_widgets if provided; fall back to static alloc()-site count.
         auto_wc = codegen.next_widget_id - 1
         widget_count = hint_wc if hint_wc > 0 else auto_wc
@@ -3566,6 +3580,12 @@ def _image_header_size(version, func_count):
     return base + func_count * 12
 
 
+def _image_is_wide(output):
+    """True if a v3+ image header sets IMAGE_FLAG_WIDE_ADDR."""
+    return (len(output) >= 7 and output[0] >= 3
+            and struct.unpack_from('<H', output, 5)[0] & IMAGE_FLAG_WIDE_ADDR != 0)
+
+
 def _print_image_header(output, debug_symbols=None):
     """Print image header summary to stdout."""
     real_names = dict(_debug_func_names(debug_symbols))
@@ -3581,6 +3601,8 @@ def _print_image_header(output, debug_symbols=None):
         flags = struct.unpack_from('<H', output, 5)[0]
         rm = 'buffered' if flags & 0x01 else 'dirty'
         extra = f', render={rm}'
+        if flags & IMAGE_FLAG_WIDE_ADDR:
+            extra += ', wide-addr'
     if version >= 4:
         wc, ec = output[7], output[8]
         extra += f', widgets={wc}, exts={ec}'
@@ -3719,7 +3741,8 @@ def main():
             print(f'; page bg_color: 0x{bg:04X}')
         if use_image:
             _print_image_header(output, debug_symbols)
-        print(disassemble(raw_code, labels=labels, symbols=debug_symbols))
+        print(disassemble(raw_code, labels=labels, symbols=debug_symbols,
+                          wide=use_image and _image_is_wide(output)))
 
     if args.hexdump:
         a = Asm()
@@ -3729,7 +3752,8 @@ def main():
     if not args.output and not args.disasm and not args.hexdump:
         if use_image:
             _print_image_header(output, debug_symbols)
-        print(disassemble(raw_code, labels=labels, symbols=debug_symbols))
+        print(disassemble(raw_code, labels=labels, symbols=debug_symbols,
+                          wide=use_image and _image_is_wide(output)))
 
 
 if __name__ == '__main__':
