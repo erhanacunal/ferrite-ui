@@ -833,15 +833,26 @@ impl Vm {
         base: u32,
         total_len: usize,
     ) -> bool {
-        // Read header into a stack buffer
-        let hdr_max = IMAGE_HEADER_SIZE_V4 + FUNC_ENTRY_SIZE * 64; // max 64 functions
-        let read_len = total_len.min(hdr_max);
-        let mut hdr_buf = [0u8; IMAGE_HEADER_SIZE_V4 + FUNC_ENTRY_SIZE * 64]; // 777 bytes on stack
-        flash.read(base, &mut hdr_buf[..read_len]);
+        // Fixed header first, then exactly the header + function table it
+        // announces, on the heap: the table grows with the program, so a
+        // fixed stack buffer would cap the function count.
+        let mut fixed = [0u8; IMAGE_HEADER_SIZE_V4];
+        let n = total_len.min(IMAGE_HEADER_SIZE_V4);
+        flash.read(base, &mut fixed[..n]);
+        let Some(hdr_len) = image_header_len(&fixed[..n]) else {
+            return false;
+        };
+        if hdr_len > total_len {
+            return false;
+        }
+        let mut hdr_buf = Vec::new();
+        if hdr_buf.try_reserve_exact(hdr_len).is_err() {
+            return false;
+        }
+        hdr_buf.resize(hdr_len, 0);
+        flash.read(base, &mut hdr_buf);
 
-        if let Some((funcs, opcode_start, gc, rm, wc, ec, wide)) =
-            parse_image_header(&hdr_buf[..read_len])
-        {
+        if let Some((funcs, opcode_start, gc, rm, wc, ec, wide)) = parse_image_header(&hdr_buf) {
             let opcode_base = base + opcode_start as u32;
             let opcode_len = total_len.saturating_sub(opcode_start);
             if !code_addressable(wide, opcode_len) {
@@ -3133,6 +3144,24 @@ fn parse_image_header(
     ))
 }
 
+/// Size of an image's header including its function table, from the fixed
+/// part (`IMAGE_HEADER_SIZE_V4` bytes suffice for every version). `None` if
+/// `fixed` is too short or not a known version.
+fn image_header_len(fixed: &[u8]) -> Option<usize> {
+    let version = *fixed.first()?;
+    let size = match version {
+        1 | 2 => IMAGE_HEADER_SIZE_V2,
+        3 => IMAGE_HEADER_SIZE_V3,
+        4 => IMAGE_HEADER_SIZE_V4,
+        _ => return None,
+    };
+    if fixed.len() < size {
+        return None;
+    }
+    let func_count = u16::from_le_bytes([fixed[1], fixed[2]]) as usize;
+    Some(size + func_count * FUNC_ENTRY_SIZE)
+}
+
 /// Whether this build can address an image's bytecode: every offset in
 /// `code_len` must fit `CodeAddr`, and wide (u32-operand) images need the
 /// `wide_code` feature to decode at all.
@@ -3447,6 +3476,59 @@ mod anim_tests {
         let mut img = alloc::vec![4, 0, 0, 0, 0, f0, f1, 0, 0];
         img.extend_from_slice(code);
         img
+    }
+
+    /// Flash backed by a byte vector (reads past the end return 0xFF).
+    struct RomFlash(Vec<u8>);
+    impl FlashBackend for RomFlash {
+        fn read(&self, addr: u32, buf: &mut [u8]) {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = *self.0.get(addr as usize + i).unwrap_or(&0xFF);
+            }
+        }
+        fn write(&self, _: u32, _: &[u8]) {}
+        fn erase_sector(&self, _: u32) {}
+        fn read_id(&self) -> (u8, u8, u8) {
+            (0, 0, 0)
+        }
+    }
+
+    #[test]
+    fn load_flash_reads_the_whole_function_table() {
+        // 300 functions — well past the old 64-entry stack buffer.
+        const FUNCS: u16 = 300;
+        let [c0, c1] = FUNCS.to_le_bytes();
+        let mut img = alloc::vec![4, c0, c1, 0, 0, 0, 0, 0, 0];
+        for i in 0..FUNCS {
+            img.extend_from_slice(&(i + 1).to_le_bytes()); // func_id
+            img.extend_from_slice(&[FunctionKind::UserFunction as u8, 0]);
+            img.extend_from_slice(&(i as u32).to_le_bytes()); // offset
+            img.extend_from_slice(&1u32.to_le_bytes()); // length
+        }
+        let code = alloc::vec![OP_HALT; FUNCS as usize];
+        img.extend_from_slice(&code);
+
+        // Image at a non-zero flash offset, followed by unrelated bytes.
+        let base = 0x100u32;
+        let mut rom = alloc::vec![0xAA; base as usize];
+        rom.extend_from_slice(&img);
+        rom.extend_from_slice(&[0x55; 64]);
+
+        let mut vm = Vm::new();
+        let flash = FlashImpl::with_backend(RomFlash(rom));
+        assert!(vm.load_flash(flash, base, img.len()));
+        assert_eq!(vm.functions.len(), FUNCS as usize);
+        assert_eq!(vm.find_func(FUNCS).map(|f| f.offset), Some(FUNCS as u32 - 1));
+        assert_eq!(vm.code.len(), code.len());
+    }
+
+    #[test]
+    fn load_flash_rejects_a_truncated_function_table() {
+        // Header announces 300 functions but the image is cut short.
+        let img = alloc::vec![4, 0x2C, 0x01, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+        let mut vm = Vm::new();
+        let flash = FlashImpl::with_backend(RomFlash(img.clone()));
+        assert!(!vm.load_flash(flash, 0, img.len()));
     }
 
     #[test]

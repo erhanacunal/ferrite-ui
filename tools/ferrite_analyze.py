@@ -219,13 +219,6 @@ def parse_image_header(data):
     widget_count = data[7] if version >= 4 else 0
     ext_count = data[8] if version >= 4 else 0
 
-    # Sanity checks on func_count
-    if func_count > 256:
-        raise ValueError(
-            f"func_count {func_count} is unreasonably large (max 256). "
-            f"Is this a VM image binary?"
-        )
-
     func_table_size = func_count * 12
     opcode_start = header_size + func_table_size
     if opcode_start > len(data):
