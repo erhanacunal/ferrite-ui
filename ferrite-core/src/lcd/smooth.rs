@@ -22,7 +22,8 @@
 //! primitives use), so smooth and aliased shapes have the same footprint.
 //!
 //! ---------------------------------------------------------------------------
-//! Portions derived from TFT_eSPI (https://github.com/Bodmer/TFT_eSPI):
+//! Portions derived from TFT_eSPI (https://github.com/Bodmer/TFT_eSPI),
+//! also listed in THIRD_PARTY_NOTICES.md at the repository root:
 //!
 //! Software License Agreement (FreeBSD License)
 //!
@@ -49,6 +50,10 @@
 //! ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 //! (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 //! SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//!
+//! The views and conclusions contained in the software and documentation are those
+//! of the authors and should not be interpreted as representing official policies,
+//! either expressed or implied, of the FreeBSD Project.
 //! ---------------------------------------------------------------------------
 
 use super::{LcdBackend, LcdImpl, isqrt, lerp_rgb565, sin_cos_deg};

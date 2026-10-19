@@ -377,6 +377,6 @@ ferrite-ui/
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE) for details. Third-party code and its licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 This project is an independent, clean-room implementation. It is not affiliated with or endorsed by ITEAD (Nextion).
