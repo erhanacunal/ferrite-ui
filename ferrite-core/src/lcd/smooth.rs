@@ -51,7 +51,7 @@
 //! SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //! ---------------------------------------------------------------------------
 
-use super::{LcdBackend, LcdImpl, isqrt, sin_cos_deg};
+use super::{LcdBackend, LcdImpl, isqrt, lerp_rgb565, sin_cos_deg};
 use crate::types::Offset;
 use alloc::vec::Vec;
 
@@ -325,6 +325,25 @@ impl Sector {
     }
 }
 
+/// What a `sym_row` row is painted with.
+#[derive(Clone, Copy)]
+enum Paint {
+    Solid(u16),
+    /// Horizontal gradient: `c1` at `x0` to `c2` at `x0 + n`
+    /// (`fill_gradient_rounded_rect` / `hspan_gradient` sampling).
+    HGrad { x0: i32, n: u16, c1: u16, c2: u16 },
+}
+
+impl Paint {
+    #[inline]
+    fn at(&self, x: i32) -> u16 {
+        match *self {
+            Paint::Solid(c) => c,
+            Paint::HGrad { x0, n, c1, c2 } => lerp_rgb565(c1, c2, (x - x0).clamp(0, n as i32) as u16, n),
+        }
+    }
+}
+
 /// How `sym_row` treats a left-half pixel.
 enum Seg {
     /// Compute its coverage.
@@ -354,6 +373,17 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
     }
 
+    /// A covered run of a `sym_row` row. Gradients carry no alpha (as in
+    /// the aliased gradient fills).
+    fn paint_span(&self, x0: i32, x1: i32, y: i32, paint: Paint, alpha: u8) {
+        match paint {
+            Paint::Solid(c) => self.aa_span(x0, x1, y, c, alpha),
+            Paint::HGrad { x0: gx, n, c1, c2 } => {
+                self.hspan_gradient(x0 as i16, x1 as i16, y as i16, gx as i16, n, c1, c2)
+            }
+        }
+    }
+
     /// One row of a shape that is mirror-symmetric about `x = s / 2`. Walks
     /// the left half from `x0`, classifying pixels with `seg` and evaluating
     /// edge pixels with `cov`; every pixel and span is mirrored onto the
@@ -364,7 +394,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         y: i32,
         x0: i32,
         s: i32,
-        color: u16,
+        paint: Paint,
         alpha: u8,
         seg: impl Fn(i32) -> Seg,
         cov: impl Fn(i32) -> u8,
@@ -373,10 +403,10 @@ impl<B: LcdBackend> LcdImpl<B> {
         let flush = |a: i32, b: i32| {
             if s - b <= b + 1 {
                 // The mirrored span touches this one: draw them as one.
-                self.aa_span(a, s - a, y, color, alpha);
+                self.paint_span(a, s - a, y, paint, alpha);
             } else {
-                self.aa_span(a, b, y, color, alpha);
-                self.aa_span(s - b, s - a, y, color, alpha);
+                self.paint_span(a, b, y, paint, alpha);
+                self.paint_span(s - b, s - a, y, paint, alpha);
             }
         };
         let mut run: Option<i32> = None;
@@ -397,9 +427,9 @@ impl<B: LcdBackend> LcdImpl<B> {
                             flush(a, px - 1);
                         }
                         let c = mul8(c, alpha);
-                        self.aa_px(px, y, color, c);
+                        self.aa_px(px, y, paint.at(px), c);
                         if s - px != px {
-                            self.aa_px(s - px, y, color, c);
+                            self.aa_px(s - px, y, paint.at(s - px), c);
                         }
                     }
                     px += 1;
@@ -462,7 +492,7 @@ impl<B: LcdBackend> LcdImpl<B> {
                     y,
                     x0,
                     cx2,
-                    color,
+                    Paint::Solid(color),
                     alpha,
                     |px| {
                         let adx2 = cx2 - 2 * px;
@@ -509,6 +539,57 @@ impl<B: LcdBackend> LcdImpl<B> {
         color: u16,
         alpha: u8,
     ) {
+        self.smooth_round_rect_paint(x, y, w, h, r, t, |_| Paint::Solid(color), alpha);
+    }
+
+    /// Anti-aliased rounded-rect fill with a horizontal (`dir == 1`) or
+    /// vertical gradient from `c1` to `c2` across the rect, sampled like
+    /// `fill_gradient_rounded_rect`. Edge pixels take their own gradient
+    /// colour.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn smooth_gradient_round_rect(
+        &self,
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+        r: u16,
+        c1: u16,
+        c2: u16,
+        dir: u8,
+    ) {
+        let (gw, gh) = (w.saturating_sub(1), h.saturating_sub(1));
+        self.smooth_round_rect_paint(
+            x,
+            y,
+            w,
+            h,
+            r,
+            0,
+            |row| {
+                if dir == 1 {
+                    Paint::HGrad { x0: x as i32, n: gw, c1, c2 }
+                } else {
+                    Paint::Solid(lerp_rgb565(c1, c2, (row - y as i32).clamp(0, gh as i32) as u16, gh))
+                }
+            },
+            255,
+        );
+    }
+
+    /// `smooth_round_rect` with a per-row paint.
+    #[allow(clippy::too_many_arguments)]
+    fn smooth_round_rect_paint(
+        &self,
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+        r: u16,
+        t: u16,
+        paint: impl Fn(i32) -> Paint,
+        alpha: u8,
+    ) {
         if w == 0 || h == 0 {
             return;
         }
@@ -518,7 +599,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         let r = (r as i32).min((w - 1) / 2).min((h - 1) / 2);
         let t = t as i32;
         let inner = t > 0 && w > 2 * t && h > 2 * t;
-        if t == 0 && r == 0 {
+        if let (0, 0, Paint::Solid(color)) = (t, r, paint(y)) {
             if alpha == 255 {
                 self.fill_rect(x as u16, y as u16, w as u16, h as u16, color);
             } else {
@@ -555,7 +636,7 @@ impl<B: LcdBackend> LcdImpl<B> {
                 row,
                 x,
                 s,
-                color,
+                paint(row),
                 alpha,
                 |px| match irow {
                     Some((_, izero, ifull)) => {
@@ -791,13 +872,17 @@ mod tests {
     struct AlphaGrid {
         cov: RefCell<Vec<u8>>,
         hits: RefCell<Vec<u8>>,
+        color: RefCell<Vec<u16>>,
+        /// Pixel-stream window (x, y, w) and the next index in it.
+        stream: RefCell<(u16, u16, u16, u16)>,
     }
     impl AlphaGrid {
-        fn put(&self, x: u16, y: u16, a: u8) {
+        fn put(&self, x: u16, y: u16, c: u16, a: u8) {
             if (x as usize) < N && (y as usize) < N {
                 let i = y as usize * N + x as usize;
                 self.cov.borrow_mut()[i] = a;
                 self.hits.borrow_mut()[i] += 1;
+                self.color.borrow_mut()[i] = c;
             }
         }
     }
@@ -810,33 +895,47 @@ mod tests {
         fn back_buf(&self) -> u8 {
             0
         }
-        fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, _: u16) {
-            self.blend_rect(x, y, w, h, 0, 255);
+        fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, c: u16) {
+            self.blend_rect(x, y, w, h, c, 255);
         }
-        fn blend_rect(&self, x: u16, y: u16, w: u16, h: u16, _: u16, alpha: u8) {
+        fn blend_rect(&self, x: u16, y: u16, w: u16, h: u16, c: u16, alpha: u8) {
             for yy in y..y.saturating_add(h) {
                 for xx in x..x.saturating_add(w) {
-                    self.put(xx, yy, alpha);
+                    self.put(xx, yy, c, alpha);
                 }
             }
         }
-        fn blend_pixel(&self, x: u16, y: u16, _: u16, alpha: u8) {
-            self.put(x, y, alpha);
+        fn blend_pixel(&self, x: u16, y: u16, c: u16, alpha: u8) {
+            self.put(x, y, c, alpha);
         }
-        fn begin_pixels(&self, _: u16, _: u16, _: u16, _: u16) {}
-        fn write_pixel(&self, _: u16) {}
+        fn begin_pixels(&self, x: u16, y: u16, w: u16, _: u16) {
+            *self.stream.borrow_mut() = (x, y, w.max(1), 0);
+        }
+        fn write_pixel(&self, c: u16) {
+            let (x, y, w, i) = *self.stream.borrow();
+            self.put(x + i % w, y + i / w, c, 255);
+            self.stream.borrow_mut().3 = i + 1;
+        }
         fn send_command(&self, _: u16) {}
         fn send_data(&self, _: u16) {}
     }
 
     fn draw(f: impl Fn(&LcdImpl<AlphaGrid>)) -> (Vec<u8>, Vec<u8>) {
+        let (cov, hits, _) = draw_colored(f);
+        (cov, hits)
+    }
+
+    /// Coverage, write counts and last colour of every pixel.
+    fn draw_colored(f: impl Fn(&LcdImpl<AlphaGrid>)) -> (Vec<u8>, Vec<u8>, Vec<u16>) {
         let lcd = LcdImpl::with_backend(AlphaGrid {
             cov: RefCell::new(alloc::vec![0; N * N]),
             hits: RefCell::new(alloc::vec![0; N * N]),
+            color: RefCell::new(alloc::vec![0; N * N]),
+            stream: RefCell::new((0, 0, 1, 0)),
         });
         f(&lcd);
         let be = lcd.backend();
-        (be.cov.borrow().clone(), be.hits.borrow().clone())
+        (be.cov.borrow().clone(), be.hits.borrow().clone(), be.color.borrow().clone())
     }
 
     fn assert_single_hits(hits: &[u8], what: &str) {
@@ -1067,6 +1166,33 @@ mod tests {
                 // ±1: float rounding at exactly half coverage.
                 let (pb, pa) = (b[y * N + x] as i32, a[y * N + x + 30] as i32);
                 assert!((pb - pa).abs() <= 1, "({x},{y}): {pb} vs {pa}");
+            }
+        }
+    }
+
+    #[test]
+    fn gradient_round_rect_matches_solid_footprint_and_samples_the_gradient() {
+        let (c1, c2) = (0xF800u16, 0x001F);
+        for (w, h, r) in [(80u16, 40u16, 12u16), (60, 60, 30), (30, 70, 9), (17, 9, 4)] {
+            let (solid, _) = draw(|l| l.fill_rounded_rect(5, 7, w, h, r, 1));
+            for dir in [1u8, 2] {
+                let what = format!("{w}x{h} r={r} dir={dir}");
+                let (cov, hits, col) = draw_colored(|l| l.fill_gradient_rounded_rect(5, 7, w, h, r, c1, c2, dir));
+                assert_single_hits(&hits, &what);
+                assert!(cov == solid, "{what}: coverage differs from the solid fill");
+                for y in 0..N {
+                    for x in 0..N {
+                        if cov[y * N + x] == 0 {
+                            continue;
+                        }
+                        let want = if dir == 1 {
+                            lerp_rgb565(c1, c2, (x - 5) as u16, w - 1)
+                        } else {
+                            lerp_rgb565(c1, c2, (y - 7) as u16, h - 1)
+                        };
+                        assert_eq!(col[y * N + x], want, "{what}: colour at ({x},{y})");
+                    }
+                }
             }
         }
     }

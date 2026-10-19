@@ -944,6 +944,10 @@ impl<B: LcdBackend> LcdImpl<B> {
         if w == 0 || h == 0 {
             return;
         }
+        if B::HAS_ALPHA && r > 0 {
+            self.smooth_gradient_round_rect(x as i16, y as i16, w, h, r, c1, c2, dir);
+            return;
+        }
         let r = r.min(w / 2).min(h / 2);
         if r == 0 {
             self.fill_gradient_rect(x, y, w, h, c1, c2, dir, 0, 0, w, h);
