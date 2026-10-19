@@ -348,6 +348,11 @@ impl<B: LcdBackend> LcdImpl<B> {
         if n < 3 {
             return;
         }
+        // Anti-aliased on blend-capable backends (aliased if its row buffer
+        // can't be allocated).
+        if B::HAS_ALPHA && self.smooth_polygon(points, color) {
+            return;
+        }
         let mut y_min = points[0].y;
         let mut y_max = points[0].y;
         for p in &points[1..] {

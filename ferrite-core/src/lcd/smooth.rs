@@ -14,6 +14,9 @@
 //!     elliptical ring sectors and rounded-rect rings)
 //!   - `drawWedgeLine` — distance-to-segment coverage with edge tracking
 //!
+//! Polygon fills use exact area coverage instead: a signed-area accumulation
+//! scanline rasterizer (the technique font renderers use), one row at a time.
+//!
 //! A disk of radius `r` is solid out to distance `r` from the centre pixel
 //! and fades to 0 at `r + 1` (50 % at `r + 0.5`, the same edge the aliased
 //! primitives use), so smooth and aliased shapes have the same footprint.
@@ -49,6 +52,8 @@
 //! ---------------------------------------------------------------------------
 
 use super::{LcdBackend, LcdImpl, isqrt, sin_cos_deg};
+use crate::types::Offset;
+use alloc::vec::Vec;
 
 /// Fractional part of `sqrt(num)` as 8 bits (TFT_eSPI `sqrt_fraction`):
 /// a bit-by-bit fixed-point square root that auto-scales from U8.8 up to
@@ -642,6 +647,125 @@ impl<B: LcdBackend> LcdImpl<B> {
     }
 }
 
+/// Add the part of edge `p0 → p1` inside pixel row `[y, y + 1)` to the row
+/// accumulator `acc` (index 0 = pixel `left`). Coordinates are continuous,
+/// pixel `i` spanning `[i, i + 1)`. Each touched cell gets the signed area
+/// the edge sweeps in it; a running sum along the row then yields the
+/// covered fraction of every pixel. Contributions left of `left` fold into
+/// index 0 (exact for a prefix sum); those right of the row are dropped.
+fn accumulate_edge(acc: &mut [f32], left: i32, y: f32, p0: (f32, f32), p1: (f32, f32)) {
+    let (p0, p1, dir) = if p0.1 < p1.1 { (p0, p1, 1.0) } else { (p1, p0, -1.0) };
+    let top = p0.1.max(y);
+    let bot = p1.1.min(y + 1.0);
+    if bot <= top {
+        return;
+    }
+    let dxdy = (p1.0 - p0.0) / (p1.1 - p0.1);
+    let xa = p0.0 + (top - p0.1) * dxdy;
+    let xb = p0.0 + (bot - p0.1) * dxdy;
+    let d = (bot - top) * dir;
+    let (x0, x1) = if xa < xb { (xa, xb) } else { (xb, xa) };
+    let mut add = |xi: i32, v: f32| {
+        let i = (xi - left).max(0) as usize;
+        if i < acc.len() {
+            acc[i] += v;
+        }
+    };
+    let x0f = libm::floorf(x0);
+    let x0i = x0f as i32;
+    let x1c = libm::ceilf(x1);
+    let x1i = x1c as i32;
+    if x1i <= x0i + 1 {
+        // Within one cell: split by the edge's mean x.
+        let xm = 0.5 * (xa + xb) - x0f;
+        add(x0i, d - d * xm);
+        add(x0i + 1, d * xm);
+    } else {
+        // Across cells: triangle in the first and last, trapezoids between.
+        let s = 1.0 / (x1 - x0);
+        let fx0 = x0 - x0f;
+        let a0 = 0.5 * s * (1.0 - fx0) * (1.0 - fx0);
+        let fx1 = x1 - x1c + 1.0;
+        let am = 0.5 * s * fx1 * fx1;
+        add(x0i, d * a0);
+        if x1i == x0i + 2 {
+            add(x0i + 1, d * (1.0 - a0 - am));
+        } else {
+            let a1 = s * (1.5 - fx0);
+            add(x0i + 1, d * (a1 - a0));
+            for xi in x0i + 2..x1i - 1 {
+                add(xi, d * s);
+            }
+            let a2 = a1 + (x1i - x0i - 3) as f32 * s;
+            add(x1i - 1, d * (1.0 - a2 - am));
+        }
+        add(x1i, d * am);
+    }
+}
+
+impl<B: LcdBackend> LcdImpl<B> {
+    /// Anti-aliased even-odd polygon fill. Vertices sit on pixel centres
+    /// (as in the aliased `fill_polygon`); every pixel's coverage is the
+    /// exact area of it inside the polygon. Returns false (nothing drawn)
+    /// if the row buffer can't be allocated.
+    pub(super) fn smooth_polygon(&self, points: &[Offset], color: u16) -> bool {
+        let (mut x_min, mut x_max) = (points[0].x as i32, points[0].x as i32);
+        let (mut y_min, mut y_max) = (points[0].y as i32, points[0].y as i32);
+        for p in points {
+            x_min = x_min.min(p.x as i32);
+            x_max = x_max.max(p.x as i32);
+            y_min = y_min.min(p.y as i32);
+            y_max = y_max.max(p.y as i32);
+        }
+        // Rows/columns limited to the screen; edges left of it still count.
+        let left = x_min.max(0);
+        let right = x_max.min(B::WIDTH as i32 - 1);
+        let (top, bottom) = (y_min.max(0), y_max.min(B::HEIGHT as i32 - 1));
+        if right < left || bottom < top {
+            return true;
+        }
+        let len = (right - left + 1) as usize;
+        let mut acc: Vec<f32> = Vec::new();
+        if acc.try_reserve_exact(len).is_err() {
+            return false;
+        }
+        acc.resize(len, 0.0);
+        let at = |i: usize| (points[i].x as f32 + 0.5, points[i].y as f32 + 0.5);
+
+        for y in top..=bottom {
+            acc.fill(0.0);
+            for i in 0..points.len() {
+                let j = if i + 1 == points.len() { 0 } else { i + 1 };
+                accumulate_edge(&mut acc, left, y as f32, at(i), at(j));
+            }
+            let mut sum = 0.0f32;
+            let mut run: Option<i32> = None;
+            for (i, v) in acc.iter().enumerate() {
+                sum += v;
+                // Even-odd: winding w → coverage |w| folded into 0..1..0.
+                let w = libm::fabsf(sum) % 2.0;
+                let c = if w > 1.0 { 2.0 - w } else { w };
+                let a = (c * 255.0 + 0.5) as i32;
+                let x = left + i as i32;
+                if a >= 255 {
+                    run.get_or_insert(x);
+                    continue;
+                }
+                if let Some(r) = run.take() {
+                    self.aa_span(r, x - 1, y, color, 255);
+                }
+                if a > 0 {
+                    self.aa_px(x, y, color, a as u8);
+                }
+            }
+            if let Some(r) = run {
+                self.aa_span(r, right, y, color, 255);
+            }
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,6 +958,115 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Aliased reference fill (the non-AA `fill_polygon`) as a pixel mask.
+    fn aliased_mask(pts: &[Offset]) -> Vec<bool> {
+        struct Mask(RefCell<Vec<bool>>);
+        impl LcdBackend for Mask {
+            const WIDTH: u16 = N as u16;
+            const HEIGHT: u16 = N as u16;
+            fn begin_frame(&mut self) {}
+            fn end_frame(&mut self) {}
+            fn back_buf(&self) -> u8 {
+                0
+            }
+            fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, _: u16) {
+                for yy in y as usize..(y as usize + h as usize).min(N) {
+                    for xx in x as usize..(x as usize + w as usize).min(N) {
+                        self.0.borrow_mut()[yy * N + xx] = true;
+                    }
+                }
+            }
+            fn begin_pixels(&self, _: u16, _: u16, _: u16, _: u16) {}
+            fn write_pixel(&self, _: u16) {}
+            fn send_command(&self, _: u16) {}
+            fn send_data(&self, _: u16) {}
+        }
+        let lcd = LcdImpl::with_backend(Mask(RefCell::new(alloc::vec![false; N * N])));
+        lcd.fill_polygon(pts, 1);
+        lcd.backend().0.borrow().clone()
+    }
+
+    fn pts(list: &[(i16, i16)]) -> Vec<Offset> {
+        list.iter().map(|&(x, y)| Offset { x, y }).collect()
+    }
+
+    const POLYS: &[&[(i16, i16)]] = &[
+        &[(10, 5), (90, 20), (40, 85)],                          // triangle
+        &[(5, 5), (90, 5), (90, 90), (5, 90)],                   // axis-aligned square
+        &[(10, 10), (80, 10), (45, 40), (80, 80), (10, 80)],     // concave
+        &[(48, 2), (60, 90), (2, 30), (94, 30), (36, 90)],       // self-intersecting star
+        &[(3, 50), (93, 47), (93, 53)],                          // thin sliver
+    ];
+
+    #[test]
+    fn polygon_fill_writes_each_pixel_once() {
+        for poly in POLYS {
+            let p = pts(poly);
+            let (_, hits) = draw(|l| l.fill_polygon(&p, 1));
+            assert_single_hits(&hits, &format!("polygon {poly:?}"));
+        }
+    }
+
+    #[test]
+    fn polygon_coverage_sums_to_its_area() {
+        for poly in POLYS[..3].iter().chain(&POLYS[4..]) {
+            let p = pts(poly);
+            let (cov, _) = draw(|l| l.fill_polygon(&p, 1));
+            let n = p.len();
+            let twice: i32 = (0..n)
+                .map(|i| {
+                    let (a, b) = (p[i], p[(i + 1) % n]);
+                    a.x as i32 * b.y as i32 - b.x as i32 * a.y as i32
+                })
+                .sum();
+            let area = twice.abs() as f32 / 2.0;
+            let got: f32 = cov.iter().map(|&c| c as f32 / 255.0).sum();
+            assert!((got - area).abs() <= area * 0.01 + 2.0, "{poly:?}: area {area} got {got}");
+        }
+    }
+
+    #[test]
+    fn polygon_interior_solid_and_exterior_empty() {
+        // Against the aliased fill (whose truncated crossings make it up to
+        // 1 px fatter): pixels 2 px deep inside it (5×5 all filled) are
+        // solid; pixels with no filled pixel within 2 px are untouched.
+        for poly in POLYS {
+            let p = pts(poly);
+            let (cov, _) = draw(|l| l.fill_polygon(&p, 1));
+            let mask = aliased_mask(&p);
+            for y in 2..N - 2 {
+                for x in 2..N - 2 {
+                    let around = (y - 2..=y + 2).flat_map(|yy| (x - 2..=x + 2).map(move |xx| (xx, yy)));
+                    let filled = around.filter(|&(xx, yy)| mask[yy * N + xx]).count();
+                    let c = cov[y * N + x];
+                    if filled == 25 {
+                        assert_eq!(c, 255, "{poly:?}: interior ({x},{y}) = {c}");
+                    }
+                    if filled == 0 {
+                        assert_eq!(c, 0, "{poly:?}: exterior ({x},{y}) = {c}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn polygon_left_of_screen_matches_shifted_copy() {
+        // Folding off-screen contributions into column 0 must be exact.
+        let tri = [(10i16, 5i16), (90, 20), (40, 85)];
+        let inside = pts(&tri);
+        let shifted: Vec<Offset> = inside.iter().map(|p| Offset { x: p.x - 30, y: p.y }).collect();
+        let (a, _) = draw(|l| l.fill_polygon(&inside, 1));
+        let (b, _) = draw(|l| l.fill_polygon(&shifted, 1));
+        for y in 0..N {
+            for x in 0..N - 30 {
+                // ±1: float rounding at exactly half coverage.
+                let (pb, pa) = (b[y * N + x] as i32, a[y * N + x + 30] as i32);
+                assert!((pb - pa).abs() <= 1, "({x},{y}): {pb} vs {pa}");
             }
         }
     }
