@@ -97,6 +97,9 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - In buffered mode: OP_BEGIN_FRAME/OP_END_FRAME are no-ops (framework handles buffer management)
 
 ### Render
+- **Anti-aliasing (blend-capable backends only — `LcdBackend::HAS_ALPHA`: n32903, tdo_y13, sim):** `lcd/smooth.rs` (adapted from TFT_eSPI smooth graphics, FreeBSD notice in the file). Circles/ellipses/rings/arcs (half-pixel ring rasterizer, `sqrt_fraction` coverage), rounded rects (fill + border ring), lines/polylines (wedge-line distance coverage, round caps). Edge pixels → `blend_pixel`, interiors stay `fill_rect` spans. Selected inside the public `LcdImpl` primitives via `if B::HAS_ALPHA`, so Nextion/e-paper compile it out (GD32 binary unchanged). Polygon *fill* and gradient rounded corners are still aliased.
+  - Don't stack 1 px primitives for thickness on these backends (overlapping soft edges double-blend): use `fill_arc`, `stroke_rounded_rect`, `draw_line_thick`, `draw_oval(x, y, w, h, t)` (box-inscribed, soft edge stays inside the widget box).
+  - Rounded (`border_radius`) and freeform shape widgets count as `shows_behind` on these backends, so dirty redraws restore what is behind first — otherwise edge pixels blend over their previous output and accumulate.
 - `fill_rect` → `set_address` + burst pixel write (hardware speed on FPGA)
 - No frame buffer in CPU RAM — writes directly to FPGA
 - **Dirty mode:** partial update — only dirty widgets are redrawn (front buffer)

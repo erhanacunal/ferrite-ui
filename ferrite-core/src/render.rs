@@ -551,13 +551,18 @@ fn covers_opaquely(tree: &WidgetTree, id: WidgetId, abs: &Rect, rect: &Rect) -> 
 }
 
 /// True when what is behind `id` shows through it: a translucent
-/// background, or a label without a background of its own (its text is
-/// drawn straight over the content behind it on readback backends).
+/// background, a label without a background of its own (its text is
+/// drawn straight over the content behind it on readback backends), or an
+/// anti-aliased outline — rounded corners and freeform shapes blend their
+/// edge pixels over what is behind (only asked on readback backends).
 fn shows_behind(tree: &WidgetTree, id: WidgetId) -> bool {
     if tree.alpha(id) < 255 {
         return true;
     }
     let w = tree.get(id);
+    if is_freeform_shape(w.kind) || tree.ext(id).is_some_and(|e| e.border_radius != 0) {
+        return true;
+    }
     w.kind == KIND_LABEL
         && effective_bg(tree, w, tree.ext(id).unwrap_or(&WidgetExt::DEFAULT)) == 0
 }
@@ -687,6 +692,44 @@ fn draw_widget<P: Platform>(
         let bw = b.top.max(b.bottom).max(b.left).max(b.right);
         for cr in clip.iter() {
             ctx.lcd.set_scissor(Some(*cr));
+            if ctx.lcd.has_alpha() {
+                // Anti-aliased: background first, then one border ring over
+                // it. The fill reaches halfway under the ring, so the ring's
+                // soft inner edge blends over the background rather than over
+                // what is behind the widget.
+                let Some(outer) = abs.intersection(&screen_rect::<P::LcdB>()) else {
+                    continue;
+                };
+                if draw_bg {
+                    let inset = (bw / 2) as u16;
+                    let bg = Rect::new(
+                        outer.x + inset as i16,
+                        outer.y + inset as i16,
+                        outer.w.saturating_sub(inset * 2),
+                        outer.h.saturating_sub(inset * 2),
+                    );
+                    if !bg.is_empty() {
+                        let bg_r = r.saturating_sub(inset);
+                        if gdir != 0 {
+                            fill_gradient_rounded_rect_screen(&ctx.lcd, bg, bg_r, bg_color, gcol, gdir);
+                        } else if alpha < 255 {
+                            fill_rounded_rect_blend_screen(&ctx.lcd, bg, bg_r, bg_color, alpha);
+                        } else {
+                            fill_rounded_rect_screen(&ctx.lcd, bg, bg_r, bg_color);
+                        }
+                    }
+                }
+                ctx.lcd.stroke_rounded_rect(
+                    outer.x,
+                    outer.y,
+                    outer.w,
+                    outer.h,
+                    r,
+                    bw as u16,
+                    widget.border_color,
+                );
+                continue;
+            }
             for i in 0..bw {
                 rounded_rect_screen(
                     &ctx.lcd,
@@ -880,6 +923,15 @@ fn shape_stroke(ext: &WidgetExt) -> u16 {
 /// Circle shape: fill with `bg_color` (if set), stroke with `border_color`
 /// drawn as `thickness` concentric rings. Centered in the widget's box.
 fn draw_circle_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    if lcd.has_alpha() {
+        // Anti-aliased: inscribed in the centred square so the soft edge
+        // stays inside the widget box (and its clip).
+        let d = abs.w.min(abs.h);
+        let x = abs.x + ((abs.w - d) / 2) as i16;
+        let y = abs.y + ((abs.h - d) / 2) as i16;
+        draw_smooth_oval_shape(lcd, widget, ext, Rect::new(x, y, d, d));
+        return;
+    }
     let r = (abs.w.min(abs.h) / 2) as i16;
     if r <= 0 {
         return;
@@ -898,6 +950,10 @@ fn draw_circle_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rec
 /// Ellipse shape: fill with `bg_color` (if set), stroke with `border_color`
 /// drawn as `thickness` concentric outlines. Fills the widget's w×h box.
 fn draw_ellipse_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    if lcd.has_alpha() {
+        draw_smooth_oval_shape(lcd, widget, ext, *abs);
+        return;
+    }
     let rx = (abs.w / 2) as i16;
     let ry = (abs.h / 2) as i16;
     if rx <= 0 || ry <= 0 {
@@ -911,6 +967,28 @@ fn draw_ellipse_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Re
     if widget.border_color != 0 {
         let t = shape_stroke(ext) as i16;
         lcd.stroke_ellipse(cx, cy, rx, ry, t, widget.border_color);
+    }
+}
+
+/// Anti-aliased circle/ellipse shape inscribed in `bx`: fill, then the
+/// stroke ring over it. The fill stops halfway under the ring, so neither
+/// soft edge blends over the other's fringe.
+fn draw_smooth_oval_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, ext: &WidgetExt, bx: Rect) {
+    let stroke = widget.border_color != 0;
+    let t = shape_stroke(ext);
+    if widget.background_color != 0 {
+        let inset = if stroke { t / 2 } else { 0 };
+        lcd.draw_oval(
+            bx.x + inset as i16,
+            bx.y + inset as i16,
+            bx.w.saturating_sub(inset * 2),
+            bx.h.saturating_sub(inset * 2),
+            0,
+            widget.background_color,
+        );
+    }
+    if stroke {
+        lcd.draw_oval(bx.x, bx.y, bx.w, bx.h, t, widget.border_color);
     }
 }
 
@@ -1318,9 +1396,7 @@ fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, inner: &Rect, ex
     } else {
         0x3186 // default dark gray
     };
-    for dr in inner_r..=outer_r {
-        lcd.draw_arc(cx, cy, dr, ARC_START, ARC_END, track_color);
-    }
+    lcd.fill_arc(cx, cy, outer_r, inner_r, ARC_START, ARC_END, track_color);
 
     // Draw value arc (filled portion)
     if val > 0 && ext.press_color != 0 {
@@ -1329,9 +1405,7 @@ fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, inner: &Rect, ex
         } else {
             value_angle as i16
         };
-        for dr in inner_r..=outer_r {
-            lcd.draw_arc(cx, cy, dr, ARC_START, end, ext.press_color);
-        }
+        lcd.fill_arc(cx, cy, outer_r, inner_r, ARC_START, end, ext.press_color);
     }
 
     // Draw needle
@@ -1345,10 +1419,15 @@ fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, inner: &Rect, ex
         let (sin_v, cos_v) = lcd::sin_cos_deg(value_angle as i16);
         let nx = cx + ((needle_r as i32 * cos_v as i32) >> 8) as i16;
         let ny = cy + ((needle_r as i32 * sin_v as i32) >> 8) as i16;
-        lcd.draw_line(cx, cy, nx, ny, needle_color);
-        // Draw thicker needle (2 extra lines offset by 1px)
-        lcd.draw_line(cx + 1, cy, nx + 1, ny, needle_color);
-        lcd.draw_line(cx, cy + 1, nx, ny + 1, needle_color);
+        if lcd.has_alpha() {
+            // One anti-aliased stroke (offset copies would double-blend).
+            lcd.draw_line_thick(cx, cy, nx, ny, needle_color, 2);
+        } else {
+            lcd.draw_line(cx, cy, nx, ny, needle_color);
+            // Draw thicker needle (2 extra lines offset by 1px)
+            lcd.draw_line(cx + 1, cy, nx + 1, ny, needle_color);
+            lcd.draw_line(cx, cy + 1, nx, ny + 1, needle_color);
+        }
     }
 
     // Center dot
@@ -1870,14 +1949,33 @@ fn draw_check_indicator<B: LcdBackend>(
                 let y1 = cy + (s as i16) * 3 / 4;
                 let x2 = cx + (s as i16) * 3 / 4;
                 let y2 = cy + (s as i16) / 4;
-                lcd.draw_line(x0, y0, x1, y1, fill_color);
-                lcd.draw_line(x1, y1, x2, y2, fill_color);
-                lcd.draw_line(x0 + 1, y0, x1 + 1, y1, fill_color);
-                lcd.draw_line(x1 + 1, y1, x2 + 1, y2, fill_color);
+                if lcd.has_alpha() {
+                    let tick = [Offset { x: x0, y: y0 }, Offset { x: x1, y: y1 }, Offset { x: x2, y: y2 }];
+                    lcd.draw_polyline(&tick, fill_color, false, 2);
+                } else {
+                    lcd.draw_line(x0, y0, x1, y1, fill_color);
+                    lcd.draw_line(x1, y1, x2, y2, fill_color);
+                    lcd.draw_line(x0 + 1, y0, x1 + 1, y1, fill_color);
+                    lcd.draw_line(x1 + 1, y1, x2 + 1, y2, fill_color);
+                }
             }
         }
     } else {
         // Radio: circle
+        if lcd.has_alpha() {
+            // Inscribed in the s×s box; the dot keeps s's parity so it is
+            // centred exactly.
+            lcd.draw_oval(cx, cy, s, s, 1, outline_color);
+            if checked {
+                let mut d = s * 2 / 3;
+                if (s - d) % 2 != 0 {
+                    d -= 1;
+                }
+                let o = ((s - d) / 2) as i16;
+                lcd.draw_oval(cx + o, cy + o, d, d, 0, fill_color);
+            }
+            return;
+        }
         let rc = (s / 2) as i16;
         let ccx = cx + rc;
         let ccy = cy + rc;

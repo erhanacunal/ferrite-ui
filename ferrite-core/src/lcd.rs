@@ -4,6 +4,10 @@ use core::cell::Cell;
 
 use crate::types::{Offset, Rect};
 
+/// Anti-aliased variants of the shape primitives, used on blend-capable
+/// backends (`LcdBackend::HAS_ALPHA`).
+mod smooth;
+
 /// Maximum vertices a polygon shape can hold (bounds the scanline-fill
 /// intersection buffer and the point parser; 16 × 4 B = 64 B of stack).
 pub const MAX_POLY_POINTS: usize = 16;
@@ -261,6 +265,10 @@ impl<B: LcdBackend> LcdImpl<B> {
     }
 
     pub fn draw_line(&self, x0: i16, y0: i16, x1: i16, y1: i16, color: u16) {
+        if B::HAS_ALPHA {
+            self.smooth_line(x0, y0, x1, y1, 128, color);
+            return;
+        }
         let mut x = x0;
         let mut y = y0;
         let dx = (x1 - x0).abs();
@@ -289,8 +297,13 @@ impl<B: LcdBackend> LcdImpl<B> {
     /// Bresenham line with a pixel thickness. `thickness <= 1` is `draw_line`;
     /// thicker lines are approximated by parallel passes offset perpendicular
     /// to the dominant axis — adequate for the small stroke widths shapes use.
+    /// Blend-capable backends draw one anti-aliased round-capped stroke.
     pub fn draw_line_thick(&self, x0: i16, y0: i16, x1: i16, y1: i16, color: u16, thickness: u16) {
         let t = thickness.max(1);
+        if B::HAS_ALPHA {
+            self.smooth_line(x0, y0, x1, y1, t as i32 * 128, color);
+            return;
+        }
         if t == 1 {
             self.draw_line(x0, y0, x1, y1, color);
             return;
@@ -389,6 +402,10 @@ impl<B: LcdBackend> LcdImpl<B> {
         if r <= 0 {
             return;
         }
+        if B::HAS_ALPHA {
+            self.smooth_ring(cx, cy, r, r, r, r, None, color, 255);
+            return;
+        }
         let mut x: i16 = 0;
         let mut y: i16 = r;
         let mut d: i16 = 1 - r;
@@ -409,6 +426,10 @@ impl<B: LcdBackend> LcdImpl<B> {
         if r <= 0 {
             return;
         }
+        if B::HAS_ALPHA {
+            self.smooth_ring(cx, cy, r, r, 0, 0, None, color, 255);
+            return;
+        }
         // Same per-row extent as `fill_ellipse`/`stroke_ellipse`, so a circle
         // shape's fill and stroke line up.
         for dy in -r..=r {
@@ -421,6 +442,10 @@ impl<B: LcdBackend> LcdImpl<B> {
     /// span per row via the ellipse equation (reuses `isqrt`).
     pub fn fill_ellipse(&self, cx: i16, cy: i16, rx: i16, ry: i16, color: u16) {
         if rx <= 0 || ry <= 0 {
+            return;
+        }
+        if B::HAS_ALPHA {
+            self.smooth_ring(cx, cy, rx, ry, 0, 0, None, color, 255);
             return;
         }
         for dy in -ry..=ry {
@@ -439,6 +464,12 @@ impl<B: LcdBackend> LcdImpl<B> {
         if rx <= 0 || ry <= 0 || thickness <= 0 {
             return;
         }
+        if B::HAS_ALPHA {
+            // Inner edge at (r - t) + ½, the same ring the spans below fill.
+            let (irx, iry) = (rx - thickness + 1, ry - thickness + 1);
+            self.smooth_ring(cx, cy, rx, ry, irx, iry, None, color, 255);
+            return;
+        }
         let (irx, iry) = (rx - thickness, ry - thickness);
         for dy in -ry..=ry {
             let xo = ellipse_half_width(rx, ry, dy);
@@ -453,9 +484,31 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
     }
 
+    /// Ellipse inscribed in the `w`×`h` box at `(x, y)`: filled when `t == 0`,
+    /// else a ring `t` px wide. Blend-capable backends draw it anti-aliased
+    /// with the edge on the box border (half-pixel centre for even sizes), so
+    /// the soft fringe stays inside the box; others use the centre/radius
+    /// primitives at `(x + w/2, y + h/2)`, radii `w/2`, `h/2`.
+    pub fn draw_oval(&self, x: i16, y: i16, w: u16, h: u16, t: u16, color: u16) {
+        if B::HAS_ALPHA {
+            self.smooth_oval(x, y, w, h, t, color);
+            return;
+        }
+        let (rx, ry) = ((w / 2) as i16, (h / 2) as i16);
+        if t == 0 {
+            self.fill_ellipse(x + rx, y + ry, rx, ry, color);
+        } else {
+            self.stroke_ellipse(x + rx, y + ry, rx, ry, t as i16, color);
+        }
+    }
+
     /// 1px ellipse outline — integer midpoint ellipse algorithm, 4-way symmetry.
     pub fn draw_ellipse(&self, cx: i16, cy: i16, rx: i16, ry: i16, color: u16) {
         if rx <= 0 || ry <= 0 {
+            return;
+        }
+        if B::HAS_ALPHA {
+            self.smooth_ring(cx, cy, rx, ry, rx, ry, None, color, 255);
             return;
         }
         let (cxi, cyi) = (cx as i64, cy as i64);
@@ -546,6 +599,10 @@ impl<B: LcdBackend> LcdImpl<B> {
         if w == 0 || h == 0 {
             return;
         }
+        if B::HAS_ALPHA && r > 0 {
+            self.smooth_round_rect(x as i16, y as i16, w, h, r, 1, color, 255);
+            return;
+        }
         let r = r.min(w / 2).min(h / 2);
         if r == 0 {
             self.draw_rect(x, y, w, h, color);
@@ -595,8 +652,37 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
     }
 
+    /// Rounded-rect border `t` px wide: nested 1 px outlines, or one
+    /// anti-aliased ring on blend-capable backends (stacked anti-aliased
+    /// outlines would blend over each other's edges).
+    #[allow(clippy::too_many_arguments)]
+    pub fn stroke_rounded_rect(&self, x: i16, y: i16, w: u16, h: u16, r: u16, t: u16, color: u16) {
+        if t == 0 || w == 0 || h == 0 {
+            return;
+        }
+        if B::HAS_ALPHA && r > 0 {
+            self.smooth_round_rect(x, y, w, h, r, t, color, 255);
+            return;
+        }
+        for i in 0..t {
+            let w = w.saturating_sub(i * 2);
+            let h = h.saturating_sub(i * 2);
+            if w == 0 || h == 0 {
+                break;
+            }
+            let (xi, yi) = (x + i as i16, y + i as i16);
+            if xi >= 0 && yi >= 0 {
+                self.draw_rounded_rect(xi as u16, yi as u16, w, h, r.saturating_sub(i), color);
+            }
+        }
+    }
+
     pub fn fill_rounded_rect(&self, x: u16, y: u16, w: u16, h: u16, r: u16, color: u16) {
         if w == 0 || h == 0 {
+            return;
+        }
+        if B::HAS_ALPHA && r > 0 {
+            self.smooth_round_rect(x as i16, y as i16, w, h, r, 0, color, 255);
             return;
         }
         let r = r.min(w / 2).min(h / 2);
@@ -644,6 +730,10 @@ impl<B: LcdBackend> LcdImpl<B> {
         alpha: u8,
     ) {
         if w == 0 || h == 0 {
+            return;
+        }
+        if B::HAS_ALPHA && r > 0 {
+            self.smooth_round_rect(x as i16, y as i16, w, h, r, 0, color, alpha);
             return;
         }
         let r = r.min(w / 2).min(h / 2);
@@ -747,6 +837,10 @@ impl<B: LcdBackend> LcdImpl<B> {
         if r <= 0 {
             return;
         }
+        if B::HAS_ALPHA {
+            self.smooth_ring(cx, cy, r, r, r, r, Some((start, end)), color, 255);
+            return;
+        }
         let start = ((start % 360) + 360) % 360;
         let end = ((end % 360) + 360) % 360;
 
@@ -764,6 +858,23 @@ impl<B: LcdBackend> LcdImpl<B> {
             if deg >= 360 {
                 deg = 0;
             }
+        }
+    }
+
+    /// Thick arc: the ring between radii `ir..=r`, clockwise from `start` to
+    /// `end` degrees (`draw_arc` convention). Stacked 1 px arcs, or one
+    /// anti-aliased ring sector (with smoothed ends) on blend-capable backends.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_arc(&self, cx: i16, cy: i16, r: i16, ir: i16, start: i16, end: i16, color: u16) {
+        if r <= 0 {
+            return;
+        }
+        if B::HAS_ALPHA {
+            self.smooth_ring(cx, cy, r, r, ir, ir, Some((start, end)), color, 255);
+            return;
+        }
+        for dr in ir..=r {
+            self.draw_arc(cx, cy, dr, start, end, color);
         }
     }
 
