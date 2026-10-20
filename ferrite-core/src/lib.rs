@@ -63,7 +63,7 @@ fn _mock_instantiation_guard() {
     let _: fn(&mut ctx::Ctx<M>) -> bool = render::buffered_has_dirty::<M>;
     let _: fn(&mut vm::Vm, &mut ctx::Ctx<M>) = vm::Vm::run::<M>;
     let _: fn(&mut vm::Vm, &mut ctx::Ctx<M>) = vm::Vm::step::<M>;
-    let _: fn(&mut vm::Vm, &mut ctx::Ctx<M>) = vm::Vm::drain_callbacks::<M>;
+    let _: fn(&mut vm::Vm, &mut ctx::Ctx<M>) -> bool = vm::Vm::drain_callbacks::<M>;
     let _: fn(&mut vm::Vm, &mut ctx::Ctx<M>) = vm::Vm::try_resume_modal::<M>;
 
     // protocol.rs: feed (flash-generic) + send_* (usart-generic).

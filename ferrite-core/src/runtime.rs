@@ -273,38 +273,14 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
         }
 
         // --- VM step ---
+        // Continues a suspended callback whose delay expired, or runs a burst
+        // of the main program. On the GD32 the burst is 1 instruction (the loop
+        // already spins at CPU speed); faster BSPs and the sim raise
+        // VM_STEPS_PER_TICK so animation runs at hardware-like speed instead
+        // of one instruction per presented frame.
         if error_code == 0 {
-            match vm.state {
-                VmState::Running | VmState::Yielded => {
-                    vm.state = VmState::Running;
-                    // Run a burst of instructions per loop iteration. On device
-                    // this is 1 (the loop already spins at CPU speed); the sim
-                    // raises it so animation runs at hardware-like speed instead
-                    // of one instruction per presented frame. A critical section
-                    // always runs to its YIELD regardless of the budget.
-                    let mut budget = P::VM_STEPS_PER_TICK.max(1);
-                    loop {
-                        vm.step(&mut ctx);
-                        while vm.is_critical() && vm.state == VmState::Running {
-                            vm.step(&mut ctx);
-                        }
-                        budget -= 1;
-                        if budget == 0 || vm.state != VmState::Running {
-                            break;
-                        }
-                    }
-                    if vm.state == VmState::Error {
-                        error_code = ERR_PROGRAM_ERROR;
-                        show_error(&mut ctx, error_code, Some((vm.fault(), vm.fault_pc())));
-                    }
-                }
-                VmState::Waiting => {
-                    if ctx.systick.millis().wrapping_sub(vm.wait_until) < 0x8000_0000 {
-                        vm.state = VmState::Running;
-                    }
-                }
-                _ => {} // Halted / Error / Ready / AwaitingModal
-            }
+            vm.tick(&mut ctx, P::VM_STEPS_PER_TICK);
+            error_code = check_vm_fault(&mut ctx, &vm);
         }
 
         // --- USART protocol (always serviced, even after an error, so a new
@@ -397,10 +373,14 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
             render_phase(&mut ctx, &mut vm, &mut input);
         }
 
-        // --- Drain callback queue, then re-render ---
-        if error_code == 0 && vm.has_pending_callbacks() {
-            vm.drain_callbacks(&mut ctx);
+        // --- Start queued callbacks, then re-render ---
+        if error_code == 0 && vm.has_pending_callbacks() && vm.drain_callbacks(&mut ctx) {
             render_phase(&mut ctx, &mut vm, &mut input);
+        }
+
+        // --- A fault in a callback or on_paint stops the program too ---
+        if error_code == 0 {
+            error_code = check_vm_fault(&mut ctx, &vm);
         }
 
         // --- End-of-frame hook (host window pump / present; no-op on device) ---
@@ -501,7 +481,7 @@ fn reserve_tree<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) {
 #[inline(never)]
 fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     if let Some(offset) = vm.find_by_kind(FunctionKind::Setup).map(|e| e.offset as CodeAddr) {
-        vm.run_callback(offset, ctx);
+        vm.call_now(offset, &[], ctx);
         if vm.pop_result() != 0 {
             return ERR_PROGRAM_ERROR;
         }
@@ -510,11 +490,10 @@ fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
         .find_by_kind(FunctionKind::OnProgramStart)
         .map(|e| e.offset as CodeAddr)
     {
-        vm.run_callback(offset, ctx);
+        vm.call_now(offset, &[], ctx);
     }
     if let Some(offset) = vm.find_by_kind(FunctionKind::Loop).map(|e| e.offset as CodeAddr) {
-        vm.set_pc(offset);
-        vm.state = VmState::Running;
+        vm.start_main(offset);
     }
     0
 }
@@ -557,6 +536,15 @@ fn reload_program<P: PlatformRuntime>(
         vm.state = VmState::Running;
         0
     }
+}
+
+/// Show the Code 6 screen if the VM has faulted. Returns the new error code.
+fn check_vm_fault<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) -> u8 {
+    if vm.state != VmState::Error {
+        return 0;
+    }
+    show_error(ctx, ERR_PROGRAM_ERROR, Some((vm.fault(), vm.fault_pc())));
+    ERR_PROGRAM_ERROR
 }
 
 // ============================================================================

@@ -114,10 +114,17 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **37 opcodes:** stack ops (PUSH/POP/DUP/SWAP), arithmetic (ADD/SUB/MUL/DIV/MOD/NEG), comparison (EQ/NE/LT/LE/GT/GE), logic (AND/OR/NOT), control (JMP/JZ/JNZ/CALL/RET/YIELD/HALT), widget (W_TARGET/W_SET/W_GET/W_DIRTY/W_RENDER/W_ALLOC/W_PARENT), flash (F_READ/F_WRITE)
 - **Opcode 0–15:** 1-byte tag (frequent), **16+:** 2-byte tag (rare)
 - **W_ALLTAR opcode (0x1C):** combined alloc + store + target (saves 5 bytes per widget)
-- **Vm struct:** eval stack (16-deep), vars (sparse Vec, max 256), call stack (8-deep)
+- **Vm struct:** eval stack (32-deep), vars (sparse Vec, max 256), call stack (16-deep)
 - **Property R/W:** scalar (W_SET wt=0, single value from stack) and compound (W_SET wt=2, LEN payload with multiple zigzag varints)
 - **Builder:** builds bytecode in RAM, forward jump patching, writes to `&mut [u8]` buffer
 - **Execution:** `vm.run(&code[..len], &mut tree, &mut lcd, &flash)` — F_READ/F_WRITE operate via flash
+- **Callbacks (interrupt-style frames):** `enqueue_callback` queues an event; `drain_callbacks` enters it on the VM's own stacks like `OP_CALL`, saving only registers in a `CbFrame` (pc, sp, call depth, target, state, wait timer, frame). Args go on the eval stack above `sp_floor`, and the callback cannot pop below it. `OP_RET` at the entry call depth (or `OP_HALT`) leaves the callback and restores the interrupted code, discarding the callback's leftover stack values. There are no heap copies.
+  - Callbacks preempt the main program anywhere outside a critical section.
+  - `delay`/`yield`/`showModal` inside a callback suspend it; `Vm::tick` continues it on a later iteration. Later callbacks queue behind a suspended one (FIFO), except while it awaits a modal, so the dialog's button callbacks can run on top of it.
+  - `call_now` runs setup / on_program_start / on_paint synchronously: `delay` busy-waits and `yield` is a no-op there.
+  - Nesting is capped by `CB_NEST_MAX` (= `MODAL_STACK_MAX + 2`).
+  - A callback shares the eval/call stack depth with the code it interrupted. Raise `eval_stack`/`call_stack` in `"memory"` if handlers run deep.
+  - A fault inside a callback or on_paint shows the Code 6 screen.
 - **Fault codes:** every `VmState::Error` goes through `Vm::fail(fault::X)` — `vm.fault()` (u8, `vm::fault::*`) + `vm.fault_pc()` (start of the faulting instruction; first fault wins). Shown on the Code 6 error screen as `VM n: <name>` + PC, and sent over USART as a 4-byte error payload `[code, fault, pc_lo, pc_hi]` (`ferrite_cli.py` `VM_FAULT_NAMES` — keep in sync)
 - **Control flow:** if/while/for — via JZ/JNZ/JMP combinations
 - **Image header v3:** version(u8=3) + func_count(u16) + global_count(u16) + flags(u16) + func_table

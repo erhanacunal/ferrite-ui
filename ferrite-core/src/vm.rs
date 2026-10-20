@@ -458,18 +458,10 @@ pub enum VmState {
     Error,
 }
 
-// --- VM Mode ---
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum VmMode {
-    Normal,
-    Callback,
-}
-
 // --- VM ---
 
 /// Default evaluation stack depth (overridable via RES_SYSCFG `eval_stack`).
-const STACK_SIZE: usize = 16;
+const STACK_SIZE: usize = 32;
 const MAX_SYSCALL_ARGS: usize = 16;
 /// Variable entry — sparse mapping from slot ID to value.
 struct VmVar {
@@ -477,7 +469,7 @@ struct VmVar {
     val: i32,
 }
 /// Default call stack depth (overridable via RES_SYSCFG `call_stack`).
-const CALL_STACK_SIZE: usize = 8;
+const CALL_STACK_SIZE: usize = 16;
 
 /// Internal heap-allocated VM array.
 struct VmArray {
@@ -493,13 +485,16 @@ struct CallFrame {
     frame_size: u8,
 }
 
-/// Saved VM state for callback push/pop. Only the live part of each stack is
-/// kept (`stack[..sp]`, `call_stack[..call_sp]`), so a callback taken at a
-/// YIELD with an empty eval stack allocates nothing for it.
-struct VmSnapshot {
+/// What a callback interrupted — the VM's "exception frame". Only registers
+/// are saved: the interrupted code's eval-stack values and call frames stay
+/// in place, and the callback runs above them (`sp_floor`, and `call_sp` as
+/// the depth at which its OP_RET returns).
+#[derive(Clone, Copy)]
+struct CbFrame {
     pc: CodeAddr,
-    stack: Vec<i32>,
-    call_stack: Vec<CallFrame>,
+    sp: u8,
+    sp_floor: u8,
+    call_sp: u8,
     target: WidgetId,
     state: VmState,
     wait_until: u32,
@@ -507,6 +502,10 @@ struct VmSnapshot {
     frame_base: u8,
     frame_size: u8,
 }
+
+/// Maximum callback nesting: a callback suspended on each open modal, the
+/// dialog-button callback on top of them, and an on_paint pass.
+const CB_NEST_MAX: usize = MODAL_STACK_MAX + 2;
 
 /// Maximum number of arguments per queued callback.
 const CB_MAX_ARGS: usize = 3;
@@ -638,13 +637,14 @@ pub struct Vm {
     code: VmCode,
     // Function table from image header
     functions: Vec<FuncEntry>,
-    // Normal or callback execution mode
-    pub mode: VmMode,
-    // Stack of saved states for nested callback execution. A callback that
-    // suspends on a modal (showModal) leaves its frame in place while later
-    // callbacks (e.g. setDialogResult) run on top, then resumes once the
-    // modal closes — see try_resume_modal.
-    saved: Vec<VmSnapshot>,
+    // Active callbacks, innermost last (empty = the main program is running).
+    // A callback that suspends (delay, yield, showModal) keeps its frame
+    // here and continues on a later tick; while it waits on a modal, the
+    // dialog's callbacks run on top of it.
+    cb_frames: Vec<CbFrame>,
+    // Lowest eval-stack slot the running code may pop: a callback cannot
+    // reach the values of the code it interrupted.
+    sp_floor: u8,
     // Callback queue — FIFO ring buffer
     cb_queue: Box<[CbRequest]>,
     cb_head: u8,
@@ -711,8 +711,8 @@ impl Vm {
             wait_until: 0,
             code: VmCode::None,
             functions: Vec::new(),
-            mode: VmMode::Normal,
-            saved: Vec::new(),
+            cb_frames: Vec::new(),
+            sp_floor: 0,
             cb_queue: alloc::vec![EMPTY_CB; CB_QUEUE_SIZE].into_boxed_slice(),
             cb_head: 0,
             cb_tail: 0,
@@ -926,38 +926,105 @@ impl Vm {
         self.cb_head != self.cb_tail
     }
 
-    /// Run one queued callback to completion. Saves/restores VM state.
-    /// Returns false if the queue was empty.
-    ///
-    /// A callback that suspends on a modal dialog (showModal) leaves its
-    /// frame on the saved stack — pop_state runs only when the callback
-    /// actually finishes (Halted/Yielded). The suspended frame is later
-    /// resumed by `try_resume_modal` when `setDialogResult` fires.
-    pub fn run_next_callback<P: Platform>(&mut self, ctx: &mut Ctx<P>) -> bool {
-        if self.cb_head == self.cb_tail {
+    /// True if a queued callback may start now. The main program can be
+    /// interrupted anywhere outside a critical section. A suspended callback
+    /// (delay, yield) holds the queue until it finishes, so handlers stay in
+    /// FIFO order — except while it waits on a modal, whose buttons must be
+    /// able to run their callbacks on top of it.
+    fn can_take_callback(&self) -> bool {
+        if self.critical || self.in_paint || self.cb_frames.len() >= CB_NEST_MAX {
             return false;
         }
-        let req = self.cb_queue[self.cb_head as usize];
-        self.cb_head = (self.cb_head + 1) % self.cb_queue.len() as u8;
-
-        self.push_state(req.offset);
-        for i in 0..req.arg_count as usize {
-            self.push_arg(req.args[i]);
+        match self.state {
+            VmState::Error | VmState::Ready => false,
+            VmState::AwaitingModal => true,
+            _ => self.cb_frames.is_empty(),
         }
-        self.run(ctx);
-        if self.state == VmState::AwaitingModal {
-            // Callback is suspended on showModal. Leave its frame in place;
-            // try_resume_modal will resume + pop_state when result arrives.
-            return true;
-        }
-        self.pop_state();
-        true
     }
 
-    /// Drain all queued callbacks, executing each to completion.
+    /// Start queued callbacks. Each runs until it returns or suspends; one
+    /// that suspends continues from `tick` on a later iteration. Returns
+    /// true if any callback ran.
     #[inline(never)]
-    pub fn drain_callbacks<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
-        while self.run_next_callback(ctx) {}
+    pub fn drain_callbacks<P: Platform>(&mut self, ctx: &mut Ctx<P>) -> bool {
+        let mut ran = false;
+        while self.cb_head != self.cb_tail && self.can_take_callback() {
+            let req = self.cb_queue[self.cb_head as usize];
+            self.cb_head = (self.cb_head + 1) % self.cb_queue.len() as u8;
+            self.enter_callback(req.offset, &req.args[..req.arg_count as usize]);
+            self.run_active_callback(ctx);
+            ran = true;
+        }
+        ran
+    }
+
+    /// One main-loop slice of execution. A suspended callback whose delay
+    /// expired (or that yielded, or whose modal closed) continues until it
+    /// returns or suspends again; otherwise the main program runs `budget`
+    /// instructions. A critical section always runs to its YIELD.
+    #[inline(never)]
+    pub fn tick<P: Platform>(&mut self, ctx: &mut Ctx<P>, budget: u32) {
+        match self.state {
+            VmState::Running => {}
+            VmState::Yielded => self.state = VmState::Running,
+            VmState::Waiting if self.wait_expired(ctx) => self.state = VmState::Running,
+            _ => return,
+        }
+        if !self.cb_frames.is_empty() {
+            self.run_active_callback(ctx);
+            return;
+        }
+        let mut budget = budget.max(1);
+        loop {
+            self.step(ctx);
+            while self.critical && self.state == VmState::Running {
+                self.step(ctx);
+            }
+            budget -= 1;
+            if budget == 0 || self.state != VmState::Running {
+                break;
+            }
+        }
+    }
+
+    /// Run a function to completion right now, on top of whatever is running:
+    /// setup before the main loop starts, on_paint inside a render pass.
+    /// Nothing else runs meanwhile, so `delay()` busy-waits and `yield` is a
+    /// no-op. A function that opens a modal stays suspended on it; the main
+    /// loop resumes it like any callback.
+    pub fn call_now<P: Platform>(&mut self, offset: CodeAddr, args: &[i32], ctx: &mut Ctx<P>) {
+        if !self.enter_callback(offset, args) {
+            return;
+        }
+        let depth = self.cb_frames.len();
+        while self.cb_frames.len() >= depth {
+            match self.state {
+                VmState::Running => self.step(ctx),
+                VmState::Yielded => self.state = VmState::Running,
+                VmState::Waiting => {
+                    if self.wait_expired(ctx) {
+                        self.state = VmState::Running;
+                    }
+                }
+                _ => break, // Error, or suspended on a modal
+            }
+        }
+    }
+
+    /// Point the main program at `offset` and make it runnable. If setup left
+    /// a callback suspended on a dialog, the main program starts once that
+    /// callback returns.
+    pub fn start_main(&mut self, offset: CodeAddr) {
+        match self.cb_frames.first_mut() {
+            Some(f) => {
+                f.pc = offset;
+                f.state = VmState::Running;
+            }
+            None => {
+                self.pc = offset;
+                self.state = VmState::Running;
+            }
+        }
     }
 
     /// Run the on_paint dispatcher now (not queued) for the widgets in
@@ -968,7 +1035,11 @@ impl Vm {
     /// earlier had already hidden the widget (e.g. a tab switch), painting
     /// over whatever replaced it.
     pub fn run_paint<P: Platform>(&mut self, ctx: &mut Ctx<P>, paint: &render::PaintList) {
-        if self.in_paint || paint.is_empty() || self.state == VmState::Error {
+        if self.in_paint
+            || paint.is_empty()
+            || self.state == VmState::Error
+            || self.cb_frames.len() >= CB_NEST_MAX
+        {
             return;
         }
         let offset = match self.find_by_kind(FunctionKind::OnPaint) {
@@ -988,23 +1059,8 @@ impl Vm {
         }
         let arr_id = self.alloc_array_from_i32s(&ids[..n]);
         self.in_paint = true;
-        self.push_state(offset);
-        self.push_arg(arr_id);
-        self.run(ctx);
-        let failed = self.state == VmState::Error;
-        self.pop_state();
+        self.call_now(offset, &[arr_id], ctx);
         self.in_paint = false;
-        if failed {
-            self.state = VmState::Error;
-        }
-    }
-
-    /// Run a callback immediately (not queued). Used during startup
-    /// when the main loop is not yet running.
-    pub fn run_callback<P: Platform>(&mut self, offset: CodeAddr, ctx: &mut Ctx<P>) {
-        self.push_state(offset);
-        self.run(ctx);
-        self.pop_state();
     }
 
     // === Modal dialog support ===
@@ -1103,15 +1159,6 @@ impl Vm {
         self.state = VmState::AwaitingModal;
     }
 
-    /// Called by the main loop each tick. If a modal has had its result set
-    /// by `setDialogResult`, destroy the overlay subtree, push the result onto
-    /// the eval stack as `showModal`'s return value, and resume the VM.
-    ///
-    /// If the suspended showModal was issued from inside a callback (saved
-    /// stack non-empty), this pumps the callback to completion and then
-    /// pop_state's its frame — the callback is effectively synchronous from
-    /// the outside, even though main-loop event processing happened during
-    /// the dialog.
     /// If `widget_id` is the current modal overlay awaiting a result, return
     /// the overlay's click handler func_id from the modal frame. Returns None
     /// for any non-overlay widget so callers can fall through to the global dispatcher.
@@ -1125,6 +1172,11 @@ impl Vm {
         })
     }
 
+    /// Called by the main loop each tick. If a modal has had its result set
+    /// by `setDialogResult`, destroy the overlay subtree, push the result onto
+    /// the eval stack as `showModal`'s return value, and make the suspended
+    /// code runnable again. A callback that opened the dialog keeps its frame
+    /// throughout, so it finishes like any other suspended callback.
     #[inline(never)]
     pub fn try_resume_modal<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
         if !matches!(self.state, VmState::AwaitingModal) {
@@ -1142,22 +1194,10 @@ impl Vm {
             ctx.tree.mark_dirty(WidgetId(0));
         }
 
+        // The code that called showModal — a callback or the main program —
+        // continues from the next `tick`.
         self.push(result);
         self.state = VmState::Running;
-
-        // If we suspended inside a callback, finish it now so its scope's
-        // "var r = showModal(...); if (r == YES) { ... }" runs to completion
-        // and its frame is properly torn down. Without this the callback
-        // would keep its slot on `saved` forever.
-        if !self.saved.is_empty() {
-            self.run(ctx);
-            // Callback completed (Halted/Yielded/Error) or hit another nested
-            // showModal. Only pop_state for completion; nested suspension
-            // leaves the new frame in place.
-            if self.state != VmState::AwaitingModal {
-                self.pop_state();
-            }
-        }
     }
 
     /// True if a modal dialog is open (regardless of phase). Useful for the
@@ -1166,28 +1206,36 @@ impl Vm {
         !self.modal_stack.is_empty()
     }
 
-    // --- Internal: save/restore VM state for callback execution ---
+    // --- Internal: callback entry/exit ---
 
-    fn push_state(&mut self, offset: CodeAddr) {
-        let snapshot = VmSnapshot {
+    /// Enter the function at `offset` as a callback, on top of whatever is
+    /// running — like OP_CALL, but it also saves the registers OP_CALL
+    /// doesn't (target, state, wait timer). Its args go on the eval stack
+    /// above `sp_floor`. Returns false (nothing entered) at the nesting cap.
+    fn enter_callback(&mut self, offset: CodeAddr, args: &[i32]) -> bool {
+        if self.cb_frames.len() >= CB_NEST_MAX {
+            return false;
+        }
+        self.cb_frames.push(CbFrame {
             pc: self.pc,
-            stack: self.stack[..self.sp as usize].to_vec(),
-            call_stack: self.call_stack[..self.call_sp as usize].to_vec(),
+            sp: self.sp,
+            sp_floor: self.sp_floor,
+            call_sp: self.call_sp,
             target: self.target,
             state: self.state,
             wait_until: self.wait_until,
             critical: self.critical,
             frame_base: self.frame_base,
             frame_size: self.frame_size,
-        };
-        self.saved.push(snapshot);
+        });
+        self.sp_floor = self.sp;
         self.pc = offset;
-        self.sp = 0;
-        self.call_sp = 0;
         self.target = WidgetId::NONE;
-        self.mode = VmMode::Callback;
         self.state = VmState::Running;
         self.critical = false;
+        for &a in args {
+            self.push(a);
+        }
         // Place the callback's frame above the interrupted function's live
         // locals so its L0.. slots don't alias (and overwrite) them. Matches
         // the OP_CALL convention: new frame_base = frame_base + frame_size.
@@ -1200,29 +1248,38 @@ impl Vm {
             self.global_count
         };
         self.frame_size = 0;
+        true
     }
 
-    fn pop_state(&mut self) {
-        if let Some(snap) = self.saved.pop() {
-            self.pc = snap.pc;
-            self.sp = snap.stack.len() as u8;
-            self.stack[..snap.stack.len()].copy_from_slice(&snap.stack);
-            self.call_sp = snap.call_stack.len() as u8;
-            self.call_stack[..snap.call_stack.len()].copy_from_slice(&snap.call_stack);
-            self.target = snap.target;
-            self.state = snap.state;
-            self.wait_until = snap.wait_until;
-            self.critical = snap.critical;
-            self.frame_base = snap.frame_base;
-            self.frame_size = snap.frame_size;
-            // Outer level still in a callback if more frames remain on the
-            // stack. Otherwise we're back in the main user program.
-            self.mode = if self.saved.is_empty() {
-                VmMode::Normal
-            } else {
-                VmMode::Callback
-            };
+    /// The active callback finished (OP_RET at its entry depth, or OP_HALT):
+    /// drop whatever it left on the eval stack and resume the code it
+    /// interrupted, in the state it was in.
+    fn leave_callback(&mut self) {
+        if let Some(f) = self.cb_frames.pop() {
+            self.pc = f.pc;
+            self.sp = f.sp;
+            self.sp_floor = f.sp_floor;
+            self.call_sp = f.call_sp;
+            self.target = f.target;
+            self.state = f.state;
+            self.wait_until = f.wait_until;
+            self.critical = f.critical;
+            self.frame_base = f.frame_base;
+            self.frame_size = f.frame_size;
         }
+    }
+
+    /// Run the active callback until it returns or suspends (delay, yield,
+    /// showModal), or the VM faults.
+    fn run_active_callback<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
+        let depth = self.cb_frames.len();
+        while self.state == VmState::Running && self.cb_frames.len() >= depth {
+            self.step(ctx);
+        }
+    }
+
+    fn wait_expired<P: Platform>(&self, ctx: &Ctx<P>) -> bool {
+        ctx.systick.millis().wrapping_sub(self.wait_until) < 0x8000_0000
     }
 
     // === Public API ===
@@ -1268,7 +1325,7 @@ impl Vm {
     }
 
     pub fn pop_result(&mut self) -> i32 {
-        if self.sp > 0 {
+        if self.sp > self.sp_floor {
             self.sp -= 1;
             self.stack[self.sp as usize]
         } else {
@@ -1296,8 +1353,8 @@ impl Vm {
         self.wait_until = 0;
         self.code = VmCode::None;
         self.functions.clear();
-        self.mode = VmMode::Normal;
-        self.saved.clear();
+        self.cb_frames.clear();
+        self.sp_floor = 0;
         self.frame_base = 0;
         self.frame_size = 0;
         self.global_count = 0;
@@ -1343,8 +1400,8 @@ impl Vm {
             match self.state {
                 VmState::Running => self.step(ctx),
                 VmState::Waiting => {
-                    // Busy-wait for delay to expire (used during setup/callbacks)
-                    if ctx.systick.millis().wrapping_sub(self.wait_until) < 0x8000_0000 {
+                    // Busy-wait for the delay to expire
+                    if self.wait_expired(ctx) {
                         self.state = VmState::Running;
                     }
                 }
@@ -1433,6 +1490,8 @@ impl Vm {
 
         match op {
             // --- No-arg: stack, arithmetic, logic, comparison ---
+            // HALT inside a callback ends just that callback.
+            OP_HALT if !self.cb_frames.is_empty() => self.leave_callback(),
             OP_HALT => self.state = VmState::Halted,
             OP_POP => {
                 self.pop();
@@ -1442,7 +1501,7 @@ impl Vm {
                 self.push(v);
             }
             OP_SWAP => {
-                if self.sp >= 2 {
+                if self.sp - self.sp_floor >= 2 {
                     let i = (self.sp - 1) as usize;
                     let j = (self.sp - 2) as usize;
                     self.stack.swap(i, j);
@@ -1534,7 +1593,10 @@ impl Vm {
                 self.push(if a >= b { 1 } else { 0 });
             }
             OP_RET => {
-                if self.call_sp > 0 {
+                if self.cb_frames.last().is_some_and(|f| f.call_sp == self.call_sp) {
+                    // Return from the callback's own entry function.
+                    self.leave_callback();
+                } else if self.call_sp > 0 {
                     self.call_sp -= 1;
                     let frame = self.call_stack[self.call_sp as usize];
                     self.pc = frame.ret_addr;
@@ -1555,9 +1617,6 @@ impl Vm {
                     if intercept {
                         self.handle_builder_return(ctx);
                     }
-                } else if self.mode == VmMode::Callback {
-                    // Callback complete — halt cleanly
-                    self.state = VmState::Halted;
                 } else {
                     self.fail(fault::RET_EMPTY);
                 }
@@ -2428,7 +2487,7 @@ impl Vm {
     }
 
     fn pop(&mut self) -> i32 {
-        if self.sp > 0 {
+        if self.sp > self.sp_floor {
             self.sp -= 1;
             self.stack[self.sp as usize]
         } else {
@@ -2438,7 +2497,7 @@ impl Vm {
     }
 
     fn peek(&self) -> i32 {
-        if self.sp > 0 {
+        if self.sp > self.sp_floor {
             self.stack[(self.sp - 1) as usize]
         } else {
             0
@@ -3418,31 +3477,234 @@ mod anim_tests {
         assert_eq!(vm.fault(), fault::STACK_OVERFLOW);
         assert_eq!(vm.fault_pc(), 4, "5th push overflows a 4-deep stack");
 
-        // Deeper than the default 16: 20 pushes then HALT run cleanly.
+        // Deeper than the default 32: 40 pushes then HALT run cleanly.
         let mut vm = Vm::new();
-        assert!(vm.configure(32, 0, 0, 0));
-        let mut code = alloc::vec![OP_PUSH_1; 20];
+        assert!(vm.configure(48, 0, 0, 0));
+        let mut code = alloc::vec![OP_PUSH_1; 40];
         code.push(OP_HALT);
         vm.code = VmCode::Ram(code);
         vm.run(&mut ctx);
         assert!(vm.state != VmState::Error);
-        assert_eq!(vm.sp, 20);
+        assert_eq!(vm.sp, 40);
+    }
+
+    // --- Callback frames ---
+
+    /// VM with `code` loaded and 4 globals (callback locals start above them).
+    fn cb_vm(code: &[u8]) -> Vm {
+        let mut vm = Vm::new();
+        vm.code = VmCode::Ram(code.to_vec());
+        vm.global_count = 4;
+        vm.state = VmState::Running;
+        vm
     }
 
     #[test]
-    fn callback_snapshot_restores_live_stack() {
-        let mut vm = Vm::new();
-        assert!(vm.configure(8, 4, 0, 0));
-        vm.push_arg(7);
-        vm.push_arg(9);
-        vm.push_state(0);
-        assert_eq!(vm.sp, 0, "callback starts on an empty eval stack");
-        vm.push_arg(1);
-        vm.push_arg(2);
-        vm.push_arg(3);
-        vm.pop_state();
+    fn callback_preempts_main_and_keeps_its_stack() {
+        // main @0: 7 9 ADD -> g0, HALT     callback @7: arg -> g1, leaves junk, RET
+        let code = [
+            OP_PUSH_I8, 7, OP_PUSH_I8, 9, OP_ADD, OP_STORE, 0, // 0..7
+            OP_STORE, 1, OP_PUSH_1, OP_PUSH_2, OP_PUSH_0, OP_RET, // 7..13
+        ];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 2); // main stops mid-expression: [7, 9]
         assert_eq!(vm.sp, 2);
-        assert_eq!(&vm.stack[..2], &[7, 9]);
+
+        vm.enqueue_callback(7, &[5]);
+        assert!(vm.drain_callbacks(&mut ctx));
+        assert_eq!(vm.var_get(1), 5, "callback got its arg");
+        assert!(vm.cb_frames.is_empty());
+        assert_eq!(vm.sp, 2, "callback leftovers dropped");
+        assert_eq!(&vm.stack[..2], &[7, 9], "interrupted values untouched");
+        assert_eq!(vm.pc, 4);
+        assert!(vm.state == VmState::Running);
+
+        vm.tick(&mut ctx, 100);
+        assert_eq!(vm.var_get(0), 16, "main resumes where it was");
+    }
+
+    #[test]
+    fn callback_cannot_pop_interrupted_values() {
+        // main @0: PUSH 7, HALT     callback @3: pops two values, gets one arg
+        let code = [OP_PUSH_I8, 7, OP_HALT, OP_POP, OP_POP, OP_RET];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 1);
+        vm.enqueue_callback(3, &[1]);
+        vm.drain_callbacks(&mut ctx);
+        assert!(vm.state == VmState::Error);
+        assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
+        assert_eq!(vm.fault_pc(), 4);
+        assert_eq!(vm.stack[0], 7);
+    }
+
+    #[test]
+    fn delay_in_callback_suspends_without_blocking() {
+        // main @0: HALT
+        // A @1: delay(1000); g0 = 1; RET      B @9: g1 = 2; RET
+        let code = [
+            OP_HALT,
+            OP_PUSH_I16, 0xE8, 0x03, OP_DELAY, OP_PUSH_1, OP_STORE, 0, OP_RET, // 1..9
+            OP_PUSH_2, OP_STORE, 1, OP_RET, // 9..13
+        ];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 1);
+        assert!(vm.state == VmState::Halted);
+
+        vm.enqueue_callback(1, &[]);
+        assert!(vm.drain_callbacks(&mut ctx), "returns instead of busy-waiting");
+        assert!(vm.state == VmState::Waiting);
+        assert_eq!(vm.cb_frames.len(), 1);
+        assert_eq!(vm.var_get(0), 0);
+
+        // B queues behind the suspended A (FIFO order is kept).
+        vm.enqueue_callback(9, &[]);
+        assert!(!vm.drain_callbacks(&mut ctx));
+        assert_eq!(vm.var_get(1), 0);
+        vm.tick(&mut ctx, 1); // mock clock stands at 0: still waiting
+        assert!(vm.state == VmState::Waiting);
+
+        vm.wait_until = 0; // the delay expires
+        vm.tick(&mut ctx, 1);
+        assert_eq!(vm.var_get(0), 1, "A finished after its delay");
+        assert!(vm.cb_frames.is_empty());
+        assert!(vm.state == VmState::Halted, "main state restored");
+
+        assert!(vm.drain_callbacks(&mut ctx));
+        assert_eq!(vm.var_get(1), 2);
+    }
+
+    #[test]
+    fn yield_in_callback_continues_on_next_tick() {
+        // main @0: HALT     callback @1: g0 = 1; YIELD; g1 = 2; RET
+        let code = [OP_HALT, OP_PUSH_1, OP_STORE, 0, OP_YIELD, OP_PUSH_2, OP_STORE, 1, OP_RET];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 1);
+        vm.enqueue_callback(1, &[]);
+        vm.drain_callbacks(&mut ctx);
+        assert_eq!(vm.var_get(0), 1);
+        assert!(vm.state == VmState::Yielded);
+        assert_eq!(vm.cb_frames.len(), 1);
+
+        vm.tick(&mut ctx, 1);
+        assert_eq!(vm.var_get(1), 2, "code after yield runs");
+        assert!(vm.cb_frames.is_empty());
+        assert!(vm.state == VmState::Halted);
+    }
+
+    #[test]
+    fn main_wait_survives_a_callback() {
+        // main @0: delay(500); HALT     callback @5: g0 = 1; RET
+        let code = [OP_PUSH_I16, 0xF4, 0x01, OP_DELAY, OP_HALT, OP_PUSH_1, OP_STORE, 0, OP_RET];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 10);
+        assert!(vm.state == VmState::Waiting);
+        vm.enqueue_callback(5, &[]);
+        vm.drain_callbacks(&mut ctx);
+        assert_eq!(vm.var_get(0), 1);
+        assert!(vm.state == VmState::Waiting);
+        assert_eq!(vm.wait_until, 500);
+    }
+
+    #[test]
+    fn halt_in_callback_ends_only_the_callback() {
+        // main @0: g0 = 3; HALT     callback @5: g1 = 1; HALT
+        let code = [OP_PUSH_I8, 3, OP_STORE, 0, OP_HALT, OP_PUSH_1, OP_STORE, 1, OP_HALT];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 1);
+        vm.enqueue_callback(5, &[]);
+        vm.drain_callbacks(&mut ctx);
+        assert_eq!(vm.var_get(1), 1);
+        assert!(vm.state == VmState::Running);
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.var_get(0), 3);
+    }
+
+    #[test]
+    fn modal_in_callback_lets_dialog_callbacks_run() {
+        // builder fn 1 @0: return overlay id 1
+        // A @2: g0 = showModal(1, 0); RET
+        // B @8: setDialogResult(42); RET
+        let code = [
+            OP_PUSH_1, OP_RET, // 0..2
+            OP_PUSH_1, OP_PUSH_0, OP_SHOW_MODAL, OP_STORE, 0, OP_RET, // 2..8
+            OP_PUSH_I8, 42, OP_SET_DIALOG_RESULT, OP_RET, // 8..12
+        ];
+        let mut ctx = mock_ctx();
+        let root = one_widget(&mut ctx);
+        let overlay = one_widget(&mut ctx);
+        assert_eq!((root.0, overlay.0), (0, 1));
+        let mut vm = cb_vm(&code);
+        vm.functions.push(FuncEntry { func_id: 1, kind: FunctionKind::UserFunction, offset: 0, length: 2 });
+        vm.state = VmState::Halted;
+
+        vm.enqueue_callback(2, &[]);
+        vm.drain_callbacks(&mut ctx);
+        assert!(vm.state == VmState::AwaitingModal);
+        assert_eq!(vm.cb_frames.len(), 1, "A stays suspended on its frame");
+
+        vm.enqueue_callback(8, &[]);
+        assert!(vm.drain_callbacks(&mut ctx), "dialog callback runs on top of A");
+        assert!(vm.state == VmState::AwaitingModal);
+        assert_eq!(vm.cb_frames.len(), 1);
+
+        vm.try_resume_modal(&mut ctx);
+        assert!(!ctx.tree.is_live(overlay));
+        vm.tick(&mut ctx, 1);
+        assert_eq!(vm.var_get(0), 42, "A sees the dialog result");
+        assert!(vm.cb_frames.is_empty());
+        assert!(vm.state == VmState::Halted);
+        assert!(!vm.modal_active());
+    }
+
+    #[test]
+    fn call_now_runs_through_yield_and_nests_over_a_suspended_callback() {
+        // main @0: HALT    A @1: delay(1000); RET    S @6: g0 = 1; YIELD; g1 = 2; RET
+        let code = [
+            OP_HALT,
+            OP_PUSH_I16, 0xE8, 0x03, OP_DELAY, OP_RET, // 1..6
+            OP_PUSH_1, OP_STORE, 0, OP_YIELD, OP_PUSH_2, OP_STORE, 1, OP_RET, // 6..14
+        ];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 1);
+        vm.enqueue_callback(1, &[]);
+        vm.drain_callbacks(&mut ctx);
+        assert!(vm.state == VmState::Waiting);
+
+        vm.call_now(6, &[], &mut ctx); // e.g. on_paint during A's delay
+        assert_eq!((vm.var_get(0), vm.var_get(1)), (1, 2));
+        assert_eq!(vm.cb_frames.len(), 1);
+        assert!(vm.state == VmState::Waiting, "A is still waiting");
+        assert_eq!(vm.wait_until, 1000);
+    }
+
+    #[test]
+    fn nesting_is_capped() {
+        let mut vm = cb_vm(&[OP_HALT]);
+        for _ in 0..CB_NEST_MAX {
+            assert!(vm.enter_callback(0, &[]));
+        }
+        assert!(!vm.enter_callback(0, &[]));
+        assert_eq!(vm.cb_frames.len(), CB_NEST_MAX);
+    }
+
+    #[test]
+    fn start_main_waits_for_a_suspended_setup() {
+        let mut vm = cb_vm(&[OP_HALT]);
+        vm.state = VmState::Ready;
+        assert!(vm.enter_callback(0, &[]));
+        vm.state = VmState::AwaitingModal;
+        vm.start_main(9);
+        assert!(vm.state == VmState::AwaitingModal);
+        vm.leave_callback();
+        assert_eq!(vm.pc, 9);
+        assert!(vm.state == VmState::Running);
     }
 
     #[test]
