@@ -186,12 +186,15 @@ impl StringPool {
     }
 
     /// Concatenate two strings. Returns new string ID or None if full.
+    /// An id that names no string (e.g. `0xFFFF` from `get(text)` on an
+    /// emptied input) counts as an empty string, as in `get` / `len`.
     pub fn concat(&mut self, a: u16, b: u16) -> Option<u16> {
-        if a as usize >= self.count as usize || b as usize >= self.count as usize {
-            return None;
-        }
-        let a_meta = self.meta[a as usize];
-        let b_meta = self.meta[b as usize];
+        let meta = |id: u16| match self.meta.get(id as usize) {
+            Some(&m) if (id as usize) < self.count as usize => m,
+            _ => StrMeta::empty(),
+        };
+        let a_meta = meta(a);
+        let b_meta = meta(b);
         let total = a_meta.len as usize + b_meta.len as usize;
         if self.count as usize >= self.meta.len() || self.next as usize + total > self.buf.len() {
             return None;
@@ -905,5 +908,26 @@ mod tests {
         assert!(pool.alloc(b"b").is_some());
         assert!(pool.alloc(b"c").is_some());
         assert!(pool.alloc(b"d").is_none());
+    }
+
+    #[test]
+    fn concat_with_an_emptied_input() {
+        // text_input: backspacing the last char, then strClear() in on_change,
+        // leaves the input with no text (0xFFFF); concat(s, get(text)) must
+        // not fail with "string pool full".
+        let mut pool = StringPool::new();
+        let mut tree = WidgetTree::new();
+        let input = tree.alloc().unwrap();
+        let t = pool.alloc(b"a").unwrap();
+        tree.ensure_ext(input).unwrap().text_id = t;
+        assert!(pool.delete_byte(t, 0));
+        pool.smart_clear(&mut tree);
+        assert_eq!(tree.text_id(input), STR_NONE);
+
+        let s = pool.alloc(b"Name: ").unwrap();
+        let out = pool.concat(s, tree.text_id(input)).expect("concat with no text");
+        assert_eq!(pool.get(out), b"Name: ");
+        let both = pool.concat(STR_NONE, STR_NONE).unwrap();
+        assert_eq!(pool.get(both), b"");
     }
 }
