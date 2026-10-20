@@ -1,11 +1,15 @@
 {
   "version": 2,
-  "screen": [800, 480],
-  "include_dirs": ["../../lib"],
-  "fonts": [],
-  "images": [
-
+  "screen": [
+    800,
+    480
   ],
+  "include_dirs": [
+    "../../../lib"
+  ],
+  "fonts": [],
+  "render_mode": "buffered",
+  "images": [],
   "programs": [
     {
       "name": "main",
