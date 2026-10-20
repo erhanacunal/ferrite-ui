@@ -19,7 +19,7 @@ For some bricked Nextion displays :)
 | Flash | W25Q256JVFQ | 32MB SPI, stores fonts/images/bytecode |
 | RTC | AT8563T | I2C |
 
-### Nextion / N32903 target
+### Nextion / N32903 target (Rebranded as Ai HMI T8)
 
 | Component | Part | Details |
 |-----------|------|---------|
