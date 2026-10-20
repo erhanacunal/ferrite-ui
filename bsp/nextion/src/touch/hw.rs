@@ -8,6 +8,23 @@
 ///
 /// Touch detection: double-read debounce (matches proven C implementation).
 /// Coordinate: raw ADC → linear calibration → screen pixel.
+///
+/// Sampling is interrupt-driven (`IRQ_TOUCH`):
+/// - idle: EXTI14 waits for PENIRQ (PC14) to fall; an untouched panel costs
+///   nothing;
+/// - pen down: the EXTI ISR masks EXTI14 (PENIRQ also toggles during every
+///   conversion) and starts sampling;
+/// - every `SAMPLE_PERIOD_MS` the SysTick ISR takes one double-read sample
+///   and queues it in a ring buffer;
+/// - the XPT2046 has no pen-up interrupt: after `UP_SAMPLES` pen-up samples
+///   in a row it queues `UP` and re-arms EXTI14.
+/// Both ISRs run below USART0's priority: a sample takes ~0.3 ms, longer than
+/// one byte time at 115200 baud, and USART0 has a 1-byte RX register.
+/// Main-loop SPI users (boot recovery check, calibration) run while the
+/// sampler is not armed yet or paused.
+use core::cell::Cell;
+use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
+
 use super::{CalParams, TouchBackend};
 use crate::lcd::Lcd;
 use crate::systick::delay_ms;
@@ -60,29 +77,269 @@ const CAL_P1: (u16, u16) = (60, 60);
 const CAL_P2: (u16, u16) = (740, 60);
 const CAL_P3: (u16, u16) = (60, 420);
 
+// --- Interrupt-driven sampling ---
+
+/// `false` falls back to polling the XPT2046 from the main loop.
+const IRQ_TOUCH: bool = true;
+
+/// Sample period while the pen is down (100 Hz).
+const SAMPLE_PERIOD_MS: u32 = 10;
+/// Pen-up samples in a row that end a contact (30 ms).
+const UP_SAMPLES: u8 = 3;
+
+const AFIO_EXTISS3: u32 = 0x4001_0014; // EXTI12..15 source select
+const EXTISS_PORT_C: u32 = 0x2;
+const EXTI_BASE: u32 = 0x4001_0400;
+const EXTI_INTEN: u32 = EXTI_BASE + 0x00;
+const EXTI_FTEN: u32 = EXTI_BASE + 0x0C;
+const EXTI_PD: u32 = EXTI_BASE + 0x14;
+const EXTI_LINE: u32 = 1 << PENIRQ_PIN;
+
+/// EXTI10..15 is IRQ 40: NVIC ISER1 bit 8, priority byte IPR + 40.
+const NVIC_ISER1: u32 = 0xE000_E104;
+const NVIC_IPR_EXTI10_15: u32 = 0xE000_E400 + 40;
+/// SysTick priority byte (SHPR3[31:24]).
+const SCB_SHPR3_SYSTICK: u32 = 0xE000_ED23;
+/// Below USART0 (priority 0); the GD32 implements the top 4 bits.
+const SAMPLER_PRIORITY: u8 = 0xC0;
+
+// Ring buffer: the SysTick ISR produces (owns the head), the main loop
+// consumes (owns the tail). Entries are raw points `(x << 16) | y`, or `UP`.
+// Aligned word accesses with one writer each, volatile, single core.
+const RING_SIZE: usize = 16;
+const RING_MASK: usize = RING_SIZE - 1;
+/// End of a contact (raw values are 12-bit, so no point encodes to this).
+const UP: u32 = u32::MAX;
+
+static mut RING: [u32; RING_SIZE] = [0; RING_SIZE];
+static mut RING_HEAD: usize = 0;
+static mut RING_TAIL: usize = 0;
+
+/// EXTI / NVIC set up (on the first poll, after boot).
+static mut ARMED: bool = false;
+/// A contact is being sampled (EXTI14 masked meanwhile).
+static mut SAMPLING: bool = false;
+/// Consecutive pen-up samples (ISR).
+static mut UP_COUNT: u8 = 0;
+/// A point of this contact was queued, so `UP` must follow.
+static mut QUEUED: bool = false;
+/// Milliseconds since the last sample (ISR).
+static mut TICKS: u32 = 0;
+
+/// Queue `v` if more than `reserve` slots stay free. Points keep one slot in
+/// reserve so the `UP` that closes a contact is never dropped.
+fn ring_push(v: u32, reserve: usize) -> bool {
+    unsafe {
+        let head = read_volatile(addr_of!(RING_HEAD));
+        let used = head.wrapping_sub(read_volatile(addr_of!(RING_TAIL))) & RING_MASK;
+        if RING_SIZE - 1 - used <= reserve {
+            return false;
+        }
+        write_volatile(addr_of_mut!(RING[head]), v);
+        write_volatile(addr_of_mut!(RING_HEAD), (head + 1) & RING_MASK);
+    }
+    true
+}
+
+fn ring_peek() -> Option<u32> {
+    unsafe {
+        let tail = read_volatile(addr_of!(RING_TAIL));
+        if tail == read_volatile(addr_of!(RING_HEAD)) {
+            return None;
+        }
+        Some(read_volatile(addr_of!(RING[tail])))
+    }
+}
+
+fn ring_pop() {
+    unsafe {
+        let tail = read_volatile(addr_of!(RING_TAIL));
+        write_volatile(addr_of_mut!(RING_TAIL), (tail + 1) & RING_MASK);
+    }
+}
+
+fn reg_write(addr: u32, v: u32) {
+    unsafe { write_volatile(addr as *mut u32, v) };
+}
+
+fn reg_read(addr: u32) -> u32 {
+    unsafe { read_volatile(addr as *const u32) }
+}
+
+/// Pen went down: mask EXTI14 and start sampling.
+fn start_contact() {
+    reg_write(EXTI_INTEN, 0); // EXTI14 is the only line in use
+    unsafe {
+        TICKS = 0;
+        write_volatile(addr_of_mut!(SAMPLING), true);
+    }
+}
+
+/// Wait for the next pen-down. Catches a pen that is already down.
+fn listen() {
+    // PENIRQ needs a moment to return high after the last conversion; an
+    // early check (or a pending flag set by that edge) would start a
+    // spurious contact.
+    spin(SPI_ADC_WAIT * 4);
+    reg_write(EXTI_PD, EXTI_LINE);
+    reg_write(EXTI_INTEN, EXTI_LINE);
+    if penirq_active() {
+        start_contact();
+    }
+}
+
+/// End the current contact: stop sampling and queue `UP` if needed.
+fn close_contact() {
+    unsafe {
+        write_volatile(addr_of_mut!(SAMPLING), false);
+        if QUEUED {
+            ring_push(UP, 0);
+        }
+        QUEUED = false;
+        UP_COUNT = 0;
+    }
+}
+
+/// Set up EXTI14 on PC14 (falling edge) and the priorities, then start
+/// listening. Main loop, once.
+fn arm() {
+    unsafe {
+        if read_volatile(addr_of!(ARMED)) {
+            return;
+        }
+        let v = reg_read(AFIO_EXTISS3) & !(0xF << 8);
+        reg_write(AFIO_EXTISS3, v | (EXTISS_PORT_C << 8));
+        reg_write(EXTI_FTEN, reg_read(EXTI_FTEN) | EXTI_LINE);
+        write_volatile(NVIC_IPR_EXTI10_15 as *mut u8, SAMPLER_PRIORITY);
+        write_volatile(SCB_SHPR3_SYSTICK as *mut u8, SAMPLER_PRIORITY);
+        reg_write(NVIC_ISER1, 1 << 8);
+        write_volatile(addr_of_mut!(ARMED), true);
+    }
+    listen();
+}
+
+/// Stop interrupt sampling so the main loop can drive the XPT2046 itself.
+/// A contact in progress is closed.
+fn pause() {
+    reg_write(EXTI_INTEN, 0);
+    close_contact();
+}
+
+/// Undo `pause`.
+fn resume() {
+    if unsafe { read_volatile(addr_of!(ARMED)) } {
+        listen();
+    }
+}
+
+/// EXTI10..15 (IRQ 40): PENIRQ fell.
+#[unsafe(no_mangle)]
+extern "C" fn EXTI10_15() {
+    reg_write(EXTI_PD, EXTI_LINE);
+    start_contact();
+}
+
+/// Called from the SysTick ISR every millisecond.
+#[inline]
+pub fn on_tick() {
+    unsafe {
+        if !read_volatile(addr_of!(SAMPLING)) {
+            return;
+        }
+        TICKS += 1;
+        if TICKS < SAMPLE_PERIOD_MS {
+            return;
+        }
+        TICKS = 0;
+    }
+    sample();
+}
+
+/// One sample of the current contact. SysTick ISR.
+fn sample() {
+    unsafe {
+        match read_raw_sample() {
+            Some(p) => {
+                UP_COUNT = 0;
+                if ring_push(encode(p), 1) {
+                    QUEUED = true;
+                }
+            }
+            // Still pressed, unstable reading: skip it.
+            None if is_pressed() => UP_COUNT = 0,
+            None => {
+                UP_COUNT += 1;
+                if UP_COUNT >= UP_SAMPLES {
+                    close_contact();
+                    listen();
+                }
+            }
+        }
+    }
+}
+
+fn encode(p: (u16, u16)) -> u32 {
+    ((p.0 as u32) << 16) | p.1 as u32
+}
+
+fn decode(v: u32) -> (u16, u16) {
+    ((v >> 16) as u16, v as u16)
+}
+
 // --- Backend struct ---
 
 pub struct XptTouch {
-    _private: (),
+    /// Last raw point of the current contact, `None` between contacts.
+    contact: Cell<Option<(u16, u16)>>,
 }
 
 impl XptTouch {
     pub fn new() -> Self {
-        Self { _private: () }
+        Self { contact: Cell::new(None) }
+    }
+
+    /// Consume the queue up to the next `UP`: the latest point if any moved
+    /// in, else the last one of the contact, else `None` once `UP` is read.
+    fn current_raw(&self) -> Option<(u16, u16)> {
+        let mut moved = false;
+        while let Some(v) = ring_peek() {
+            if v == UP {
+                // Report the final point first; the release on the next poll.
+                if !moved {
+                    ring_pop();
+                    self.contact.set(None);
+                }
+                break;
+            }
+            ring_pop();
+            self.contact.set(Some(decode(v)));
+            moved = true;
+        }
+        self.contact.get()
     }
 }
 
 impl TouchBackend for XptTouch {
     fn is_active(&self) -> bool {
-        penirq_active()
+        if IRQ_TOUCH {
+            arm();
+            ring_peek().is_some()
+        } else {
+            penirq_active()
+        }
     }
 
     fn read_screen(&self, cal: &CalParams) -> Option<(u16, u16)> {
-        let (rx, ry) = read_raw_sample()?;
+        let (rx, ry) = if IRQ_TOUCH { self.current_raw()? } else { read_raw_sample()? };
         let (cx, cy) = if cal.xy_swap { (ry, rx) } else { (rx, ry) };
         let x = apply_cal(cx, cal.x_min, cal.x_max, SCREEN_W, cal.x_flip);
         let y = apply_cal(cy, cal.y_min, cal.y_max, SCREEN_H, cal.y_flip);
         Some((x, y))
+    }
+
+    /// The ISR debounces lift-off: release on the first `None`.
+    fn release_debounce(&self) -> u8 {
+        if IRQ_TOUCH { 1 } else { super::RELEASE_DEBOUNCE }
     }
 }
 
@@ -109,6 +366,8 @@ pub fn run_calibration(touch: &mut super::Touch, lcd: &Lcd) -> CalParams {
     let cross_color = 0xF800u16;
     let done_color = 0x07E0u16;
 
+    // The crosshair waits read the XPT2046 directly.
+    pause();
     lcd.fill_rect(0, 0, SCREEN_W, SCREEN_H, bg);
 
     draw_crosshair(lcd, CAL_P1.0, CAL_P1.1, cross_color);
@@ -126,6 +385,7 @@ pub fn run_calibration(touch: &mut super::Touch, lcd: &Lcd) -> CalParams {
 
     let cal = compute_calibration(raw1, raw2, raw3);
     touch.cal = cal;
+    resume();
 
     lcd.fill_rect(0, 0, SCREEN_W, SCREEN_H, bg);
 

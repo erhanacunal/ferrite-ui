@@ -41,4 +41,5 @@ extern "C" fn SysTick() {
     unsafe {
         TICK_MS = TICK_MS.wrapping_add(1);
     }
+    crate::touch::hw::on_tick();
 }

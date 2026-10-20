@@ -13,16 +13,18 @@ union Vector {
 
 unsafe extern "C" {
     fn USART0();
+    fn EXTI10_15();
 }
 
 const V0: Vector = Vector { _reserved: 0 };
 
 /// GD32F103 — 68 IRQ slots (medium/high density)
-/// IRQ 37 = USART0
+/// IRQ 37 = USART0, IRQ 40 = EXTI10_15 (touch PENIRQ on PC14)
 #[unsafe(link_section = ".vector_table.interrupts")]
 #[unsafe(no_mangle)]
 pub static __INTERRUPTS: [Vector; 68] = {
     let mut v = [V0; 68];
     v[37] = Vector { handler: USART0 };
+    v[40] = Vector { handler: EXTI10_15 };
     v
 };

@@ -221,7 +221,11 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - Red progress bar fills to indicate progress, release to cancel
 - In recovery mode: program is not loaded, only USART is active
 - New program can be flashed via `writefs`
-- **PENIRQ (PC14):** touch detection via GPIO polling (EXTI interrupt NOT USED — SPI conflict)
+- **PENIRQ (PC14): touch is interrupt-driven** (`bsp/nextion/src/touch/hw.rs`, `IRQ_TOUCH`; `false` = old main-loop polling).
+  - EXTI14 falling edge (IRQ 40 `EXTI10_15`) masks itself, then the SysTick ISR samples every 10 ms into a ring; 3 pen-up samples queue `UP` and re-arm.
+  - Armed lazily on the first main-loop poll, so the boot recovery check still bit-bangs the XPT2046 directly; calibration pauses the sampler.
+  - EXTI14 + SysTick run at priority 0xC0, below USART0 (a ~0.3 ms sample > one RX byte time).
+  - The old EXTI attempt hung because `irq.rs`'s hand-written `__INTERRUPTS` had slot 40 = 0: an IRQ must be added there (and to `device.x`) or it jumps to address 0.
 - **RAM cost:** ~18 bytes (8 × WidgetId + count + active)
 
 ### Font Renderer (Adafruit GFX compatible, sparse/UTF-8)
@@ -328,7 +332,7 @@ ferrite-ui/                  (workspace root — virtual manifest + shared relea
 - [x] Touch event → VM callback (on_click, on_tap, on_paint, on_touch_down/up/move)
 - [x] Touch gestures (swipe left/right/up/down, long press — global callbacks OnSwipe=10, OnLongPress=11)
 - [x] Iterative render (flat DFS instead of recursive, DFS cache)
-- [x] PENIRQ GPIO polling (skip SPI when idle)
+- [x] PENIRQ: interrupt-driven touch sampling (EXTI14 + SysTick, ring buffer)
 - [x] SPI timing constants (SPI_HALF_CLK=54, ~1MHz)
 - [x] Recovery mode (hold top-left corner 3s at boot → USART-only mode)
 - [x] @func_name syntax (compiler callback references)
