@@ -22,6 +22,7 @@ use ferrite_core::widget::WidgetTree;
 // --- Concrete host backends (type aliases + free-fn constructors) ---
 mod backlight;
 mod flash;
+mod gpio;
 mod lcd;
 mod rtc;
 mod sdcard;
@@ -95,6 +96,7 @@ fn main() {
         usart: usart::init(),
         systick: systick::Systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
+        gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::SimGpio::default()),
         cursor_visible: false,
     });
 

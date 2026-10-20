@@ -7,6 +7,7 @@
 
 use crate::backlight::BacklightBackend;
 use crate::flash::FlashBackend;
+use crate::gpio::{GpioBackend, MODE_INPUT_PULLDOWN, MODE_INPUT_PULLUP, MODE_OUTPUT};
 use crate::lcd::LcdBackend;
 use crate::platform::Platform;
 use crate::rtc::{DateTime, RtcBackend};
@@ -86,6 +87,35 @@ impl SdCardBackend for MockSdCard {
     fn acquire_bus(&self) {}
 }
 
+/// Four pins with remembered mode and level (pull-down unsupported, like the
+/// N32903). An input reads its pull level; a floating input reads low.
+#[derive(Default)]
+pub struct MockGpio {
+    pub mode: [core::cell::Cell<u8>; 4],
+    pub level: [core::cell::Cell<bool>; 4],
+}
+impl GpioBackend for MockGpio {
+    const PIN_COUNT: u8 = 4;
+    fn set_mode(&self, pin: u8, mode: u8) -> bool {
+        if mode == MODE_INPUT_PULLDOWN {
+            return false;
+        }
+        self.mode[pin as usize].set(mode);
+        true
+    }
+    fn write(&self, pin: u8, high: bool) {
+        if self.mode[pin as usize].get() == MODE_OUTPUT {
+            self.level[pin as usize].set(high);
+        }
+    }
+    fn read(&self, pin: u8) -> bool {
+        match self.mode[pin as usize].get() {
+            MODE_OUTPUT => self.level[pin as usize].get(),
+            m => m == MODE_INPUT_PULLUP,
+        }
+    }
+}
+
 pub struct MockUsart;
 impl UsartBackend for MockUsart {
     fn write_byte(&self, _byte: u8) {}
@@ -130,4 +160,5 @@ impl Platform for MockPlatform {
     type UsartB = MockUsart;
     type SystickB = MockSystick;
     type AudioB = crate::audio::NoAudio;
+    type GpioB = MockGpio;
 }

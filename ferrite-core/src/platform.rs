@@ -8,6 +8,7 @@
 use crate::audio::AudioBackend;
 use crate::backlight::BacklightBackend;
 use crate::flash::FlashBackend;
+use crate::gpio::GpioBackend;
 use crate::lcd::LcdBackend;
 use crate::rtc::RtcBackend;
 use crate::sdcard::SdCardBackend;
@@ -42,6 +43,9 @@ pub trait Platform {
     type SystickB: SystickBackend;
     // Boards without audio hardware use `ferrite_core::audio::NoAudio`.
     type AudioB: AudioBackend;
+    // User GPIO header (`pinMode`/`pinWrite`/`pinRead`); boards without one
+    // use `ferrite_core::gpio::NoGpio`.
+    type GpioB: GpioBackend;
 
     // --- Flash layout (Rust's stand-in for C-style per-board `#define`s) ---
     //

@@ -11,11 +11,11 @@ use ferrite_core::runtime::{ERR_EMPTY_RUN, FullInput, PlatformRuntime};
 use ferrite_core::strpool::StringPool;
 use ferrite_core::types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
 use ferrite_core::vm::Vm;
-use ferrite_core::{config, protocol, render};
+use ferrite_core::{config, protocol, render, sdboot};
 
 use crate::gpio::Gpio;
 use crate::systick::delay_ms;
-use crate::{fat, sdcard, touch};
+use crate::{sdcard, touch};
 
 // === Device syscalls (GPIOB / FPGA bus poking from Ferrite programs) ===
 
@@ -38,6 +38,7 @@ impl Platform for NextionPlatform {
     type UsartB = crate::usart::hw::Hw;
     type SystickB = crate::systick::Gd32Systick;
     type AudioB = ferrite_core::audio::NoAudio;
+    type GpioB = crate::user_gpio::HeaderGpio;
 }
 
 impl PlatformRuntime for NextionPlatform {
@@ -208,15 +209,14 @@ fn recovery_hold(ctx: &mut Ctx<NextionPlatform>, cal: &CalParams) -> bool {
     }
 }
 
-/// SD card boot: EMPTY.BIN → recovery, PROGRAM.BIN → flash update.
-/// Returns `ERR_EMPTY_RUN` for recovery, otherwise 0.
+/// SD card boot (EMPTY.BIN → recovery, PROGRAM.BIN → flash update), see
+/// `ferrite_core::sdboot`. Returns `ERR_EMPTY_RUN` for recovery, otherwise 0.
 fn sd_boot_check(ctx: &Ctx<NextionPlatform>) -> u8 {
     if !sdcard::probe() {
         return 0; // no SD card — continue normal boot
     }
 
-    let font = ctx.fonts.embedded();
-    font.draw_str(
+    ctx.fonts.embedded().draw_str(
         &ctx.lcd,
         &ctx.flash,
         b"SD card found...",
@@ -226,107 +226,8 @@ fn sd_boot_check(ctx: &Ctx<NextionPlatform>) -> u8 {
         Some(0x0000),
     );
 
-    let sd = match sdcard::init() {
-        Ok(sd) => sd,
-        Err(_) => return 0,
-    };
-
-    let mut fat = match fat::Fat::mount(&sd) {
-        Ok(f) => f,
-        Err(_) => {
-            sd.release_bus();
-            return 0;
-        }
-    };
-
-    // EMPTY.BIN — recovery mode.
-    if fat.find_by_name(&sd, b"EMPTY.BIN").is_some() {
-        ctx.lcd.fill_rect(0, 200, 800, 30, 0x0000);
-        font.draw_str(
-            &ctx.lcd,
-            &ctx.flash,
-            b"SD: recovery mode",
-            280,
-            220,
-            COLOR_WHITE,
-            Some(0x0000),
-        );
-        sd.release_bus();
-        delay_ms(1000);
-        return ERR_EMPTY_RUN;
+    match sdcard::init() {
+        Ok(sd) => sdboot::sd_boot_check(ctx, &sd, || {}),
+        Err(_) => 0,
     }
-
-    // PROGRAM.BIN — flash update.
-    let entry = match fat.find_by_name(&sd, b"PROGRAM.BIN") {
-        Some(e) => e,
-        None => {
-            sd.release_bus();
-            return 0;
-        }
-    };
-
-    let file_size = entry.size;
-    if file_size == 0 {
-        sd.release_bus();
-        return 0;
-    }
-
-    ctx.lcd.fill_rect(0, 200, 800, 60, 0x0000);
-    font.draw_str(
-        &ctx.lcd,
-        &ctx.flash,
-        b"SD: flashing program...",
-        250,
-        220,
-        COLOR_WHITE,
-        Some(0x0000),
-    );
-
-    const SECTOR: usize = 4096;
-    const PAGE: usize = 256;
-    let mut buf = alloc::vec![0u8; SECTOR];
-    let mut offset: u32 = 0;
-    let dest_base: u32 = NextionPlatform::FS_BASE;
-
-    while offset < file_size {
-        let remaining = (file_size - offset) as usize;
-        let chunk = remaining.min(SECTOR);
-
-        let read = fat.read_file(&sd, &entry, offset, &mut buf[..chunk]);
-        if read == 0 {
-            break;
-        }
-
-        ctx.flash.erase_sector(dest_base + offset);
-
-        let mut page_off = 0;
-        while page_off < read {
-            let page_len = (read - page_off).min(PAGE);
-            ctx.flash.write(
-                dest_base + offset + page_off as u32,
-                &buf[page_off..page_off + page_len],
-            );
-            page_off += page_len;
-        }
-
-        offset += read as u32;
-        let progress = (offset * 700 / file_size) as u16;
-        ctx.lcd.fill_rect(50, 240, progress, 10, 0x07E0);
-    }
-
-    sd.release_bus();
-
-    ctx.lcd.fill_rect(0, 200, 800, 60, 0x0000);
-    font.draw_str(
-        &ctx.lcd,
-        &ctx.flash,
-        b"SD: flash complete!",
-        270,
-        220,
-        0x07E0,
-        Some(0x0000),
-    );
-    delay_ms(1000);
-
-    0
 }

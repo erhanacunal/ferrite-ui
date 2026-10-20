@@ -3180,6 +3180,7 @@ class FerriteSyntaxHighlighter(QSyntaxHighlighter):
                      "strLen", "setText", "strClear", "strFree", "arrFree",
                      "itof", "ftoi", "fneg", "fadd", "fsub", "fmul", "fdiv",
                      "setBrightness", "brightness",
+                     "pinMode", "pinWrite", "pinRead",
                      "rtcRead", "rtcWrite", "sendUsart",
                      "fpgaCmd", "fpgaData", "beginFrame", "endFrame",
                      "layout"]

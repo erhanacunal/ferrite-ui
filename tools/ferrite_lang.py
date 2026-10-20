@@ -981,6 +981,7 @@ NO_VALUE_BUILTINS = {
     'fileSeek',
     'setDialogResult',
     'animate', 'stopAnim', 'stopAnimProp',
+    'pinMode', 'pinWrite',
 }
 
 # Builtins whose return value is an array ID (so the variable must be in array_vars)
@@ -1547,7 +1548,7 @@ class CodeGen:
     _INT_RETURNING = {
         'ftoi', 'feq', 'fne', 'flt', 'fle', 'fgt', 'fge',
         'alloc', 'get', 'parseInt', 'strLen', 'strlen', 'strcmp',
-        'millis', 'brightness',
+        'millis', 'brightness', 'pinRead',
         'arrFree', 'strFree', 'arrLen',
         'syscall',
     }
@@ -2835,6 +2836,33 @@ class CodeGen:
             if len(node.args) != 0:
                 raise CompileError("brightness() takes no arguments", node.line)
             self.asm.builtin(Builtin.BRIGHTNESS)
+            return
+
+        if name == 'pinMode':
+            # pinMode(pin, mode) — mode: GPIO_INPUT / GPIO_OUTPUT /
+            # GPIO_INPUT_PULLUP / GPIO_INPUT_PULLDOWN (lib/gpio.fl)
+            if len(node.args) != 2:
+                raise CompileError("pinMode() takes 2 arguments: pin, mode", node.line)
+            self._gen_expr(node.args[0])
+            self._gen_expr(node.args[1])
+            self.asm.builtin(Builtin.PIN_MODE)
+            return
+
+        if name == 'pinWrite':
+            # pinWrite(pin, value) — non-zero drives the pin high
+            if len(node.args) != 2:
+                raise CompileError("pinWrite() takes 2 arguments: pin, value", node.line)
+            self._gen_expr(node.args[0])
+            self._gen_expr(node.args[1])
+            self.asm.builtin(Builtin.PIN_WRITE)
+            return
+
+        if name == 'pinRead':
+            # pinRead(pin) → 0 / 1
+            if len(node.args) != 1:
+                raise CompileError("pinRead() takes 1 argument: pin", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.PIN_READ)
             return
 
         if name == 'rtcRead':

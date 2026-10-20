@@ -1,0 +1,103 @@
+// main.fl — GPIO Header Demo (800x480)
+//
+// Pins 0-3: outputs, tap a tile to toggle it.
+// Pins 4-7: inputs with pull-up, tiles follow the pin level
+//           (short a pin to GND to see it go low).
+// Green = high, dark = low. Runs unchanged on the GD32 Nextion
+// (PC2-PC9) and the N32903 (GPD3, GPD2, GPB2-GPB6, GPA0).
+
+#include "core.fl"
+#include "color.fl"
+#include "gpio.fl"
+
+var tiles[8] = [0, 0, 0, 0, 0, 0, 0, 0];
+var shown[8] = [0, 0, 0, 0, 0, 0, 0, 0];
+// set(on_click) wires file-scope widget variables, one per clickable tile.
+var out0;
+var out1;
+var out2;
+var out3;
+
+fn show(pin, level) {
+    target(tiles[pin]);
+    set(bg_color, level ? GREEN : DARK_GRAY);
+    shown[pin] = level;
+}
+
+fn make_tile(t, pin) {
+    target(t);
+    set(kind, KIND_LABEL);
+    set(location, 40 + (pin % 4) * 185, 110 + (pin / 4) * 170);
+    set(size, 165, 140);
+    set(border_radius, 8);
+    set(text, itos(pin));
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+    tiles[pin] = t;
+    pinMode(pin, pin < 4 ? GPIO_OUTPUT : GPIO_INPUT_PULLUP);
+    show(pin, pinRead(pin));
+}
+
+fn on_tile(wid) {
+    var pin = 0;
+    while (pin < 4) {
+        if (tiles[pin] == wid) {
+            pinWrite(pin, shown[pin] ? GPIO_LOW : GPIO_HIGH);
+            show(pin, pinRead(pin));
+        }
+        pin++;
+    }
+}
+
+fn setup() {
+    var title = alloc();
+    target(title);
+    set(kind, KIND_LABEL);
+    set(location, 0, 20);
+    set(size, 800, 40);
+    set(text, "GPIO header demo");
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+
+    out0 = alloc();
+    make_tile(out0, 0);
+    target(out0);
+    set(clickable, ON);
+    set(on_click, @on_tile);
+    out1 = alloc();
+    make_tile(out1, 1);
+    target(out1);
+    set(clickable, ON);
+    set(on_click, @on_tile);
+    out2 = alloc();
+    make_tile(out2, 2);
+    target(out2);
+    set(clickable, ON);
+    set(on_click, @on_tile);
+    out3 = alloc();
+    make_tile(out3, 3);
+    target(out3);
+    set(clickable, ON);
+    set(on_click, @on_tile);
+
+    var pin = 4;
+    while (pin < 8) {
+        var t = alloc();
+        make_tile(t, pin);
+        pin++;
+    }
+}
+
+fn loop() {
+    var pin = 4;
+    while (pin < 8) {
+        var level = pinRead(pin);
+        if (level != shown[pin]) {
+            show(pin, level);
+        }
+        pin++;
+    }
+    delay(20);
+}

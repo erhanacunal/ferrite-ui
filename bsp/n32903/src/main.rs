@@ -36,6 +36,7 @@ use n32903_rs::cache::{self, CacheMode};
 
 mod backlight;
 mod flash;
+mod gpio;
 mod lcd;
 mod rtc;
 mod sdcard;
@@ -105,6 +106,7 @@ pub extern "C" fn rust_main() -> ! {
         usart: UsartImpl::with_backend(usart::new()),
         systick: systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
+        gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::HeaderGpio),
         cursor_visible: false,
     });
     let touch = TouchImpl::with_backend(touch::new());

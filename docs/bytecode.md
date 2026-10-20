@@ -220,6 +220,9 @@ Builtins are single-byte opcodes. Operands are passed on the stack unless noted.
 | `0xAD` | `animate` | pop `on_end`, `ctrl`, `duration`, `to`, `prop`, `widget`; start a property tween |
 | `0xAE` | `stopAnim` | pop `widget`; cancel all tweens on the widget |
 | `0xAF` | `stopAnimProp` | pop `prop`, pop `widget`; cancel that one tween |
+| `0xB0` | `pinMode` | pop `mode`, pop `pin`; configure a user GPIO pin (fault 14 on unknown pin / unsupported mode) |
+| `0xB1` | `pinWrite` | pop `value`, pop `pin`; drive an output pin (non-zero = high) |
+| `0xB2` | `pinRead` | pop `pin`; push its level `0`/`1` |
 
 `sprintf` has an inline `u8 argc` byte (number of format arguments after the format string). Stack layout before execution: `[... fmt, arg0, arg1, ..., argN-1]` (fmt pushed first).
 

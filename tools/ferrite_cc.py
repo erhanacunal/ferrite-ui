@@ -136,6 +136,11 @@ class Op:
     STOP_ANIM       = 0xAE  # pop widget → cancel all tweens on the widget
     STOP_ANIM_PROP  = 0xAF  # pop prop, pop widget → cancel that one tween
 
+    # User GPIO header (pins 0..N-1, mapped per board)
+    PIN_MODE        = 0xB0  # pop mode, pop pin → configure pin
+    PIN_WRITE       = 0xB1  # pop value, pop pin → drive output
+    PIN_READ        = 0xB2  # pop pin → push 0/1
+
     # Float ops (all no-arg)
     ITOF = 0xC0
     FTOI = 0xC1
@@ -214,6 +219,9 @@ class Builtin:
     # index 41 = 0xA9 is SPRINTF (emitted directly via str_sprintf, not via asm.builtin)
     FILE_SEEK = 42  # (handle, pos) → void; seek to byte position (clamped to [0, size])
     STR_CMP = 43    # (str_id, str_id) → -1/0/1
+    PIN_MODE = 48   # (pin, mode) → void
+    PIN_WRITE = 49  # (pin, value) → void
+    PIN_READ = 50   # (pin) → 0/1
 
 
 class Prop:
@@ -1036,6 +1044,7 @@ OP_NAMES = {
     0xA7: 'showModal', 0xA8: 'setDialogResult', 0xA9: 'sprintf',
     0xAC: 'strCmp',
     0xAD: 'animate', 0xAE: 'stopAnim', 0xAF: 'stopAnimProp',
+    0xB0: 'pinMode', 0xB1: 'pinWrite', 0xB2: 'pinRead',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -1075,6 +1084,7 @@ _NO_ARG_OPS = (
     {op for op in range(0x80, 0xA9)    # 0x80-0xA8 except 0x86, 0x88
      if op not in (0x86, 0x88)} |
     {0xAD, 0xAE, 0xAF} |               # animate, stopAnim, stopAnimProp
+    {0xB0, 0xB1, 0xB2} |               # pinMode, pinWrite, pinRead
     set(range(0xC0, 0xCD))             # 0xC0-0xCC
 )
 

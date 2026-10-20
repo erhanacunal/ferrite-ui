@@ -806,6 +806,28 @@ setBrightness(100);       // full brightness
 var current = brightness(); // read current level
 ```
 
+### pinMode(pin, mode) / pinWrite(pin, value) / pinRead(pin)
+
+Drive the board's user GPIO header. Pins are numbered `0..7` on every board
+that has one (GD32 Nextion: PC2–PC9; N32903: GPD3, GPD2, GPB2–GPB6, GPA0 —
+see `lib/gpio.fl`), so the same program runs on both.
+
+```c
+#include "gpio.fl"
+
+pinMode(0, GPIO_OUTPUT);
+pinWrite(0, GPIO_HIGH);         // any non-zero value drives high
+pinMode(1, GPIO_INPUT_PULLUP);
+if (pinRead(1) == 0) { /* button pressed (pulls to ground) */ }
+```
+
+Modes: `GPIO_INPUT` (floating), `GPIO_OUTPUT` (push-pull),
+`GPIO_INPUT_PULLUP`, `GPIO_INPUT_PULLDOWN` (GD32 only). Pins stay floating
+inputs until `pinMode` is called; `pinWrite` on a pin that isn't an output does
+nothing. A pin number the board doesn't have or an unsupported mode stops the
+program with VM fault 14 (`invalid gpio pin/mode`). There is no pin-change
+callback: poll `pinRead` from `loop()`.
+
 ### fpgaCmd(cmd, data) / fpgaData(data)
 
 Send raw commands/data to the FPGA display controller. For advanced use only.
@@ -1670,8 +1692,8 @@ Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnPageChangin
 |----------|-------|
 | Widget arena | 1024 widgets |
 | Variable slots | 256 (sparse map, shared globals + function locals) |
-| Eval stack | 16 deep |
-| Call stack | 8 deep |
+| Eval stack | 32 deep (`"memory": {"eval_stack"}`) |
+| Call stack | 16 deep (`"memory": {"call_stack"}`) |
 | Callback queue | 8 pending |
 | String pool | 2,048 bytes, 64 slots |
 | Open files | 2 simultaneous (handles 1 and 2) |

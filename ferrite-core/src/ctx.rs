@@ -6,6 +6,7 @@
 use crate::audio::AudioImpl;
 use crate::backlight::BacklightImpl;
 use crate::flash::FlashImpl;
+use crate::gpio::GpioImpl;
 use crate::lcd::LcdImpl;
 use crate::platform::Platform;
 use crate::rtc::RtcImpl;
@@ -31,5 +32,6 @@ pub struct Ctx<P: Platform> {
     pub usart: UsartImpl<P::UsartB>,
     pub systick: SystickImpl<P::SystickB>,
     pub audio: AudioImpl<P::AudioB>,
+    pub gpio: GpioImpl<P::GpioB>,
     pub cursor_visible: bool,
 }

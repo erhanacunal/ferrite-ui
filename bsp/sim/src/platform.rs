@@ -35,6 +35,7 @@ impl Platform for SimPlatform {
     type UsartB = crate::usart::sim::Stdio;
     type SystickB = crate::systick::SimSystick;
     type AudioB = ferrite_core::audio::NoAudio;
+    type GpioB = crate::gpio::SimGpio;
 }
 
 // --- Host window state (thread-local; minifb Window is !Send) ---

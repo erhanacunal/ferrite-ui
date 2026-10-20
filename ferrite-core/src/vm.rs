@@ -363,6 +363,9 @@ const OP_SPRINTF: u8 = 0xA9; // + u8 argc — pop argc args + fmt str_id → pus
 const OP_ANIMATE: u8 = 0xAD; // pop on_end, ctrl, duration, to, prop, widget → start tween
 const OP_STOP_ANIM: u8 = 0xAE; // pop widget → cancel all tweens on the widget
 const OP_STOP_ANIM_PROP: u8 = 0xAF; // pop prop, pop widget → cancel that one tween
+const OP_PIN_MODE: u8 = 0xB0; // pop mode, pop pin → configure user GPIO pin
+const OP_PIN_WRITE: u8 = 0xB1; // pop value, pop pin → drive output pin
+const OP_PIN_READ: u8 = 0xB2; // pop pin → push 0/1
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -398,11 +401,12 @@ pub mod fault {
     pub const CODE_OOB: u8 = 1;
     /// Unknown opcode.
     pub const BAD_OPCODE: u8 = 2;
-    /// Eval stack overflow (more than 16 values).
+    /// Eval stack overflow (more values than the configured eval stack holds).
     pub const STACK_OVERFLOW: u8 = 3;
     /// Eval stack underflow (pop from empty stack).
     pub const STACK_UNDERFLOW: u8 = 4;
-    /// Call stack overflow (call depth > 8, e.g. runaway recursion).
+    /// Call stack overflow (call depth past the configured call stack, e.g.
+    /// runaway recursion).
     pub const CALL_OVERFLOW: u8 = 5;
     /// RET with an empty call stack outside a callback.
     pub const RET_EMPTY: u8 = 6;
@@ -420,6 +424,8 @@ pub mod fault {
     pub const SYSCALL: u8 = 12;
     /// Invalid operand value (array too short / too long for the operation).
     pub const BAD_OPERAND: u8 = 13;
+    /// GPIO pin the board doesn't have, or a mode it doesn't support.
+    pub const GPIO: u8 = 14;
 
     /// Short human-readable name for the error screen.
     pub fn name(code: u8) -> &'static [u8] {
@@ -437,6 +443,7 @@ pub mod fault {
             BAD_FILE => b"invalid file handle",
             SYSCALL => b"syscall failed",
             BAD_OPERAND => b"bad operand",
+            GPIO => b"invalid gpio pin/mode",
             _ => b"unknown fault",
         }
     }
@@ -2230,6 +2237,29 @@ impl Vm {
                 self.push(ctx.backlight.brightness() as i32);
             }
 
+            // --- User GPIO ---
+            OP_PIN_MODE => {
+                let mode = self.pop();
+                let pin = self.pop();
+                if !ctx.gpio.set_mode(pin, mode) {
+                    self.fail(fault::GPIO);
+                }
+            }
+            OP_PIN_WRITE => {
+                let value = self.pop();
+                let pin = self.pop();
+                if !ctx.gpio.write(pin, value) {
+                    self.fail(fault::GPIO);
+                }
+            }
+            OP_PIN_READ => {
+                let pin = self.pop();
+                match ctx.gpio.read(pin) {
+                    Some(level) => self.push(level),
+                    None => self.fail(fault::GPIO),
+                }
+            }
+
             // --- Animation engine ---
             OP_ANIMATE => {
                 // Pushed order: widget, prop, to, duration, ctrl, on_end.
@@ -3303,7 +3333,7 @@ fn prop_is_color(prop_id: u8) -> bool {
 #[cfg(all(test, feature = "mock"))]
 mod anim_tests {
     use super::*;
-    use crate::mock::{MockBacklight, MockFlash, MockLcd, MockPlatform, MockRtc, MockUsart};
+    use crate::mock::{MockBacklight, MockFlash, MockGpio, MockLcd, MockPlatform, MockRtc, MockUsart};
     use crate::backlight::BacklightImpl;
     use crate::flash::FlashImpl;
     use crate::lcd::LcdImpl;
@@ -3315,6 +3345,7 @@ mod anim_tests {
     use crate::strpool::StringPool;
     use crate::widget::WidgetTree;
     use crate::audio::AudioImpl;
+    use crate::gpio::GpioImpl;
 
     fn mock_ctx() -> Ctx<MockPlatform> {
         Ctx {
@@ -3330,6 +3361,7 @@ mod anim_tests {
             usart: UsartImpl::with_backend(MockUsart),
             systick: SystickImpl::init(),
             audio: AudioImpl::none(),
+            gpio: GpioImpl::with_backend(MockGpio::default()),
             cursor_visible: false,
         }
     }
@@ -3682,6 +3714,46 @@ mod anim_tests {
         assert_eq!(vm.cb_frames.len(), 1);
         assert!(vm.state == VmState::Waiting, "A is still waiting");
         assert_eq!(vm.wait_until, 1000);
+    }
+
+    // --- User GPIO ---
+
+    #[test]
+    fn gpio_ops_drive_and_read_pins() {
+        // pinMode(1, OUTPUT); pinWrite(1, 5); g0 = pinRead(1);
+        // pinMode(2, INPUT_PULLUP); g1 = pinRead(2); HALT
+        let code = [
+            OP_PUSH_1, OP_PUSH_1, OP_PIN_MODE,
+            OP_PUSH_1, OP_PUSH_I8, 5, OP_PIN_WRITE,
+            OP_PUSH_1, OP_PIN_READ, OP_STORE, 0,
+            OP_PUSH_2, OP_PUSH_2, OP_PIN_MODE,
+            OP_PUSH_2, OP_PIN_READ, OP_STORE, 1,
+            OP_HALT,
+        ];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 100);
+        assert!(vm.state == VmState::Halted);
+        assert_eq!(vm.var_get(0), 1, "non-zero writes drive high");
+        assert_eq!(vm.var_get(1), 1, "pull-up input reads high");
+    }
+
+    #[test]
+    fn gpio_faults_on_a_missing_pin_or_mode() {
+        let mut ctx = mock_ctx();
+        // MockGpio has 4 pins: pinRead(4)
+        let mut vm = cb_vm(&[OP_PUSH_I8, 4, OP_PIN_READ, OP_HALT]);
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.fault(), fault::GPIO);
+        assert_eq!(vm.fault_pc(), 2);
+        // pinMode(0, INPUT_PULLDOWN): unsupported on this board
+        let mut vm = cb_vm(&[OP_PUSH_0, OP_PUSH_I8, 3, OP_PIN_MODE, OP_HALT]);
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.fault(), fault::GPIO);
+        // pinWrite(-1, 1)
+        let mut vm = cb_vm(&[OP_PUSH_I8, 0xFF, OP_PUSH_1, OP_PIN_WRITE, OP_HALT]);
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.fault(), fault::GPIO);
     }
 
     #[test]

@@ -1,18 +1,21 @@
-/// FAT16/FAT32 read-only filesystem driver for SD card
-///
-/// Reads MBR → BPB → FAT → directory entries → file data.
-/// Heap-allocated sector buffer (512B). FAT sectors cached one at a time.
-///
-/// Usage:
-///   let sd = SdCard::init()?;
-///   let mut fat = Fat::mount(&sd)?;
-///   if let Some(entry) = fat.find(&sd, b"DATA    TXT") {
-///       fat.read_file(&sd, &entry, offset, &mut buf);
-///   }
-///   sd.release_bus();
+//! FAT16/FAT32 read-only filesystem driver for SD card
+//!
+//! Reads MBR → BPB → FAT → directory entries → file data.
+//! Heap-allocated sector buffer (512B). FAT sectors cached one at a time.
+//!
+//! Usage:
+//!   let sd = sdcard::init()?;   // BSP-specific, yields an SdCardImpl<B>
+//!   let mut fat = Fat::mount(&sd)?;
+//!   if let Some(entry) = fat.find(&sd, b"DATA    TXT") {
+//!       fat.read_file(&sd, &entry, offset, &mut buf);
+//!   }
+//!   sd.release_bus();
+// Full BPB / attribute layout kept for reference; not every field is read.
+#![allow(dead_code)]
+
 extern crate alloc;
 
-use crate::sdcard::{SdCard, SdError};
+use crate::sdcard::{SdCardBackend, SdCardImpl, SdError};
 use alloc::boxed::Box;
 
 /// Sector size (always 512 for SD cards in SPI mode).
@@ -90,7 +93,7 @@ const ATTR_LFN: u8 = 0x0F;
 impl Fat {
     /// Mount a FAT filesystem from the SD card.
     /// Reads MBR to find the first partition, then parses the BPB.
-    pub fn mount(sd: &SdCard) -> Result<Self, FatError> {
+    pub fn mount<B: SdCardBackend>(sd: &SdCardImpl<B>) -> Result<Self, FatError> {
         let mut buf = Box::new([0u8; SECTOR_SIZE]);
 
         // Read MBR (sector 0)
@@ -189,7 +192,7 @@ impl Fat {
     ///
     /// `name` must be exactly 11 bytes: 8 name + 3 extension, space-padded, uppercase.
     /// Example: `b"DATA    TXT"` for "DATA.TXT", `b"README  MD "` for "README.MD".
-    pub fn find(&mut self, sd: &SdCard, name: &[u8; 11]) -> Option<DirEntry> {
+    pub fn find<B: SdCardBackend>(&mut self, sd: &SdCardImpl<B>, name: &[u8; 11]) -> Option<DirEntry> {
         if self.fat_type == FatType::Fat32 {
             self.find_in_cluster_chain(sd, self.root_cluster, name)
         } else {
@@ -199,16 +202,16 @@ impl Fat {
 
     /// Find a file by a regular filename string (e.g. "data.txt").
     /// Converts to 8.3 format internally.
-    pub fn find_by_name(&mut self, sd: &SdCard, filename: &[u8]) -> Option<DirEntry> {
+    pub fn find_by_name<B: SdCardBackend>(&mut self, sd: &SdCardImpl<B>, filename: &[u8]) -> Option<DirEntry> {
         let name83 = to_83_name(filename)?;
         self.find(sd, &name83)
     }
 
     /// Read file data starting at `offset` into `buf`.
     /// Returns the number of bytes actually read.
-    pub fn read_file(
+    pub fn read_file<B: SdCardBackend>(
         &mut self,
-        sd: &SdCard,
+        sd: &SdCardImpl<B>,
         entry: &DirEntry,
         offset: u32,
         out: &mut [u8],
@@ -274,7 +277,7 @@ impl Fat {
     }
 
     /// Read the next cluster from the FAT table. Returns None at end-of-chain.
-    fn next_cluster(&mut self, sd: &SdCard, cluster: u32) -> Option<u32> {
+    fn next_cluster<B: SdCardBackend>(&mut self, sd: &SdCardImpl<B>, cluster: u32) -> Option<u32> {
         match self.fat_type {
             FatType::Fat16 => {
                 let offset = cluster * 2;
@@ -318,7 +321,7 @@ impl Fat {
     }
 
     /// Search FAT16 fixed root directory area.
-    fn find_in_fat16_root(&mut self, sd: &SdCard, name: &[u8; 11]) -> Option<DirEntry> {
+    fn find_in_fat16_root<B: SdCardBackend>(&mut self, sd: &SdCardImpl<B>, name: &[u8; 11]) -> Option<DirEntry> {
         let root_sectors = ((self.root_entry_count as u32) * 32 + 511) / 512;
         for s in 0..root_sectors {
             if sd
@@ -335,9 +338,9 @@ impl Fat {
     }
 
     /// Search a cluster chain for a directory entry (FAT32 root or subdirectory).
-    fn find_in_cluster_chain(
+    fn find_in_cluster_chain<B: SdCardBackend>(
         &mut self,
-        sd: &SdCard,
+        sd: &SdCardImpl<B>,
         start_cluster: u32,
         name: &[u8; 11],
     ) -> Option<DirEntry> {

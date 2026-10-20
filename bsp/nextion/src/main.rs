@@ -30,12 +30,12 @@ mod sdcard;
 mod stack;
 mod systick;
 mod touch;
+mod user_gpio;
 mod usart;
 
 // --- Device-only modules (binary-local) ---
 mod gpio;
 mod irq;
-mod fat;
 mod panic;
 mod platform;
 
@@ -297,6 +297,7 @@ fn build_ctx(gpio: Gpio) -> Box<Ctx<NextionPlatform>> {
         usart: usart::init(),
         systick: systick::Systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
+        gpio: ferrite_core::gpio::GpioImpl::with_backend(user_gpio::HeaderGpio),
         cursor_visible: false,
     })
 }

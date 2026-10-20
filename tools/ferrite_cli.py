@@ -75,6 +75,7 @@ VM_FAULT_NAMES = {
     11: "invalid file handle",
     12: "syscall failed",
     13: "bad operand",
+    14: "invalid gpio pin/mode",
 }
 
 

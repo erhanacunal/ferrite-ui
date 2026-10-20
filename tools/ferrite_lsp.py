@@ -545,6 +545,9 @@ BUILTIN_SIGNATURES = {
     'animate':     {'sig': 'animate(widget, prop, to, durationMs, easing, [@onEnd])', 'desc': 'Tween a widget property from its current value to `to`. easing = EASE_* | REPEAT_LOOP/REPEAT_YOYO. Optional @onEnd fires when a one-shot tween finishes.'},
     'stopAnim':    {'sig': 'stopAnim(widget)', 'desc': 'Cancel all running tweens on a widget.'},
     'stopAnimProp': {'sig': 'stopAnimProp(widget, prop)', 'desc': 'Cancel the tween on one property of a widget.'},
+    'pinMode':     {'sig': 'pinMode(pin, mode)', 'desc': 'Configure a user GPIO pin: GPIO_INPUT, GPIO_OUTPUT, GPIO_INPUT_PULLUP, GPIO_INPUT_PULLDOWN (gpio.fl).'},
+    'pinWrite':    {'sig': 'pinWrite(pin, value)', 'desc': 'Drive an output pin: non-zero = high, 0 = low.'},
+    'pinRead':     {'sig': 'pinRead(pin) -> int', 'desc': 'Read a GPIO pin level (0 or 1).'},
 }
 
 PROP_DOCS = {

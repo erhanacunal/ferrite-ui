@@ -7,6 +7,7 @@ use ferrite_core::ctx::Ctx;
 use ferrite_core::platform::Platform;
 use ferrite_core::protocol::{self, RxEvent};
 use ferrite_core::render;
+use ferrite_core::sdboot;
 use ferrite_core::runtime::{ERR_EMPTY_RUN, FullInput, PlatformRuntime};
 use ferrite_core::strpool::StringPool;
 use ferrite_core::touch::{CalParams, TouchImpl};
@@ -15,7 +16,7 @@ use ferrite_core::vm::Vm;
 
 use n32903_rs::timer::{self, WdtInterval};
 
-use crate::{flash, lcd, systick, touch, usart};
+use crate::{flash, lcd, sdcard, systick, touch, usart};
 
 /// Top of the SVC stack and the bottom of its 256 KB area (startup.s).
 const SVC_STACK_TOP: u32 = 0x0080_0000 - 1024;
@@ -29,10 +30,11 @@ impl Platform for N32903Platform {
     type TouchB = crate::touch::AdcTouch;
     type BacklightB = crate::backlight::PwmBl;
     type RtcB = crate::rtc::At8563;
-    type SdCardB = crate::sdcard::StubSd;
+    type SdCardB = crate::sdcard::SicSd;
     type UsartB = crate::usart::HwUart;
     type SystickB = crate::systick::N32903Systick;
     type AudioB = ferrite_core::audio::NoAudio;
+    type GpioB = crate::gpio::HeaderGpio;
 
     // The "flash" is the SDRAM shadow of a NAND region (see flash/mod.rs), so
     // the default layout applies: config at 0x0000, resource FS from 0x1000.
@@ -108,7 +110,17 @@ impl PlatformRuntime for N32903Platform {
                 return ERR_EMPTY_RUN;
             }
         }
-        0
+
+        // SD card boot actions (EMPTY.BIN / PROGRAM.BIN), if a card is in.
+        let Ok(sd) = sdcard::init() else {
+            return 0;
+        };
+        usart::log("sd: card found
+");
+        let r = sdboot::sd_boot_check(ctx, &sd, lcd::flush_cache);
+        // A PROGRAM.BIN update is in the SDRAM shadow: put it on NAND now.
+        flash::flush();
+        r
     }
 
     fn initial_render(_ctx: &mut Ctx<Self>, _vm: &Vm) {

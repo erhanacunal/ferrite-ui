@@ -84,6 +84,7 @@ impl Platform for EpaperPlatform {
     type UsartB = crate::usart::epaper::EspUart;
     type SystickB = crate::systick::EpdSystick;
     type AudioB = ferrite_core::audio::NoAudio;
+    type GpioB = ferrite_core::gpio::NoGpio;
     // E-paper is white when idle; anti-aliased text on transparent labels
     // blends against this instead of the raster-board default (black).
     const DEFAULT_BG_COLOR: u16 = COLOR_WHITE;
