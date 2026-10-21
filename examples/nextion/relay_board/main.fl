@@ -1,0 +1,649 @@
+// main.fl — 8-channel relay board (800x480)
+//
+// Up to 10 buttons, each driving a group of relays on the user GPIO header
+// (relay channel N = pin N-1). Tap a button to toggle it; a relay is on while
+// any active button includes it, so groups may overlap.
+//
+// Settings: add/delete buttons in the left list (a new button is selected),
+// name it, tick its relay channels on the right, optionally enter an image
+// number (0 = none, 1-4 = the sample icons in project.json), then OK. Cancel
+// drops the edits. Settings live in RAM only for now.
+//
+// Names are kept in widgets, not variables: strClear() only keeps strings a
+// widget shows. Committed names live in the button captions, names being
+// edited in the settings list rows.
+
+#include "core.fl"
+#include "color.fl"
+#include "gpio.fl"
+
+// Widgets are created in loops, so the compiler's alloc()-site count (43)
+// is far too low. The firmware pre-sizes its widget/extension arrays from
+// this; past it they double (ext 86 -> 172 = a 6 KB block), which overflows
+// the GD32's ~17 KB heap. 93 widgets + root, 89 extensions + 4 spare.
+#hint_widgets 94 93
+
+// Most 8-channel relay modules switch a relay on when its input is pulled
+// low. Set to 0 for a board that is active-high.
+const RELAY_ACTIVE_LOW = 1;
+
+const MAX_BUTTONS = 10;
+const NAME_LEN    = 12;
+const PER_ROW     = 5;
+const CHANNELS    = 8;
+
+const BTN_W   = 144;
+const BTN_H   = 150;
+const BTN_GAP = 12;
+const AREA_Y  = 64;     // button area: below the title bar...
+const AREA_H  = 348;    // ...and above the relay indicators
+
+const BG       = 0x18E3;
+const BAR_BG   = 0x2124;
+const BTN_BG   = 0x2966; // RGB 40,44,52 — the sample icons use it as background
+const BTN_EDGE = 0x4A69;
+const ACTIVE   = 0x07E0;
+const LED_OFF  = 0x3186;
+const ROW_BG   = 0x2945;
+const ROW_SEL  = 0x2C9F;
+
+// --- Configuration in use ---
+var count = 0;
+var masks[10];      // bit N = relay channel N+1
+var images[10];     // image_id, 0 = none
+var active[10];     // button toggled on
+
+// --- Copy being edited in the settings page ---
+var ed_count = 0;
+var ed_masks[10];
+var ed_images[10];
+var ed_active[10];
+var sel = -1;       // selected list row, -1 = none
+
+// --- Widget ids ---
+var btns[10];
+var icons[10];
+var captions[10];
+var chans[10];
+var leds[8];
+var rows[10];
+var checks[8];
+var hint;
+var settings;
+var detail;
+var no_sel;
+var img_input;
+
+// set(on_click) is wired per file-scope widget variable, so every clickable
+// widget gets its own variable assigned straight from alloc().
+var btn0; var btn1; var btn2; var btn3; var btn4;
+var btn5; var btn6; var btn7; var btn8; var btn9;
+var row0; var row1; var row2; var row3; var row4;
+var row5; var row6; var row7; var row8; var row9;
+var settings_btn;
+var ok_btn;
+var cancel_btn;
+var add_btn;
+var del_btn;
+var name_input;     // file-scope: wired to on_change
+
+// ============================================================
+// Helpers
+// ============================================================
+
+// Configure a freshly alloc()'d widget as a label. `text` is a string id.
+// Leaves the label targeted, so the caller follows up with parent().
+fn label_init(l: widget, x, y, w, h, color, align, text) {
+    target(l);
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+    set(text_color, color);
+    set(text_align, align);
+    set(text, text);
+}
+
+// Flat clickable label-button. Styles the current target (alloc() leaves the
+// new widget targeted).
+fn style_flat(x, y, width, height, color) {
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, width, height);
+    set(bg_color, color);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(border_radius, 6);
+    set(clickable, ON);
+}
+
+// "1 3 5" — the channels in a mask, or "-" when empty.
+fn mask_text(m) -> string {
+    if (m == 0) {
+        return str("-");
+    }
+    var s = str("");
+    for (var ch = 0; ch < CHANNELS; ch++) {
+        if ((m >> ch) & 1) {
+            s = concat(s, sprintf(strLen(s) ? " %d" : "%d", ch + 1));
+        }
+    }
+    return s;
+}
+
+// A private copy of string `id`. The keyboard edits an input's string in
+// place, so an input must never share its string with another widget.
+fn copy_text(id) -> string {
+    return concat(id, str(""));
+}
+
+// ============================================================
+// Relays
+// ============================================================
+
+fn apply_relays() {
+    var on = 0;
+    for (var i = 0; i < count; i++) {
+        if (active[i]) {
+            on = on | masks[i];
+        }
+    }
+    for (var ch = 0; ch < CHANNELS; ch++) {
+        var level = (on >> ch) & 1;
+        pinWrite(ch, RELAY_ACTIVE_LOW ? 1 - level : level);
+        target(leds[ch]);
+        set(bg_color, level ? ACTIVE : LED_OFF);
+        set(text_color, level ? BLACK : GRAY);
+        dirty();
+    }
+}
+
+// ============================================================
+// Main page
+// ============================================================
+
+fn style_button(i) {
+    target(btns[i]);
+    set(border_color, active[i] ? ACTIVE : BTN_EDGE);
+    dirty();
+    target(captions[i]);
+    set(text_color, active[i] ? ACTIVE : WHITE);
+}
+
+// Lay out `count` buttons: up to 5 per row, each row centered, a single
+// row centered vertically in the button area.
+fn layout_buttons() {
+    var row_count = count > PER_ROW ? 2 : 1;
+    var top = AREA_Y + (AREA_H - row_count * BTN_H - (row_count - 1) * 20) / 2;
+    for (var i = 0; i < MAX_BUTTONS; i++) {
+        target(btns[i]);
+        if (i >= count) {
+            set(visible, OFF);
+            continue;
+        }
+        var row = i / PER_ROW;
+        var col = i % PER_ROW;
+        var in_row = count - row * PER_ROW;
+        if (in_row > PER_ROW) {
+            in_row = PER_ROW;
+        }
+        var row_w = in_row * BTN_W + (in_row - 1) * BTN_GAP;
+        set(location, (800 - row_w) / 2 + col * (BTN_W + BTN_GAP), top + row * (BTN_H + 20));
+        set(visible, ON);
+
+        // Caption under the icon, or centered when there is no image.
+        var text_y = images[i] ? 92 : 44;
+        target(icons[i]);
+        set(image_id, images[i]);
+        set(visible, images[i] ? ON : OFF);
+        target(captions[i]);
+        set(loc_y, text_y);
+        target(chans[i]);
+        set(loc_y, text_y + 26);
+        set(text, mask_text(masks[i]));
+        style_button(i);
+        // mask_text builds up to ~17 temporary strings: drop them per button
+        // (strClear keeps the texts widgets show).
+        strClear();
+    }
+    target(hint);
+    set(visible, count == 0 ? ON : OFF);
+    target(0);
+    dirty();
+}
+
+fn make_button(b: widget, i) {
+    target(b);
+    set(size, BTN_W, BTN_H);
+    set(bg_color, BTN_BG);
+    set(border, 3, 3, 3, 3);
+    set(border_color, BTN_EDGE);
+    set(border_radius, 10);
+    set(press_color, 0x4208);
+    set(clickable, ON);
+    set(visible, OFF);
+    parent(0);
+    btns[i] = b;
+
+    // 64x64 icon slot, centered; the image is drawn as its background.
+    var icon = alloc();
+    target(icon);
+    set(location, (BTN_W - 6 - 64) / 2, 14);
+    set(size, 64, 64);
+    set(bg_color, BTN_BG);
+    parent(b);
+    icons[i] = icon;
+
+    var cap = alloc();
+    label_init(cap, 0, 92, BTN_W - 6, 26, WHITE, ALIGN_CENTER, str(""));
+    parent(b);
+    captions[i] = cap;
+    var ch = alloc();
+    label_init(ch, 0, 118, BTN_W - 6, 22, GRAY, ALIGN_CENTER, str(""));
+    parent(b);
+    chans[i] = ch;
+}
+
+fn on_relay_button(wid) {
+    for (var i = 0; i < count; i++) {
+        if (btns[i] == wid) {
+            active[i] = !active[i];
+            style_button(i);
+        }
+    }
+    apply_relays();
+    render();
+}
+
+// ============================================================
+// Settings page
+// ============================================================
+
+// Copy the checkboxes and image number back into the selected entry.
+fn save_selection() {
+    if (sel < 0) {
+        return 0;
+    }
+    var m = 0;
+    for (var ch = 0; ch < CHANNELS; ch++) {
+        target(checks[ch]);
+        if (get(checked)) {
+            m = m | (1 << ch);
+        }
+    }
+    ed_masks[sel] = m;
+    target(img_input);
+    var n = parseInt(get(text));
+    if (n < 0) { n = 0; }
+    if (n > 254) { n = 254; }
+    ed_images[sel] = n;
+    store_name();
+}
+
+// Selected row's name <- name input; an emptied name falls back to "Button N".
+fn store_name() {
+    target(name_input);
+    var t = get(text);
+    target(rows[sel]);
+    if (strLen(t) == 0) {
+        set(text, sprintf("Button %d", sel + 1));
+    } else {
+        set(text, copy_text(t));
+    }
+    dirty();
+}
+
+fn on_name_changed(wid, xx) {
+    if (sel >= 0) {
+        store_name();
+        render();
+        strClear();
+    }
+}
+
+fn show_selection() {
+    target(detail);
+    set(visible, sel >= 0 ? ON : OFF);
+    dirty();
+    target(no_sel);
+    set(visible, sel >= 0 ? OFF : ON);
+    dirty();
+    if (sel < 0) {
+        return 0;
+    }
+    for (var ch = 0; ch < CHANNELS; ch++) {
+        target(checks[ch]);
+        set(checked, (ed_masks[sel] >> ch) & 1);
+    }
+    target(img_input);
+    set(text, itos(ed_images[sel]));
+    target(rows[sel]);
+    var t = get(text);
+    target(name_input);
+    set(text, copy_text(t));
+}
+
+fn refresh_list() {
+    for (var i = 0; i < MAX_BUTTONS; i++) {
+        target(rows[i]);
+        set(visible, i < ed_count ? ON : OFF);
+        set(bg_color, i == sel ? ROW_SEL : ROW_BG);
+        dirty();
+    }
+    target(add_btn);
+    set(bg_color, ed_count < MAX_BUTTONS ? DARK_GREEN : DARK_GRAY);
+    dirty();
+    target(del_btn);
+    set(bg_color, sel >= 0 ? DARK_RED : DARK_GRAY);
+    dirty();
+}
+
+fn select_row(i) {
+    sel = i;
+    refresh_list();
+    show_selection();
+    render();
+    strClear();
+}
+
+fn on_row(wid) {
+    save_selection();
+    for (var i = 0; i < ed_count; i++) {
+        if (rows[i] == wid) {
+            select_row(i);
+        }
+    }
+}
+
+fn on_add(wid) {
+    if (ed_count >= MAX_BUTTONS) {
+        return 0;
+    }
+    save_selection();
+    ed_masks[ed_count] = 0;
+    ed_images[ed_count] = 0;
+    ed_active[ed_count] = 0;
+    target(rows[ed_count]);
+    set(text, sprintf("Button %d", ed_count + 1));
+    ed_count++;
+    select_row(ed_count - 1);
+}
+
+fn on_delete(wid) {
+    if (sel < 0) {
+        return 0;
+    }
+    for (var i = sel; i < ed_count - 1; i++) {
+        ed_masks[i] = ed_masks[i + 1];
+        ed_images[i] = ed_images[i + 1];
+        ed_active[i] = ed_active[i + 1];
+        target(rows[i + 1]);
+        var t = get(text);
+        target(rows[i]);
+        set(text, t);
+    }
+    ed_count--;
+    if (sel >= ed_count) {
+        sel = ed_count - 1;     // deleted the last row: select the new last
+    }
+    select_row(sel);
+}
+
+fn open_settings(wid) {
+    ed_count = count;
+    for (var i = 0; i < MAX_BUTTONS; i++) {
+        ed_masks[i] = masks[i];
+        ed_images[i] = images[i];
+        ed_active[i] = active[i];
+        target(captions[i]);
+        var t = get(text);
+        target(rows[i]);
+        set(text, t);
+    }
+    target(settings);
+    set(visible, ON);
+    dirty();
+    select_row(count > 0 ? 0 : -1);
+}
+
+fn close_settings() {
+    target(settings);
+    set(visible, OFF);
+    target(0);
+    dirty();
+}
+
+fn on_ok(wid) {
+    save_selection();
+    count = ed_count;
+    for (var i = 0; i < MAX_BUTTONS; i++) {
+        masks[i] = ed_masks[i];
+        images[i] = ed_images[i];
+        active[i] = i < count ? ed_active[i] : 0;
+        target(rows[i]);
+        var t = get(text);
+        target(captions[i]);
+        set(text, t);
+    }
+    close_settings();
+    layout_buttons();
+    apply_relays();
+    render();
+    strClear();
+}
+
+fn on_cancel(wid) {
+    close_settings();
+    render();
+}
+
+fn make_row(r: widget, i) {
+    target(r);
+    style_flat(0, i * 34, 284, 30, ROW_BG);
+    set(text_align, ALIGN_LEFT);
+    set(padding, 0, 0, 0, 12);
+    set(visible, OFF);
+    parent(settings);
+    set(loc_x, 16);
+    set(loc_y, 68 + i * 34);
+    rows[i] = r;
+}
+
+fn build_settings() {
+    // Full-screen and clickable: covers the main page and absorbs its taps.
+    settings = alloc();
+    target(settings);
+    set(size, 800, 480);
+    set(bg_color, BG);
+    set(clickable, ON);
+    set(visible, OFF);
+    parent(0);
+
+    var bar = alloc();
+    target(bar);
+    set(size, 800, 56);
+    set(bg_color, BAR_BG);
+    parent(settings);
+    var title = alloc();
+    label_init(title, 20, 8, 300, 40, WHITE, ALIGN_LEFT, str("Button Settings"));
+    parent(bar);
+
+    cancel_btn = alloc();
+    style_flat(520, 8, 120, 40, DARK_GRAY);
+    set(text, "Cancel");
+    set(on_click, @on_cancel);
+    parent(bar);
+    ok_btn = alloc();
+    style_flat(660, 8, 120, 40, BLUE);
+    set(text, "OK");
+    set(on_click, @on_ok);
+    parent(bar);
+
+    // Left: button list + Add / Delete
+    row0 = alloc(); make_row(row0, 0); target(row0); set(on_click, @on_row);
+    row1 = alloc(); make_row(row1, 1); target(row1); set(on_click, @on_row);
+    row2 = alloc(); make_row(row2, 2); target(row2); set(on_click, @on_row);
+    row3 = alloc(); make_row(row3, 3); target(row3); set(on_click, @on_row);
+    row4 = alloc(); make_row(row4, 4); target(row4); set(on_click, @on_row);
+    row5 = alloc(); make_row(row5, 5); target(row5); set(on_click, @on_row);
+    row6 = alloc(); make_row(row6, 6); target(row6); set(on_click, @on_row);
+    row7 = alloc(); make_row(row7, 7); target(row7); set(on_click, @on_row);
+    row8 = alloc(); make_row(row8, 8); target(row8); set(on_click, @on_row);
+    row9 = alloc(); make_row(row9, 9); target(row9); set(on_click, @on_row);
+
+    add_btn = alloc();
+    style_flat(16, 416, 138, 48, DARK_GREEN);
+    set(text, "+ Add");
+    set(on_click, @on_add);
+    parent(settings);
+    del_btn = alloc();
+    style_flat(162, 416, 138, 48, DARK_RED);
+    set(text, "Delete");
+    set(on_click, @on_delete);
+    parent(settings);
+
+    // Right: shown while a row is selected. The name and image inputs sit at
+    // the top so the on-screen keyboard (bottom 200 px) does not cover them.
+    no_sel = alloc();
+    label_init(no_sel, 340, 200, 440, 40, GRAY, ALIGN_CENTER,
+               str("Add a button to configure it"));
+    parent(settings);
+
+    detail = alloc();
+    target(detail);
+    set(location, 330, 64);
+    set(size, 460, 370);
+    set(bg_color, BG);
+    set(visible, OFF);
+    parent(settings);
+
+    var name_lbl = alloc();
+    label_init(name_lbl, 10, 8, 120, 40, LIGHT_GRAY, ALIGN_LEFT, str("Name"));
+    parent(detail);
+    name_input = alloc();
+    target(name_input);
+    set(kind, KIND_INPUT);
+    set(location, 130, 8);
+    set(size, 310, 40);
+    set(bg_color, BAR_BG);
+    set(border, 1, 1, 1, 1);
+    set(border_color, GRAY);
+    set(border_radius, 4);
+    set(padding, 6, 6, 6, 6);
+    set(text_color, WHITE);
+    set(max_length, NAME_LEN);
+    set(clickable, ON);
+    set(on_change, @on_name_changed);
+    parent(detail);
+
+    var img_lbl = alloc();
+    label_init(img_lbl, 10, 56, 120, 40, LIGHT_GRAY, ALIGN_LEFT, str("Image #"));
+    parent(detail);
+    img_input = alloc();
+    target(img_input);
+    set(kind, KIND_INPUT);
+    set(location, 130, 56);
+    set(size, 110, 40);
+    set(bg_color, BAR_BG);
+    set(border, 1, 1, 1, 1);
+    set(border_color, GRAY);
+    set(border_radius, 4);
+    set(padding, 6, 6, 6, 6);
+    set(text_color, WHITE);
+    set(max_length, 3);
+    set(clickable, ON);
+    parent(detail);
+    var img_hint = alloc();
+    label_init(img_hint, 252, 56, 200, 40, GRAY, ALIGN_LEFT, str("0 = no image"));
+    parent(detail);
+
+    var relays_lbl = alloc();
+    label_init(relays_lbl, 10, 108, 200, 30, LIGHT_GRAY, ALIGN_LEFT, str("Relays"));
+    parent(detail);
+
+    // 8 checkboxes, 2 columns. The box is drawn in the widget's left part;
+    // the child label is not clickable, so a tap on it toggles the box too.
+    for (var ch = 0; ch < CHANNELS; ch++) {
+        var cb = alloc();
+        target(cb);
+        set(kind, KIND_CHECKBOX);
+        set(location, 10 + (ch / 4) * 220, 146 + (ch % 4) * 56);
+        set(size, 200, 48);
+        set(padding, 6, 6, 6, 6);
+        set(bg_color, ROW_BG);
+        set(text_color, WHITE);
+        set(press_color, ACTIVE);
+        set(border_radius, 6);
+        set(clickable, ON);
+        parent(detail);
+        checks[ch] = cb;
+        var cb_lbl = alloc();
+        label_init(cb_lbl, 52, 0, 140, 48, WHITE, ALIGN_LEFT, sprintf("Relay %d", ch + 1));
+        parent(cb);
+    }
+}
+
+// ============================================================
+// Setup
+// ============================================================
+
+fn setup() {
+    target(0);
+    set(bg_color, BG);
+
+    for (var ch = 0; ch < CHANNELS; ch++) {
+        pinMode(ch, GPIO_OUTPUT);
+    }
+
+    var bar = alloc();
+    target(bar);
+    set(size, 800, 56);
+    set(bg_color, BAR_BG);
+    parent(0);
+    var title = alloc();
+    label_init(title, 20, 8, 300, 40, WHITE, ALIGN_LEFT, str("Relay Board"));
+    parent(bar);
+    settings_btn = alloc();
+    style_flat(640, 8, 144, 40, BLUE);
+    set(text, "Settings");
+    set(on_click, @open_settings);
+    parent(bar);
+
+    hint = alloc();
+    label_init(hint, 0, 210, 800, 40, GRAY, ALIGN_CENTER,
+               str("No buttons yet - tap Settings to add one"));
+    parent(0);
+
+    btn0 = alloc(); make_button(btn0, 0); target(btn0); set(on_click, @on_relay_button);
+    btn1 = alloc(); make_button(btn1, 1); target(btn1); set(on_click, @on_relay_button);
+    btn2 = alloc(); make_button(btn2, 2); target(btn2); set(on_click, @on_relay_button);
+    btn3 = alloc(); make_button(btn3, 3); target(btn3); set(on_click, @on_relay_button);
+    btn4 = alloc(); make_button(btn4, 4); target(btn4); set(on_click, @on_relay_button);
+    btn5 = alloc(); make_button(btn5, 5); target(btn5); set(on_click, @on_relay_button);
+    btn6 = alloc(); make_button(btn6, 6); target(btn6); set(on_click, @on_relay_button);
+    btn7 = alloc(); make_button(btn7, 7); target(btn7); set(on_click, @on_relay_button);
+    btn8 = alloc(); make_button(btn8, 8); target(btn8); set(on_click, @on_relay_button);
+    btn9 = alloc(); make_button(btn9, 9); target(btn9); set(on_click, @on_relay_button);
+
+    // Relay indicators along the bottom edge.
+    for (ch = 0; ch < CHANNELS; ch++) {
+        var led = alloc();
+        label_init(led, 38 + ch * 92, 424, 80, 44, GRAY, ALIGN_CENTER, sprintf("R%d", ch + 1));
+        parent(0);
+        target(led);
+        set(border_radius, 6);
+        leds[ch] = led;
+    }
+
+    build_settings();
+
+    sel = -1;
+    layout_buttons();
+    apply_relays();
+    render();
+    strClear();
+    return 0;
+}
+
+fn loop() {
+    delay(100);
+}

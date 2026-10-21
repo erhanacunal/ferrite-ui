@@ -1,0 +1,20 @@
+{
+    "screen_width": 800,
+    "screen_height": 480,
+    "include_dirs": ["../../../lib"],
+    "render_mode": "buffered",
+    "memory": {"max_strings": 96},
+    "images": [
+        {"name": "bulb", "image_id": 1, "source": "assets/bulb.png"},
+        {"name": "fan",  "image_id": 2, "source": "assets/fan.png"},
+        {"name": "plug", "image_id": 3, "source": "assets/plug.png"},
+        {"name": "pump", "image_id": 4, "source": "assets/pump.png"}
+    ],
+    "programs": [
+        {
+            "name": "main",
+            "source": "main.fl",
+            "exec_mode": "flash"
+        }
+    ]
+}
