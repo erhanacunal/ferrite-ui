@@ -112,7 +112,15 @@ Hold the top-left corner for 3 seconds at boot. A red progress bar fills while h
 |-------|-------------|----------------------|
 | ![Gauge](docs/images/gauge.JPG) | ![Scroll List](docs/images/list.JPG) | ![Text Input](docs/images/text_input_keyboard.JPG) |
 
-Example projects live under [examples/](examples/), including clock, widget demo, touch test, brick breaker, gradient demo, gauge, scroll list, text input, printer menu, and dropdown demos.
+### Relay Board
+
+Drives an 8-channel relay board from the user GPIO header ([examples/nextion/relay_board](examples/nextion/relay_board/)). Up to 10 buttons, laid out automatically in two rows of five; each button has a name, an optional image and a group of relays, and switches the group on and off. A relay stays on while any active button includes it. The settings page adds, deletes and edits buttons; settings are kept in RAM for now.
+
+| Main Page | Settings |
+|-----------|----------|
+| ![Relay Board](docs/images/relay_board_main.png) | ![Relay Board Settings](docs/images/relay_board_settings.png) |
+
+Example projects live under [examples/](examples/), including clock, widget demo, touch test, brick breaker, gradient demo, gauge, scroll list, text input, printer menu, dropdown, GPIO, and relay board demos.
 
 ## Ferrite Language
 
