@@ -699,6 +699,15 @@ const EMPTY_FRAME: CallFrame = CallFrame {
     frame_size: 0,
 };
 
+/// Top two eval-stack slots as laid out in memory (`a` pushed first, so lower).
+/// Two `i32`s come back from a call in r0:r1, not through a stack slot.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StackPair {
+    a: i32,
+    b: i32,
+}
+
 impl Vm {
     pub fn new() -> Self {
         Self {
@@ -1517,28 +1526,23 @@ impl Vm {
                 }
             }
             OP_ADD => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(a.wrapping_add(b));
             }
             OP_SUB => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(a.wrapping_sub(b));
             }
             OP_MUL => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(a.wrapping_mul(b));
             }
             OP_DIV => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(if b != 0 { a / b } else { 0 });
             }
             OP_MOD => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(if b != 0 { a % b } else { 0 });
             }
             OP_NEG => {
@@ -1546,57 +1550,47 @@ impl Vm {
                 self.push(a.wrapping_neg());
             }
             OP_AND => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(a & b);
             }
             OP_OR => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(a | b);
             }
             OP_SHL => {
-                let b = self.pop() as u32 & 31;
-                let a = self.pop();
-                self.push(a << b);
+                let (a, b) = self.pop2();
+                self.push(a << (b as u32 & 31));
             }
             OP_SHR => {
-                let b = self.pop() as u32 & 31;
-                let a = self.pop();
-                self.push(a >> b);
+                let (a, b) = self.pop2();
+                self.push(a >> (b as u32 & 31));
             }
             OP_NOT => {
                 let a = self.pop();
                 self.push(if a == 0 { 1 } else { 0 });
             }
             OP_EQ => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(if a == b { 1 } else { 0 });
             }
             OP_NE => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(if a != b { 1 } else { 0 });
             }
             OP_LT => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(if a < b { 1 } else { 0 });
             }
             OP_LE => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(if a <= b { 1 } else { 0 });
             }
             OP_GT => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(if a > b { 1 } else { 0 });
             }
             OP_GE => {
-                let b = self.pop();
-                let a = self.pop();
+                let (a, b) = self.pop2();
                 self.push(if a >= b { 1 } else { 0 });
             }
             OP_RET => {
@@ -1668,13 +1662,11 @@ impl Vm {
                 }
             },
             OP_ARR_LOAD => {
-                let idx = self.pop();
-                let arr_id = self.pop();
+                let (arr_id, idx) = self.pop2();
                 self.arr_load(arr_id, idx);
             }
             OP_ARR_STORE => {
-                let val = self.pop();
-                let idx = self.pop();
+                let (idx, val) = self.pop2();
                 let arr_id = self.pop();
                 self.arr_store(arr_id, idx, val);
             }
@@ -1966,39 +1958,43 @@ impl Vm {
 
             // --- Builtins (args on stack) ---
             OP_FILL_RECT => {
-                let color = self.pop() as u16;
-                let (w, h) = unpack_pair(self.pop());
+                let (wh, color) = self.pop2();
+                let (w, h) = unpack_pair(wh);
                 let (x, y) = unpack_pair(self.pop());
+                let color = color as u16;
                 ctx.lcd.fill_rect(x, y, w, h, color);
             }
             OP_RECT => {
-                let color = self.pop() as u16;
-                let (w, h) = unpack_pair(self.pop());
+                let (wh, color) = self.pop2();
+                let (w, h) = unpack_pair(wh);
                 let (x, y) = unpack_pair(self.pop());
+                let color = color as u16;
                 ctx.lcd.draw_rect(x, y, w, h, color);
             }
             OP_LINE => {
-                let color = self.pop() as u16;
-                let (x1, y1) = unpack_pair(self.pop());
+                let (xy1, color) = self.pop2();
+                let (x1, y1) = unpack_pair(xy1);
+                let color = color as u16;
                 let (x0, y0) = unpack_pair(self.pop());
                 ctx.lcd
                     .draw_line(x0 as i16, y0 as i16, x1 as i16, y1 as i16, color);
             }
             OP_CIRCLE => {
-                let color = self.pop() as u16;
-                let radius = self.pop() as i16;
+                let (radius, color) = self.pop2();
+                let (radius, color) = (radius as i16, color as u16);
                 let (cx, cy) = unpack_pair(self.pop());
                 ctx.lcd.draw_circle(cx as i16, cy as i16, radius, color);
             }
             OP_FILL_CIRCLE => {
-                let color = self.pop() as u16;
-                let radius = self.pop() as i16;
+                let (radius, color) = self.pop2();
+                let (radius, color) = (radius as i16, color as u16);
                 let (cx, cy) = unpack_pair(self.pop());
                 ctx.lcd.fill_circle(cx as i16, cy as i16, radius, color);
             }
             OP_DRAW_IMAGE => {
-                let image_id = self.pop() as u8;
-                let (x, y) = unpack_pair(self.pop());
+                let (xy, image_id) = self.pop2();
+                let (x, y) = unpack_pair(xy);
+                let image_id = image_id as u8;
                 if let Some(img) = ctx.images.find(image_id) {
                     img.draw(&ctx.lcd, &ctx.flash, x, y);
                 }
@@ -2012,9 +2008,9 @@ impl Vm {
                     let n = len.min(buf.len());
                     self.code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as CodeAddr;
-                    let colors = self.pop();
+                    let (font_id, colors) = self.pop2();
                     let (fg, bg) = unpack_pair(colors);
-                    let font_id = self.pop() as u8;
+                    let font_id = font_id as u8;
                     let (x, y) = unpack_pair(self.pop());
                     if let Some(font) = ctx.fonts.resolve(font_id) {
                         let bg_opt = if bg == 0 { None } else { Some(bg) };
@@ -2069,8 +2065,8 @@ impl Vm {
                 }
             }
             OP_CONCAT => {
-                let b = self.pop() as u16;
-                let a = self.pop() as u16;
+                let (a, b) = self.pop2();
+                let (a, b) = (a as u16, b as u16);
                 match ctx.strpool.concat(a, b) {
                     Some(id) => self.push(id as i32),
                     None => self.fail(fault::STR_ALLOC),
@@ -2089,8 +2085,8 @@ impl Vm {
                 self.push(ctx.strpool.len(id) as i32);
             }
             OP_STR_CMP => {
-                let b = self.pop() as u16;
-                let a = self.pop() as u16;
+                let (a, b) = self.pop2();
+                let (a, b) = (a as u16, b as u16);
                 self.push(ctx.strpool.compare(a, b));
             }
             OP_SET_TEXT => {
@@ -2106,9 +2102,9 @@ impl Vm {
             }
             OP_DRAW_STR => {
                 let str_id = self.pop() as u16;
-                let colors = self.pop();
+                let (font_id, colors) = self.pop2();
                 let (fg, bg) = unpack_pair(colors);
-                let font_id = self.pop() as u8;
+                let font_id = font_id as u8;
                 let (x, y) = unpack_pair(self.pop());
                 let data = ctx.strpool.get(str_id);
                 if let Some(font) = ctx.fonts.resolve(font_id) {
@@ -2122,22 +2118,22 @@ impl Vm {
                 ctx.strpool.free(str_id);
             }
             OP_ROUNDED_RECT => {
-                let color = self.pop() as u16;
-                let r = self.pop() as u16;
+                let (r, color) = self.pop2();
+                let (r, color) = (r as u16, color as u16);
                 let (w, h) = unpack_pair(self.pop());
                 let (x, y) = unpack_pair(self.pop());
                 ctx.lcd.draw_rounded_rect(x, y, w, h, r, color);
             }
             OP_FILL_ROUNDED_RECT => {
-                let color = self.pop() as u16;
-                let r = self.pop() as u16;
+                let (r, color) = self.pop2();
+                let (r, color) = (r as u16, color as u16);
                 let (w, h) = unpack_pair(self.pop());
                 let (x, y) = unpack_pair(self.pop());
                 ctx.lcd.fill_rounded_rect(x, y, w, h, r, color);
             }
             OP_ARC => {
-                let color = self.pop() as u16;
-                let end = self.pop() as i16;
+                let (end, color) = self.pop2();
+                let (end, color) = (end as i16, color as u16);
                 let start = self.pop() as i16;
                 let radius = self.pop() as i16;
                 let (cx, cy) = unpack_pair(self.pop());
@@ -2215,8 +2211,8 @@ impl Vm {
             }
             OP_FPGA_CMD => {
                 // fpgaCmd(cmd, data) — raw FPGA command + data
-                let data = self.pop() as u16;
-                let cmd = self.pop() as u16;
+                let (cmd, data) = self.pop2();
+                let (cmd, data) = (cmd as u16, data as u16);
                 ctx.lcd.send_command(cmd);
                 ctx.lcd.send_data(data);
             }
@@ -2239,15 +2235,13 @@ impl Vm {
 
             // --- User GPIO ---
             OP_PIN_MODE => {
-                let mode = self.pop();
-                let pin = self.pop();
+                let (pin, mode) = self.pop2();
                 if !ctx.gpio.set_mode(pin, mode) {
                     self.fail(fault::GPIO);
                 }
             }
             OP_PIN_WRITE => {
-                let value = self.pop();
-                let pin = self.pop();
+                let (pin, value) = self.pop2();
                 if !ctx.gpio.write(pin, value) {
                     self.fail(fault::GPIO);
                 }
@@ -2263,12 +2257,12 @@ impl Vm {
             // --- Animation engine ---
             OP_ANIMATE => {
                 // Pushed order: widget, prop, to, duration, ctrl, on_end.
-                let on_end = self.pop() as u16;
-                let ctrl = self.pop() as u8;
+                let (ctrl, on_end) = self.pop2();
+                let (ctrl, on_end) = (ctrl as u8, on_end as u16);
                 let duration = self.pop() as u16;
                 let to = self.pop();
-                let prop = self.pop() as u8;
-                let widget = WidgetId(self.pop() as u16);
+                let (widget, prop) = self.pop2();
+                let (widget, prop) = (WidgetId(widget as u16), prop as u8);
                 let now = ctx.systick.millis();
                 self.start_anim(ctx, widget, prop, to, duration, ctrl, on_end, now);
             }
@@ -2277,8 +2271,8 @@ impl Vm {
                 self.stop_anim(widget);
             }
             OP_STOP_ANIM_PROP => {
-                let prop = self.pop() as u8;
-                let widget = WidgetId(self.pop() as u16);
+                let (widget, prop) = self.pop2();
+                let (widget, prop) = (WidgetId(widget as u16), prop as u8);
                 self.stop_anim_prop(widget, prop);
             }
 
@@ -2321,8 +2315,7 @@ impl Vm {
                 }
             }
             OP_FILE_SEEK => {
-                let pos = self.pop();
-                let handle = self.pop();
+                let (handle, pos) = self.pop2();
                 match self.file_slot_mut(handle) {
                     Some(f) => f.pos = (pos.max(0) as u32).min(f.size),
                     None => self.fail(fault::BAD_FILE),
@@ -2341,8 +2334,7 @@ impl Vm {
                 }
             }
             OP_ARR_TO_STR => {
-                let len = self.pop();
-                let arr_id = self.pop();
+                let (arr_id, len) = self.pop2();
                 match self.find_array(arr_id) {
                     Some(pos) => {
                         let data = &self.arrays[pos].data;
@@ -2416,23 +2408,19 @@ impl Vm {
                 self.push(f32::from_bits(bits) as i32);
             }
             OP_FADD => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
+                let (a, b) = self.pop2_f32();
                 self.push((a + b).to_bits() as i32);
             }
             OP_FSUB => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
+                let (a, b) = self.pop2_f32();
                 self.push((a - b).to_bits() as i32);
             }
             OP_FMUL => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
+                let (a, b) = self.pop2_f32();
                 self.push((a * b).to_bits() as i32);
             }
             OP_FDIV => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
+                let (a, b) = self.pop2_f32();
                 self.push(if b != 0.0 { a / b } else { 0.0 }.to_bits() as i32);
             }
             OP_FNEG => {
@@ -2440,33 +2428,27 @@ impl Vm {
                 self.push((-a).to_bits() as i32);
             }
             OP_FEQ => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
+                let (a, b) = self.pop2_f32();
                 self.push(if a == b { 1 } else { 0 });
             }
             OP_FLT => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
+                let (a, b) = self.pop2_f32();
                 self.push(if a < b { 1 } else { 0 });
             }
             OP_FLE => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
+                let (a, b) = self.pop2_f32();
                 self.push(if a <= b { 1 } else { 0 });
             }
             OP_FGT => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
+                let (a, b) = self.pop2_f32();
                 self.push(if a > b { 1 } else { 0 });
             }
             OP_FGE => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
+                let (a, b) = self.pop2_f32();
                 self.push(if a >= b { 1 } else { 0 });
             }
             OP_FNE => {
-                let b = f32::from_bits(self.pop() as u32);
-                let a = f32::from_bits(self.pop() as u32);
+                let (a, b) = self.pop2_f32();
                 self.push(if a != b { 1 } else { 0 });
             }
 
@@ -2488,8 +2470,7 @@ impl Vm {
                 self.push(libm::fabsf(v).to_bits() as i32);
             }
             OP_FATAN2 => {
-                let x = f32::from_bits(self.pop() as u32);
-                let y = f32::from_bits(self.pop() as u32);
+                let (y, x) = self.pop2_f32();
                 self.push(libm::atan2f(y, x).to_bits() as i32);
             }
             OP_FFLOOR => {
@@ -2516,13 +2497,55 @@ impl Vm {
         }
     }
 
+    // Out of line: once unchecked it is small enough for LLVM to inline at
+    // some call sites, which costs more flash than the `bl` it replaces.
+    #[inline(never)]
     fn pop(&mut self) -> i32 {
         if self.sp > self.sp_floor {
             self.sp -= 1;
-            self.stack[self.sp as usize]
+            let i = self.sp as usize;
+            debug_assert!(i < self.stack.len());
+            // SAFETY: sp <= stack.len() invariant (see pop2_raw), so the slot
+            // below the old sp is in bounds.
+            unsafe { *self.stack.get_unchecked(i) }
         } else {
             self.fail(fault::STACK_UNDERFLOW);
             0
+        }
+    }
+
+    /// Pops two values with a single underflow check, in push order:
+    /// `push a; push b` → `(a, b)`. On underflow the VM faults, `sp` is left
+    /// alone and both read as 0.
+    #[inline(always)]
+    fn pop2(&mut self) -> (i32, i32) {
+        let v = self.pop2_raw();
+        (v.a, v.b)
+    }
+
+    /// `pop2` for two f32 operands (stored as raw bits).
+    #[inline(always)]
+    fn pop2_f32(&mut self) -> (f32, f32) {
+        let (a, b) = self.pop2();
+        (f32::from_bits(a as u32), f32::from_bits(b as u32))
+    }
+
+    /// `pop2` body, out of line so each call site is just `mov r0, vm; bl`.
+    #[inline(never)]
+    fn pop2_raw(&mut self) -> StackPair {
+        if self.sp as usize >= self.sp_floor as usize + 2 {
+            self.sp -= 2;
+            let i = self.sp as usize;
+            debug_assert!(i + 2 <= self.stack.len());
+            // SAFETY: sp <= stack.len() always holds — sp only grows through the
+            // bounds-checked push/push_arg, leave_callback restores an older sp,
+            // and configure resets sp before swapping the stack. So the two
+            // slots below the old sp are in bounds; skipping the slice check
+            // saves ~30 B here.
+            unsafe { *(self.stack.as_ptr().add(i) as *const StackPair) }
+        } else {
+            self.fail(fault::STACK_UNDERFLOW);
+            StackPair { a: 0, b: 0 }
         }
     }
 
@@ -3825,6 +3848,40 @@ mod anim_tests {
         // the recorded cause must stay STACK_UNDERFLOW.
         let vm = run_code(&[OP_ADD]);
         assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
+    }
+
+    #[test]
+    fn pop2_keeps_push_order() {
+        // g0 = 9 - 2, g1 = 2 < 9
+        let vm = run_code(&[
+            OP_PUSH_I8, 9, OP_PUSH_I8, 2, OP_SUB, OP_STORE, 0,
+            OP_PUSH_I8, 2, OP_PUSH_I8, 9, OP_LT, OP_STORE, 1, OP_HALT,
+        ]);
+        assert!(vm.state != VmState::Error);
+        assert_eq!(vm.var_get(0), 7);
+        assert_eq!(vm.var_get(1), 1);
+    }
+
+    #[test]
+    fn pop2_underflow_with_one_value() {
+        let vm = run_code(&[OP_PUSH_I8, 5, OP_SUB]);
+        assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
+        assert_eq!(vm.fault_pc(), 2);
+        assert_eq!(vm.stack[0], 5);
+    }
+
+    #[test]
+    fn callback_pop2_respects_floor() {
+        // main @0: PUSH 7, HALT     callback @3: SUB with one arg
+        let code = [OP_PUSH_I8, 7, OP_HALT, OP_SUB, OP_RET];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 1);
+        vm.enqueue_callback(3, &[1]);
+        vm.drain_callbacks(&mut ctx);
+        assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
+        assert_eq!(vm.fault_pc(), 3);
+        assert_eq!(vm.stack[0], 7);
     }
 
     /// v4 image with no functions: header flags + opcodes.
