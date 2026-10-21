@@ -20,7 +20,7 @@ use crate::strpool::StringPool;
 use crate::types::{Edges, Offset, Size};
 use crate::widget::{
     FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_HAS_ON_CLICK,
-    FLAG_HAS_ON_PAINT, FLAG_HAS_ON_TAP, FLAG_MULTI_LINE, FLAG_VISIBLE, WidgetId,
+    FLAG_HAS_ON_PAINT, FLAG_HAS_ON_TAP, FLAG_MULTI_LINE, FLAG_VISIBLE, WidgetExt, WidgetId,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -1328,6 +1328,7 @@ impl Vm {
     /// failures within the same instruction (e.g. a push after a failed pop)
     /// don't overwrite the root cause.
     #[cold]
+    #[inline(never)]
     fn fail(&mut self, code: u8) {
         if self.state != VmState::Error {
             self.fault = code;
@@ -1428,7 +1429,7 @@ impl Vm {
 
     // --- Byte reading helpers (read from self.code) ---
 
-    #[inline]
+    #[inline(never)]
     fn read_u8(&mut self) -> u8 {
         let pos = self.pc as usize;
         if pos < self.code.len() {
@@ -1440,45 +1441,29 @@ impl Vm {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn read_i8(&mut self) -> i8 {
         self.read_u8() as i8
     }
 
-    #[inline]
+    #[inline(never)]
     fn read_u16(&mut self) -> u16 {
-        let pos = self.pc as usize;
-        if pos + 2 <= self.code.len() {
-            self.pc += 2;
-            let mut buf = [0u8; 2];
-            self.code.read_bytes(pos, &mut buf);
-            u16::from_le_bytes(buf)
-        } else {
-            self.fail(fault::CODE_OOB);
-            0
-        }
+        let lo = self.read_u8() as u16;
+        lo | (self.read_u8() as u16) << 8
     }
 
-    #[inline]
+    #[inline(always)]
     fn read_i16(&mut self) -> i16 {
         self.read_u16() as i16
     }
 
-    #[inline]
+    #[inline(never)]
     fn read_i32(&mut self) -> i32 {
-        let pos = self.pc as usize;
-        if pos + 4 <= self.code.len() {
-            self.pc += 4;
-            let mut buf = [0u8; 4];
-            self.code.read_bytes(pos, &mut buf);
-            i32::from_le_bytes(buf)
-        } else {
-            self.fail(fault::CODE_OOB);
-            0
-        }
+        let lo = self.read_u16() as u32;
+        (lo | (self.read_u16() as u32) << 16) as i32
     }
 
-    #[inline]
+    #[inline(always)]
     fn read_u32(&mut self) -> u32 {
         self.read_i32() as u32
     }
@@ -2488,6 +2473,7 @@ impl Vm {
 
     // --- Stack operations ---
 
+    #[inline(never)]
     fn push(&mut self, val: i32) {
         if (self.sp as usize) < self.stack.len() {
             self.stack[self.sp as usize] = val;
@@ -2568,6 +2554,28 @@ impl Vm {
     /// so the animation engine can drive any widget without disturbing the
     /// VM's current `self.target`. Marks the widget dirty exactly as before.
     fn set_scalar_prop_on<P: Platform>(ctx: &mut Ctx<P>, target: WidgetId, prop_id: u8, val: i32) {
+        // Boolean flag props: one table lookup + one set_flag instead of a
+        // full match arm (and get_mut bounds check) per flag.
+        let flag = match prop_id {
+            PROP_VISIBLE => FLAG_VISIBLE,
+            PROP_ENABLED => FLAG_ENABLED,
+            PROP_CLICKABLE => FLAG_CLICKABLE,
+            PROP_CHECKED => FLAG_CHECKED,
+            PROP_CLIP_CHILDREN => FLAG_CLIP_CHILDREN,
+            PROP_MULTI_LINE => FLAG_MULTI_LINE,
+            PROP_ON_CLICK => FLAG_HAS_ON_CLICK,
+            PROP_ON_PAINT => FLAG_HAS_ON_PAINT,
+            PROP_ON_TAP | PROP_ON_CHANGE => FLAG_HAS_ON_TAP,
+            _ => 0,
+        };
+        if flag != 0 {
+            set_flag(&mut ctx.tree.get_mut(target).flags, flag, val != 0);
+            if flag & (FLAG_VISIBLE | FLAG_ENABLED) != 0 {
+                ctx.tree.mark_dirty(target);
+            }
+            return;
+        }
+
         // Base widget fields (no extension needed)
         let mut dirty = false;
         let mut prop_set = false;
@@ -2591,80 +2599,6 @@ impl Vm {
             PROP_SIZE_H => {
                 ctx.tree.get_mut(target).size.h = val as u16;
                 dirty = true;
-                prop_set = true;
-            }
-            PROP_VISIBLE => {
-                set_flag(
-                    &mut ctx.tree.get_mut(target).flags,
-                    FLAG_VISIBLE,
-                    val != 0,
-                );
-                dirty = true;
-                prop_set = true;
-            }
-            PROP_ENABLED => {
-                set_flag(
-                    &mut ctx.tree.get_mut(target).flags,
-                    FLAG_ENABLED,
-                    val != 0,
-                );
-                dirty = true;
-                prop_set = true;
-            }
-            PROP_CLICKABLE => {
-                set_flag(
-                    &mut ctx.tree.get_mut(target).flags,
-                    FLAG_CLICKABLE,
-                    val != 0,
-                );
-                prop_set = true;
-            }
-            PROP_CHECKED => {
-                set_flag(
-                    &mut ctx.tree.get_mut(target).flags,
-                    FLAG_CHECKED,
-                    val != 0,
-                );
-                prop_set = true;
-            }
-            PROP_CLIP_CHILDREN => {
-                set_flag(
-                    &mut ctx.tree.get_mut(target).flags,
-                    FLAG_CLIP_CHILDREN,
-                    val != 0,
-                );
-                prop_set = true;
-            }
-            PROP_MULTI_LINE => {
-                set_flag(
-                    &mut ctx.tree.get_mut(target).flags,
-                    FLAG_MULTI_LINE,
-                    val != 0,
-                );
-                prop_set = true;
-            }
-            PROP_ON_CLICK => {
-                set_flag(
-                    &mut ctx.tree.get_mut(target).flags,
-                    FLAG_HAS_ON_CLICK,
-                    val != 0,
-                );
-                prop_set = true;
-            }
-            PROP_ON_PAINT => {
-                set_flag(
-                    &mut ctx.tree.get_mut(target).flags,
-                    FLAG_HAS_ON_PAINT,
-                    val != 0,
-                );
-                prop_set = true;
-            }
-            PROP_ON_TAP | PROP_ON_CHANGE => {
-                set_flag(
-                    &mut ctx.tree.get_mut(target).flags,
-                    FLAG_HAS_ON_TAP,
-                    val != 0,
-                );
                 prop_set = true;
             }
             PROP_BG_COLOR => {
@@ -2737,6 +2671,8 @@ impl Vm {
     /// VM's current `self.target`.
     fn get_scalar_prop_on<P: Platform>(ctx: &Ctx<P>, target: WidgetId, prop_id: u8) -> i32 {
         let w = ctx.tree.get(target);
+        // One extension lookup for all ext props; no extension reads as the defaults.
+        let e = ctx.tree.ext(target).unwrap_or(&WidgetExt::DEFAULT);
         match prop_id {
             // Base fields
             PROP_LOC_X => w.location.x as i32,
@@ -2789,39 +2725,39 @@ impl Vm {
             PROP_BORDER_COLOR => w.border_color as i32,
             PROP_KIND => w.kind as i32,
             // Extension fields (return defaults when no extension)
-            PROP_MARGIN_T => ctx.tree.margin(target).top as i32,
-            PROP_MARGIN_R => ctx.tree.margin(target).right as i32,
-            PROP_MARGIN_B => ctx.tree.margin(target).bottom as i32,
-            PROP_MARGIN_L => ctx.tree.margin(target).left as i32,
-            PROP_BORDER_T => ctx.tree.border(target).top as i32,
-            PROP_BORDER_R => ctx.tree.border(target).right as i32,
-            PROP_BORDER_B => ctx.tree.border(target).bottom as i32,
-            PROP_BORDER_L => ctx.tree.border(target).left as i32,
-            PROP_PADDING_T => ctx.tree.padding(target).top as i32,
-            PROP_PADDING_R => ctx.tree.padding(target).right as i32,
-            PROP_PADDING_B => ctx.tree.padding(target).bottom as i32,
-            PROP_PADDING_L => ctx.tree.padding(target).left as i32,
+            PROP_MARGIN_T => e.margin.top as i32,
+            PROP_MARGIN_R => e.margin.right as i32,
+            PROP_MARGIN_B => e.margin.bottom as i32,
+            PROP_MARGIN_L => e.margin.left as i32,
+            PROP_BORDER_T => e.border.top as i32,
+            PROP_BORDER_R => e.border.right as i32,
+            PROP_BORDER_B => e.border.bottom as i32,
+            PROP_BORDER_L => e.border.left as i32,
+            PROP_PADDING_T => e.padding.top as i32,
+            PROP_PADDING_R => e.padding.right as i32,
+            PROP_PADDING_B => e.padding.bottom as i32,
+            PROP_PADDING_L => e.padding.left as i32,
             // String id of the widget's text (0xFFFF = none → reads as "").
-            PROP_TEXT => ctx.tree.text_id(target) as i32,
-            PROP_TEXT_COLOR => ctx.tree.text_color(target) as i32,
-            PROP_FONT_ID => ctx.tree.font_id(target) as i32,
-            PROP_TEXT_ALIGN => ctx.tree.text_align(target) as i32,
-            PROP_PRESS_COLOR => ctx.tree.press_color(target) as i32,
-            PROP_IMAGE_ID => ctx.tree.image_id(target) as i32,
-            PROP_BORDER_RADIUS => ctx.tree.border_radius(target) as i32,
-            PROP_VALUE => ctx.tree.value(target) as i32,
+            PROP_TEXT => e.text_id as i32,
+            PROP_TEXT_COLOR => e.text_color as i32,
+            PROP_FONT_ID => e.font_id as i32,
+            PROP_TEXT_ALIGN => e.text_align as i32,
+            PROP_PRESS_COLOR => e.press_color as i32,
+            PROP_IMAGE_ID => e.image_id as i32,
+            PROP_BORDER_RADIUS => e.border_radius as i32,
+            PROP_VALUE => e.value as i32,
             PROP_ON_CLICK => (w.flags & FLAG_HAS_ON_CLICK != 0) as i32,
             PROP_ON_PAINT => (w.flags & FLAG_HAS_ON_PAINT != 0) as i32,
             PROP_ON_TAP | PROP_ON_CHANGE => (w.flags & FLAG_HAS_ON_TAP != 0) as i32,
-            PROP_MAX_LENGTH => ctx.tree.max_length(target) as i32,
-            PROP_CURSOR_POS => ctx.tree.value(target) as i32,
-            PROP_SCROLL_Y => ctx.tree.value(target) as i32,
-            PROP_GRADIENT_COLOR => ctx.tree.gradient_color(target) as i32,
-            PROP_GRADIENT_DIR => ctx.tree.gradient_dir(target) as i32,
-            PROP_ALPHA => ctx.tree.alpha(target) as i32,
-            PROP_GRAPH_ARR => ctx.tree.value(target) as i32,
-            PROP_GRAPH_COUNT => ctx.tree.max_length(target) as i32,
-            PROP_GRAPH_FLAGS => ctx.tree.image_id(target) as i32,
+            PROP_MAX_LENGTH => e.max_length as i32,
+            PROP_CURSOR_POS => e.value as i32,
+            PROP_SCROLL_Y => e.value as i32,
+            PROP_GRADIENT_COLOR => e.gradient_color as i32,
+            PROP_GRADIENT_DIR => e.gradient_dir as i32,
+            PROP_ALPHA => e.alpha as i32,
+            PROP_GRAPH_ARR => e.value as i32,
+            PROP_GRAPH_COUNT => e.max_length as i32,
+            PROP_GRAPH_FLAGS => e.image_id as i32,
             _ => 0,
         }
     }
@@ -3182,34 +3118,27 @@ fn parse_image_header(
         0
     };
 
-    // v3+: flags field after global_count
-    let (header_size, render_mode, widget_count, ext_count, wide) = if version >= 4 {
-        if data.len() < IMAGE_HEADER_SIZE_V4 {
-            return None;
-        }
-        let flags = u16::from_le_bytes([data[5], data[6]]);
-        let rm = if flags & 0x01 != 0 {
-            RenderMode::Buffered
-        } else {
-            RenderMode::Dirty
-        };
-        let wide = flags & IMAGE_FLAG_WIDE_ADDR != 0;
-        (IMAGE_HEADER_SIZE_V4, rm, data[7], data[8], wide)
-    } else if version >= 3 {
-        if data.len() < IMAGE_HEADER_SIZE_V3 {
-            return None;
-        }
-        let flags = u16::from_le_bytes([data[5], data[6]]);
-        let rm = if flags & 0x01 != 0 {
-            RenderMode::Buffered
-        } else {
-            RenderMode::Dirty
-        };
-        let wide = flags & IMAGE_FLAG_WIDE_ADDR != 0;
-        (IMAGE_HEADER_SIZE_V3, rm, 0u8, 0u8, wide)
-    } else {
-        (IMAGE_HEADER_SIZE_V2, RenderMode::Dirty, 0u8, 0u8, false)
+    // v3+: flags field after global_count; v4 adds widget/ext counts.
+    let header_size = match version {
+        4 => IMAGE_HEADER_SIZE_V4,
+        3 => IMAGE_HEADER_SIZE_V3,
+        _ => IMAGE_HEADER_SIZE_V2,
     };
+    if data.len() < header_size {
+        return None;
+    }
+    let flags = if version >= 3 {
+        u16::from_le_bytes([data[5], data[6]])
+    } else {
+        0
+    };
+    let render_mode = if flags & 0x01 != 0 {
+        RenderMode::Buffered
+    } else {
+        RenderMode::Dirty
+    };
+    let wide = flags & IMAGE_FLAG_WIDE_ADDR != 0;
+    let (widget_count, ext_count) = if version >= 4 { (data[7], data[8]) } else { (0, 0) };
 
     let table_size = func_count * FUNC_ENTRY_SIZE;
     let opcode_start = header_size + table_size;
@@ -3219,23 +3148,13 @@ fn parse_image_header(
     }
 
     let mut functions = Vec::with_capacity(func_count);
-    for i in 0..func_count {
-        let base = header_size + i * FUNC_ENTRY_SIZE;
-        let func_id = u16::from_le_bytes([data[base], data[base + 1]]);
-        let kind_byte = data[base + 2];
-        // data[base + 3] = pad
-        let offset = u32::from_le_bytes([
-            data[base + 4],
-            data[base + 5],
-            data[base + 6],
-            data[base + 7],
-        ]);
-        let length = u32::from_le_bytes([
-            data[base + 8],
-            data[base + 9],
-            data[base + 10],
-            data[base + 11],
-        ]);
+    // Fixed-size chunks: the field reads below need no bounds checks.
+    for e in data[header_size..opcode_start].chunks_exact(FUNC_ENTRY_SIZE) {
+        let func_id = u16::from_le_bytes([e[0], e[1]]);
+        let kind_byte = e[2];
+        // e[3] = pad
+        let offset = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+        let length = u32::from_le_bytes([e[8], e[9], e[10], e[11]]);
 
         let kind = FunctionKind::from_u8(kind_byte).unwrap_or(FunctionKind::UserFunction);
 
