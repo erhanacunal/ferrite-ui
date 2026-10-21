@@ -104,6 +104,7 @@ fn on_reset(wid) {
     set(text_color, ORANGE);
     dirty();
     render();
+    strClear();
 }
 
 fn on_color(wid) {
