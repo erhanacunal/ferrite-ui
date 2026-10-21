@@ -1891,16 +1891,16 @@ class CodeGen:
             self.asm.store(slot)
 
         if self.widget_page and fn.name in self._init_only:
-            def emit(stmt, gen):
-                self._gen_paged(stmt, gen)
+            def emit(stmt, gen, global_init=False):
+                self._gen_paged(stmt, gen, global_init)
         else:
-            def emit(stmt, gen):
+            def emit(stmt, gen, global_init=False):
                 gen(stmt)
 
         # Inject global var init code at the start of setup()
         if fn.name == 'setup' and self._global_init_stmts:
             for stmt in self._global_init_stmts:
-                emit(stmt, self._gen_global_init)
+                emit(stmt, self._gen_global_init, global_init=True)
 
         if fn.name == 'loop' and self._global_init_stmts is not None:
             # Compiler-generated: while(1) { <user body>; yield; }
@@ -1933,9 +1933,11 @@ class CodeGen:
 
     # --- Widget page ---
 
-    def _gen_paged(self, stmt, gen):
+    def _gen_paged(self, stmt, gen, global_init=False):
         """Generate `stmt`; if its code is static widget setup, move it to the
-        pending widget page block instead of the bytecode."""
+        pending widget page block instead of the bytecode. A `global_init`
+        that only stores 0 is dropped: it runs before any other code, and an
+        unset variable reads as 0."""
         if not _page_candidate(stmt):
             self._page_flush()
             gen(stmt)
@@ -1945,7 +1947,10 @@ class CodeGen:
         gen(stmt)
         code = bytes(buf[start:])
         ops = _page_translate(code)
-        if ops is not None:
+        if global_init and ops is not None and len(ops) == 3 and ops[0] == PAGE_STORE \
+                and ops[1] < 0x80 and ops[2] == 0:  # STORE <global> = 0
+            del buf[start:]
+        elif ops is not None:
             del buf[start:]
             self._page_ops += ops
             self._page_code += code

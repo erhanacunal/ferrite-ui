@@ -167,7 +167,8 @@ used as callbacks. Each run of statements whose code is only `W_ALLTAR`,
 `target`, `parent`, `set` with constant values and constant stores becomes one
 `W_LOAD`. The ops run in the same order with the same operands, so widget ids,
 tree order and the target left behind are unchanged. A run that saves 3 bytes
-or less stays bytecode.
+or less stays bytecode. Global initialisers that only store 0 are dropped:
+they run first in `setup()`, and an unset variable reads as 0.
 
 ```text
 page   "FP", version u8 = 1, reserved u8, then blocks
