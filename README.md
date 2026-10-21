@@ -196,6 +196,10 @@ python tools/ferrite_img.py icon.png -o icon.fi
 python tools/ferrite_analyze.py program.fl -v
 ```
 
+## Prebuilt Firmware
+
+Each [release](https://github.com/erhanacunal/ferrite-ui/releases/latest) has the GD32 and N32903 firmware, a filesystem image of every example, `ferrite_cli.py` and checksums, built by CI from the release tag. Flashing steps are in the release notes.
+
 ## Building
 
 Requires Rust 1.85+ (2024 edition).

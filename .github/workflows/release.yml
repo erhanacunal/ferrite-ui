@@ -1,0 +1,129 @@
+# Build firmware + example filesystem images and publish them as a GitHub
+# Release when a version tag is pushed:
+#
+#   git tag v0.3.0
+#   git push origin v0.3.0
+#
+# "Run workflow" (workflow_dispatch) builds everything as downloadable
+# artifacts without creating a release — use it to test the pipeline.
+#
+# Asset names carry no version, so the latest build is always at
+#   https://github.com/<owner>/ferrite-ui/releases/latest/download/<asset>
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # bsp/n32903/rust-toolchain.toml asks for plain "nightly"; pin CI to a
+  # known-good one so a new nightly can't break a release. Bump deliberately.
+  N32903_NIGHTLY: nightly-2026-06-03
+
+jobs:
+  gd32:
+    name: Firmware (GD32 Nextion)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # vendor/ crates are workspace members
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7m-none-eabi
+      - name: Install ARM binutils
+        run: sudo apt-get update && sudo apt-get install -y binutils-arm-none-eabi
+      - name: Build
+        run: cargo build -p bsp-nextion --release
+      - name: Raw image
+        run: |
+          mkdir -p dist
+          arm-none-eabi-objcopy -O binary target/thumbv7m-none-eabi/release/ferrite-ui \
+            dist/ferrite-gd32-nextion.bin
+          arm-none-eabi-size target/thumbv7m-none-eabi/release/ferrite-ui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gd32
+          path: dist/
+
+  n32903:
+    name: Firmware (N32903)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install nightly + rust-src
+        run: rustup toolchain install "$N32903_NIGHTLY" --profile minimal --component rust-src
+      - name: Install ARM GNU toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
+      - name: Build
+        working-directory: bsp/n32903
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.N32903_NIGHTLY }}
+        run: cargo build --release
+      - name: Raw image
+        run: |
+          mkdir -p dist
+          arm-none-eabi-objcopy -O binary target/arm926ej-s/release/ferrite-ui \
+            dist/ferrite-n32903.bin
+          arm-none-eabi-size target/arm926ej-s/release/ferrite-ui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: n32903
+          path: dist/
+
+  examples:
+    name: Example filesystem images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pillow
+      - name: Build every example
+        run: |
+          mkdir -p dist
+          for board in nextion:gd32 n32903:n32903; do
+            dir=${board%%:*}; tag=${board##*:}
+            for project in examples/$dir/*/project.json; do
+              name=$(basename "$(dirname "$project")")
+              python tools/ferrite_build.py "$project" -o "dist/fs-$tag-$name.bin"
+            done
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: examples
+          path: dist/
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [gd32, n32903, examples]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Add tools, notices and checksums
+        run: |
+          cp tools/ferrite_cli.py files/flash_tool.py THIRD_PARTY_NOTICES.md dist/
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file .github/release-notes.md \
+            --generate-notes \
+            --verify-tag
