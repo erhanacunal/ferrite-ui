@@ -313,6 +313,20 @@ const OP_F_READ: u8 = 0x40; // + u32 addr + u16 len
 const OP_F_WRITE: u8 = 0x41; // + u32 addr + u8 len + data
 const OP_W_TARGET_S: u8 = 0x42; // widget id from stack (dynamic target)
 const OP_W_PARENT_S: u8 = 0x43; // parent id from stack (dynamic parent)
+const OP_W_LOAD: u8 = 0x44; // + u16 block offset in the widget page (RES_PAGE)
+
+// Widget page (RES_PAGE) ops: static widget setup the compiler moved out of
+// the bytecode. 0x01..=0x3F = W_SET <tag> + zigzag varint, 0x40..=0x7F =
+// W_SET_LEN <tag> + u8 len + payload, the rest below + operands.
+// Keep in sync with tools/ferrite_lang.py (PAGE_*).
+// Target/parent ops: bit 0 = operand is a var slot holding the widget id
+// (else the id itself), bit 1 = parent (else target).
+const PG_STORE: u8 = 0x80; // + u8 slot + zigzag varint
+const PG_ALLTAR: u8 = 0x81; // + u8 slot
+const PG_TARGET_ID: u8 = 0x84; // + u8 widget id
+const PG_TARGET: u8 = 0x85; // + u8 slot
+const PG_PARENT_ID: u8 = 0x86; // + u8 widget id
+const PG_PARENT: u8 = 0x87; // + u8 slot
 
 // Builtins as first-class opcodes (args on stack)
 const OP_FILL_RECT: u8 = 0x80;
@@ -426,6 +440,8 @@ pub mod fault {
     pub const BAD_OPERAND: u8 = 13;
     /// GPIO pin the board doesn't have, or a mode it doesn't support.
     pub const GPIO: u8 = 14;
+    /// Widget page (RES_PAGE) missing, truncated or malformed (OP_W_LOAD).
+    pub const PAGE: u8 = 15;
 
     /// Short human-readable name for the error screen.
     pub fn name(code: u8) -> &'static [u8] {
@@ -444,6 +460,7 @@ pub mod fault {
             SYSCALL => b"syscall failed",
             BAD_OPERAND => b"bad operand",
             GPIO => b"invalid gpio pin/mode",
+            PAGE => b"bad widget page",
             _ => b"unknown fault",
         }
     }
@@ -686,6 +703,9 @@ pub struct Vm {
     // True while `run_paint` executes on_paint: render() is then a no-op (the
     // frame being painted is presented by run_paint's caller).
     in_paint: bool,
+    // The program's widget page (RES_PAGE) in flash; page_len 0 = none.
+    page_base: u32,
+    page_len: u32,
 }
 
 const EMPTY_CB: CbRequest = CbRequest {
@@ -740,6 +760,8 @@ impl Vm {
             render_mode: RenderMode::Dirty,
             forced_render_mode: None,
             in_paint: false,
+            page_base: 0,
+            page_len: 0,
             widget_count: 0,
             ext_count: 0,
             open_files: [None, None],
@@ -1382,6 +1404,14 @@ impl Vm {
         self.open_files = [None, None];
         self.modal_stack.clear();
         self.anims.clear();
+        self.page_len = 0;
+    }
+
+    /// Attach the program's widget page (RES_PAGE resource at `base` in
+    /// flash), read by OP_W_LOAD. Call after loading the program.
+    pub fn set_page(&mut self, base: u32, len: u32) {
+        self.page_base = base;
+        self.page_len = len;
     }
 
     pub fn has_code(&self) -> bool {
@@ -1667,15 +1697,8 @@ impl Vm {
                 }
             }
             OP_W_ALLTAR => {
-                // Combined: alloc widget, store to var slot, set as target
                 let raw = self.read_u8();
-                let slot = self.resolve_slot(raw);
-                if let Some(id) = ctx.tree.alloc() {
-                    self.var_set(slot, id.0 as i32);
-                    self.target = id;
-                } else {
-                    self.fail(fault::WIDGET_ALLOC);
-                }
+                self.w_alltar(ctx, raw);
             }
             OP_FRAME => {
                 // Function prologue: set frame_size for this function
@@ -1816,25 +1839,7 @@ impl Vm {
             OP_W_SET => {
                 let prop_id = self.read_u8();
                 let val = self.pop();
-                if self.target.is_some() {
-                    self.set_scalar_prop(ctx, prop_id, val);
-                    if prop_id == PROP_FONT_ID {
-                        if let Some(fs) = ctx.fs.as_ref() {
-                            ctx.fonts.find_or_load(val as u8, fs, &ctx.flash, P::CACHE_FONT_BITMAPS);
-                        }
-                    }
-                    if prop_id == PROP_IMAGE_ID {
-                        if let Some(fs) = ctx.fs.as_ref() {
-                            ctx.images.find_or_load(val as u8, fs, &ctx.flash);
-                        }
-                    }
-                    // A property write that changes appearance schedules a
-                    // redraw, so `render()` repaints without an explicit
-                    // `dirty(widget)` call.
-                    if prop_is_visual(prop_id) {
-                        ctx.tree.mark_dirty(self.target);
-                    }
-                }
+                self.w_set(ctx, prop_id, val);
             }
             OP_W_GET => {
                 let prop_id = self.read_u8();
@@ -1849,17 +1854,17 @@ impl Vm {
                 // Static parent id (u8). Used for parent(0) and other literal
                 // widget references that fit in u8.
                 let parent = self.read_u8();
-                if self.target.is_some() {
-                    ctx.tree.add_child(WidgetId(parent as u16), self.target);
-                }
+                self.w_parent(ctx, parent as u16);
             }
             OP_W_PARENT_S => {
                 // Dynamic parent — id from stack. Used when the parent is a
                 // widget variable (its slot stores the runtime id from alloc).
                 let parent = self.pop() as u16;
-                if self.target.is_some() {
-                    ctx.tree.add_child(WidgetId(parent), self.target);
-                }
+                self.w_parent(ctx, parent);
+            }
+            OP_W_LOAD => {
+                let off = self.read_u16();
+                self.load_page_block(ctx, off as u32);
             }
             OP_W_SET_LEN => {
                 let prop_id = self.read_u8();
@@ -1867,15 +1872,24 @@ impl Vm {
                 let start = self.pc as usize;
                 let end = start + len;
                 if end <= self.code.len() {
-                    let mut buf = [0u8; 32];
-                    let n = len.min(buf.len());
-                    self.code.read_bytes(start, &mut buf[..n]);
+                    // Compound values fit the stack buffer; longer payloads
+                    // (text literals up to 255 bytes) go through the heap.
+                    let mut small = [0u8; 32];
+                    let mut big = Vec::new();
+                    let buf: Option<&mut [u8]> = if len <= small.len() {
+                        Some(&mut small[..len])
+                    } else if big.try_reserve_exact(len).is_ok() {
+                        big.resize(len, 0);
+                        Some(&mut big)
+                    } else {
+                        None
+                    };
                     self.pc = end as CodeAddr;
-                    if self.target.is_some() {
-                        self.set_compound_prop(prop_id, &buf[..n], ctx);
-                        if prop_is_visual(prop_id) {
-                            ctx.tree.mark_dirty(self.target);
-                        }
+                    if let Some(buf) = buf {
+                        self.code.read_bytes(start, buf);
+                        self.w_set_len(ctx, prop_id, buf);
+                    } else {
+                        self.fail(fault::STR_ALLOC);
                     }
                 } else {
                     self.fail(fault::CODE_OOB);
@@ -2541,6 +2555,137 @@ impl Vm {
             self.stack[(self.sp - 1) as usize]
         } else {
             0
+        }
+    }
+
+    // --- Widget ops (shared by the opcodes and the widget page) ---
+
+    /// Alloc a widget, store its id in var `raw` and make it the target.
+    #[inline(never)]
+    fn w_alltar<P: Platform>(&mut self, ctx: &mut Ctx<P>, raw: u8) {
+        let slot = self.resolve_slot(raw);
+        if let Some(id) = ctx.tree.alloc() {
+            self.var_set(slot, id.0 as i32);
+            self.target = id;
+        } else {
+            self.fail(fault::WIDGET_ALLOC);
+        }
+    }
+
+    #[inline(never)]
+    fn w_parent<P: Platform>(&mut self, ctx: &mut Ctx<P>, parent: u16) {
+        if self.target.is_some() {
+            ctx.tree.add_child(WidgetId(parent), self.target);
+        }
+    }
+
+    /// Scalar property write on the target (W_SET).
+    #[inline(never)]
+    fn w_set<P: Platform>(&mut self, ctx: &mut Ctx<P>, prop_id: u8, val: i32) {
+        if self.target.is_none() {
+            return;
+        }
+        self.set_scalar_prop(ctx, prop_id, val);
+        if prop_id == PROP_FONT_ID {
+            if let Some(fs) = ctx.fs.as_ref() {
+                ctx.fonts.find_or_load(val as u8, fs, &ctx.flash, P::CACHE_FONT_BITMAPS);
+            }
+        }
+        if prop_id == PROP_IMAGE_ID {
+            if let Some(fs) = ctx.fs.as_ref() {
+                ctx.images.find_or_load(val as u8, fs, &ctx.flash);
+            }
+        }
+        // A property write that changes appearance schedules a redraw, so
+        // `render()` repaints without an explicit `dirty(widget)` call.
+        if prop_is_visual(prop_id) {
+            ctx.tree.mark_dirty(self.target);
+        }
+    }
+
+    /// Compound property write on the target (W_SET_LEN).
+    #[inline(never)]
+    fn w_set_len<P: Platform>(&mut self, ctx: &mut Ctx<P>, prop_id: u8, data: &[u8]) {
+        if self.target.is_some() {
+            self.set_compound_prop(prop_id, data, ctx);
+            if prop_is_visual(prop_id) {
+                ctx.tree.mark_dirty(self.target);
+            }
+        }
+    }
+
+    /// OP_W_LOAD: run one block of the widget page — a run of static widget
+    /// setup statements the compiler moved out of the bytecode. Block at
+    /// `off`: u16 LE length + ops (see `PG_*`). Each op does exactly what its
+    /// bytecode form would, so ids, tree order and the final target match.
+    #[inline(never)]
+    fn load_page_block<P: Platform>(&mut self, ctx: &mut Ctx<P>, off: u32) {
+        let mut hdr = [0u8; 2];
+        if off + 2 > self.page_len {
+            return self.fail(fault::PAGE);
+        }
+        ctx.flash.read(self.page_base + off, &mut hdr);
+        let len = u16::from_le_bytes(hdr) as usize;
+        if off as usize + 2 + len > self.page_len as usize {
+            return self.fail(fault::PAGE);
+        }
+        let mut buf = Vec::new();
+        if buf.try_reserve_exact(len).is_err() {
+            return self.fail(fault::PAGE);
+        }
+        buf.resize(len, 0);
+        ctx.flash.read(self.page_base + off + 2, &mut buf);
+        self.run_page_ops(ctx, &buf);
+    }
+
+    #[inline]
+    fn run_page_ops<P: Platform>(&mut self, ctx: &mut Ctx<P>, buf: &[u8]) {
+        let len = buf.len();
+        let mut i = 0;
+        while i < len && self.state != VmState::Error {
+            let op = buf[i];
+            // Every op has at least one operand byte.
+            let Some(&arg) = buf.get(i + 1) else {
+                return self.fail(fault::PAGE);
+            };
+            i += 2;
+            match op {
+                0x01..=0x3F | PG_STORE => {
+                    let pos = if op == PG_STORE { i } else { i - 1 };
+                    let Some((val, n)) = proto::decode_signed_varint(buf, pos) else {
+                        return self.fail(fault::PAGE);
+                    };
+                    i = pos + n;
+                    if op == PG_STORE {
+                        let slot = self.resolve_slot(arg);
+                        self.var_set(slot, val);
+                    } else {
+                        self.w_set(ctx, op, val);
+                    }
+                }
+                0x40..=0x7F => {
+                    let end = i + arg as usize;
+                    let Some(data) = buf.get(i..end) else {
+                        return self.fail(fault::PAGE);
+                    };
+                    i = end;
+                    self.w_set_len(ctx, op, data);
+                }
+                PG_ALLTAR => self.w_alltar(ctx, arg),
+                PG_TARGET_ID..=PG_PARENT => {
+                    let id = if op & 1 != 0 {
+                        self.var_get(self.resolve_slot(arg)) as u16
+                    } else {
+                        arg as u16
+                    };
+                    if op & 2 != 0 {
+                        self.w_parent(ctx, id);
+                    } else {
+                        self.target = WidgetId(id);
+                    }
+                }
+                _ => return self.fail(fault::PAGE),
+            }
         }
     }
 
@@ -3804,6 +3949,80 @@ mod anim_tests {
         assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
         assert_eq!(vm.fault_pc(), 3);
         assert_eq!(vm.stack[0], 7);
+    }
+
+    #[test]
+    fn page_ops_build_widgets_like_bytecode() {
+        let mut ctx = mock_ctx();
+        ctx.tree.root = ctx.tree.alloc().unwrap();
+        let mut vm = cb_vm(&[OP_HALT]);
+        vm.frame_base = 4; // locals after the 4 globals
+        #[rustfmt::skip]
+        let ops = [
+            PG_STORE, 1, 14,                    // g1 = 7
+            PG_ALLTAR, 0,                       // g0 = alloc(); target(g0)
+            PROP_SIZE, 3, 0xC0, 0x0C, 0x64,     // set(size, 800, 50)
+            PROP_BG_COLOR, 0x82, 0x21,          // set(bg_color, 0x0841)
+            PG_PARENT_ID, 0,                    // parent(0)
+            PG_ALLTAR, 0x80,                    // var l = alloc(); target(l)
+            PROP_TEXT, 2, b'H', b'i',           // set(text, "Hi")
+            PG_PARENT, 0,                       // parent(g0)
+        ];
+        vm.run_page_ops(&mut ctx, &ops);
+        assert_eq!(vm.fault(), fault::NONE);
+        assert_eq!(vm.var_get(1), 7);
+        let (a, b) = (WidgetId(1), WidgetId(2));
+        assert_eq!(vm.var_get(0), 1);
+        assert_eq!(vm.var_get(4), 2);
+        let w = ctx.tree.get(a);
+        assert!(w.parent == ctx.tree.root);
+        assert_eq!((w.size.w, w.size.h), (800, 50));
+        assert_eq!(w.background_color, 0x0841);
+        assert!(ctx.tree.get(b).parent == a);
+        assert_eq!(ctx.strpool.get(ctx.tree.text_id(b)), b"Hi");
+        assert!(vm.target == b);
+    }
+
+    #[test]
+    fn malformed_page_ops_fault() {
+        let cases: [&[u8]; 4] = [
+            &[PROP_BG_COLOR, 0x82],   // truncated varint
+            &[PROP_SIZE, 5, 1],       // payload past the block
+            &[0x90, 0],               // unknown op
+            &[PG_ALLTAR],             // missing operand
+        ];
+        for ops in cases {
+            let mut ctx = mock_ctx();
+            ctx.tree.root = ctx.tree.alloc().unwrap();
+            let mut vm = cb_vm(&[OP_HALT]);
+            vm.run_page_ops(&mut ctx, ops);
+            assert_eq!(vm.fault(), fault::PAGE, "{ops:?}");
+        }
+    }
+
+    #[test]
+    fn w_set_len_keeps_long_text() {
+        let text = b"Spline graph (Catmull-Rom + fill, vs linear)";
+        assert!(text.len() > 32);
+        let mut code = alloc::vec![OP_W_TARGET, 1, OP_W_SET_LEN, PROP_TEXT, text.len() as u8];
+        code.extend_from_slice(text);
+        code.push(OP_HALT);
+        let mut ctx = mock_ctx();
+        ctx.tree.root = ctx.tree.alloc().unwrap();
+        let w = ctx.tree.alloc().unwrap();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 8);
+        assert_eq!(vm.fault(), fault::NONE);
+        assert_eq!(ctx.strpool.get(ctx.tree.text_id(w)), text);
+    }
+
+    #[test]
+    fn w_load_without_page_faults() {
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&[OP_W_LOAD, 0, 0, OP_HALT]);
+        vm.tick(&mut ctx, 4);
+        assert_eq!(vm.fault(), fault::PAGE);
+        assert_eq!(vm.fault_pc(), 0);
     }
 
     /// v4 image with no functions: header flags + opcodes.

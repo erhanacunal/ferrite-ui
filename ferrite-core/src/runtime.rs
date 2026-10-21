@@ -422,7 +422,11 @@ fn apply_syscfg<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
 
 #[inline(never)]
 fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
-    let entry = match ctx.fs.as_ref().and_then(|fs| fs.find(&ctx.flash, b"main")) {
+    let entry = match ctx
+        .fs
+        .as_ref()
+        .and_then(|fs| fs.find_kind(&ctx.flash, b"main", fs::RES_PROGRAM))
+    {
         Some(e) => e,
         None => {
             return if ctx.fs.is_some() {
@@ -452,6 +456,14 @@ fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
         if !vm.load_ram(&img) {
             err = ERR_PROGRAM_ERROR;
         }
+    }
+    // Static widget setup the compiler moved out of the bytecode (optional).
+    if let Some(page) = ctx
+        .fs
+        .as_ref()
+        .and_then(|fs| fs.find_kind(&ctx.flash, b"main", fs::RES_PAGE))
+    {
+        vm.set_page(page.offset, page.size);
     }
     reserve_tree(ctx, vm);
     err

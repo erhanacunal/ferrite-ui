@@ -12,6 +12,10 @@ Usage:
   python ferrite_build.py project.json --info
   python ferrite_build.py project.json --expand   # print fully expanded source
                                                    # (includes + dispatchers) and exit
+  python ferrite_build.py project.json --disasm   # build in memory and print every
+                                                   # resource; programs disassembled
+                                                   # (add -o to also write the image)
+  python ferrite_build.py flash.bin --disasm      # same for an already built image
 
 JSON format:
   {
@@ -23,37 +27,8 @@ JSON format:
     "images": [
       {"name": "logo", "image_id": 1, "source": "assets/logo.png", "mode": "auto", "max_colors": 256}
     ],
-    "pages": [
-      {
-        "name": "main",
-        "background": "0x0000",
-        "widgets": [
-          {
-            "type": "button",
-            "location": [150, 100],
-            "size": [200, 60],
-            "background_color": "0xF800",
-            "border": [1, 1, 1, 1],
-            "border_color": "0xFFFF",
-            "press_color": "0x07E0",
-            "clickable": true,
-            "padding": [10, 10, 10, 10],
-            "children": [
-              {
-                "type": "label",
-                "size": [180, 40],
-                "text": "Click Me",
-                "font_id": 0,
-                "text_color": "0xFFFF",
-                "text_align": "center"
-              }
-            ]
-          }
-        ]
-      }
-    ],
     "programs": [
-      {"name": "init", "source": "scripts/init.fl", "exec_mode": "ram|flash"}
+      {"name": "main", "source": "main.fl", "exec_mode": "ram|flash", "widget_page": false}
     ],
     "files": [
       {"name": "config", "source": "data/config.bin"}
@@ -64,6 +39,10 @@ JSON format:
       "eval_stack": 32, "call_stack": 12, "cb_queue": 16, "anim_slots": 8
     }
   }
+
+  "widget_page": true moves static widget setup out of the program into a
+  RES_PAGE resource with the program's name (see docs/bytecode.md). Set it
+  at the top level for every program, or on a program to override that.
 
   "memory" is optional; it becomes the RES_SYSCFG entry "sys" that sizes the
   runtime pools at boot (see ferrite-core/src/syscfg.rs). Omitted keys keep
@@ -78,7 +57,6 @@ from pathlib import Path
 
 # ferrite_cc ve ferrite_img'den import
 sys.path.insert(0, str(Path(__file__).parent))
-from ferrite_cc import Asm, Compiler, Prop, encode_svarint
 import ferrite_devices
 
 # --- Constants (fs.rs ile birebir aynı) ---
@@ -101,47 +79,8 @@ RES_SYSCFG = 5
 # Resource flags (stored in entry reserved[0], byte 28)
 RES_FLAG_FLASH_EXEC = 0x01
 
-KIND_BASE = 0
-KIND_LABEL = 1
-KIND_BUTTON = 2
-KIND_DROPDOWN = 9
-KIND_IMAGE = 11
-# Shape widgets — fill=bg_color, stroke=border_color; polygon points in `text`.
-KIND_RECTANGLE = 12
-KIND_CIRCLE = 13
-KIND_POLYGON = 14
-KIND_LINE = 15
-KIND_ELLIPSE = 16
-
-ALIGN_MAP = {"left": 0, "center": 1, "right": 2}
-
-
-# --- Color parsing ---
-
-def parse_color(val) -> int:
-    """Parse color: int, "0xFFFF", "#F800", "rgb(255,0,0)"."""
-    if isinstance(val, int):
-        return val & 0xFFFF
-    s = str(val).strip()
-    if s.startswith("0x") or s.startswith("0X"):
-        return int(s, 16) & 0xFFFF
-    if s.startswith("#"):
-        hex_str = s[1:]
-        if len(hex_str) == 4:
-            # #RGBS short RGB565 hex
-            return int(hex_str, 16) & 0xFFFF
-        elif len(hex_str) == 6:
-            # #RRGGBB → RGB565
-            r = int(hex_str[0:2], 16)
-            g = int(hex_str[2:4], 16)
-            b = int(hex_str[4:6], 16)
-            return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-    if s.startswith("rgb("):
-        parts = s[4:-1].split(",")
-        r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
-        return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-    return int(s) & 0xFFFF
-
+KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE",
+              RES_FILE: "FILE", RES_SYSCFG: "SYSCFG"}
 
 # --- Image conversion (shared encoder in ferrite_img.py) ---
 
@@ -160,139 +99,6 @@ def convert_image(source_path: str, mode: str = "auto", max_colors: int = 256,
     fi_data, _stats = ferrite_img.convert_bytes(
         img, mode=mode, max_colors=max_colors, want_alpha=want_alpha)
     return fi_data
-
-
-# --- Page: widget tree JSON → bytecode ---
-
-def compile_page(page_json: dict, page_widget_id: int, base_id: int) -> tuple[bytes, int]:
-    """Page JSON → (page_binary, content_widget_count).
-
-    page_binary = bg_color(u16 LE) + bytecode
-    content_widget_count = kaç widget bytecode ile oluşturuldu
-    """
-    bg_color = parse_color(page_json.get("background", "0x0000"))
-
-    cc = Compiler(base_id=base_id)
-    widgets = page_json.get("widgets", [])
-    count = _compile_widgets(cc, widgets, page_widget_id)
-    cc.halt()
-
-    data = cc.build_page(bg_color)
-    return data, count
-
-
-def _compile_widgets(cc: Compiler, widgets: list, parent_id: int) -> int:
-    """Widget listesini recursive olarak bytecode'a çevir. Returns widget count."""
-    count = 0
-    for w in widgets:
-        name = f"_w{cc._next_id}"
-        wid = cc.alloc(name)
-        count += 1
-
-        cc.target(name)
-
-        # Type
-        wtype = w.get("type", "base")
-        if wtype == "label":
-            cc.set_prop("kind", KIND_LABEL)
-        elif wtype == "button":
-            cc.set_prop("kind", KIND_BUTTON)
-        elif wtype == "dropdown":
-            cc.set_prop("kind", KIND_DROPDOWN)
-        elif wtype == "image":
-            cc.set_prop("kind", KIND_IMAGE)
-        elif wtype == "rectangle":
-            cc.set_prop("kind", KIND_RECTANGLE)
-        elif wtype == "circle":
-            cc.set_prop("kind", KIND_CIRCLE)
-        elif wtype == "polygon":
-            cc.set_prop("kind", KIND_POLYGON)
-        elif wtype == "line":
-            cc.set_prop("kind", KIND_LINE)
-        elif wtype == "ellipse":
-            cc.set_prop("kind", KIND_ELLIPSE)
-
-        # Location
-        if "location" in w:
-            loc = w["location"]
-            cc.set_prop("location", loc[0], loc[1])
-
-        # Size
-        if "size" in w:
-            sz = w["size"]
-            cc.set_prop("size", sz[0], sz[1])
-
-        # Box model
-        if "margin" in w:
-            m = w["margin"]
-            if isinstance(m, list):
-                cc.set_prop("margin", *m)
-            else:
-                cc.set_prop("margin", m, m, m, m)
-
-        if "border" in w:
-            b = w["border"]
-            if isinstance(b, list):
-                cc.set_prop("border", *b)
-            else:
-                cc.set_prop("border", b, b, b, b)
-
-        if "padding" in w:
-            p = w["padding"]
-            if isinstance(p, list):
-                cc.set_prop("padding", *p)
-            else:
-                cc.set_prop("padding", p, p, p, p)
-
-        # Colors
-        if "background_color" in w:
-            cc.set_prop("bg_color", parse_color(w["background_color"]))
-        if "border_color" in w:
-            cc.set_prop("border_color", parse_color(w["border_color"]))
-        if "text_color" in w:
-            cc.set_prop("text_color", parse_color(w["text_color"]))
-        if "press_color" in w:
-            cc.set_prop("press_color", parse_color(w["press_color"]))
-        if "gradient_color" in w:
-            cc.set_prop("gradient_color", parse_color(w["gradient_color"]))
-        if "gradient_dir" in w:
-            cc.set_prop("gradient_dir", int(w["gradient_dir"]))
-        if "alpha" in w:
-            cc.set_prop("alpha", int(w["alpha"]))
-
-        # Flags
-        if w.get("clickable", False):
-            cc.set_prop("clickable", 1)
-        if w.get("visible") is False:
-            cc.set_prop("visible", 0)
-
-        # Background image
-        if "image_id" in w:
-            cc.set_prop("image_id", w["image_id"])
-
-        # Callbacks
-        if "on_click" in w:
-            cc.set_prop("on_click", w["on_click"])
-
-        # Label properties
-        if "font_id" in w:
-            cc.set_prop("font_id", w["font_id"])
-        if "text_align" in w:
-            align = w["text_align"]
-            cc.set_prop("text_align", ALIGN_MAP.get(align, 0) if isinstance(align, str) else align)
-        if "text" in w:
-            cc.set_text(w["text"])
-
-        # Parent
-        cc.parent(parent_id)
-
-        # Children (recursive)
-        children = w.get("children", [])
-        if children:
-            child_count = _compile_widgets(cc, children, wid)
-            count += child_count
-
-    return count
 
 
 # --- Debug symbols ---
@@ -316,8 +122,10 @@ def _write_debug_sidecar(source_path: str, image: bytes) -> str | None:
 
 # --- Program compilation ---
 
-def compile_program(source_path: str, include_dirs=None, render_mode="dirty") -> bytes:
-    """Ferrite lang source → VM image (header + opcodes)."""
+def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
+                    widget_page=False) -> bytes:
+    """Ferrite lang source → VM image (header + opcodes). With widget_page,
+    static widget setup moves to the image's `.page` (RES_PAGE contents)."""
     try:
         from ferrite_lang import build_image, CompileError
     except ImportError:
@@ -328,7 +136,7 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty") ->
     source = Path(source_path).read_text(encoding="utf-8")
     try:
         image = build_image(source, filename=source_path, include_dirs=include_dirs,
-                            render_mode=render_mode)
+                            render_mode=render_mode, widget_page=widget_page)
         _write_debug_sidecar(source_path, image)
         return image
     except CompileError as e:
@@ -477,8 +285,9 @@ def dump_expanded(project_path: str):
 
 # --- Main build pipeline ---
 
-def build(project_path: str, output_path: str) -> dict:
-    """JSON proje → flash binary."""
+def build(project_path: str, output_path: str | None) -> dict:
+    """JSON proje → flash binary. output_path None = don't write the file
+    (the binary is returned in the stats as "binary")."""
     project_dir = Path(project_path).parent
     project = json.loads(Path(project_path).read_text(encoding="utf-8"))
 
@@ -594,48 +403,33 @@ def build(project_path: str, output_path: str) -> dict:
             fi_data.insert(8, image_id)
         resources.append((name, RES_IMAGE, bytes(fi_data), 0))
 
-    # 3. Pages — JSON widget tree OR .fl source → bytecode
-    # Widget ID tahsisi: root(0) → page widgets → page contents
-    next_id = 1  # root=0 main.rs'de, page'ler 1'den başlar
-
-    for page in project.get("pages", []):
-        name = page["name"]
-        page_widget_id = next_id
-        next_id += 1  # page widget'ı PageManager tarafından alloc edilir
-
-        if "source" in page:
-            # Compile .fl source as page (bg_color prefix + bytecode)
-            from ferrite_lang import compile_page as fl_compile_page, CompileError
-            bg_color = parse_color(page.get("background", "0x0000"))
-            source_path = project_dir / page["source"]
-            source = source_path.read_text(encoding="utf-8")
-            try:
-                page_data = fl_compile_page(source, bg_color, str(source_path), include_dirs=include_dirs)
-                _write_debug_sidecar(str(source_path), page_data)
-            except CompileError as e:
-                raise CompileError(f"{source_path}: {e}") from e
-            # Count alloc() calls in bytecode to track widget IDs
-            widget_count = source.count("alloc(")
-            next_id += widget_count
-        else:
-            base_id = next_id  # content widget'lar buradan başlar
-            page_data, widget_count = compile_page(page, page_widget_id, base_id)
-            next_id += widget_count
-
-        resources.append((name, RES_PAGE, page_data, 0))
+    # 3. Pages — RES_PAGE now holds a program's widget page (step 4).
+    if "pages" in project:
+        print('Error: "pages" is no longer supported (RES_PAGE now holds the '
+              'widget page of a program: "widget_page": true)', file=sys.stderr)
+        sys.exit(1)
+    next_id = 1  # root = 0
 
     # 4. Programs — .fl → VM image (header + opcodes, metadata embedded)
     render_mode = project.get("render_mode", "dirty")
+    # Project-level default; a program's own "widget_page" overrides it.
+    widget_page = project.get("widget_page", False)
     prog_widget_count = 0
     prog_widget_hinted = False
+    symbols = {}  # program name -> debug symbols (for --disasm)
     for prog in project.get("programs", []):
         name = prog["name"]
         source = project_dir / prog["source"]
         image_data = compile_program(str(source), include_dirs=include_dirs,
-                                     render_mode=render_mode)
+                                     render_mode=render_mode,
+                                     widget_page=prog.get("widget_page", widget_page))
         exec_mode = prog.get("exec_mode", "ram")
         prog_flags = RES_FLAG_FLASH_EXEC if exec_mode == "flash" else 0
         resources.append((name, RES_PROGRAM, image_data, prog_flags))
+        symbols[name] = getattr(image_data, "debug_symbols", {})
+        page = getattr(image_data, "page", b"")
+        if page:
+            resources.append((name, RES_PAGE, page, 0))
         # Read widget_count back from v4 header (byte 7)
         if len(image_data) >= 9 and image_data[0] >= 4:
             prog_widget_count = max(prog_widget_count, image_data[7])
@@ -663,7 +457,8 @@ def build(project_path: str, output_path: str) -> dict:
 
     # 7. Build flash binary
     fs_binary = build_fs(project, resources, fs_base)
-    Path(output_path).write_bytes(fs_binary)
+    if output_path is not None:
+        Path(output_path).write_bytes(fs_binary)
     if fs_base != FS_BASE:
         print(f"  FS base: 0x{fs_base:X} (device '{device_id}') — "
               f"write image to this flash address")
@@ -680,7 +475,78 @@ def build(project_path: str, output_path: str) -> dict:
         "widget_count": effective_widget_count,
         "widget_count_hinted": prog_widget_hinted,
         "details": [(name, kind, len(data)) for name, kind, data, _flags in resources],
+        "binary": fs_binary,
+        "symbols": symbols,
     }
+
+
+# --- Image dump (--disasm) ---
+
+def dump_fs(binary: bytes, symbols: dict | None = None) -> str:
+    """Describe every resource of a flash FS image; programs are
+    disassembled with their widget page blocks inline. `symbols` maps a
+    program name to its debug symbols (names for functions and variables)."""
+    from ferrite_lang import format_image, disassemble_page_block
+
+    if binary[:4] != MAGIC:
+        raise ValueError("not a ferrite FS image (missing FERR magic)")
+    version, scr_w, scr_h, count, checksum = struct.unpack_from("<HHHHI", binary, 4)
+    table = binary[TABLE_OFFSET:TABLE_OFFSET + count * ENTRY_SIZE]
+    entries = []
+    for i in range(count):
+        e = table[i * ENTRY_SIZE:(i + 1) * ENTRY_SIZE]
+        name = e[:16].split(b"\0", 1)[0].decode("ascii", "replace")
+        offset, size = struct.unpack_from("<II", e, 20)
+        entries.append((name, e[16], offset, size, e[28]))
+    # TOC offsets are absolute flash addresses; data follows the table.
+    fs_base = entries[0][2] - (TABLE_OFFSET + count * ENTRY_SIZE) if entries else FS_BASE
+    data = {(name, kind): binary[off - fs_base:off - fs_base + size]
+            for name, kind, off, size, _ in entries}
+    sum_ok = (sum(table) & 0xFFFFFFFF) == checksum
+
+    out = [f"; ferrite FS v{version}, screen {scr_w}x{scr_h}, {count} resources, "
+           f"base 0x{fs_base:X}, {len(binary)} bytes, checksum {'ok' if sum_ok else 'BAD'}",
+           ";  #  kind     name              address    size  flags"]
+    for i, (name, kind, off, size, flags) in enumerate(entries):
+        flag_text = "flash-exec" if flags & RES_FLAG_FLASH_EXEC else ""
+        out.append(f"; {i:2d}  {KIND_NAMES.get(kind, kind):<7}  {name:<16}  0x{off:06X}  {size:6d}  {flag_text}")
+
+    for name, kind, off, size, flags in entries:
+        blob = data[(name, kind)]
+        title = f"{KIND_NAMES.get(kind, kind)} {name} ({size} B)"
+        out += ["", f"; ==== {title} ===="]
+        if kind == RES_PROGRAM:
+            page = data.get((name, RES_PAGE), b"")
+            out.append(format_image(blob, page, (symbols or {}).get(name)))
+        elif kind == RES_PAGE:
+            blocks, pos = [], 4
+            while pos + 2 <= len(blob):
+                blocks.append(pos)
+                pos += 2 + struct.unpack_from("<H", blob, pos)[0]
+            out.append(f"; widget page of program '{name}': {len(blocks)} blocks, "
+                       f"shown under its W_LOAD instructions")
+            if (name, RES_PROGRAM) not in data:
+                for b in blocks:
+                    out.append(f"; page+0x{b:04X}")
+                    out += ["        " + l for l in disassemble_page_block(blob, b)]
+        elif kind == RES_IMAGE and len(blob) >= 9:
+            _magic, w, h, fl, colors = struct.unpack_from("<HHHBB", blob)
+            mode = ("raw", "rle", "indexed+rle")[fl & 3] if fl & 3 < 3 else f"mode {fl & 3}"
+            alpha = ", alpha" if fl & 0x04 else ""
+            pal = f", {colors or 256} colors" if fl & 3 == 2 else ""
+            out.append(f"; image_id {blob[8]}, {w}x{h}, {mode}{pal}{alpha}")
+        elif kind == RES_FONT and len(blob) >= 4:
+            glyphs, y_adv, font_id = struct.unpack_from("<HBB", blob)
+            out.append(f"; font_id {font_id}, {glyphs} glyphs, line height {y_adv}")
+        elif kind == RES_SYSCFG:
+            fields = [f"{key}={struct.unpack_from(fmt, blob, off)[0]}"
+                      for key, (off, fmt, _max) in SYSCFG_FIELDS.items()
+                      if off + struct.calcsize(fmt) <= len(blob)]
+            out.append("; " + ", ".join(fields) + "  (0 = firmware default)")
+        else:
+            head = " ".join(f"{b:02X}" for b in blob[:32])
+            out.append(f"; {head}{' ...' if len(blob) > 32 else ''}")
+    return "\n".join(out)
 
 
 def show_info(project_path: str):
@@ -689,36 +555,21 @@ def show_info(project_path: str):
     screen = project.get("screen", [800, 480])
     fonts = project.get("fonts", [])
     images = project.get("images", [])
-    pages = project.get("pages", [])
     programs = project.get("programs", [])
     files = project.get("files", [])
 
-    total_res = len(fonts) + len(images) + len(pages) + len(programs) + len(files)
+    total_res = len(fonts) + len(images) + len(programs) + len(files)
 
     print(f"Project: {project_path}")
     print(f"Screen:  {screen[0]}×{screen[1]}")
     print(f"Fonts:   {len(fonts)}")
     print(f"Images:  {len(images)}")
-    print(f"Pages:   {len(pages)}")
     print(f"Programs:{len(programs)}")
     print(f"Files:   {len(files)}")
     print(f"Total:   {total_res} resources")
 
     if total_res > MAX_RESOURCES:
         print(f"WARNING: {total_res} > {MAX_RESOURCES} max resources!")
-
-    # Widget count estimate
-    def count_widgets(widgets):
-        c = 0
-        for w in widgets:
-            c += 1 + count_widgets(w.get("children", []))
-        return c
-
-    total_widgets = 1  # root
-    for page in pages:
-        total_widgets += 1  # page widget
-        total_widgets += count_widgets(page.get("widgets", []))
-    print(f"Widgets: ~{total_widgets} (max 64)")
 
 
 # --- CLI ---
@@ -740,8 +591,18 @@ def main():
         dump_expanded(project_path)
         return
 
-    # Default output
-    output_path = "flash.bin"
+    disasm = "--disasm" in args
+    if disasm and not project_path.endswith(".json"):
+        # An already built FS image: no source, so no symbol names.
+        try:
+            print(dump_fs(Path(project_path).read_bytes()))
+        except (OSError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Default output (--disasm alone builds in memory only)
+    output_path = None if disasm else "flash.bin"
     for i, a in enumerate(args):
         if a == "-o" and i + 1 < len(args):
             output_path = args[i + 1]
@@ -756,6 +617,10 @@ def main():
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    if disasm:
+        print(dump_fs(stats["binary"], stats["symbols"]))
+        return
+
     print(f"Built: {output_path}")
     print(f"  Resources: {stats['resources']}")
     print(f"  Data size: {stats['data_size']} bytes")
@@ -766,8 +631,6 @@ def main():
     print(f"  Widgets:   {wc_label}")
     print()
 
-    KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE",
-                  RES_FILE: "FILE", RES_SYSCFG: "SYSCFG"}
     for name, kind, size in stats["details"]:
         print(f"  {KIND_NAMES.get(kind, '?'):>7s}  {name:<16s}  {size:>6d} bytes")
 

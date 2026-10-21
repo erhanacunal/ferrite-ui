@@ -112,7 +112,7 @@ OPCODE_CATEGORIES = {
     Op.W_ALLOC: CATEGORY_WIDGET, Op.W_ALLTAR: CATEGORY_WIDGET,
     Op.W_TARGET: CATEGORY_WIDGET, Op.W_SET: CATEGORY_WIDGET,
     Op.W_GET: CATEGORY_WIDGET, Op.W_PARENT: CATEGORY_WIDGET,
-    Op.W_SET_LEN: CATEGORY_WIDGET,
+    Op.W_SET_LEN: CATEGORY_WIDGET, Op.W_LOAD: CATEGORY_WIDGET,
     Op.W_DIRTY: CATEGORY_WIDGET, Op.W_RENDER: CATEGORY_WIDGET,
     # Array
     Op.ARR_ALLOC: CATEGORY_ARRAY, Op.ARR_INIT: CATEGORY_ARRAY,
@@ -558,6 +558,10 @@ def walk_bytecode(data, start=0, end=None, wide=False):
         elif op in (Op.W_TARGET, Op.W_PARENT):
             pos += 1  # u8 id
             yield addr, op, 2
+
+        elif op == Op.W_LOAD:
+            pos += 2  # u16 widget page offset
+            yield addr, op, 3
 
         elif op in (Op.W_SET, Op.W_GET):
             pos += 1  # u8 prop

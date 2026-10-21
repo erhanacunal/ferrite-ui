@@ -76,6 +76,7 @@ VM_FAULT_NAMES = {
     12: "syscall failed",
     13: "bad operand",
     14: "invalid gpio pin/mode",
+    15: "bad widget page",
 }
 
 

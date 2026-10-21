@@ -3,6 +3,7 @@
     "screen_height": 480,
     "include_dirs": ["../../../lib"],
     "render_mode": "buffered",
+    "widget_page": true,
     "programs": [
         {
             "name": "main",

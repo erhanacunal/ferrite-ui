@@ -561,18 +561,6 @@ const GRADIENT_H    = 1;   // horizontal
 const GRADIENT_V    = 2;   // vertical
 ```
 
-**project.json syntax:**
-
-```json
-{
-  "type": "base",
-  "size": [400, 200],
-  "background_color": "0x0014FF",
-  "gradient_color": "0x00B4DC",
-  "gradient_dir": 2
-}
-```
-
 **Performance notes:**
 - Vertical gradients render nearly as fast as solid fills — one `fill_rect` call per row.
 - Horizontal gradients use per-pixel writes — slower for wide widgets; prefer vertical for large areas.

@@ -22,7 +22,8 @@ from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
                         AddrOverflow, IMAGE_FLAG_WIDE_ADDR, NARROW_CODE_MAX,
                         FunctionKind as CcFunctionKind,
                         SYSTEM_CALLBACK_KINDS,
-                        disassemble, encode_svarint,
+                        disassemble, encode_svarint, decode_svarint,
+                        PROP_NAMES, _slot_name,
                         _resolve_prop, PROP_MAP, pack_pair, float_bits)
 
 
@@ -988,6 +989,172 @@ NO_VALUE_BUILTINS = {
 _ARRAY_RETURNING_BUILTINS = {'rtcRead'}
 
 
+# ============================================================
+# Widget page (RES_PAGE)
+# ============================================================
+#
+# Static widget setup — runs of statements in setup() (and functions only
+# setup() calls) whose bytecode is nothing but W_ALLTAR / target / parent /
+# set with constant values / constant stores — moves to a widget page, a
+# RES_PAGE resource named like the program. Each run becomes one
+# `W_LOAD <offset>` instruction that runs the same ops from flash, so widget
+# ids, tree order and the target left behind are unchanged.
+#
+# Page: "FP" + version u8 + reserved u8, then blocks of u16 LE length + ops:
+#   0x01..0x3F  W_SET <prop> + zigzag varint
+#   0x40..0x7F  W_SET_LEN <prop> + u8 len + payload
+#   0x80 STORE slot + zigzag varint | 0x81 ALLTAR slot
+#   0x84 TARGET_ID id | 0x85 TARGET slot | 0x86 PARENT_ID id | 0x87 PARENT slot
+# Keep in sync with PG_* in ferrite-core/src/vm.rs.
+PAGE_HEADER = b'FP\x01\x00'
+PAGE_STORE = 0x80
+PAGE_ALLTAR = 0x81
+PAGE_TARGET_ID = 0x84
+PAGE_TARGET = 0x85
+PAGE_PARENT_ID = 0x86
+PAGE_PARENT = 0x87
+# W_LOAD + u16: a run must save more bytecode than this to be moved.
+_W_LOAD_SIZE = 3
+
+_PUSH_SHORT = {Op.PUSH_0: 0, Op.PUSH_1: 1, Op.PUSH_2: 2, Op.PUSH_M1: -1}
+_PUSH_WIDE = {Op.PUSH_I8: '<b', Op.PUSH_I16: '<h', Op.PUSH_I32: '<i'}
+
+
+def _slot_operand(code, i, short_base, long_op):
+    """Decode a LOAD/STORE form at `i` → (slot, next index), or None."""
+    op = code[i]
+    if short_base <= op <= short_base + 4:
+        return 0x80 | (op - short_base), i + 1   # local 0..4
+    if op == long_op and i + 1 < len(code):
+        return code[i + 1], i + 2
+    return None
+
+
+def _page_translate(code):
+    """Bytecode of one statement → widget page ops, or None if any of it
+    isn't static widget setup."""
+    out = bytearray()
+    i, n = 0, len(code)
+    try:
+        while i < n:
+            op = code[i]
+            if op in _PUSH_SHORT or op in _PUSH_WIDE:
+                if op in _PUSH_SHORT:
+                    val, i = _PUSH_SHORT[op], i + 1
+                else:
+                    fmt = _PUSH_WIDE[op]
+                    val = struct.unpack_from(fmt, code, i + 1)[0]
+                    i += 1 + struct.calcsize(fmt)
+                if code[i] == Op.W_SET and 0x01 <= code[i + 1] <= 0x3F:
+                    out += bytes([code[i + 1]]) + encode_svarint(val)
+                    i += 2
+                    continue
+                store = _slot_operand(code, i, Op.STORE_0, Op.STORE)
+                if store is None:
+                    return None
+                slot, i = store
+                out += bytes([PAGE_STORE, slot]) + encode_svarint(val)
+                continue
+            load = _slot_operand(code, i, Op.LOAD_0, Op.LOAD)
+            if load is not None:
+                slot, i = load
+                if code[i] == Op.W_TARGET_S:
+                    out += bytes([PAGE_TARGET, slot])
+                elif code[i] == Op.W_PARENT_S:
+                    out += bytes([PAGE_PARENT, slot])
+                else:
+                    return None
+                i += 1
+            elif op in (Op.W_ALLTAR, Op.W_TARGET, Op.W_PARENT):
+                page_op = {Op.W_ALLTAR: PAGE_ALLTAR, Op.W_TARGET: PAGE_TARGET_ID,
+                           Op.W_PARENT: PAGE_PARENT_ID}[op]
+                out += bytes([page_op, code[i + 1]])
+                i += 2
+            elif op == Op.W_SET_LEN and 0x40 <= code[i + 1] <= 0x7F:
+                end = i + 3 + code[i + 2]
+                if end > n:
+                    return None
+                out += code[i + 1:end]
+                i = end
+            else:
+                return None
+    except (IndexError, struct.error):
+        return None
+    return bytes(out)
+
+
+def _page_pure(e):
+    """True if expression `e` compiles to straight-line code with no jumps
+    or calls (so its bytecode can be moved), e.g. constants and variables."""
+    if isinstance(e, (NumLit, BoolLit, StrLit, FloatLit, VarRef, FuncRef, DotExpr)):
+        return True
+    if isinstance(e, UnaryOp):
+        return _page_pure(e.operand)
+    if isinstance(e, BinOp):
+        return e.op not in ('&&', '||') and _page_pure(e.left) and _page_pure(e.right)
+    if isinstance(e, ArrayLit):
+        return all(_page_pure(x) for x in e.elements)
+    if isinstance(e, CallExpr):
+        return e.name == 'alloc' and not e.args
+    return False
+
+
+def _page_candidate(stmt):
+    """Statements that may compile to static widget setup."""
+    if isinstance(stmt, ExprStmt):
+        e = stmt.expr
+        return (isinstance(e, CallExpr) and e.name in ('set', 'target', 'parent')
+                and all(_page_pure(a) for a in e.args))
+    if isinstance(stmt, VarDecl):
+        return stmt.array_size is None and (stmt.init is None or _page_pure(stmt.init))
+    if isinstance(stmt, Assign):
+        return stmt.index is None and _page_pure(stmt.value)
+    if isinstance(stmt, DotAssign):
+        return _page_pure(stmt.value)
+    return False
+
+
+def _walk_ast(node):
+    """Yield every AST node under `node`, not descending into lambdas (their
+    bodies are compiled as functions of their own)."""
+    if isinstance(node, list):
+        for item in node:
+            yield from _walk_ast(item)
+    elif hasattr(node, '__dict__'):
+        yield node
+        if isinstance(node, LambdaExpr):
+            return
+        for value in vars(node).values():
+            if isinstance(value, list) or hasattr(value, '__dict__'):
+                yield from _walk_ast(value)
+
+
+def _init_only_functions(functions):
+    """setup() plus the functions only it reaches: called from nowhere else
+    and never used as a callback (@ref, lambda, system callback)."""
+    callers = {fn.name: set() for fn in functions}
+    referenced = set()
+    for fn in functions:
+        for node in _walk_ast(fn.body):
+            if isinstance(node, CallExpr) and node.name in callers:
+                callers[node.name].add(fn.name)
+            elif isinstance(node, FuncRef):
+                referenced.add(node.name)
+            elif isinstance(node, LambdaExpr):
+                referenced.add(node.func_name)
+    init = {'setup'}
+    changed = True
+    while changed:
+        changed = False
+        for name, cs in callers.items():
+            if (name in init or name in referenced or name in SYSTEM_CALLBACKS
+                    or not cs or not cs <= init):
+                continue
+            init.add(name)
+            changed = True
+    return init
+
+
 class CodeGen:
     # Type constants for compile-time type inference
     T_INT = "int"
@@ -1024,6 +1191,12 @@ class CodeGen:
         self._current_fn_return_type = 'int'  # current function's declared return type
         self.debug_globals = {}    # slot -> source name
         self.debug_functions = {}  # function name -> {offset, length, locals}
+        # Widget page (generate_image with widget_page=True)
+        self.widget_page = False
+        self.page = bytearray()        # RES_PAGE contents ('' = no page)
+        self._page_ops = bytearray()   # pending block
+        self._page_code = bytearray()  # bytecode the pending block replaces
+        self._init_only = set()
 
     def generate(self, program):
         """Compile program to bytecode (raw, no image header).
@@ -1159,6 +1332,9 @@ class CodeGen:
             raise CompileError("missing required function: fn setup()")
         if 'loop' not in self.functions:
             raise CompileError("missing required function: fn loop()")
+
+        if self.widget_page:
+            self._init_only = _init_only_functions(program.functions)
 
         # Phase 3: Emit all functions (no JMP-over needed — functions are the code)
         # Allocate global variable slots first (visible to all functions)
@@ -1714,10 +1890,17 @@ class CodeGen:
         for slot in reversed(param_slots):
             self.asm.store(slot)
 
+        if self.widget_page and fn.name in self._init_only:
+            def emit(stmt, gen):
+                self._gen_paged(stmt, gen)
+        else:
+            def emit(stmt, gen):
+                gen(stmt)
+
         # Inject global var init code at the start of setup()
         if fn.name == 'setup' and self._global_init_stmts:
             for stmt in self._global_init_stmts:
-                self._gen_global_init(stmt)
+                emit(stmt, self._gen_global_init)
 
         if fn.name == 'loop' and self._global_init_stmts is not None:
             # Compiler-generated: while(1) { <user body>; yield; }
@@ -1730,7 +1913,8 @@ class CodeGen:
         else:
             # Body
             for stmt in fn.body:
-                self._gen_stmt(stmt)
+                emit(stmt, self._gen_stmt)
+            self._page_flush()
 
             # Implicit return 0
             if not fn.body or not isinstance(fn.body[-1], ReturnStmt):
@@ -1746,6 +1930,50 @@ class CodeGen:
         self.next_slot = saved_slot
         self._in_function = saved_in_fn
         self._current_fn_name = saved_current_fn
+
+    # --- Widget page ---
+
+    def _gen_paged(self, stmt, gen):
+        """Generate `stmt`; if its code is static widget setup, move it to the
+        pending widget page block instead of the bytecode."""
+        if not _page_candidate(stmt):
+            self._page_flush()
+            gen(stmt)
+            return
+        buf = self.asm._buf
+        start = len(buf)
+        gen(stmt)
+        code = bytes(buf[start:])
+        ops = _page_translate(code)
+        if ops is not None:
+            del buf[start:]
+            self._page_ops += ops
+            self._page_code += code
+        elif self._page_ops:
+            # Candidates compile to code without jumps or calls, so it can
+            # move past the W_LOAD that ends the pending block.
+            del buf[start:]
+            self._page_flush()
+            self.asm._emit(code)
+
+    def _page_flush(self):
+        """End the pending block: emit its W_LOAD, or its original code when
+        the block is too small to be worth a W_LOAD."""
+        ops, code = bytes(self._page_ops), bytes(self._page_code)
+        self._page_ops = bytearray()
+        self._page_code = bytearray()
+        if not ops:
+            return
+        if len(code) <= _W_LOAD_SIZE:
+            self.asm._emit(code)
+            return
+        if not self.page:
+            self.page += PAGE_HEADER
+        offset = len(self.page)
+        if offset > 0xFFFF or len(ops) > 0xFFFF:
+            raise CompileError("widget page exceeds 64 KB")
+        self.page += struct.pack('<H', len(ops)) + ops
+        self.asm.w_load(offset)
 
     # --- Statements ---
 
@@ -3406,7 +3634,8 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
     return build_image(source, filename, include_dirs), None
 
 
-def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty"):
+def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty",
+                widget_page=False):
     """Compile source to VM image format (v4 header + opcodes).
 
     Image format (v4):
@@ -3422,6 +3651,10 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
 
     Requires fn setup() and fn loop() in the source.
     Global variables (top-level var) are supported.
+
+    widget_page=True moves static widget setup to a widget page, returned as
+    the image's `.page` (b'' if nothing moved); store it as a RES_PAGE
+    resource with the program's name.
     """
     try:
         # Extract #hint_widgets from raw source before preprocessing strips the directive.
@@ -3452,6 +3685,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         # regenerate from a fresh parse with u32 targets (wide-address image).
         wide = False
         codegen = CodeGen()
+        codegen.widget_page = widget_page
         try:
             bytecode = codegen.generate_image(parse_program())
             wide = len(bytecode) > NARROW_CODE_MAX
@@ -3459,6 +3693,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
             wide = True
         if wide:
             codegen = CodeGen(wide=True)
+            codegen.widget_page = widget_page
             bytecode = codegen.generate_image(parse_program())
         debug_symbols = codegen.debug_info(filename)
 
@@ -3492,6 +3727,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
 
         # Stash function name map on the bytes object for CLI use
         image = _ImageBytes(image, func_names, debug_symbols)
+        image.page = bytes(codegen.page)
         return image
 
     except CompileError:
@@ -3506,6 +3742,7 @@ class _ImageBytes(bytes):
         obj = super().__new__(cls, data)
         obj.func_names = func_names or {}
         obj.debug_symbols = debug_symbols or {}
+        obj.page = b''
         return obj
 
 
@@ -3614,8 +3851,87 @@ def _image_is_wide(output):
             and struct.unpack_from('<H', output, 5)[0] & IMAGE_FLAG_WIDE_ADDR != 0)
 
 
+def disassemble_page_block(page, offset, symbols=None, addr=None):
+    """Decode the widget page block at `offset` → lines, written like the
+    bytecode each op stands for. `addr` (the W_LOAD) resolves local names."""
+    if offset + 2 > len(page):
+        return [f'; page+0x{offset:04X} is past the end of the page ({len(page)} B)']
+    length = struct.unpack_from('<H', page, offset)[0]
+    ops = bytes(page[offset + 2:offset + 2 + length])
+    lines = []
+    i = 0
+    try:
+        while i < len(ops):
+            op = ops[i]
+            pname = PROP_NAMES.get(op, f'0x{op:02X}')
+            if 0x01 <= op <= 0x3F:
+                val, n = decode_svarint(ops, i + 1)
+                i += 1 + n
+                hexval = f' (0x{val & 0xFFFF:04X})' if not -128 <= val <= 127 else ''
+                lines.append(f'W_SET {pname} {val}{hexval}')
+            elif 0x40 <= op <= 0x7F:
+                payload = ops[i + 2:i + 2 + ops[i + 1]]
+                i += 2 + ops[i + 1]
+                if op == Prop.TEXT:
+                    lines.append(f'W_SET {pname} "{payload.decode("utf-8", "replace")}"')
+                else:
+                    vals, p = [], 0
+                    while p < len(payload):
+                        v, n = decode_svarint(payload, p)
+                        vals.append(str(v))
+                        p += n
+                    lines.append(f'W_SET {pname} ({", ".join(vals)})')
+            elif op == PAGE_STORE:
+                val, n = decode_svarint(ops, i + 2)
+                lines.append(f'STORE {_slot_name(ops[i + 1], symbols, addr)} = {val}')
+                i += 2 + n
+            elif op in (PAGE_ALLTAR, PAGE_TARGET, PAGE_PARENT):
+                mnemonic = {PAGE_ALLTAR: 'W_ALLTAR', PAGE_TARGET: 'W_TARGET',
+                            PAGE_PARENT: 'W_PARENT'}[op]
+                lines.append(f'{mnemonic} {_slot_name(ops[i + 1], symbols, addr)}')
+                i += 2
+            elif op in (PAGE_TARGET_ID, PAGE_PARENT_ID):
+                mnemonic = 'W_TARGET' if op == PAGE_TARGET_ID else 'W_PARENT'
+                lines.append(f'{mnemonic} #{ops[i + 1]}')
+                i += 2
+            else:
+                lines.append(f'??? 0x{op:02X}')
+                break
+    except (IndexError, ValueError):
+        lines.append('; <truncated op>')
+    if offset + 2 + length > len(page):
+        lines.append('; <block runs past the end of the page>')
+    return lines
+
+
+def format_image(image, page=b'', symbols=None):
+    """Header + disassembly of a VM image; each W_LOAD is followed by its
+    widget page block (indented)."""
+    image = _ImageBytes(image) if not hasattr(image, 'func_names') else image
+    version = image[0]
+    func_count = struct.unpack_from('<H', image, 1)[0]
+    code = image[_image_header_size(version, func_count):]
+    out = _image_header_lines(image, symbols)
+    text = disassemble(code, labels=_extract_labels(image, symbols), symbols=symbols,
+                       wide=_image_is_wide(image))
+    load = re.compile(r'^([0-9A-F]{4,}): W_LOAD page\+0x([0-9A-F]+)')
+    for line in text.splitlines():
+        out.append(line)
+        m = load.match(line)
+        if m:
+            addr, off = int(m.group(1), 16), int(m.group(2), 16)
+            out += ['        ' + l for l in disassemble_page_block(page, off, symbols, addr)]
+    return '\n'.join(out)
+
+
 def _print_image_header(output, debug_symbols=None):
     """Print image header summary to stdout."""
+    print('\n'.join(_image_header_lines(output, debug_symbols)))
+
+
+def _image_header_lines(output, debug_symbols=None):
+    """Image header summary lines."""
+    lines = []
     real_names = dict(_debug_func_names(debug_symbols))
     real_names.update(getattr(output, 'func_names', {}))
     version = output[0]
@@ -3635,7 +3951,7 @@ def _print_image_header(output, debug_symbols=None):
         wc, ec = output[7], output[8]
         extra += f', widgets={wc}, exts={ec}'
 
-    print(f'; image v{version}: {func_count} functions, {global_count} globals, opcodes={len(output) - opcode_start}B{extra}')
+    lines.append(f'; image v{version}: {func_count} functions, {global_count} globals, opcodes={len(output) - opcode_start}B{extra}')
     for i in range(func_count):
         base = hdr_base + i * 12
         fid = struct.unpack_from('<H', output, base)[0]
@@ -3646,7 +3962,8 @@ def _print_image_header(output, debug_symbols=None):
             name = real_names[offset]
         else:
             name = _KIND_NAMES.get(kind, f'kind={kind}')
-        print(f';   #{fid} {name}  offset={offset} length={length}')
+        lines.append(f';   #{fid} {name}  offset={offset} length={length}')
+    return lines
 
 
 def main():

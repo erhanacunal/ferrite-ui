@@ -99,6 +99,7 @@ class Op:
     F_WRITE    = 0x41  # + u32 addr + u8 len + data
     W_TARGET_S = 0x42  # widget id from stack (dynamic target)
     W_PARENT_S = 0x43  # parent id from stack (dynamic parent)
+    W_LOAD     = 0x44  # + u16 block offset in the widget page (RES_PAGE)
 
     # Builtins as first-class opcodes (all no-arg, operands on stack)
     FILL_RECT       = 0x80
@@ -703,6 +704,11 @@ class Asm:
         widget variable whose runtime id is stored in its var slot."""
         self._emit(Op.W_PARENT_S)
 
+    def w_load(self, offset):
+        """Run the widget page block at `offset` (static widget setup)."""
+        self._emit(Op.W_LOAD)
+        self._emit_u16(offset)
+
     # --- Array ops ---
 
     def arr_alloc(self, size):
@@ -1024,6 +1030,7 @@ OP_NAMES = {
     0x40: 'F_READ', 0x41: 'F_WRITE',
     0x42: 'W_TARGET_S',
     0x43: 'W_PARENT_S',
+    0x44: 'W_LOAD',
 
     0x80: 'fillRect', 0x81: 'rect', 0x82: 'line', 0x83: 'circle',
     0x84: 'fillCircle', 0x85: 'drawImage', 0x86: 'drawTextLit',
@@ -1213,6 +1220,9 @@ def disassemble(data, labels=None, symbols=None, wide=False):
         elif op == Op.W_PARENT:
             pid = data[pos]; pos += 1
             lines.append(f'{addr:04X}: W_PARENT {pid}')
+        elif op == Op.W_LOAD:
+            off = struct.unpack_from('<H', data, pos)[0]; pos += 2
+            lines.append(f'{addr:04X}: W_LOAD page+0x{off:04X}')
 
         # W_SET_LEN: prop_id + len + data
         elif op == Op.W_SET_LEN:

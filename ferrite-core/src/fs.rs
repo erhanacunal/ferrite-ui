@@ -42,10 +42,14 @@ const CURRENT_VERSION: u16 = 2;
 pub const RES_FONT: u8 = 0;
 pub const RES_IMAGE: u8 = 1;
 pub const RES_PROGRAM: u8 = 2;
+/// Widget page: static widget setup of the program with the same name,
+/// run by its OP_W_LOAD blocks (see `vm::Vm::set_page`).
 pub const RES_PAGE: u8 = 3;
 pub const RES_FILE: u8 = 4;
 /// System configuration record (pool sizes) — see [`crate::syscfg`].
 pub const RES_SYSCFG: u8 = 5;
+/// `Fs::find_kind` wildcard.
+pub const RES_ANY: u8 = 0xFF;
 
 // --- Header (flash'tan okunan, RAM'de cache) ---
 
@@ -136,10 +140,22 @@ impl Fs {
 
     /// Resource'u isimle bul. Linear scan — max 127 entry, yeterince hızlı.
     /// Bulunamazsa None döner.
+    #[inline]
     pub fn find<F: FlashBackend>(
         &self,
         flash: &FlashImpl<F>,
         name: &[u8],
+    ) -> Option<ResourceEntry> {
+        self.find_kind(flash, name, RES_ANY)
+    }
+
+    /// Find a resource by name and kind (`RES_ANY` = first with that name).
+    /// A program and its widget page share a name.
+    pub fn find_kind<F: FlashBackend>(
+        &self,
+        flash: &FlashImpl<F>,
+        name: &[u8],
+        want: u8,
     ) -> Option<ResourceEntry> {
         let mut entry_buf = [0u8; ENTRY_SIZE];
 
@@ -148,8 +164,8 @@ impl Fs {
             flash.read(addr, &mut entry_buf);
 
             // İsim karşılaştır (null-terminated)
-            if name_eq(&entry_buf[..NAME_LEN], name) {
-                let kind = entry_buf[16];
+            let kind = entry_buf[16];
+            if name_eq(&entry_buf[..NAME_LEN], name) && (want == RES_ANY || kind == want) {
                 // [17..20] = padding
                 let offset = u32::from_le_bytes([
                     entry_buf[20],

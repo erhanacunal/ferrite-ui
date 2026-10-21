@@ -150,9 +150,42 @@ Older images are still parsed:
 | `0x3B` | `W_GET` | `u8 prop_id` | push scalar property value |
 | `0x3C` | `W_PARENT` | `u8 parent_id` | parent current target under fixed parent |
 | `0x3D` | `W_SET_LEN` | `u8 prop_id, u8 len, bytes` | set compound/text property |
+| `0x43` | `W_PARENT_S` | - | pop widget id and parent current target under it |
+| `0x44` | `W_LOAD` | `u16 offset` | run the widget page block at `offset` |
 
 `W_SET_LEN` uses either UTF-8 bytes for `TEXT` or packed ZigZag varints for
 compound numeric properties.
+
+### Widget Page
+
+With `"widget_page": true` in `project.json` (top level for every program, or
+on one program to override it), the compiler moves
+static widget setup out of the bytecode into a widget page: a `RES_PAGE`
+resource with the program's name. It applies to `setup()` and to functions
+called only from `setup()` (directly or through each other) that are never
+used as callbacks. Each run of statements whose code is only `W_ALLTAR`,
+`target`, `parent`, `set` with constant values and constant stores becomes one
+`W_LOAD`. The ops run in the same order with the same operands, so widget ids,
+tree order and the target left behind are unchanged. A run that saves 3 bytes
+or less stays bytecode.
+
+```text
+page   "FP", version u8 = 1, reserved u8, then blocks
+block  u16 LE length + ops        (W_LOAD offset = block start in the page)
+
+op          operands                        bytecode equivalent
+0x01..0x3F  ZigZag varint                   PUSH value; W_SET op
+0x40..0x7F  u8 len, payload                 W_SET_LEN op len payload
+0x80        u8 slot, ZigZag varint          PUSH value; STORE slot
+0x81        u8 slot                         W_ALLTAR slot
+0x84        u8 widget_id                    W_TARGET id
+0x85        u8 slot                         LOAD slot; W_TARGET_S
+0x86        u8 widget_id                    W_PARENT id
+0x87        u8 slot                         LOAD slot; W_PARENT_S
+```
+
+A missing page, a block past its end or a malformed op is VM fault 15
+(`bad widget page`).
 
 ### Arrays And Flash
 
