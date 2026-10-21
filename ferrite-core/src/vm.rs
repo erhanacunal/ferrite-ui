@@ -2019,7 +2019,8 @@ impl Vm {
                 self.state = VmState::Waiting;
             }
             OP_STR_LIT => {
-                // Inline text: u8 len + text bytes → allocate in pool, push str_id
+                // Inline text: u8 len + text bytes → interned pool string (an
+                // identical live literal is reused), push str_id
                 let len = self.read_u8() as usize;
                 let start = self.pc as usize;
                 if start + len <= self.code.len() {
@@ -2027,7 +2028,7 @@ impl Vm {
                     let n = len.min(buf.len());
                     self.code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as CodeAddr;
-                    match ctx.strpool.alloc(&buf[..n]) {
+                    match ctx.strpool.intern(&buf[..n]) {
                         Some(id) => self.push(id as i32),
                         None => self.fail(fault::STR_ALLOC),
                     }
@@ -2898,7 +2899,9 @@ impl Vm {
     fn set_compound_prop<P: Platform>(&mut self, prop_id: u8, data: &[u8], ctx: &mut Ctx<P>) {
         if prop_id == PROP_TEXT {
             if self.target.is_some() {
-                if let Some(str_id) = ctx.strpool.alloc(data) {
+                // `set(text, "…")` literal: interned like OP_STR_LIT, so a
+                // handler that runs it repeatedly reuses one slot.
+                if let Some(str_id) = ctx.strpool.intern(data) {
                     if let Some(ext) = ctx.tree.ensure_ext(self.target) {
                         ext.text_id = str_id;
                     }

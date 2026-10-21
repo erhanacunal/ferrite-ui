@@ -62,6 +62,10 @@ pub struct StringPool {
     meta: Box<[StrMeta]>,
     /// smart_clear scratch: keep marker + old→new id remap, one per slot.
     remap: Box<[u16]>,
+    /// One bit per slot: set for literals from `intern`. Those may be shared
+    /// by several users, so they are never freed or edited in place. `u16`
+    /// words so the allocation shares `remap`'s `try_alloc_slice::<u16>`.
+    interned: Box<[u16]>,
     count: u16,
     next: Off,
 }
@@ -80,6 +84,7 @@ impl StringPool {
             buf: Box::new([]),
             meta: Box::new([]),
             remap: Box::new([]),
+            interned: Box::new([]),
             count: 0,
             next: 0,
         }
@@ -106,17 +111,35 @@ impl StringPool {
     }
 
     fn alloc_storage(&mut self, bytes: usize, strings: usize) -> bool {
-        let (Some(buf), Some(meta), Some(remap)) = (
+        let (Some(buf), Some(meta), Some(remap), Some(interned)) = (
             try_alloc_slice(bytes, 0u8),
             try_alloc_slice(strings, StrMeta::empty()),
             try_alloc_slice(strings, STR_NONE),
+            try_alloc_slice(strings.div_ceil(16), 0u16),
         ) else {
             return false;
         };
         self.buf = buf;
         self.meta = meta;
         self.remap = remap;
+        self.interned = interned;
         true
+    }
+
+    #[inline(never)]
+    fn is_interned(&self, id: u16) -> bool {
+        self.interned[id as usize / 16] & (1 << (id % 16)) != 0
+    }
+
+    #[inline(never)]
+    fn set_interned(&mut self, id: u16, on: bool) {
+        let word = &mut self.interned[id as usize / 16];
+        let bit = 1 << (id % 16);
+        if on {
+            *word |= bit;
+        } else {
+            *word &= !bit;
+        }
     }
 
     /// Pool buffer size in bytes.
@@ -145,12 +168,41 @@ impl StringPool {
         };
         self.next += len as Off;
         self.count += 1;
+        self.set_interned(id, false);
         Some(id as u16)
     }
 
+    /// Allocate a string literal, or return the id of an identical literal
+    /// that is still live. Without this every run of a `set(text, "…")` line
+    /// took a new slot, and a handler without `strClear()` filled the pool.
+    /// The result may be shared: `free` ignores it and `insert_byte` /
+    /// `delete_byte` edit a private copy. `smart_clear` reclaims it as usual.
+    pub fn intern(&mut self, data: &[u8]) -> Option<u16> {
+        for id in 0..self.count {
+            if self.is_interned(id) && self.get(id) == data {
+                return Some(id);
+            }
+        }
+        let id = self.alloc(data)?;
+        self.set_interned(id, true);
+        Some(id)
+    }
+
+    /// Id that can be edited in place: `id` itself, or a fresh private copy
+    /// when `id` is an interned (possibly shared) literal.
+    fn unshare(&mut self, id: u16) -> Option<u16> {
+        if self.is_interned(id) {
+            // concat with "nothing" = copy into a fresh, non-interned slot.
+            self.concat(id, STR_NONE)
+        } else {
+            Some(id)
+        }
+    }
+
     /// Mark a string as freed (zero-length). Reclaimed on next smart_clear().
+    /// Interned literals may be shared, so they are left alone.
     pub fn free(&mut self, id: u16) {
-        if (id as usize) < self.count as usize {
+        if (id as usize) < self.count as usize && !self.is_interned(id) {
             self.meta[id as usize].len = 0;
         }
     }
@@ -220,6 +272,7 @@ impl StringPool {
         };
         self.next += total as Off;
         self.count += 1;
+        self.set_interned(id, false);
         Some(id as u16)
     }
 
@@ -231,20 +284,23 @@ impl StringPool {
 
     /// Insert a byte at `pos` in string `id`. Copies to end of pool.
     /// Old space becomes a gap, reclaimed by smart_clear().
-    pub fn insert_byte(&mut self, id: u16, pos: usize, byte: u8, max_len: u8) -> bool {
+    /// Returns the id now holding the text — a new one when `id` was a shared
+    /// literal, so the caller must store it — or None if nothing changed.
+    pub fn insert_byte(&mut self, id: u16, pos: usize, byte: u8, max_len: u8) -> Option<u16> {
         if id as usize >= self.count as usize {
-            return false;
+            return None;
         }
+        // Enforce max_length (0 = no limit)
+        if max_len > 0 && self.meta[id as usize].len as usize >= max_len as usize {
+            return None;
+        }
+        let id = self.unshare(id)?;
         let m = self.meta[id as usize];
         let old_len = m.len as usize;
-        // Enforce max_length (0 = no limit)
-        if max_len > 0 && old_len >= max_len as usize {
-            return false;
-        }
         let pos = pos.min(old_len);
         let new_len = old_len + 1;
         if self.next as usize + new_len > self.buf.len() {
-            return false;
+            return None;
         }
         let buf = &mut self.buf;
         let src = m.offset as usize;
@@ -264,27 +320,29 @@ impl StringPool {
             len: new_len as Off,
         };
         self.next += new_len as Off;
-        true
+        Some(id)
     }
 
     /// Delete byte at `pos` in string `id`. Copies to end of pool.
     /// Old space becomes a gap, reclaimed by smart_clear().
-    pub fn delete_byte(&mut self, id: u16, pos: usize) -> bool {
+    /// Returns the id now holding the text (see `insert_byte`).
+    pub fn delete_byte(&mut self, id: u16, pos: usize) -> Option<u16> {
         if id as usize >= self.count as usize {
-            return false;
+            return None;
         }
+        if pos >= self.meta[id as usize].len as usize {
+            return None;
+        }
+        let id = self.unshare(id)?;
         let m = self.meta[id as usize];
         let old_len = m.len as usize;
-        if pos >= old_len || old_len == 0 {
-            return false;
-        }
         let new_len = old_len - 1;
         if new_len == 0 {
             self.meta[id as usize].len = 0;
-            return true;
+            return Some(id);
         }
         if self.next as usize + new_len > self.buf.len() {
-            return false;
+            return None;
         }
         let buf = &mut self.buf;
         let src = m.offset as usize;
@@ -302,7 +360,7 @@ impl StringPool {
             len: new_len as Off,
         };
         self.next += new_len as Off;
-        true
+        Some(id)
     }
 
     /// Smart clear: keep strings referenced by widget text_id fields,
@@ -345,33 +403,30 @@ impl StringPool {
         // Phase 2: Compact survivors to front with new sequential IDs.
         // A survivor's remap entry is overwritten with its new id; dropped
         // strings (and empty survivors) go back to STR_NONE.
-        let buf = &mut self.buf;
         let mut new_id: u16 = 0;
         let mut write_pos: Off = 0;
 
         for old_id in 0..old_count {
-            if remap[old_id] != KEEP {
+            if self.remap[old_id] != KEEP {
                 continue;
             }
             let m = self.meta[old_id];
             if m.len == 0 {
-                remap[old_id] = STR_NONE;
+                self.remap[old_id] = STR_NONE;
                 continue;
             }
             let src = m.offset as usize;
-            let len = m.len as usize;
-            let dst = write_pos as usize;
             // Move bytes forward (src >= dst always since we compact left)
-            if dst != src {
-                for i in 0..len {
-                    buf[dst + i] = buf[src + i];
-                }
-            }
+            self.buf.copy_within(src..src + m.len as usize, write_pos as usize);
             self.meta[new_id as usize] = StrMeta {
                 offset: write_pos,
                 len: m.len,
             };
-            remap[old_id] = new_id;
+            // Carry the interned bit. Ids only move down and are visited in
+            // order, so `new_id`'s old bit was already consumed.
+            let interned = self.is_interned(old_id as u16);
+            self.set_interned(new_id, interned);
+            self.remap[old_id] = new_id;
             write_pos += m.len;
             new_id += 1;
         }
@@ -920,7 +975,7 @@ mod tests {
         let input = tree.alloc().unwrap();
         let t = pool.alloc(b"a").unwrap();
         tree.ensure_ext(input).unwrap().text_id = t;
-        assert!(pool.delete_byte(t, 0));
+        assert_eq!(pool.delete_byte(t, 0), Some(t));
         pool.smart_clear(&mut tree);
         assert_eq!(tree.text_id(input), STR_NONE);
 
@@ -929,5 +984,62 @@ mod tests {
         assert_eq!(pool.get(out), b"Name: ");
         let both = pool.concat(STR_NONE, STR_NONE).unwrap();
         assert_eq!(pool.get(both), b"");
+    }
+
+    #[test]
+    fn intern_reuses_identical_literals() {
+        let mut pool = StringPool::new();
+        assert!(pool.configure(64, 4));
+        let a = pool.intern(b"Tapped: 0").unwrap();
+        let b = pool.intern(b"Reset").unwrap();
+        // widget_demo on_reset: the same literals on every tap, no strClear().
+        for _ in 0..20 {
+            assert_eq!(pool.intern(b"Tapped: 0"), Some(a));
+            assert_eq!(pool.intern(b"Reset"), Some(b));
+        }
+        // A computed string with the same bytes is not shared.
+        let c = pool.alloc(b"Reset").unwrap();
+        assert_ne!(c, b);
+        assert_eq!(pool.intern(b"Reset"), Some(b));
+    }
+
+    #[test]
+    fn interned_literal_is_not_freed_or_edited_in_place() {
+        let mut pool = StringPool::new();
+        let lit = pool.intern(b"ab").unwrap();
+        pool.free(lit);
+        assert_eq!(pool.get(lit), b"ab", "free ignores shared literals");
+
+        // Typing into an input that shows the literal edits a copy.
+        let edited = pool.insert_byte(lit, 2, b'c', 0).unwrap();
+        assert_ne!(edited, lit);
+        assert_eq!(pool.get(edited), b"abc");
+        assert_eq!(pool.get(lit), b"ab", "other users keep the literal");
+        // The copy is private: later edits stay in place.
+        assert_eq!(pool.delete_byte(edited, 0), Some(edited));
+        assert_eq!(pool.get(edited), b"bc");
+
+        let gone = pool.delete_byte(lit, 0).unwrap();
+        assert_ne!(gone, lit);
+        assert_eq!(pool.get(lit), b"ab");
+    }
+
+    #[test]
+    fn smart_clear_keeps_interned_flag() {
+        let mut pool = StringPool::new();
+        let mut tree = WidgetTree::new();
+        let w = tree.alloc().unwrap();
+        let _tmp = pool.alloc(b"tmp").unwrap();
+        let lit = pool.intern(b"label").unwrap();
+        tree.ensure_ext(w).unwrap().text_id = lit;
+
+        pool.smart_clear(&mut tree);
+        let moved = tree.text_id(w);
+        assert_eq!(moved, 0);
+        assert_eq!(pool.intern(b"label"), Some(moved), "still found after compaction");
+        // The slot it vacated is a plain string again.
+        let plain = pool.alloc(b"x").unwrap();
+        pool.free(plain);
+        assert_eq!(pool.get(plain), b"");
     }
 }

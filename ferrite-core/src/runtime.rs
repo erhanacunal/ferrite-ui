@@ -1424,8 +1424,10 @@ impl FullInput {
                 let max_len = ctx.tree.max_length(id);
                 let cursor = ctx.tree.value(id).max(0) as usize;
                 if text_id != 0xFFFF {
-                    if ctx.strpool.insert_byte(text_id, cursor, ch, max_len) {
+                    // A shared literal is edited as a private copy: store its id.
+                    if let Some(new_id) = ctx.strpool.insert_byte(text_id, cursor, ch, max_len) {
                         if let Some(ext) = ctx.tree.ensure_ext(id) {
+                            ext.text_id = new_id;
                             ext.value = (cursor + 1) as i16;
                         }
                         ctx.tree.mark_dirty(id);
@@ -1450,8 +1452,9 @@ impl FullInput {
                 let text_id = ctx.tree.text_id(id);
                 let cursor = ctx.tree.value(id).max(0) as usize;
                 if text_id != 0xFFFF && cursor > 0 {
-                    if ctx.strpool.delete_byte(text_id, cursor - 1) {
+                    if let Some(new_id) = ctx.strpool.delete_byte(text_id, cursor - 1) {
                         if let Some(ext) = ctx.tree.ensure_ext(id) {
+                            ext.text_id = new_id;
                             ext.value = (cursor - 1) as i16;
                         }
                         ctx.tree.mark_dirty(id);
