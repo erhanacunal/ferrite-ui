@@ -815,11 +815,11 @@ fn draw_widget<P: Platform>(
     ctx.lcd.update_underlay(|_| Underlay::solid(content_bg));
 
     // Background image. KIND_GRAPH repurposes ext.image_id as graph flags,
-    // so skip the image lookup for graphs.
+    // and KIND_IMAGE draws its image centered below, so skip both here.
     // Image draws honor the scissor (see `Image::draw`): set it per clip
     // rect so a partial redraw decodes only the exposed part instead of the
     // whole image, and does not paint over widgets in front of it.
-    if ext.image_id != 0 && widget.kind != KIND_GRAPH {
+    if ext.image_id != 0 && widget.kind != KIND_GRAPH && widget.kind != KIND_IMAGE {
         let bg = inner_rect(abs, &b);
         for cr in clip.iter() {
             ctx.lcd.set_scissor(Some(*cr));
