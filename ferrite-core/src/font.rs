@@ -385,8 +385,8 @@ impl Font {
         // label bleed onto the page that is actually on screen.
         if draw_x + glyph.width as i16 <= 0
             || draw_y + glyph.height as i16 <= 0
-            || draw_x >= L::WIDTH as i16
-            || draw_y >= L::HEIGHT as i16
+            || draw_x >= lcd.width() as i16
+            || draw_y >= lcd.height() as i16
         {
             return glyph.x_advance;
         }

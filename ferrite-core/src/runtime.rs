@@ -465,8 +465,21 @@ fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     {
         vm.set_page(page.offset, page.size);
     }
+    apply_orientation(ctx, vm);
     reserve_tree(ctx, vm);
     err
+}
+
+/// Rotate the screen as the loaded image asks (header portrait flag) and size
+/// the root widget to the resulting logical screen.
+fn apply_orientation<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) {
+    ctx.lcd.set_portrait(vm.portrait);
+    let size = Size {
+        w: ctx.lcd.width(),
+        h: ctx.lcd.height(),
+    };
+    let root = ctx.tree.root;
+    ctx.tree.get_mut(root).size = size;
 }
 
 /// Pre-allocate tree capacity (one allocation per Vec): the RES_SYSCFG caps
@@ -539,6 +552,7 @@ fn reload_program<P: PlatformRuntime>(
     if !vm.load_ram(prog) {
         vm.load_raw(prog);
     }
+    apply_orientation(ctx, vm);
     reserve_tree(ctx, vm);
 
     if vm.has_code() {
@@ -604,8 +618,8 @@ pub fn show_error<P: PlatformRuntime>(
     code: u8,
     vm_fault: Option<(u8, CodeAddr)>,
 ) {
-    let sw = P::LcdB::WIDTH;
-    let sh = P::LcdB::HEIGHT;
+    let sw = ctx.lcd.width();
+    let sh = ctx.lcd.height();
     let bg = P::BG_COLOR;
     let fg = P::FG_COLOR;
 
@@ -898,10 +912,11 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
 
     #[inline(never)]
     fn handle(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, touch: &mut TouchImpl<P::TouchB>) {
-        let event = match touch.poll() {
+        let mut event = match touch.poll() {
             Some(e) => e,
             None => return,
         };
+        (event.x, event.y) = ctx.lcd.touch_to_logical(event.x, event.y);
         match event.kind {
             TouchEventKind::Press => {
                 let hit = crate::touch::hit_test(&mut ctx.tree, event.x, event.y);
@@ -978,10 +993,11 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
 
     #[inline(never)]
     fn handle(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, touch: &mut TouchImpl<P::TouchB>) {
-        let event = match touch.poll() {
+        let mut event = match touch.poll() {
             Some(e) => e,
             None => return,
         };
+        (event.x, event.y) = ctx.lcd.touch_to_logical(event.x, event.y);
         match event.kind {
             TouchEventKind::Press => self.on_press(ctx, vm, event.x, event.y),
             TouchEventKind::Hold => self.on_hold(ctx, vm, event.x, event.y),

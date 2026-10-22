@@ -1,0 +1,12 @@
+{
+    "screen": [480, 800],
+    "include_dirs": ["../../../lib"],
+    "portrait": true,
+    "programs": [
+        {
+            "name": "main",
+            "source": "main.fl",
+            "exec_mode": "ram"
+        }
+    ]
+}

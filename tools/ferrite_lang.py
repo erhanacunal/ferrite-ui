@@ -19,7 +19,7 @@ import sys
 import struct
 import json
 from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
-                        AddrOverflow, IMAGE_FLAG_WIDE_ADDR, NARROW_CODE_MAX,
+                        AddrOverflow, IMAGE_FLAG_WIDE_ADDR, IMAGE_FLAG_PORTRAIT, NARROW_CODE_MAX,
                         FunctionKind as CcFunctionKind,
                         SYSTEM_CALLBACK_KINDS,
                         disassemble, encode_svarint, decode_svarint,
@@ -3640,7 +3640,7 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
 
 
 def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty",
-                widget_page=False):
+                widget_page=False, portrait=False):
     """Compile source to VM image format (v4 header + opcodes).
 
     Image format (v4):
@@ -3652,6 +3652,8 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
     Flags bit 0: render_mode (0=dirty, 1=buffered, 2=epaper)
     Flags bit 2: wide_addr — set when the bytecode outgrows 64 KB; jump/call
       targets are then u32 and the image needs a `wide_code` firmware build.
+    Flags bit 3: portrait — screen rotated 90° (480x800 logical on an 800x480
+      panel); keep IMAGE_FLAG_PORTRAIT in vm.rs in sync.
     widget_count: number of alloc() call sites for firmware Vec pre-allocation.
 
     Requires fn setup() and fn loop() in the source.
@@ -3718,6 +3720,8 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         flags = 0x01 if render_mode == "buffered" else 0x02 if render_mode == "epaper" else 0x00
         if wide:
             flags |= IMAGE_FLAG_WIDE_ADDR
+        if portrait:
+            flags |= IMAGE_FLAG_PORTRAIT
         # Use #hint_widgets if provided; fall back to static alloc()-site count.
         auto_wc = codegen.next_widget_id - 1
         widget_count = hint_wc if hint_wc > 0 else auto_wc

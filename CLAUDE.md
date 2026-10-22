@@ -26,6 +26,7 @@ Bare-metal HMI framework written in Rust for the Nextion NX8048K070 display.
 | 0x03 | X start (x1)        | uint16 pixel  |
 | 0x06 | Y end (y2)          | uint16 pixel  |
 | 0x07 | X end (x2)          | uint16 pixel  |
+| 0x0D | Write scan order     | bit 0: 0=row-major (x first), 1=column-major (y first) |
 | 0x0F | Begin pixel write    | subsequent data = pixel color |
 | 0x04 | Front buffer swap    | lcd4Value = lcd5Value |
 | 0x05 | Select back buffer   | 0 or 1        |
@@ -40,6 +41,14 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 
 `lcd4Value` = what FPGA displays (front), `lcd5Value` = what is written (back).
 `begin_frame` is not called when `lcd4 == lcd5` — buffer is already fresh.
+
+### CMD 0x0D — Write Scan Order
+
+- Bit 0 = 1: pixel data fills the window column by column (y increments first, then the next x column). The window registers (0x02/0x03/0x06/0x07) mean the same thing in both modes.
+- Solid fills look identical in both modes, but streamed content (glyphs, images) comes out transposed inside its window — a transpose is a rotation *plus a mirror*, so portrait mode does not use it (see Portrait Mode).
+- Firmware never sets it; leave it 0 (row-major), or text drawing garbles.
+- Bits 1–15 showed no effect on writes (text and solid fills); scan-out effects not checked.
+- Found with `examples/nextion/fpga/fpga_probe.fl` (bit sweep), `fpga_map_probe.fl`, `fpga_stream_probe.fl`.
 
 ## Architecture Decisions
 
@@ -96,6 +105,13 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - Set via `"render_mode": "dirty"|"buffered"` in project.json
   - In buffered mode: OP_BEGIN_FRAME/OP_END_FRAME are no-ops (framework handles buffer management)
 
+### Portrait Mode
+- `"portrait": true` in project.json → image header flags bit 3 → `runtime::apply_orientation` (after load) sets `LcdImpl::set_portrait` and sizes the root widget to the logical screen. Off by default; only one rotation exists.
+- Logical screen = `HEIGHT`×`WIDTH` (480×800 on Nextion), mounted with the panel's **right edge at the top**: logical `(x, y)` → panel `(WIDTH-1-y, x)`. `lcd.width()`/`height()` give the logical size; use them, not `LcdBackend::WIDTH/HEIGHT`, for screen bounds.
+- Done entirely in `LcdImpl` (all backends, sim included): rects/pixels are remapped + clipped to the logical screen; a `begin_pixels` stream opens one 1 px wide panel column window per logical row (`RotStream`), ~10 extra bus writes per streamed row. CMD 0x0D is not used — column-major writes give a transpose (mirror), not a rotation.
+- Touch: `lcd.touch_to_logical` in both `InputHandler`s. Raw `fpgaCmd`/`fpgaData` and boot-time screens (recovery, SD boot) stay in panel coordinates.
+- Still landscape-only: the on-screen keyboard (`keyboard.rs`, 800 px layout) and `lib/modal.fl` (800×480 backdrop).
+
 ### Render
 - **Anti-aliasing (`lcd/smooth.rs`, adapted from TFT_eSPI smooth graphics, FreeBSD notice in the file + THIRD_PARTY_NOTICES.md):** circles/ellipses/rings/arcs (half-pixel ring rasterizer, `sqrt_fraction` coverage), rounded rects (fill, gradient fill + border ring), lines/polylines/paths (wedge-line distance coverage, round caps, tapered `draw_wedge`), polygon fills (exact-area signed-accumulation scanline, even-odd, one screen-width f32 row buffer on the heap). Interiors stay `fill_rect` spans. Selected inside the public `LcdImpl` primitives (`lcd.smooth()`).
   - **Readback backends** (`LcdBackend::HAS_ALPHA`: n32903, tdo_y13, sim): everything above; edge pixels → `blend_pixel`.
@@ -131,6 +147,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Image header v3:** version(u8=3) + func_count(u16) + global_count(u16) + flags(u16) + func_table
   - flags bit 0: render_mode (0=dirty, 1=buffered)
   - flags bit 2: wide_addr — JMP/JZ/JNZ/CALL targets are u32 instead of u16. The compiler sets it automatically only when bytecode exceeds 64 KB (smaller images are byte-identical to before).
+  - flags bit 3: portrait — `"portrait": true` in project.json (see Portrait mode)
   - Backward compatible: v1/v2 images parsed with 5-byte header, v3 with 7-byte header
 - **Code addresses (`vm::CodeAddr`):** `u16` by default; `u32` with the ferrite-core `wide_code` feature (enabled by tdo_y13, n32903, sim). Widens pc, call frames, callback queue, snapshots. A narrow build (nextion, epaper) rejects wide images and >64 KB code at load → Code 6. VM error USART payload carries a u32 PC (6 bytes) once PC > 0xFFFF.
 

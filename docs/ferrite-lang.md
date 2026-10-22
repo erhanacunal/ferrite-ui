@@ -1665,7 +1665,7 @@ The compiler produces a binary image with an embedded function table header (cur
 version:        u8  (= 4)
 function_count: u16 LE
 global_count:   u16 LE
-flags:          u16 LE  (bit 0: render_mode — 0=dirty, 1=buffered)
+flags:          u16 LE  (bit 0: render_mode — 0=dirty, 1=buffered; bit 3: portrait)
 widget_count:   u8      (pre-allocation hint)
 ext_count:      u8      (pre-allocation hint)
 [func_id: u16, kind: u8, pad: u8, offset: u32, length: u32] × N

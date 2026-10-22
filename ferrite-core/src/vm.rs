@@ -231,6 +231,9 @@ const FUNC_ENTRY_SIZE: usize = 12;
 /// Image header flags bit 2: JMP/JZ/JNZ/CALL targets are u32 LE instead of u16.
 /// Set by the compiler when the bytecode exceeds 64 KB. (Bit 1 = e-paper mode.)
 const IMAGE_FLAG_WIDE_ADDR: u16 = 0x04;
+/// Image header flags bit 3: portrait — the screen is rotated 90° (logical
+/// 480x800 on the 800x480 panel, see `LcdImpl::set_portrait`).
+const IMAGE_FLAG_PORTRAIT: u16 = 0x08;
 
 /// Bytecode address: pc, return addresses, callback entry points. `u32` with
 /// the `wide_code` feature (RAM-rich BSPs), `u16` otherwise so the GD32 build
@@ -686,6 +689,8 @@ pub struct Vm {
     // Platform policy override: when set, replaces the header's render mode after
     // load (e-paper panels force `EPaper`). `None` honors the image header.
     pub forced_render_mode: Option<RenderMode>,
+    // Portrait screen from the image header (IMAGE_FLAG_PORTRAIT).
+    pub portrait: bool,
     // Widget allocation hint from v4 image header (0 = unknown, use fallback).
     pub widget_count: u8,
     pub ext_count: u8,
@@ -758,6 +763,7 @@ impl Vm {
             global_count: 0,
             wide_addr: false,
             render_mode: RenderMode::Dirty,
+            portrait: false,
             forced_render_mode: None,
             in_paint: false,
             page_base: 0,
@@ -843,7 +849,7 @@ impl Vm {
     /// Load a VM image from RAM bytes. Parses the image header and keeps
     /// opcodes in a Vec<u8>. Returns false if the header is invalid.
     pub fn load_ram(&mut self, image: &[u8]) -> bool {
-        if let Some((funcs, opcode_start, gc, rm, wc, ec, wide)) = parse_image_header(image) {
+        if let Some((funcs, opcode_start, gc, rm, wc, ec, wide, portrait)) = parse_image_header(image) {
             if !code_addressable(wide, image.len() - opcode_start) {
                 return false;
             }
@@ -855,6 +861,7 @@ impl Vm {
             self.frame_base = gc;
             self.frame_size = 0;
             self.render_mode = self.forced_render_mode.unwrap_or(rm);
+            self.portrait = portrait;
             self.widget_count = wc;
             self.ext_count = ec;
             true
@@ -890,7 +897,7 @@ impl Vm {
         hdr_buf.resize(hdr_len, 0);
         flash.read(base, &mut hdr_buf);
 
-        if let Some((funcs, opcode_start, gc, rm, wc, ec, wide)) = parse_image_header(&hdr_buf) {
+        if let Some((funcs, opcode_start, gc, rm, wc, ec, wide, portrait)) = parse_image_header(&hdr_buf) {
             let opcode_base = base + opcode_start as u32;
             let opcode_len = total_len.saturating_sub(opcode_start);
             if !code_addressable(wide, opcode_len) {
@@ -911,6 +918,7 @@ impl Vm {
             self.frame_base = gc;
             self.frame_size = 0;
             self.render_mode = self.forced_render_mode.unwrap_or(rm);
+            self.portrait = portrait;
             self.widget_count = wc;
             self.ext_count = ec;
             true
@@ -1401,6 +1409,7 @@ impl Vm {
         self.cb_tail = 0;
         self.critical = false;
         self.render_mode = RenderMode::Dirty;
+        self.portrait = false;
         self.open_files = [None, None];
         self.modal_stack.clear();
         self.anims.clear();
@@ -3233,7 +3242,7 @@ impl Vm {
 // === Image header parser ===
 
 /// Parse VM image header. Returns (function table, opcode start, global_count, render_mode,
-/// widget_count, ext_count, wide_addr). widget_count/ext_count are 0 for v1-v3 images.
+/// widget_count, ext_count, wide_addr, portrait). widget_count/ext_count are 0 for v1-v3 images.
 ///
 /// Format v1/v2:
 ///   version(u8) + function_count(u16 LE) + global_count(u16 LE)
@@ -3245,10 +3254,11 @@ impl Vm {
 ///   v3 header + widget_count(u8) + ext_count(u8) + [...]
 ///   flags bit 0: render_mode (0=dirty, 1=buffered)
 ///   flags bit 2: wide_addr (jump/call targets are u32)
+///   flags bit 3: portrait (screen rotated 90°)
 #[allow(clippy::type_complexity)]
 fn parse_image_header(
     data: &[u8],
-) -> Option<(Vec<FuncEntry>, usize, u8, RenderMode, u8, u8, bool)> {
+) -> Option<(Vec<FuncEntry>, usize, u8, RenderMode, u8, u8, bool, bool)> {
     if data.len() < IMAGE_HEADER_SIZE_V2 {
         return None;
     }
@@ -3286,6 +3296,7 @@ fn parse_image_header(
         RenderMode::Dirty
     };
     let wide = flags & IMAGE_FLAG_WIDE_ADDR != 0;
+    let portrait = flags & IMAGE_FLAG_PORTRAIT != 0;
     let (widget_count, ext_count) = if version >= 4 { (data[7], data[8]) } else { (0, 0) };
 
     let table_size = func_count * FUNC_ENTRY_SIZE;
@@ -3322,6 +3333,7 @@ fn parse_image_header(
         widget_count,
         ext_count,
         wide,
+        portrait,
     ))
 }
 

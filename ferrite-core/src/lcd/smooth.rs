@@ -968,8 +968,8 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
         // Rows/columns limited to the screen; edges left of it still count.
         let left = x_min.max(0);
-        let right = x_max.min(B::WIDTH as i32 - 1);
-        let (top, bottom) = (y_min.max(0), y_max.min(B::HEIGHT as i32 - 1));
+        let right = x_max.min(self.width() as i32 - 1);
+        let (top, bottom) = (y_min.max(0), y_max.min(self.height() as i32 - 1));
         if right < left || bottom < top {
             return true;
         }

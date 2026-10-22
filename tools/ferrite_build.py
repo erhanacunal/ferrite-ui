@@ -123,7 +123,7 @@ def _write_debug_sidecar(source_path: str, image: bytes) -> str | None:
 # --- Program compilation ---
 
 def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
-                    widget_page=False) -> bytes:
+                    widget_page=False, portrait=False) -> bytes:
     """Ferrite lang source → VM image (header + opcodes). With widget_page,
     static widget setup moves to the image's `.page` (RES_PAGE contents)."""
     try:
@@ -136,7 +136,8 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
     source = Path(source_path).read_text(encoding="utf-8")
     try:
         image = build_image(source, filename=source_path, include_dirs=include_dirs,
-                            render_mode=render_mode, widget_page=widget_page)
+                            render_mode=render_mode, widget_page=widget_page,
+                            portrait=portrait)
         _write_debug_sidecar(source_path, image)
         return image
     except CompileError as e:
@@ -412,6 +413,8 @@ def build(project_path: str, output_path: str | None) -> dict:
 
     # 4. Programs — .fl → VM image (header + opcodes, metadata embedded)
     render_mode = project.get("render_mode", "dirty")
+    # Portrait: whole UI rotated 90° (image header flag, applied at load).
+    portrait = bool(project.get("portrait", False))
     # Project-level default; a program's own "widget_page" overrides it.
     widget_page = project.get("widget_page", False)
     prog_widget_count = 0
@@ -422,7 +425,8 @@ def build(project_path: str, output_path: str | None) -> dict:
         source = project_dir / prog["source"]
         image_data = compile_program(str(source), include_dirs=include_dirs,
                                      render_mode=render_mode,
-                                     widget_page=prog.get("widget_page", widget_page))
+                                     widget_page=prog.get("widget_page", widget_page),
+                                     portrait=portrait)
         exec_mode = prog.get("exec_mode", "ram")
         prog_flags = RES_FLAG_FLASH_EXEC if exec_mode == "flash" else 0
         resources.append((name, RES_PROGRAM, image_data, prog_flags))

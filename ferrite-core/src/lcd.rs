@@ -105,6 +105,28 @@ pub struct LcdImpl<B: LcdBackend> {
     /// What lies under the shape being drawn, for `AA_UNDERLAY` backends;
     /// `None` = unknown, draw aliased.
     underlay: Cell<Option<Underlay>>,
+    /// Portrait mode (image header flag): the framework draws on a
+    /// `HEIGHT`x`WIDTH` logical screen, mapped onto the panel rotated 90°
+    /// (logical top = the panel's right edge): `(x, y)` -> `(WIDTH-1-y, x)`.
+    portrait: Cell<bool>,
+    /// Portrait `begin_pixels` stream: each logical row is one panel column,
+    /// opened as its own 1 px wide window when the row starts.
+    stream: Cell<RotStream>,
+}
+
+/// Portrait pixel-stream cursor (see `LcdImpl::stream`).
+#[derive(Clone, Copy, Default)]
+struct RotStream {
+    /// Logical window x (= panel y of every column window).
+    x: u16,
+    /// Logical window width (= column window height).
+    w: u16,
+    /// Logical y of the next row to open.
+    next_y: u16,
+    /// Pixels left in the current row; 0 = open the next row first.
+    left: u16,
+    /// Current row lies on screen (rows past the bottom are discarded).
+    vis: bool,
 }
 
 /// Colours known to lie under a shape, for anti-aliasing without readback
@@ -131,6 +153,97 @@ impl<B: LcdBackend> LcdImpl<B> {
             be,
             scissor: Cell::new(None),
             underlay: Cell::new(None),
+            portrait: Cell::new(false),
+            stream: Cell::new(RotStream::default()),
+        }
+    }
+
+    /// Switch between landscape (panel orientation) and portrait (rotated
+    /// 90°, see `portrait`). Set when a program image is loaded.
+    #[inline]
+    pub fn set_portrait(&self, on: bool) {
+        self.portrait.set(on);
+    }
+
+    #[inline]
+    pub fn is_portrait(&self) -> bool {
+        self.portrait.get()
+    }
+
+    /// Logical screen width (the panel's height in portrait).
+    #[inline]
+    pub fn width(&self) -> u16 {
+        if self.portrait.get() { B::HEIGHT } else { B::WIDTH }
+    }
+
+    /// Logical screen height (the panel's width in portrait).
+    #[inline]
+    pub fn height(&self) -> u16 {
+        if self.portrait.get() { B::WIDTH } else { B::HEIGHT }
+    }
+
+    /// Panel touch point -> logical coordinates (inverse of the portrait map).
+    #[inline]
+    pub fn touch_to_logical(&self, x: u16, y: u16) -> (u16, u16) {
+        if self.portrait.get() {
+            (y, (B::WIDTH - 1).saturating_sub(x))
+        } else {
+            (x, y)
+        }
+    }
+
+    /// Portrait: logical rect -> panel rect, clipped to the logical screen.
+    #[inline]
+    fn rot_rect(&self, x: u16, y: u16, w: u16, h: u16) -> Option<(u16, u16, u16, u16)> {
+        let (lw, lh) = (B::HEIGHT, B::WIDTH);
+        if x >= lw || y >= lh || w == 0 || h == 0 {
+            return None;
+        }
+        let w = w.min(lw - x);
+        let h = h.min(lh - y);
+        Some((B::WIDTH - y - h, x, h, w))
+    }
+
+    /// Portrait stream: open the next row's column window if the current row
+    /// is used up. Returns (pixels left in the row, row is on screen).
+    #[inline]
+    fn rot_row(&self) -> (u16, bool) {
+        let mut s = self.stream.get();
+        if s.left == 0 {
+            let ly = s.next_y;
+            s.next_y = ly.wrapping_add(1);
+            s.left = s.w;
+            s.vis = ly < B::WIDTH;
+            if s.vis {
+                self.be.begin_pixels(B::WIDTH - 1 - ly, s.x, 1, s.w);
+            }
+            self.stream.set(s);
+        }
+        (s.left, s.vis)
+    }
+
+    #[inline]
+    fn rot_consume(&self, n: u16) {
+        let mut s = self.stream.get();
+        s.left -= n;
+        self.stream.set(s);
+    }
+
+    /// Portrait: stream `n` pixels row by row; `emit(offset, count)` writes
+    /// pixels `offset..offset+count` of the run into the open column window.
+    fn rot_write(&self, n: usize, emit: impl Fn(usize, usize)) {
+        if self.stream.get().w == 0 {
+            return;
+        }
+        let mut i = 0;
+        while i < n {
+            let (left, vis) = self.rot_row();
+            let k = (left as usize).min(n - i);
+            if vis {
+                emit(i, k);
+            }
+            self.rot_consume(k as u16);
+            i += k;
         }
     }
 
@@ -211,6 +324,12 @@ impl<B: LcdBackend> LcdImpl<B> {
     #[inline]
     pub fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
         if let Some((x, y, w, h)) = self.scissored(x, y, w, h) {
+            if self.portrait.get() {
+                if let Some((x, y, w, h)) = self.rot_rect(x, y, w, h) {
+                    self.be.fill_rect(x, y, w, h, color)
+                }
+                return;
+            }
             self.be.fill_rect(x, y, w, h, color)
         }
     }
@@ -235,27 +354,50 @@ impl<B: LcdBackend> LcdImpl<B> {
 
     #[inline]
     pub fn begin_pixels(&self, x: u16, y: u16, w: u16, h: u16) {
+        if self.portrait.get() {
+            // Rows are opened lazily by `rot_row` as pixels arrive.
+            self.stream.set(RotStream { x, w, next_y: y, left: 0, vis: false });
+            return;
+        }
         self.be.begin_pixels(x, y, w, h)
     }
 
     #[inline(always)]
     pub fn write_pixel(&self, color: u16) {
+        if self.portrait.get() {
+            self.rot_write(1, |_, _| self.be.write_pixel(color));
+            return;
+        }
         self.be.write_pixel(color)
     }
 
     #[inline]
     pub fn write_pixels(&self, colors: &[u16]) {
+        if self.portrait.get() {
+            self.rot_write(colors.len(), |i, k| self.be.write_pixels(&colors[i..i + k]));
+            return;
+        }
         self.be.write_pixels(colors)
     }
 
     #[inline]
     pub fn write_run(&self, color: u16, n: usize) {
+        if self.portrait.get() {
+            self.rot_write(n, |_, k| self.be.write_run(color, k));
+            return;
+        }
         self.be.write_run(color, n)
     }
 
     #[inline]
     pub fn draw_pixel(&self, x: u16, y: u16, color: u16) {
         if self.scissored_out(x, y) {
+            return;
+        }
+        if self.portrait.get() {
+            if x < B::HEIGHT && y < B::WIDTH {
+                self.be.draw_pixel(B::WIDTH - 1 - y, x, color)
+            }
             return;
         }
         self.be.draw_pixel(x, y, color)
@@ -286,6 +428,12 @@ impl<B: LcdBackend> LcdImpl<B> {
     #[inline]
     pub fn blend_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16, alpha: u8) {
         if let Some((x, y, w, h)) = self.scissored(x, y, w, h) {
+            if self.portrait.get() {
+                if let Some((x, y, w, h)) = self.rot_rect(x, y, w, h) {
+                    self.be.blend_rect(x, y, w, h, color, alpha)
+                }
+                return;
+            }
             self.be.blend_rect(x, y, w, h, color, alpha)
         }
     }
@@ -293,6 +441,12 @@ impl<B: LcdBackend> LcdImpl<B> {
     #[inline]
     pub fn blend_pixel(&self, x: u16, y: u16, color: u16, alpha: u8) {
         if self.scissored_out(x, y) {
+            return;
+        }
+        if self.portrait.get() {
+            if x < B::HEIGHT && y < B::WIDTH {
+                self.be.blend_pixel(B::WIDTH - 1 - y, x, color, alpha)
+            }
             return;
         }
         self.be.blend_pixel(x, y, color, alpha)
@@ -1431,6 +1585,93 @@ mod tests {
 
     fn grid() -> LcdImpl<Grid> {
         LcdImpl::with_backend(Grid(RefCell::new(vec![0; N * N])))
+    }
+
+    /// 8x4 panel with a hardware-style address window: `begin_pixels` sets
+    /// the window, `write_pixel` fills it row-major and wraps.
+    struct Panel {
+        px: RefCell<Vec<u16>>,
+        win: Cell<(u16, u16, u16, u16)>,
+        pos: Cell<u16>,
+    }
+    const PW: usize = 8;
+    const PH: usize = 4;
+    impl LcdBackend for Panel {
+        const WIDTH: u16 = PW as u16;
+        const HEIGHT: u16 = PH as u16;
+        fn begin_frame(&mut self) {}
+        fn end_frame(&mut self) {}
+        fn back_buf(&self) -> u8 {
+            0
+        }
+        fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
+            for yy in y..y + h {
+                for xx in x..x + w {
+                    self.px.borrow_mut()[yy as usize * PW + xx as usize] = color;
+                }
+            }
+        }
+        fn begin_pixels(&self, x: u16, y: u16, w: u16, h: u16) {
+            self.win.set((x, y, w, h));
+            self.pos.set(0);
+        }
+        fn write_pixel(&self, color: u16) {
+            let (x, y, w, h) = self.win.get();
+            let i = self.pos.get();
+            self.pos.set((i + 1) % (w * h));
+            let (xx, yy) = (x + i % w, y + i / w);
+            self.px.borrow_mut()[yy as usize * PW + xx as usize] = color;
+        }
+        fn send_command(&self, _: u16) {}
+        fn send_data(&self, _: u16) {}
+    }
+
+    #[test]
+    fn portrait_maps_every_primitive_onto_the_rotated_panel() {
+        let lcd = LcdImpl::with_backend(Panel {
+            px: RefCell::new(vec![0; PW * PH]),
+            win: Cell::new((0, 0, 0, 0)),
+            pos: Cell::new(0),
+        });
+        lcd.set_portrait(true);
+        assert_eq!((lcd.width(), lcd.height()), (PH as u16, PW as u16));
+
+        // Logical 4x8 reference image, drawn with every primitive kind.
+        let mut want = vec![0u16; PW * PH]; // logical, row-major, width PH
+        lcd.fill_rect(0, 0, 4, 2, 7);
+        for ly in 0..2 {
+            for lx in 0..4 {
+                want[ly * PH + lx] = 7;
+            }
+        }
+        // Streamed 3x3 window at (1, 3): pixels 10, 11, ... in row order,
+        // split across write_pixel / write_pixels / write_run.
+        lcd.begin_pixels(1, 3, 3, 3);
+        lcd.write_pixel(10);
+        lcd.write_pixels(&[11, 12, 13, 14]);
+        lcd.write_run(15, 4);
+        let stream = [10, 11, 12, 13, 14, 15, 15, 15, 15];
+        for (i, &c) in stream.iter().enumerate() {
+            want[(3 + i / 3) * PH + 1 + i % 3] = c;
+        }
+        lcd.draw_pixel(0, 7, 20);
+        want[7 * PH] = 20;
+        // Off the logical screen: clipped, not wrapped.
+        lcd.fill_rect(2, 6, 10, 10, 30);
+        for ly in 6..8 {
+            for lx in 2..4 {
+                want[ly * PH + lx] = 30;
+            }
+        }
+
+        // Logical (lx, ly) sits at panel (W-1-ly, lx).
+        let got = lcd.backend().px.borrow();
+        for ly in 0..PW {
+            for lx in 0..PH {
+                assert_eq!(got[lx * PW + (PW - 1 - ly)], want[ly * PH + lx], "lx={lx} ly={ly}");
+            }
+        }
+        assert_eq!(lcd.touch_to_logical(PW as u16 - 1, 2), (2, 0));
     }
 
     #[test]

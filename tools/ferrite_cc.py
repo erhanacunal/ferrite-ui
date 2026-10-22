@@ -387,6 +387,9 @@ def pack_pair(high, low):
 # Image header flags bit 2: JMP/JZ/JNZ/CALL targets are u32 LE (bytecode
 # past 64 KB). Keep in sync with IMAGE_FLAG_WIDE_ADDR in ferrite-core/src/vm.rs.
 IMAGE_FLAG_WIDE_ADDR = 0x04
+# Image header flags bit 3: portrait (screen rotated 90 degrees). Keep in sync
+# with IMAGE_FLAG_PORTRAIT in ferrite-core/src/vm.rs.
+IMAGE_FLAG_PORTRAIT = 0x08
 # Largest bytecode a narrow (u16-target) image can address.
 NARROW_CODE_MAX = 0xFFFF
 

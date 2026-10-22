@@ -1,0 +1,103 @@
+// main.fl — Portrait mode demo (480x800 logical screen)
+//
+// project.json "portrait": true rotates the whole UI 90°: mount the panel
+// with its right edge at the top. Coordinates, widgets, text and touch all
+// work in the rotated 480x800 space.
+//
+// Tap the button: the counter label updates.
+
+#include "core.fl"
+#include "color.fl"
+#include "shapes.fl"
+
+var count_lbl;
+var tap_btn;
+var count;
+
+fn on_tap_click(widget_id) {
+    count = count + 1;
+    count_lbl.text = sprintf("Taps: %d", count);
+    // Free the previous text (strClear keeps strings widgets still use)
+    strClear();
+    dirty();
+    render();
+}
+
+fn setup() {
+    target(0);
+    set(bg_color, 0x18C3);
+
+    var title_lbl = alloc();
+    parent(0);
+    set(kind, KIND_LABEL);
+    set(loc_x, 0);
+    set(loc_y, 40);
+    set(size_w, 480);
+    set(size_h, 40);
+    set(bg_color, 0x18C3);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Portrait 480 x 800");
+
+    // Corner markers: red = logical top-left, green = bottom-right
+    var tl = alloc();
+    parent(0);
+    set(loc_x, 0);
+    set(loc_y, 0);
+    set(size_w, 30);
+    set(size_h, 30);
+    set(bg_color, RED);
+
+    var br = alloc();
+    parent(0);
+    set(loc_x, 450);
+    set(loc_y, 770);
+    set(size_w, 30);
+    set(size_h, 30);
+    set(bg_color, GREEN);
+
+    tap_btn = alloc();
+    parent(0);
+    set(kind, KIND_LABEL);
+    set(loc_x, 140);
+    set(loc_y, 360);
+    set(size_w, 200);
+    set(size_h, 80);
+    set(bg_color, BLUE);
+    set(text_color, WHITE);
+    set(press_color, NAVY);
+    set(border_radius, 12);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Tap me");
+    set(clickable, ON);
+    set(on_click, @on_tap_click);
+
+    count_lbl = alloc();
+    parent(0);
+    set(kind, KIND_LABEL);
+    set(loc_x, 90);
+    set(loc_y, 480);
+    set(size_w, 300);
+    set(size_h, 40);
+    set(bg_color, 0x18C3);
+    set(text_color, LIGHT_GRAY);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Taps: 0");
+
+    var ring = alloc();
+    parent(0);
+    set(kind, KIND_CIRCLE);
+    set(loc_x, 190);
+    set(loc_y, 600);
+    set(size_w, 100);
+    set(size_h, 100);
+    set(bg_color, ORANGE);
+    set(border, 4, 4, 4, 4);
+    set(border_color, WHITE);
+
+    return 0;
+}
+
+fn loop() {
+    delay(50);
+}

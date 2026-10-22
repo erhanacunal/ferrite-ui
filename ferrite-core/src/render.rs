@@ -12,12 +12,11 @@ use crate::widget::{
     KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
 };
 
-/// Screen-bounds rect for the panel backing `B`. The panel defines its own
-/// dimensions via `LcdBackend::WIDTH`/`HEIGHT`, so the framework stays free of
-/// feature-gated size consts.
+/// Screen-bounds rect: the panel size from `LcdBackend::WIDTH`/`HEIGHT`,
+/// swapped in portrait mode (`LcdImpl::width`/`height`).
 #[inline]
-fn screen_rect<B: LcdBackend>() -> Rect {
-    Rect::new(0, 0, B::WIDTH, B::HEIGHT)
+fn screen_rect<B: LcdBackend>(lcd: &LcdImpl<B>) -> Rect {
+    Rect::new(0, 0, lcd.width(), lcd.height())
 }
 
 // --- Buffered render (double-buffered partial redraw) ---
@@ -95,7 +94,7 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) -> PaintL
     let buf = ctx.lcd.back_buf();
     ctx.tree.ensure_dfs();
     // Whole-screen clip for the unclipped Pass-2 draws (built once).
-    let full = ClipRegion::from_rect(screen_rect::<P::LcdB>());
+    let full = ClipRegion::from_rect(screen_rect(&ctx.lcd));
 
     // Pass 1: for each dirty widget whose rect in THIS buffer is stale,
     // redraw everything behind it clipped to the stale rect.
@@ -232,7 +231,7 @@ fn set_buf_prev_rect(tree: &mut WidgetTree, id: WidgetId, buf: u8, rect: Rect) {
 /// before entering the enclosing render loop.
 fn redraw_behind<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm, target_idx: usize, stale: Rect) {
     let mut clip = ClipRegion::from_rect(stale);
-    clip.clip_to_bounds(&screen_rect::<P::LcdB>());
+    clip.clip_to_bounds(&screen_rect(&ctx.lcd));
     if clip.is_empty() {
         return;
     }
@@ -279,7 +278,7 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
     ctx.tree.ensure_dfs();
     // Whole-screen clip for the full redraw — built once, reused for every
     // widget so we don't pay region setup in the per-widget loop.
-    let full = ClipRegion::from_rect(screen_rect::<P::LcdB>());
+    let full = ClipRegion::from_rect(screen_rect(&ctx.lcd));
     let mut i = 0;
     while i < ctx.tree.dfs_len() {
         let id = ctx.tree.dfs_at(i);
@@ -444,7 +443,7 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
             let sabs = ctx.tree.absolute_rect(sid);
 
             let mut clip = ClipRegion::from_rect(sabs);
-            clip.clip_to_bounds(&screen_rect::<P::LcdB>());
+            clip.clip_to_bounds(&screen_rect(&ctx.lcd));
 
             // Viewport clipping for children of scroll containers
             let sp = ctx.tree.scroll_parent(sid);
@@ -705,7 +704,7 @@ fn draw_widget<P: Platform>(
                 // soft inner edge blends over the background rather than over
                 // what is behind the widget (without readback: mixes with the
                 // fill colour, its outer edge with the backdrop).
-                let Some(outer) = abs.intersection(&screen_rect::<P::LcdB>()) else {
+                let Some(outer) = abs.intersection(&screen_rect(&ctx.lcd)) else {
                     continue;
                 };
                 if draw_bg {
@@ -1787,14 +1786,14 @@ fn blend_clipped<B: LcdBackend>(
 
 /// Draw rect clipped to screen bounds.
 fn fill_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, color: Color) {
-    if let Some(r) = rect.intersection(&screen_rect::<B>()) {
+    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
         lcd.fill_rect(r.x as u16, r.y as u16, r.w, r.h, color);
     }
 }
 
 /// Blend rect clipped to screen bounds.
 fn blend_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, color: Color, alpha: u8) {
-    if let Some(r) = rect.intersection(&screen_rect::<B>()) {
+    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
         lcd.blend_rect(r.x as u16, r.y as u16, r.w, r.h, color, alpha);
     }
 }
@@ -1810,7 +1809,7 @@ fn fill_gradient_rect_screen<B: LcdBackend>(
     c2: Color,
     dir: u8,
 ) {
-    if let Some(r) = rect.intersection(&screen_rect::<B>()) {
+    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
         let x_off = (r.x as i32 - full_rect.x as i32).max(0) as u16;
         let y_off = (r.y as i32 - full_rect.y as i32).max(0) as u16;
         lcd.fill_gradient_rect(
@@ -1838,21 +1837,21 @@ fn fill_gradient_rounded_rect_screen<B: LcdBackend>(
     c2: Color,
     dir: u8,
 ) {
-    if let Some(r) = rect.intersection(&screen_rect::<B>()) {
+    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
         lcd.fill_gradient_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, c1, c2, dir);
     }
 }
 
 /// Draw rounded rect outline clipped to screen bounds.
 fn rounded_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, radius: u16, color: Color) {
-    if let Some(r) = rect.intersection(&screen_rect::<B>()) {
+    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
         lcd.draw_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, color);
     }
 }
 
 /// Fill rounded rect clipped to screen bounds.
 fn fill_rounded_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, radius: u16, color: Color) {
-    if let Some(r) = rect.intersection(&screen_rect::<B>()) {
+    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
         lcd.fill_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, color);
     }
 }
@@ -1865,7 +1864,7 @@ fn fill_rounded_rect_blend_screen<B: LcdBackend>(
     color: Color,
     alpha: u8,
 ) {
-    if let Some(r) = rect.intersection(&screen_rect::<B>()) {
+    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
         lcd.fill_rounded_rect_blend(r.x as u16, r.y as u16, r.w, r.h, radius, color, alpha);
     }
 }
