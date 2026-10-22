@@ -6,7 +6,7 @@
     "programs": [
         {
             "name": "main",
-            "source": "fpga_read_probe.fl",
+            "source": "fpga_stream_probe.fl",
             "exec_mode": "ram"
         }
     ]

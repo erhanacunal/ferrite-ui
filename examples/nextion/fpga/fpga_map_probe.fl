@@ -1,0 +1,156 @@
+// fpga_map_probe.fl — Map the pixel shuffle caused by REG 0x0D bit 0
+//
+// With 0x0D bit 0 set, solid fills look right but any pattern inside a
+// small area is scrambled — the writes look like they land at permuted
+// positions. This probe draws 1 px lines at every offset 0..15 inside
+// 32-aligned cells, with bit 0 set, next to reference marks drawn with
+// 0x0D = 0. Comparing where each line lands with its red tick gives the
+// permutation.
+//
+// Everything in red / gray / labels is drawn with 0x0D = 0 (correct).
+// Everything in white is drawn with 0x0D = 0x0001.
+//
+// Screens (10 s each, then repeat):
+//   1  vertical lines:   cell i -> 1x32 line at x0+i, red tick above at x0+i
+//   2  horizontal lines: cell i -> 32x1 line at y0+i, red tick left at y0+i
+//   3  asymmetric "F" shape: normal | bit 0, 32-aligned | bit 0, offset (+5,+3)
+//
+// Cells are 32-aligned (x0 = 32 + 96*col, y0 = 96 / 288) so line offsets
+// are relative to a power-of-two block boundary.
+
+var REG = 0x0D;
+var MODE = 0x0001;
+var HOLD = 10000;
+var n = 0;
+var x0 = 0;
+var y0 = 0;
+var s = 0;
+
+fn reg_off() {
+    fpgaCmd(REG, 0x0000);
+}
+
+fn reg_on() {
+    fpgaCmd(REG, MODE);
+}
+
+fn header(title) {
+    reg_off();
+    fillRect(0, 0, 800, 480, 0x0000);
+    drawStr(10, 16, 0, 0xFFFF, 0, title);
+    drawStr(10, 40, 0, 0x7BEF, 0, str("red/gray = reg 0  |  white = reg 0x0001"));
+    strClear();
+}
+
+// Cell origin for cell 0..15: 2 rows of 8, 32-aligned
+fn cell_x(i) {
+    return 32 + (i % 8) * 96;
+}
+
+fn cell_y(i) {
+    return 96 + (i / 8) * 192;
+}
+
+fn cell_label(i) {
+    s = sprintf("%d", i);
+    drawStr(cell_x(i) + 40, cell_y(i) - 14, 0, 0x7BEF, 0, s);
+    strClear();
+}
+
+fn screen_vertical() {
+    header(str("1: VERTICAL 1x32 line at x0+i (red tick = intended x)"));
+    n = 0;
+    while (n < 16) {
+        x0 = cell_x(n);
+        y0 = cell_y(n);
+        cell_label(n);
+        // Reference (reg 0): 32 px span markers + intended column tick
+        fillRect(x0, y0 - 4, 32, 1, 0x4208);
+        fillRect(x0, y0 + 35, 32, 1, 0x4208);
+        fillRect(x0 + 16, y0 - 6, 1, 3, 0x4208);
+        fillRect(x0 + n, y0 - 10, 1, 6, 0xF800);
+        fillRect(x0 + n, y0 + 36, 1, 6, 0xF800);
+        // Test (reg 0x0001)
+        reg_on();
+        fillRect(x0 + n, y0, 1, 32, 0xFFFF);
+        reg_off();
+        n = n + 1;
+    }
+    delay(HOLD);
+}
+
+fn screen_horizontal() {
+    header(str("2: HORIZONTAL 32x1 line at y0+i (red tick = intended y)"));
+    n = 0;
+    while (n < 16) {
+        x0 = cell_x(n);
+        y0 = cell_y(n);
+        cell_label(n);
+        // Reference (reg 0): 32 px span markers + intended row tick
+        fillRect(x0 - 4, y0, 1, 32, 0x4208);
+        fillRect(x0 + 35, y0, 1, 32, 0x4208);
+        fillRect(x0 - 6, y0 + 16, 3, 1, 0x4208);
+        fillRect(x0 - 10, y0 + n, 6, 1, 0xF800);
+        fillRect(x0 + 36, y0 + n, 6, 1, 0xF800);
+        // Test (reg 0x0001)
+        reg_on();
+        fillRect(x0, y0 + n, 32, 1, 0xFFFF);
+        reg_off();
+        n = n + 1;
+    }
+    delay(HOLD);
+}
+
+// 16x16 asymmetric "F": left bar, top bar, short middle bar, corner dot
+fn draw_f(x, y, c) {
+    fillRect(x, y, 1, 16, c);
+    fillRect(x, y, 12, 1, c);
+    fillRect(x, y + 7, 8, 1, c);
+    fillRect(x + 15, y + 15, 1, 1, c);
+}
+
+fn screen_shape() {
+    header(str("3: 'F' 16x16  |  normal  |  reg 1 aligned  |  reg 1 offset +5,+3"));
+    // 32-aligned frames (reg 0) around each sample
+    fillRect(64, 128, 32, 1, 0x4208);
+    fillRect(256, 128, 32, 1, 0x4208);
+    fillRect(448, 128, 32, 1, 0x4208);
+    drawStr(64, 120, 0, 0x7BEF, 0, str("normal"));
+    drawStr(256, 120, 0, 0x7BEF, 0, str("reg 1"));
+    drawStr(448, 120, 0, 0x7BEF, 0, str("reg 1 +5,+3"));
+    strClear();
+    // Normal
+    draw_f(64, 160, 0xF800);
+    // Bit 0, 32-aligned
+    reg_on();
+    draw_f(256, 160, 0xFFFF);
+    reg_off();
+    // Bit 0, not aligned
+    reg_on();
+    draw_f(448 + 5, 160 + 3, 0xFFFF);
+    reg_off();
+    // Same three, twice the size (32x32), lower row
+    fillRect(64, 260, 1, 32, 0xF800);
+    fillRect(64, 260, 24, 1, 0xF800);
+    fillRect(64, 275, 16, 1, 0xF800);
+    reg_on();
+    fillRect(256, 260, 1, 32, 0xFFFF);
+    fillRect(256, 260, 24, 1, 0xFFFF);
+    fillRect(256, 275, 16, 1, 0xFFFF);
+    fillRect(453, 263, 1, 32, 0xFFFF);
+    fillRect(453, 263, 24, 1, 0xFFFF);
+    fillRect(453, 278, 16, 1, 0xFFFF);
+    reg_off();
+    delay(HOLD);
+}
+
+fn setup() {
+    setBrightness(100);
+    return 0;
+}
+
+fn loop() {
+    screen_vertical();
+    screen_horizontal();
+    screen_shape();
+}

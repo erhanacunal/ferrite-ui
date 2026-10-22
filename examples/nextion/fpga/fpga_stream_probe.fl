@@ -1,0 +1,166 @@
+// fpga_stream_probe.fl — How REG 0x0D bit 0 changes streamed pixel data
+//
+// The map probe showed bit 0 does not move fillRect writes. fillRect holds
+// ONE colour on the bus and only pulses the clock; text (2bpp ROM font)
+// streams DIFFERENT words into a window — and that is what gets scrambled.
+// This probe streams known words via fpgaCmd/fpgaData into raw windows,
+// each test drawn twice: left = reg 0 (reference), right = reg 0x0001.
+//
+// Rows:
+//   1  COUNT  32x20 window, gray backdrop, exactly 320 red words (half the
+//             window). Reference fills the top 10 rows. 5 rows -> 2 words
+//             per pixel; 20 rows -> 2 pixels per word.
+//   2  ORDER  32x40 window, 8 colours x 4 px per row:
+//             red orange yellow green cyan blue magenta white
+//   3  ALT    32x40 window, alternating red/blue words (1 px stripes);
+//             a solid mix colour means words are being paired
+//   4  ALT2   32x40 window, alternating white/black words
+//   5  COLOR  fillRect (constant bus) 30x30: F800 07E0 001F 1234
+//
+// Gray (0x4208) backdrops are drawn with reg 0 so unwritten pixels show.
+// Screen holds 15 s, then repeats.
+
+var REG = 0x09;
+var MODE = 0x0001;
+var HOLD = 15000;
+var LX = 160;      // reference column x
+var RX = 420;      // reg 0x0001 column x
+var n = 0;
+var r = 0;
+var c = 0;
+
+fn reg_off() {
+    fpgaCmd(REG, 0x0000);
+}
+
+fn reg_set(on) {
+    if (on) {
+        fpgaCmd(REG, MODE);
+    } else {
+        fpgaCmd(REG, 0x0000);
+    }
+}
+
+// Open a raw pixel window. CMD 0x0F's data word is the FIRST pixel.
+fn win(x, y, w, h, first) {
+    fpgaCmd(0x03, x);
+    fpgaCmd(0x02, y);
+    fpgaCmd(0x07, x + w - 1);
+    fpgaCmd(0x06, y + h - 1);
+    fpgaCmd(0x0F, first);
+}
+
+fn rainbow(k) {
+    if (k == 0) { return 0xF800; }
+    if (k == 1) { return 0xFD20; }
+    if (k == 2) { return 0xFFE0; }
+    if (k == 3) { return 0x07E0; }
+    if (k == 4) { return 0x07FF; }
+    if (k == 5) { return 0x001F; }
+    if (k == 6) { return 0xF81F; }
+    return 0xFFFF;
+}
+
+fn backdrop(x, y, w, h) {
+    reg_off();
+    fillRect(x - 2, y - 2, w + 4, h + 4, 0x4208);
+}
+
+fn test_count(x, y, on) {
+    backdrop(x, y, 32, 20);
+    reg_set(on);
+    win(x, y, 32, 20, 0xF800);
+    n = 1;
+    while (n < 320) {
+        fpgaData(0xF800);
+        n = n + 1;
+    }
+    reg_off();
+}
+
+fn test_order(x, y, on) {
+    backdrop(x, y, 32, 40);
+    reg_set(on);
+    win(x, y, 32, 40, 0xF800);
+    // first word already sent; finish row 0 then rows 1..39
+    n = 1;
+    r = 0;
+    while (r < 40) {
+        while (n < 32) {
+            fpgaData(rainbow(n / 4));
+            n = n + 1;
+        }
+        n = 0;
+        r = r + 1;
+    }
+    reg_off();
+}
+
+fn test_alt(x, y, on, a, b) {
+    backdrop(x, y, 32, 40);
+    reg_set(on);
+    win(x, y, 32, 40, a);
+    n = 1;
+    while (n < 32 * 40) {
+        if (n % 2 == 0) {
+            fpgaData(a);
+        } else {
+            fpgaData(b);
+        }
+        n = n + 1;
+    }
+    reg_off();
+}
+
+fn test_color(x, y, on) {
+    backdrop(x, y, 150, 30);
+    reg_set(on);
+    fillRect(x, y, 30, 30, 0xF800);
+    fillRect(x + 40, y, 30, 30, 0x07E0);
+    fillRect(x + 80, y, 30, 30, 0x001F);
+    fillRect(x + 120, y, 30, 30, 0x1234);
+    reg_off();
+}
+
+fn label(y, t) {
+    drawStr(10, y, 0, 0xFFFF, 0, t);
+    strClear();
+}
+
+fn setup() {
+    setBrightness(100);
+    return 0;
+}
+
+fn loop() {
+    reg_off();
+    fillRect(0, 0, 800, 480, 0x0000);
+    drawStr(10, 16, 0, 0xFFFF, 0, str("STREAM PROBE  REG 0x0D   left = reg 0   right = reg 0x0001"));
+    drawStr(LX, 40, 0, 0x7BEF, 0, str("reg 0"));
+    drawStr(RX, 40, 0, 0x7BEF, 0, str("reg 0x0001"));
+    strClear();
+
+    label(70, str("1 COUNT"));
+    test_count(LX, 60, 0);
+    test_count(RX, 60, 1);
+
+    label(125, str("2 ORDER"));
+    test_order(LX, 105, 0);
+    test_order(RX, 105, 1);
+
+    label(195, str("3 ALT r/b"));
+    test_alt(LX, 175, 0, 0xF800, 0x001F);
+    test_alt(RX, 175, 1, 0xF800, 0x001F);
+
+    label(265, str("4 ALT w/k"));
+    test_alt(LX, 245, 0, 0xFFFF, 0x0000);
+    test_alt(RX, 245, 1, 0xFFFF, 0x0000);
+
+    label(335, str("5 COLOR"));
+    drawStr(LX, 395, 0, 0x7BEF, 0, str("F800 07E0 001F 1234"));
+    strClear();
+    test_color(LX, 315, 0);
+    test_color(RX, 315, 1);
+
+    delay(HOLD);
+}

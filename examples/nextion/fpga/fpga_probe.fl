@@ -1,0 +1,107 @@
+// fpga_probe.fl — Probe FPGA register 0x0D, one bit at a time
+//
+// Writing 0x00FF to CMD 0x0D garbles transparent text (1x1 pixel writes)
+// while large fillRects stay correct. This probe isolates which bit does it
+// and which write patterns it affects.
+//
+// For each value: the screen and row labels are drawn with 0x0D = 0 (always
+// readable), then 0x0D is set, then the probe rows are drawn, then 0x0D is
+// reset to 0. Nothing carries over from one value to the next.
+//
+// Rows (drawn AFTER the value is set):
+//   A  transparent text, gray 0x7BEF    (per-pixel 1x1 windows)
+//   B  transparent text, white 0xFFFF
+//   C  opaque text, bg 0x0001           (one window per glyph, streamed)
+//   D  single pixels via fillRect 1x1   (every 4th px)
+//   E  narrow rects, widths 1,2,3,4,5,7,8,16 x 40
+//   F  wide reference rect 200x40
+//
+// Usage: load via USART, watch each screen (3 s per value).
+
+var REG = 0x0D;
+var v = 0;
+var i = 0;
+var x = 0;
+var s = 0;
+var k = 0;
+
+fn reset_reg() {
+    fpgaCmd(REG, 0x0000);
+}
+
+fn draw_frame(val, n) {
+    // Header + row labels, drawn with the register in its reset state
+    reset_reg();
+    fillRect(0, 0, 800, 480, 0x0000);
+    s = sprintf("REG 0x%02X = 0x%04X   (%d/18)", REG, val, n);
+    drawStr(10, 16, 0, 0xFFFF, 0, s);
+    drawStr(10, 70, 0, 0x7BEF, 0, str("A"));
+    drawStr(10, 100, 0, 0x7BEF, 0, str("B"));
+    drawStr(10, 130, 0, 0x7BEF, 0, str("C"));
+    drawStr(10, 160, 0, 0x7BEF, 0, str("D"));
+    drawStr(10, 215, 0, 0x7BEF, 0, str("E"));
+    drawStr(10, 285, 0, 0x7BEF, 0, str("F"));
+    strClear();
+}
+
+fn draw_rows() {
+    // A: transparent gray text
+    drawStr(40, 70, 0, 0x7BEF, 0, str("Quick brown fox 0123456789 +=:"));
+    // B: transparent white text
+    drawStr(40, 100, 0, 0xFFFF, 0, str("Quick brown fox 0123456789 +=:"));
+    // C: opaque text (bg != 0 -> streamed glyph window)
+    drawStr(40, 130, 0, 0xFFFF, 0x0001, str("Quick brown fox 0123456789 +=:"));
+    strClear();
+
+    // D: single pixels, every 4th px
+    i = 0;
+    while (i < 100) {
+        fillRect(40 + i * 4, 155, 1, 1, 0xFFFF);
+        i = i + 1;
+    }
+
+    // E: narrow rects of increasing width
+    x = 40;
+    fillRect(x, 190, 1, 40, 0xFFFF);  x = x + 21;
+    fillRect(x, 190, 2, 40, 0xFFFF);  x = x + 22;
+    fillRect(x, 190, 3, 40, 0xFFFF);  x = x + 23;
+    fillRect(x, 190, 4, 40, 0xFFFF);  x = x + 24;
+    fillRect(x, 190, 5, 40, 0xFFFF);  x = x + 25;
+    fillRect(x, 190, 7, 40, 0xFFFF);  x = x + 27;
+    fillRect(x, 190, 8, 40, 0xFFFF);  x = x + 28;
+    fillRect(x, 190, 16, 40, 0xFFFF);
+
+    // F: wide reference rect
+    fillRect(40, 260, 200, 40, 0x07E0);
+}
+
+fn probe(val, n) {
+    draw_frame(val, n);
+    fpgaCmd(REG, val);
+    draw_rows();
+    reset_reg();
+    delay(3000);
+}
+
+fn setup() {
+    setBrightness(100);
+    return 0;
+}
+
+fn loop() {
+    // Baseline, then each bit 0..15, then the known-bad value
+    probe(0x0000, 0);
+    v = 1;
+    k = 1;
+    while (v <= 0x8000) {
+        probe(v, k);
+        v = v * 2;
+        k = k + 1;
+    }
+    probe(0x00FF, 17);
+    probe(0x07E0, 18);
+
+    fillRect(0, 0, 800, 480, 0x0000);
+    drawText(300, 250, 0, 0x07E0, 0, "PROBE COMPLETE");
+    delay(5000);
+}
