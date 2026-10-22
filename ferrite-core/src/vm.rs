@@ -691,9 +691,9 @@ pub struct Vm {
     pub forced_render_mode: Option<RenderMode>,
     // Portrait screen from the image header (IMAGE_FLAG_PORTRAIT).
     pub portrait: bool,
-    // Widget allocation hint from v4 image header (0 = unknown, use fallback).
-    pub widget_count: u8,
-    pub ext_count: u8,
+    // `(widgets, extensions)` the program allocates, from a v4 image header
+    // (exact — 0 means none). `None` = older image without counts.
+    pub tree_hint: Option<(u8, u8)>,
     // Open file slots — index 0 = handle 1, index 1 = handle 2.
     open_files: [Option<OpenFile>; 2],
     // Open modal dialogs (innermost = last). Empty when no dialog is showing.
@@ -768,8 +768,7 @@ impl Vm {
             in_paint: false,
             page_base: 0,
             page_len: 0,
-            widget_count: 0,
-            ext_count: 0,
+            tree_hint: None,
             open_files: [None, None],
             modal_stack: Vec::new(),
             anims: Vec::new(),
@@ -868,7 +867,7 @@ impl Vm {
     /// Load a VM image from RAM bytes. Parses the image header and keeps
     /// opcodes in a Vec<u8>. Returns false if the header is invalid.
     pub fn load_ram(&mut self, image: &[u8]) -> bool {
-        if let Some((funcs, opcode_start, gc, rm, wc, ec, wide, portrait)) = parse_image_header(image) {
+        if let Some((funcs, opcode_start, gc, rm, hint, wide, portrait)) = parse_image_header(image) {
             if !code_addressable(wide, image.len() - opcode_start) {
                 return false;
             }
@@ -881,8 +880,7 @@ impl Vm {
             self.frame_size = 0;
             self.render_mode = self.forced_render_mode.unwrap_or(rm);
             self.portrait = portrait;
-            self.widget_count = wc;
-            self.ext_count = ec;
+            self.tree_hint = hint;
             true
         } else {
             false
@@ -916,7 +914,7 @@ impl Vm {
         hdr_buf.resize(hdr_len, 0);
         flash.read(base, &mut hdr_buf);
 
-        if let Some((funcs, opcode_start, gc, rm, wc, ec, wide, portrait)) = parse_image_header(&hdr_buf) {
+        if let Some((funcs, opcode_start, gc, rm, hint, wide, portrait)) = parse_image_header(&hdr_buf) {
             let opcode_base = base + opcode_start as u32;
             let opcode_len = total_len.saturating_sub(opcode_start);
             if !code_addressable(wide, opcode_len) {
@@ -938,8 +936,7 @@ impl Vm {
             self.frame_size = 0;
             self.render_mode = self.forced_render_mode.unwrap_or(rm);
             self.portrait = portrait;
-            self.widget_count = wc;
-            self.ext_count = ec;
+            self.tree_hint = hint;
             true
         } else {
             false
@@ -949,6 +946,7 @@ impl Vm {
     /// Load raw bytecode (no image header). Used for page bytecode.
     pub fn load_raw(&mut self, data: &[u8]) {
         self.code = VmCode::Ram(data.to_vec());
+        self.tree_hint = None;
         self.wide_addr = false;
         self.functions.clear();
     }
@@ -3261,7 +3259,7 @@ impl Vm {
 // === Image header parser ===
 
 /// Parse VM image header. Returns (function table, opcode start, global_count, render_mode,
-/// widget_count, ext_count, wide_addr, portrait). widget_count/ext_count are 0 for v1-v3 images.
+/// (widget_count, ext_count) — `None` before v4, wide_addr, portrait). widget_count/ext_count are 0 for v1-v3 images.
 ///
 /// Format v1/v2:
 ///   version(u8) + function_count(u16 LE) + global_count(u16 LE)
@@ -3277,7 +3275,7 @@ impl Vm {
 #[allow(clippy::type_complexity)]
 fn parse_image_header(
     data: &[u8],
-) -> Option<(Vec<FuncEntry>, usize, u8, RenderMode, u8, u8, bool, bool)> {
+) -> Option<(Vec<FuncEntry>, usize, u8, RenderMode, Option<(u8, u8)>, bool, bool)> {
     if data.len() < IMAGE_HEADER_SIZE_V2 {
         return None;
     }
@@ -3316,7 +3314,7 @@ fn parse_image_header(
     };
     let wide = flags & IMAGE_FLAG_WIDE_ADDR != 0;
     let portrait = flags & IMAGE_FLAG_PORTRAIT != 0;
-    let (widget_count, ext_count) = if version >= 4 { (data[7], data[8]) } else { (0, 0) };
+    let tree_hint = if version >= 4 { Some((data[7], data[8])) } else { None };
 
     let table_size = func_count * FUNC_ENTRY_SIZE;
     let opcode_start = header_size + table_size;
@@ -3349,8 +3347,7 @@ fn parse_image_header(
         opcode_start,
         global_count,
         render_mode,
-        widget_count,
-        ext_count,
+        tree_hint,
         wide,
         portrait,
     ))

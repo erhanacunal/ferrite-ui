@@ -532,15 +532,12 @@ fn reserve_tree<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) {
         ctx.tree.reserve(max_w, max_e);
         return;
     }
-    let wc = if vm.widget_count > 0 {
-        vm.widget_count as usize
-    } else {
-        96
-    };
-    let ec = if vm.ext_count > 0 {
-        vm.ext_count as usize
-    } else {
-        96
+    // A v4 header carries the program's exact alloc() counts (0 = none — a
+    // program that only draws must not hold widget storage it never uses);
+    // older images have none, so guess.
+    let (wc, ec) = match vm.tree_hint {
+        Some((w, e)) => (w as usize, e as usize),
+        None => (96, 96),
     };
     ctx.tree.reserve(wc, ec);
 }
@@ -1619,6 +1616,26 @@ mod mem_detail_tests {
             gpio: GpioImpl::with_backend(MockGpio::default()),
             cursor_visible: false,
         }
+    }
+
+    #[test]
+    fn reserve_tree_trusts_a_v4_count_of_zero() {
+        // fpga probe: no alloc() sites. A v4 header says so exactly — the
+        // old 96 + 96 fallback held ~6.6 KB of a 17 KB GD32 heap for nothing.
+        let mut c = ctx();
+        let mut vm = Vm::new();
+        vm.tree_hint = Some((0, 0));
+        reserve_tree(&mut c, &vm);
+        let (_, _, wbytes, ebytes) = c.tree.mem_stats();
+        assert_eq!((wbytes, ebytes), (0, 0));
+
+        // Older images carry no counts: keep the fallback.
+        let mut c = ctx();
+        vm.tree_hint = None;
+        reserve_tree(&mut c, &vm);
+        let (_, _, wbytes, ebytes) = c.tree.mem_stats();
+        assert!(wbytes >= 96 * core::mem::size_of::<widget::Widget>());
+        assert!(ebytes >= 96 * core::mem::size_of::<widget::WidgetExt>());
     }
 
     #[test]
