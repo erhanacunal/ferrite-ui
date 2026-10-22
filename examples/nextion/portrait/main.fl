@@ -4,7 +4,8 @@
 // with its right edge at the top. Coordinates, widgets, text and touch all
 // work in the rotated 480x800 space.
 //
-// Tap the button: the counter label updates.
+// Tap the button: the counter label updates. Tap the text field: the
+// on-screen keyboard opens at the bottom, scaled to the 480 px width.
 
 #include "core.fl"
 #include "color.fl"
@@ -38,6 +39,22 @@ fn setup() {
     set(text_color, WHITE);
     set(text_align, ALIGN_CENTER);
     set(text, "Portrait 480 x 800");
+
+    // Text input: tap it and the on-screen keyboard docks at the bottom
+    var name_input = alloc();
+    parent(0);
+    set(kind, KIND_INPUT);
+    set(location, 40, 110);
+    set(size, 400, 40);
+    set(bg_color, 0x0000);
+    set(border, 1, 1, 1, 1);
+    set(border_color, LIGHT_GRAY);
+    set(border_radius, 4);
+    set(padding, 6, 6, 6, 6);
+    set(text_color, WHITE);
+    set(font_id, 0);
+    set(max_length, 24);
+    set(clickable, ON);
 
     // Corner markers: red = logical top-left, green = bottom-right
     var tl = alloc();

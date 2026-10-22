@@ -10,9 +10,11 @@ use crate::lcd::{LcdBackend, LcdImpl};
 
 // --- Layout constants ---
 
-pub const KB_Y: u16 = 280;
 pub const KB_H: u16 = 200;
-const KB_W: u16 = 800;
+/// Width the layout tables are designed for. Key x/w are scaled to the
+/// actual screen width (`Keyboard::set_screen`) — identity on 800 px
+/// landscape, 0.6 in portrait (480 px). The keyboard docks at the bottom.
+const DESIGN_W: u16 = 800;
 const ROW_H: u16 = 50;
 const KEY_GAP: u16 = 4;
 
@@ -160,6 +162,9 @@ pub struct Keyboard {
     blink_last: u32,
     pub cursor_visible: bool,
     pub dirty: bool,
+    /// Screen size the keyboard is laid out for (logical, see `set_screen`).
+    sw: u16,
+    sh: u16,
 }
 
 impl Keyboard {
@@ -172,12 +177,34 @@ impl Keyboard {
             blink_last: 0,
             cursor_visible: false,
             dirty: false,
+            sw: DESIGN_W,
+            sh: 480,
         }
+    }
+
+    /// Lay the keyboard out for a `w`x`h` screen (call before showing it;
+    /// portrait mode changes the logical screen size).
+    pub fn set_screen(&mut self, w: u16, h: u16) {
+        self.sw = w;
+        self.sh = h;
+    }
+
+    /// Screen y of the keyboard's top edge (docked at the bottom).
+    pub fn top(&self) -> u16 {
+        self.sh.saturating_sub(KB_H)
+    }
+
+    /// A key's screen x and width (design layout scaled to the screen).
+    fn key_span(&self, key: &KeyDef) -> (u16, u16) {
+        let sw = self.sw as u32;
+        let x0 = key.x as u32 * sw / DESIGN_W as u32;
+        let x1 = (key.x + key.w) as u32 * sw / DESIGN_W as u32;
+        (x0 as u16, (x1 - x0) as u16)
     }
 
     /// Handle touch press. Returns true if the press was on a keyboard key.
     pub fn handle_press(&mut self, x: u16, y: u16) -> bool {
-        if !self.visible || y < KB_Y {
+        if !self.visible || y < self.top() {
             return false;
         }
         if let Some(code) = self.key_at(x, y) {
@@ -198,7 +225,7 @@ impl Keyboard {
         }
 
         // Check if release is on the same key
-        if y < KB_Y {
+        if y < self.top() {
             return None;
         }
         let released = self.key_at(x, y).unwrap_or(KEY_NONE);
@@ -254,10 +281,11 @@ impl Keyboard {
 
     /// Find key code at screen position.
     fn key_at(&self, x: u16, y: u16) -> Option<u8> {
-        if y < KB_Y || y >= KB_Y + KB_H || x >= KB_W {
+        let top = self.top();
+        if y < top || y >= top + KB_H || x >= self.sw {
             return None;
         }
-        let row_idx = ((y - KB_Y) / ROW_H) as usize;
+        let row_idx = ((y - top) / ROW_H) as usize;
         if row_idx >= 4 {
             return None;
         }
@@ -307,7 +335,8 @@ impl Keyboard {
             _ => return None,
         };
         for key in row {
-            if x >= key.x && x < key.x + key.w {
+            let (kx, kw) = self.key_span(key);
+            if x >= kx && x < kx + kw {
                 return Some(key.code);
             }
         }
@@ -326,7 +355,7 @@ impl Keyboard {
         }
 
         // Background
-        lcd.fill_rect(0, KB_Y, KB_W, KB_H, KB_BG);
+        lcd.fill_rect(0, self.top(), self.sw, KB_H, KB_BG);
 
         let font = match fonts.resolve(0) {
             Some(f) => f,
@@ -413,9 +442,10 @@ impl Keyboard {
         for (row_idx, row) in rows.iter().enumerate() {
             for key in *row {
                 if key.code == code {
-                    let ky = KB_Y + row_idx as u16 * ROW_H + 2;
+                    let ky = self.top() + row_idx as u16 * ROW_H + 2;
                     let kh = ROW_H - 4;
-                    draw_single_key(lcd, font, flash, key, ky, kh, pressed);
+                    let (kx, kw) = self.key_span(key);
+                    draw_single_key(lcd, font, flash, key.code, kx, kw, ky, kh, pressed);
                     return;
                 }
             }
@@ -430,27 +460,31 @@ impl Keyboard {
         row: &[KeyDef],
         row_idx: u16,
     ) {
-        let ky = KB_Y + row_idx * ROW_H + 2;
+        let ky = self.top() + row_idx * ROW_H + 2;
         let kh = ROW_H - 4;
 
         for key in row {
             let is_pressed = self.pressed_key == key.code && key.code != KEY_NONE;
-            draw_single_key(lcd, font, flash, key, ky, kh, is_pressed);
+            let (kx, kw) = self.key_span(key);
+            draw_single_key(lcd, font, flash, key.code, kx, kw, ky, kh, is_pressed);
         }
     }
 }
 
-/// Draw one key at the given row position.
+/// Draw one key (`code`) in the screen rect (kx, ky, kw, kh).
+#[allow(clippy::too_many_arguments)]
 fn draw_single_key<L: LcdBackend, F: FlashBackend>(
     lcd: &LcdImpl<L>,
     font: &crate::font::Font,
     flash: &FlashImpl<F>,
-    key: &KeyDef,
+    code: u8,
+    kx: u16,
+    kw: u16,
     ky: u16,
     kh: u16,
     pressed: bool,
 ) {
-    let is_special = key.code >= 0x80;
+    let is_special = code >= 0x80;
     let bg = if pressed {
         KEY_PRESSED_BG
     } else if is_special {
@@ -459,12 +493,12 @@ fn draw_single_key<L: LcdBackend, F: FlashBackend>(
         KEY_BG
     };
 
-    lcd.fill_rect(key.x, ky, key.w, kh, bg);
+    lcd.fill_rect(kx, ky, kw, kh, bg);
 
     let lh = font.line_height() as i16;
 
     // Draw key label
-    let label: &[u8] = match key.code {
+    let label: &[u8] = match code {
         KEY_SHIFT => b"SHIFT",
         KEY_BACKSPACE => b"DEL",
         KEY_ENTER => b"ENTER",
@@ -474,7 +508,7 @@ fn draw_single_key<L: LcdBackend, F: FlashBackend>(
         ch => {
             // Single character
             let cw = font.char_width(ch as char) as i16;
-            let tx = key.x as i16 + (key.w as i16 - cw) / 2;
+            let tx = kx as i16 + (kw as i16 - cw) / 2;
             let ty = ky as i16 + (kh as i16 - lh) / 2 + (lh * 3) / 4;
             font.draw_char(lcd, flash, ch as char, tx, ty, KEY_TEXT, Some(bg));
             return;
@@ -482,7 +516,41 @@ fn draw_single_key<L: LcdBackend, F: FlashBackend>(
     };
 
     let tw = font.text_width(label) as i16;
-    let tx = key.x as i16 + (key.w as i16 - tw) / 2;
+    let tx = kx as i16 + (kw as i16 - tw) / 2;
     let ty = ky as i16 + (kh as i16 - lh) / 2 + (lh * 3) / 4;
     font.draw_str(lcd, flash, label, tx, ty, KEY_TEXT, Some(bg));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn landscape_layout_is_the_design_table() {
+        let kb = Keyboard::new();
+        assert_eq!(kb.top(), 280);
+        for key in ROW2_LOWER.iter().chain(ROW3_LOWER.iter()) {
+            assert_eq!(kb.key_span(key), (key.x, key.w));
+        }
+    }
+
+    #[test]
+    fn portrait_layout_scales_keys_and_docks_at_the_bottom() {
+        let mut kb = Keyboard::new();
+        kb.set_screen(480, 800);
+        assert_eq!(kb.top(), 600);
+        // Design 'q' = x 2..78, 'p' = x 722..798 → scaled by 0.6.
+        assert_eq!(kb.key_at(2, 610), Some(b'q'));
+        assert_eq!(kb.key_at(470, 610), Some(b'p'));
+        // Bottom row: ENTER spans the right side.
+        assert_eq!(kb.key_at(470, 790), Some(KEY_ENTER));
+        // Above the keyboard / past the screen: no key.
+        assert_eq!(kb.key_at(100, 599), None);
+        assert_eq!(kb.key_at(480, 610), None);
+        // Keys stay inside the screen.
+        for key in ROW0_LOWER.iter().chain(ROW3_LOWER.iter()) {
+            let (x, w) = kb.key_span(key);
+            assert!(x + w <= 480);
+        }
+    }
 }

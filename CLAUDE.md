@@ -110,7 +110,8 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - Logical screen = `HEIGHT`×`WIDTH` (480×800 on Nextion), mounted with the panel's **right edge at the top**: logical `(x, y)` → panel `(WIDTH-1-y, x)`. `lcd.width()`/`height()` give the logical size; use them, not `LcdBackend::WIDTH/HEIGHT`, for screen bounds.
 - Done entirely in `LcdImpl` (all backends, sim included): rects/pixels are remapped + clipped to the logical screen; a `begin_pixels` stream opens one 1 px wide panel column window per logical row (`RotStream`), ~10 extra bus writes per streamed row. CMD 0x0D is not used — column-major writes give a transpose (mirror), not a rotation.
 - Touch: `lcd.touch_to_logical` in both `InputHandler`s. Raw `fpgaCmd`/`fpgaData` and boot-time screens (recovery, SD boot) stay in panel coordinates.
-- Still landscape-only: the on-screen keyboard (`keyboard.rs`, 800 px layout) and `lib/modal.fl` (800×480 backdrop).
+- On-screen keyboard: the layout tables are an 800 px design, scaled to the screen width (`Keyboard::key_span`) and docked at the bottom (`Keyboard::top`); `focus_input` calls `set_screen(lcd.width(), lcd.height())`.
+- Still landscape-only: `lib/modal.fl` (800×480 backdrop).
 
 ### Render
 - **Anti-aliasing (`lcd/smooth.rs`, adapted from TFT_eSPI smooth graphics, FreeBSD notice in the file + THIRD_PARTY_NOTICES.md):** circles/ellipses/rings/arcs (half-pixel ring rasterizer, `sqrt_fraction` coverage), rounded rects (fill, gradient fill + border ring), lines/polylines/paths (wedge-line distance coverage, round caps, tapered `draw_wedge`), polygon fills (exact-area signed-accumulation scanline, even-odd, one screen-width f32 row buffer on the heap). Interiors stay `fill_rect` spans. Selected inside the public `LcdImpl` primitives (`lcd.smooth()`).

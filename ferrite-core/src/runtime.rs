@@ -1039,7 +1039,7 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
 impl FullInput {
     fn on_press<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, x: u16, y: u16) {
         // Keyboard intercept.
-        if self.kb.visible && y >= keyboard::KB_Y {
+        if self.kb.visible && y >= self.kb.top() {
             self.kb.handle_press(x, y);
             if vm.render_mode != RenderMode::Buffered {
                 self.kb
@@ -1365,6 +1365,7 @@ impl FullInput {
         self.kb.focused = id;
         ctx.tree.get_mut(id).flags |= widget::FLAG_FOCUSED;
         ctx.tree.mark_dirty(id);
+        self.kb.set_screen(ctx.lcd.width(), ctx.lcd.height());
         self.kb.visible = true;
         self.kb.dirty = true;
         let now = ctx.systick.millis();
@@ -1385,7 +1386,7 @@ impl FullInput {
         for i in 0..ctx.tree.dfs_len() {
             let id = ctx.tree.dfs_at(i);
             let abs = ctx.tree.absolute_rect(id);
-            if abs.y + abs.h as i16 > keyboard::KB_Y as i16 {
+            if abs.y + abs.h as i16 > self.kb.top() as i16 {
                 ctx.tree.mark_dirty(id);
             }
         }
