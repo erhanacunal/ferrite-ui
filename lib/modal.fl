@@ -52,23 +52,28 @@ fn __modalNo(widget_id)  { setDialogResult(NO);  }
 
 // --- Builder: alert dialog with single OK button ---
 fn __modalAlertBuilder() {
+    // Screen size from the root widget (480x800 in portrait mode).
+    target(0);
+    var sw = get(size_w);
+    var sh = get(size_h);
+
     // Translucent full-screen backdrop. Background click → CANCEL via
     // modalDefaultOverlayClick (wired by showModal when no override given).
     var overlay = alloc();
     parent(0);
     set(loc_x, 0);
     set(loc_y, 0);
-    set(size_w, 800);
-    set(size_h, 480);
+    set(size_w, sw);
+    set(size_h, sh);
     set(bg_color, 0x2104);
     set(clickable, ON);
 
-    // Centred white box. clickable=ON absorbs clicks so the backdrop's
+    // 400x200 white box centred on the screen. clickable=ON absorbs clicks so the backdrop's
     // CANCEL handler doesn't fire when the user taps inside the dialog.
     var box = alloc();
     parent(overlay);
-    set(loc_x, 200);
-    set(loc_y, 140);
+    set(loc_x, (sw - 400) / 2);
+    set(loc_y, (sh - 200) / 2);
     set(size_w, 400);
     set(size_h, 200);
     set(bg_color, WHITE);
@@ -121,19 +126,24 @@ fn __modalAlertBuilder() {
 
 // --- Builder: confirmation dialog with Yes / No buttons ---
 fn __modalConfirmBuilder() {
+    // Screen size from the root widget (480x800 in portrait mode).
+    target(0);
+    var sw = get(size_w);
+    var sh = get(size_h);
+
     var overlay = alloc();
     parent(0);
     set(loc_x, 0);
     set(loc_y, 0);
-    set(size_w, 800);
-    set(size_h, 480);
+    set(size_w, sw);
+    set(size_h, sh);
     set(bg_color, 0x2104);
     set(clickable, ON);
 
     var box = alloc();
     parent(overlay);
-    set(loc_x, 200);
-    set(loc_y, 140);
+    set(loc_x, (sw - 400) / 2);
+    set(loc_y, (sh - 200) / 2);
     set(size_w, 400);
     set(size_h, 200);
     set(bg_color, WHITE);

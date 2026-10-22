@@ -6,19 +6,30 @@
 //
 // Tap the button: the counter label updates. Tap the text field: the
 // on-screen keyboard opens at the bottom, scaled to the 480 px width.
+// Tap "Dialog": a Yes/No confirmation opens centred on the screen.
 
-#include "core.fl"
-#include "color.fl"
+#include "modal.fl"     // also pulls in core.fl + color.fl
 #include "shapes.fl"
 
 var count_lbl;
 var tap_btn;
+var dlg_btn;
 var count;
 
 fn on_tap_click(widget_id) {
     count = count + 1;
     count_lbl.text = sprintf("Taps: %d", count);
     // Free the previous text (strClear keeps strings widgets still use)
+    strClear();
+    dirty();
+    render();
+}
+
+fn on_dialog_click(widget_id) {
+    var r = showConfirmation(str("Portrait dialog"), str("Centred on 480 x 800"));
+    if (r == YES) { count_lbl.text = "Dialog: Yes"; }
+    if (r == NO) { count_lbl.text = "Dialog: No"; }
+    if (r == CANCEL) { count_lbl.text = "Dialog: Cancel"; }
     strClear();
     dirty();
     render();
@@ -100,6 +111,22 @@ fn setup() {
     set(text_color, LIGHT_GRAY);
     set(text_align, ALIGN_CENTER);
     set(text, "Taps: 0");
+
+    dlg_btn = alloc();
+    parent(0);
+    set(kind, KIND_LABEL);
+    set(loc_x, 140);
+    set(loc_y, 535);
+    set(size_w, 200);
+    set(size_h, 50);
+    set(bg_color, TEAL);
+    set(text_color, WHITE);
+    set(press_color, DARK_GREEN);
+    set(border_radius, 8);
+    set(text_align, ALIGN_CENTER);
+    set(text, "Dialog");
+    set(clickable, ON);
+    set(on_click, @on_dialog_click);
 
     var ring = alloc();
     parent(0);
