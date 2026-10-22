@@ -149,6 +149,22 @@ from ferrite_devices import (
     load_devices,
 )
 
+# project.json "memory" keys -> RES_SYSCFG record layout (offset, fmt, max).
+from ferrite_build import SYSCFG_FIELDS
+
+# Designer labels for the "memory" (system config) keys, in display order.
+MEMORY_LABELS = {
+    "strpool_bytes": "String pool (bytes)",
+    "max_strings": "Max strings",
+    "uart_rx_bytes": "UART RX buffer (bytes)",
+    "max_widgets": "Max widgets",
+    "max_ext": "Max widget extensions",
+    "eval_stack": "Eval stack depth",
+    "call_stack": "Call stack depth",
+    "cb_queue": "Callback queue",
+    "anim_slots": "Animation slots",
+}
+
 KIND_BASE = 0
 KIND_LABEL = 1
 KIND_BUTTON = 2
@@ -689,6 +705,9 @@ class DesignerModel(QWidget):
         self.include_dirs = []  # extra include dirs for compilation
         self.exec_mode = "flash"  # default exec_mode for the main program
         self.render_mode = spec["render_mode"]  # "dirty", "buffered", or "epaper"
+        # project.json "memory" block (RES_SYSCFG): key -> value; omitted key
+        # (or 0) = firmware default.
+        self.memory = {}
         self.main_fl = DEFAULT_MAIN_FL  # user code — embedded in .fui
 
     def set_device(self, device_id):
@@ -701,6 +720,13 @@ class DesignerModel(QWidget):
         """Device screen size, swapped in portrait mode."""
         w, h = device_spec(self.device_id)["screen"]
         return (h, w) if self.portrait else (w, h)
+
+    def set_memory(self, key, value):
+        """Set one system-config pool size; 0 = firmware default."""
+        if value:
+            self.memory[key] = int(value)
+        else:
+            self.memory.pop(key, None)
 
     def set_portrait(self, on):
         """Rotate the canvas between landscape and portrait. Widgets keep
@@ -957,6 +983,7 @@ class DesignerModel(QWidget):
         self.include_dirs = []
         self.exec_mode = "flash"
         self.render_mode = spec["render_mode"]
+        self.memory = {}
         self.main_fl = DEFAULT_MAIN_FL
         self.tree_changed.emit()
         self.selection_changed.emit()
@@ -978,6 +1005,7 @@ class DesignerModel(QWidget):
             "exec_mode": self.exec_mode,
             "render_mode": self.render_mode,
             "portrait": self.portrait,
+            "memory": dict(self.memory),
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -1114,6 +1142,8 @@ class DesignerModel(QWidget):
         self.include_dirs = data.get("include_dirs", [])
         self.exec_mode = data.get("exec_mode", "flash")
         self.render_mode = render_mode
+        self.memory = {k: int(v) for k, v in data.get("memory", {}).items()
+                       if k in SYSCFG_FIELDS and v}
         self._path = path
         self._res_gen += 1
         self.selected = None
@@ -1208,6 +1238,8 @@ class DesignerModel(QWidget):
         }
         if self.portrait:
             proj["portrait"] = True
+        if self.memory:
+            proj["memory"] = {k: self.memory[k] for k in SYSCFG_FIELDS if k in self.memory}
         json_path = os.path.join(build_dir, "project.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(proj, f, indent=2)
@@ -2738,6 +2770,28 @@ class ResourcePanel(QWidget):
         em_row.addStretch()
         layout.addLayout(em_row)
 
+        # System config: runtime pool sizes (project.json "memory" ->
+        # RES_SYSCFG, applied at boot). 0 = firmware default.
+        mem_group = QGroupBox("Memory (system config) — 0 = firmware default")
+        mem_cols = QHBoxLayout(mem_group)
+        forms = [QFormLayout(), QFormLayout()]
+        self.memory_spins = {}
+        for i, (key, label) in enumerate(MEMORY_LABELS.items()):
+            _off, _fmt, max_value = SYSCFG_FIELDS[key]
+            spin = QSpinBox()
+            # QSpinBox is int32; a string pool past 2 GB is not a real case.
+            spin.setRange(0, min(max_value, 0x7FFFFFFF))
+            spin.setSpecialValueText("default")
+            spin.setToolTip(f'project.json "memory".{key} (0..{max_value})'
+                            + (" — rounded up to a power of two"
+                               if key == "uart_rx_bytes" else ""))
+            spin.valueChanged.connect(lambda v, k=key: model.set_memory(k, v))
+            forms[i % 2].addRow(label, spin)
+            self.memory_spins[key] = spin
+        for f in forms:
+            mem_cols.addLayout(f)
+        layout.addWidget(mem_group)
+
         layout.addStretch()
 
         model.tree_changed.connect(self.refresh)
@@ -2784,6 +2838,10 @@ class ResourcePanel(QWidget):
         self.portrait_check.blockSignals(True)
         self.portrait_check.setChecked(self.model.portrait)
         self.portrait_check.blockSignals(False)
+        for key, spin in self.memory_spins.items():
+            spin.blockSignals(True)
+            spin.setValue(self.model.memory.get(key, 0))
+            spin.blockSignals(False)
 
     def _add_font(self):
         dlg = AddFontDialog(self)

@@ -177,6 +177,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Embedding:** `project.json` → `"memory": {"strpool_bytes", "max_strings", "uart_rx_bytes", "max_widgets", "max_ext", "eval_stack", "call_stack", "cb_queue", "anim_slots"}` → 32-byte entry named `"sys"`. Omitted key / 0 = firmware default; no `"memory"` block = no entry = all defaults.
 - **Record (LE):** magic `"SC"` u16, version u8 (=1), rsvd u8, strpool_bytes u32, max_strings u16, uart_rx_bytes u16, max_widgets u16, max_ext u16, eval_stack u8, call_stack u8, cb_queue u8, anim_slots u8, 12 B reserved. Layout duplicated in `syscfg.rs` and `tools/ferrite_build.py` (`SYSCFG_FIELDS`) — keep in sync.
 - **Apply (`runtime::apply_syscfg`):** `usart.set_rx_capacity` (`UsartBackend` hook; nextion: heap ring, power of two 16 B–32 KB; other BSPs ignore it), `strpool.configure`, `tree.set_limits` (+ `reserve_tree` preallocates to the caps), `vm.configure` (eval/call ≤ 255, queue ≥ 2; snapshots save only the live stack prefix).
+- **Designer:** Resources panel → "Memory (system config)" group, one spin box per key (0 shown as "default"). Stored as `"memory"` in the `.fui`; exported to project.json only for non-zero keys. Field list comes from `ferrite_build.SYSCFG_FIELDS` (labels: `MEMORY_LABELS` in `ferrite_designer.py`).
 - **Errors:** malformed entry → Code 8 (invalid system config); a pool the heap can't hold → Code 7 (insufficient memory).
 
 ### User Files (RES_FILE)
