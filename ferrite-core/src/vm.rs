@@ -812,6 +812,25 @@ impl Vm {
         (self.stack.len(), self.call_stack.len(), self.cb_queue.len())
     }
 
+    /// Diagnostics: `(used, capacity, heap bytes)` of the eval stack, call
+    /// stack, callback queue and animation pool, in that order. Stack depths
+    /// are current values (≈0 between main-loop iterations).
+    pub fn mem_stats<P: Platform>(&self) -> [(usize, usize, usize); 4] {
+        use core::mem::size_of;
+        let qlen = self.cb_queue.len();
+        let queued = if qlen == 0 {
+            0
+        } else {
+            (self.cb_tail as usize + qlen - self.cb_head as usize) % qlen
+        };
+        [
+            (self.sp as usize, self.stack.len(), self.stack.len() * size_of::<i32>()),
+            (self.call_sp as usize, self.call_stack.len(), self.call_stack.len() * size_of::<CallFrame>()),
+            (queued, qlen, qlen * size_of::<CbRequest>()),
+            (self.anims.len(), self.anim_cap::<P>(), self.anims.capacity() * size_of::<Anim>()),
+        ]
+    }
+
     // === Variable access (sparse map) ===
 
     /// Resolve slot byte: bit 7 set = local (frame_base + index), else global.

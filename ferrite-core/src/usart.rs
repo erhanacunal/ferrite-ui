@@ -19,6 +19,12 @@ pub trait UsartBackend {
         let _ = bytes;
         true
     }
+
+    /// `(bytes waiting, ring size)` of the RX ring, for diagnostics.
+    /// `(0, 0)` = not reported by this backend.
+    fn rx_stats(&self) -> (usize, usize) {
+        (0, 0)
+    }
 }
 
 pub struct UsartImpl<B: UsartBackend> {
@@ -54,6 +60,17 @@ impl<B: UsartBackend> UsartImpl<B> {
     #[inline]
     pub fn set_rx_capacity(&self, bytes: usize) -> bool {
         self.be.set_rx_capacity(bytes)
+    }
+
+    #[inline]
+    pub fn rx_stats(&self) -> (usize, usize) {
+        self.be.rx_stats()
+    }
+
+    /// The wrapped backend (tests read recorded bytes through it).
+    #[cfg(test)]
+    pub(crate) fn backend(&self) -> &B {
+        &self.be
     }
 }
 

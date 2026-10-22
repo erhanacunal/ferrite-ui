@@ -86,6 +86,18 @@ pub unsafe fn init(start: *mut u8, len: usize) {
     }
 }
 
+/// Arena size in bytes (0 before `init`, or when another allocator is the
+/// global one).
+pub fn size() -> usize {
+    #[cfg(feature = "epaper")]
+    return 0;
+
+    #[cfg_attr(feature = "epaper", allow(unreachable_code))]
+    unsafe {
+        if HEAP.initialized { HEAP.size } else { 0 }
+    }
+}
+
 /// Return (total_free_bytes, largest_free_block) for diagnostics.
 pub fn stats() -> (usize, usize) {
     #[cfg(feature = "epaper")]

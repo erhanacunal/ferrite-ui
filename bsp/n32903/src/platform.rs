@@ -83,6 +83,10 @@ impl PlatformRuntime for N32903Platform {
         (s.free, s.largest_free)
     }
 
+    fn heap_total() -> usize {
+        n32903_rs::heap::stats().size
+    }
+
     fn boot(ctx: &mut Ctx<Self>, touch: &mut TouchImpl<Self::TouchB>) -> u8 {
         touch.cal = touch::DEFAULT_CAL;
 

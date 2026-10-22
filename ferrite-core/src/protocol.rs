@@ -7,6 +7,7 @@
 /// Device sends (TX):
 ///   Field 1, Payload = Error (payload: error code byte)
 ///   Field 2, Varint  = Pong (also used as ACK for WriteFs chunks)
+///   Field 6, Payload = MemDetail (per-pool memory usage, see `send_memdetail`)
 ///
 /// Device receives (RX):
 ///   Field 1, Varint  = Ping
@@ -19,6 +20,7 @@
 ///   Field 8, Varint  = TouchCalibrate (start 3-point touch calibration)
 ///   Field 9, Varint  = StackInfo (query current stack usage)
 ///   Field 10, Payload = SetDateTime (7B: year(0-99) + month + day + weekday + hour + minute + second)
+///   Field 11, Varint  = MemDetail (query per-pool memory usage)
 extern crate alloc;
 
 use crate::flash::{FlashBackend, FlashImpl};
@@ -185,6 +187,8 @@ pub enum RxEvent {
     SetDateTime,
     /// Program too large — exceeds MAX_PROGRAM_SIZE (2KB)
     ProgramTooLarge,
+    /// Per-pool memory usage query — respond with `send_memdetail`
+    MemDetail,
 }
 
 // --- Protocol ---
@@ -268,6 +272,7 @@ impl Protocol {
                         7 => RxEvent::MemInfo,
                         8 => RxEvent::TouchCalibrate,
                         9 => RxEvent::StackInfo,
+                        11 => RxEvent::MemDetail,
                         _ => RxEvent::None,
                     },
                     // Payload type: tag + length varint + payload
@@ -504,6 +509,74 @@ pub fn send_meminfo<U: UsartBackend>(usart: &UsartImpl<U>, free_bytes: u32) {
     }
 }
 
+/// MemDetail pool ids (`MemEntry::id`). Mirrored in `tools/ferrite_cli.py`
+/// (`MEM_POOLS`) — keep in sync.
+pub mod mem_pool {
+    /// used / total heap bytes; extra = largest free block.
+    pub const HEAP: u8 = 1;
+    /// used / (used + free) CPU stack bytes; extra = peak (0 = not measured).
+    pub const CPU_STACK: u8 = 2;
+    /// String pool bytes used / `strpool_bytes`; extra = pool heap bytes.
+    pub const STR_BYTES: u8 = 3;
+    /// Live string slots / `max_strings`.
+    pub const STR_SLOTS: u8 = 4;
+    /// UART RX bytes waiting / ring size (0 / 0 = backend doesn't report).
+    pub const UART_RX: u8 = 5;
+    /// Live widgets / `max_widgets`; extra = widget storage bytes.
+    pub const WIDGETS: u8 = 6;
+    /// Live widget extensions / `max_ext`; extra = extension storage bytes.
+    pub const WIDGET_EXT: u8 = 7;
+    /// Eval stack depth / `eval_stack`; extra = heap bytes.
+    pub const EVAL_STACK: u8 = 8;
+    /// Call stack depth / `call_stack`; extra = heap bytes.
+    pub const CALL_STACK: u8 = 9;
+    /// Queued callbacks / `cb_queue`; extra = heap bytes.
+    pub const CB_QUEUE: u8 = 10;
+    /// Active tweens / animation slot cap; extra = heap bytes.
+    pub const ANIMS: u8 = 11;
+}
+
+/// One MemDetail row: pool `id` (`mem_pool`), `used` and `capacity` in the
+/// pool's unit, plus a pool-specific `extra` (see `mem_pool`).
+#[derive(Clone, Copy)]
+pub struct MemEntry {
+    pub id: u8,
+    pub used: u32,
+    pub capacity: u32,
+    pub extra: u32,
+}
+
+/// MemDetail payload version.
+const MEMDETAIL_VERSION: u8 = 1;
+
+/// Send per-pool memory usage: Field 6, Payload type — tag + length varint +
+/// version(u8) + count(u8) + count × [id u8, used u32, capacity u32, extra u32]
+/// (all LE, 13 bytes each).
+pub fn send_memdetail<U: UsartBackend>(usart: &UsartImpl<U>, entries: &[MemEntry]) {
+    // tag = (6 << 3) | 2 = 0x32
+    usart.write_byte(0x32);
+    let mut len = 2 + entries.len() as u32 * 13;
+    loop {
+        let mut b = (len & 0x7F) as u8;
+        len >>= 7;
+        if len != 0 {
+            b |= 0x80;
+        }
+        usart.write_byte(b);
+        if len == 0 {
+            break;
+        }
+    }
+    usart.write_byte(MEMDETAIL_VERSION);
+    usart.write_byte(entries.len() as u8);
+    for e in entries {
+        usart.write_byte(e.id);
+        usart.write(&e.used.to_le_bytes());
+        usart.write(&e.capacity.to_le_bytes());
+        usart.write(&e.extra.to_le_bytes());
+    }
+}
+
 /// Send stack info: Field 5, Payload type — tag + length(8) + used(u32 LE) + free(u32 LE)
 /// Payload: used u32 + free u32 (current SP) + peak u32 (high-water mark, 0 =
 /// not measured) = 12 bytes.
@@ -524,4 +597,52 @@ pub fn send_touch_cal<U: UsartBackend>(usart: &UsartImpl<U>, cal: &crate::touch:
     usart.write_byte(0x22);
     usart.write_byte(9);
     usart.write(&cal.to_bytes());
+}
+
+#[cfg(test)]
+mod memdetail_tests {
+    use super::*;
+    use core::cell::RefCell;
+
+    /// Records every byte written.
+    struct Rec(RefCell<Vec<u8>>);
+    impl UsartBackend for Rec {
+        fn write_byte(&self, byte: u8) {
+            self.0.borrow_mut().push(byte);
+        }
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn memdetail_request_is_field_11_varint() {
+        let mut p = Protocol::new(0x1000);
+        let flash = crate::flash::FlashImpl::with_backend(crate::mock::MockFlash);
+        assert!(matches!(p.feed(0x58, &flash), RxEvent::MemDetail));
+    }
+
+    #[test]
+    fn memdetail_response_layout() {
+        // Same bytes are decoded by tools/ferrite_cli.py (parse_memdetail).
+        let usart = UsartImpl::with_backend(Rec(RefCell::new(Vec::new())));
+        send_memdetail(&usart, &[
+            MemEntry { id: mem_pool::HEAP, used: 100, capacity: 200, extra: 50 },
+            MemEntry { id: mem_pool::STR_SLOTS, used: 3, capacity: 47, extra: 0 },
+        ]);
+        let want: &[u8] = &[
+            0x32, 28, 1, 2, //
+            1, 100, 0, 0, 0, 200, 0, 0, 0, 50, 0, 0, 0, //
+            4, 3, 0, 0, 0, 47, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(*usart.backend().0.borrow(), want);
+    }
+
+    #[test]
+    fn memdetail_length_is_a_multibyte_varint_past_127() {
+        let usart = UsartImpl::with_backend(Rec(RefCell::new(Vec::new())));
+        let e = MemEntry { id: 1, used: 0, capacity: 0, extra: 0 };
+        send_memdetail(&usart, &[e; 11]); // 2 + 11*13 = 145
+        let out = usart.backend().0.borrow().clone();
+        assert_eq!(&out[..3], &[0x32, 0x80 | (145 & 0x7F), 145 >> 7]);
+        assert_eq!(out.len(), 3 + 145);
+    }
 }

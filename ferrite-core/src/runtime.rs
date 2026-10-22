@@ -128,6 +128,13 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
         heap::stats()
     }
 
+    /// Total heap size in bytes for the `MemDetail` report (0 = unknown).
+    /// Defaults to the lib's static heap arena; BSPs with their own global
+    /// allocator may override it.
+    fn heap_total() -> usize {
+        heap::size()
+    }
+
     /// Pre-filesystem boot hook: backlight, screen clear, recovery mode, SD-card
     /// flashing, flash-address probing. Returns a nonzero error code to abort
     /// program load (`ERR_EMPTY_RUN` enters recovery without an error screen).
@@ -304,6 +311,10 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                     let (used, free) = P::stack_info();
                     protocol::send_stackinfo(&ctx.usart, used, free, P::stack_peak());
                 }
+                RxEvent::MemDetail => {
+                    let entries = mem_detail(&ctx, &vm);
+                    protocol::send_memdetail(&ctx.usart, &entries);
+                }
                 RxEvent::SetDateTime => {
                     let dt = protocol.datetime();
                     ctx.rtc.set_time(&dt);
@@ -468,6 +479,37 @@ fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     apply_orientation(ctx, vm);
     reserve_tree(ctx, vm);
     err
+}
+
+/// Per-pool memory usage for the `MemDetail` USART command.
+fn mem_detail<P: PlatformRuntime>(ctx: &Ctx<P>, vm: &Vm) -> [protocol::MemEntry; 11] {
+    use protocol::{MemEntry, mem_pool};
+    let e = |id: u8, used: usize, capacity: usize, extra: usize| MemEntry {
+        id,
+        used: used as u32,
+        capacity: capacity as u32,
+        extra: extra as u32,
+    };
+    let (free, largest) = P::heap_stats();
+    let total = P::heap_total();
+    let (stack_used, stack_free) = P::stack_info();
+    let (rx_waiting, rx_size) = ctx.usart.rx_stats();
+    let (widgets, exts, widget_bytes, ext_bytes) = ctx.tree.mem_stats();
+    let (max_widgets, max_ext) = ctx.tree.limits();
+    let [eval, call, cbq, anims] = vm.mem_stats::<P>();
+    [
+        e(mem_pool::HEAP, total.saturating_sub(free), total, largest),
+        e(mem_pool::CPU_STACK, stack_used as usize, (stack_used + stack_free) as usize, P::stack_peak() as usize),
+        e(mem_pool::STR_BYTES, ctx.strpool.used_bytes(), ctx.strpool.capacity_bytes(), ctx.strpool.heap_bytes()),
+        e(mem_pool::STR_SLOTS, ctx.strpool.used_strings(), ctx.strpool.capacity_strings(), 0),
+        e(mem_pool::UART_RX, rx_waiting, rx_size, rx_size),
+        e(mem_pool::WIDGETS, widgets, max_widgets, widget_bytes),
+        e(mem_pool::WIDGET_EXT, exts, max_ext, ext_bytes),
+        e(mem_pool::EVAL_STACK, eval.0, eval.1, eval.2),
+        e(mem_pool::CALL_STACK, call.0, call.1, call.2),
+        e(mem_pool::CB_QUEUE, cbq.0, cbq.1, cbq.2),
+        e(mem_pool::ANIMS, anims.0, anims.1, anims.2),
+    ]
 }
 
 /// Rotate the screen as the loaded image asks (header portrait flag) and size
@@ -1540,5 +1582,76 @@ mod mock_runtime {
         let _: fn(Box<Ctx<MockPlatform>>, TouchImpl<crate::mock::MockTouch>) -> ! =
             run::<MockPlatform>;
         let _: fn(&mut Ctx<MockPlatform>, u8, Option<(u8, CodeAddr)>) = show_error::<MockPlatform>;
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
+mod mem_detail_tests {
+    use super::*;
+    use crate::audio::AudioImpl;
+    use crate::backlight::BacklightImpl;
+    use crate::flash::FlashImpl;
+    use crate::font::FontList;
+    use crate::gpio::GpioImpl;
+    use crate::image::ImageList;
+    use crate::lcd::LcdImpl;
+    use crate::mock::{MockBacklight, MockFlash, MockGpio, MockLcd, MockPlatform, MockRtc, MockUsart};
+    use crate::protocol::mem_pool;
+    use crate::rtc::RtcImpl;
+    use crate::systick::SystickImpl;
+    use crate::usart::UsartImpl;
+    use crate::widget::WidgetTree;
+
+    fn ctx() -> Ctx<MockPlatform> {
+        Ctx {
+            lcd: LcdImpl::with_backend(MockLcd),
+            flash: FlashImpl::with_backend(MockFlash),
+            tree: WidgetTree::new(),
+            fonts: FontList::new(),
+            images: ImageList::new(),
+            strpool: StringPool::new(),
+            fs: None,
+            backlight: BacklightImpl::with_backend(MockBacklight),
+            rtc: RtcImpl::with_backend(MockRtc),
+            usart: UsartImpl::with_backend(MockUsart),
+            systick: SystickImpl::init(),
+            audio: AudioImpl::none(),
+            gpio: GpioImpl::with_backend(MockGpio::default()),
+            cursor_visible: false,
+        }
+    }
+
+    #[test]
+    fn mem_detail_reports_pool_usage_and_capacity() {
+        let mut ctx = ctx();
+        let mut vm = Vm::new();
+        assert!(ctx.strpool.configure(256, 10));
+        assert!(vm.configure(20, 6, 5, 3));
+        ctx.tree.set_limits(50, 40);
+        ctx.strpool.alloc(b"hello").unwrap();
+        ctx.strpool.alloc(b"world!").unwrap();
+        for _ in 0..4 {
+            ctx.tree.alloc().unwrap();
+        }
+
+        let rows = mem_detail(&ctx, &vm);
+        let row = |id: u8| {
+            let e = rows.iter().find(|e| e.id == id).expect("pool row");
+            (e.used, e.capacity, e.extra)
+        };
+        assert_eq!(rows.len(), 11);
+        let (used, cap, heap) = row(mem_pool::STR_BYTES);
+        assert_eq!((used, cap), (11, 256));
+        assert!(heap >= 256);
+        assert_eq!(row(mem_pool::STR_SLOTS), (2, 10, 0));
+        let (live, max, _) = row(mem_pool::WIDGETS);
+        assert_eq!((live, max), (4, 50));
+        assert_eq!(row(mem_pool::WIDGET_EXT).1, 40);
+        assert_eq!(row(mem_pool::EVAL_STACK), (0, 20, 80));
+        assert_eq!((row(mem_pool::CALL_STACK).0, row(mem_pool::CALL_STACK).1), (0, 6));
+        assert_eq!((row(mem_pool::CB_QUEUE).0, row(mem_pool::CB_QUEUE).1), (0, 5));
+        assert_eq!((row(mem_pool::ANIMS).0, row(mem_pool::ANIMS).1), (0, 3));
+        // Mock USART doesn't report its ring.
+        assert_eq!(row(mem_pool::UART_RX), (0, 0, 0));
     }
 }

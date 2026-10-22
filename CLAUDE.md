@@ -180,6 +180,11 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Designer:** Resources panel → "Memory (system config)" group, one spin box per key (0 shown as "default"). Stored as `"memory"` in the `.fui`; exported to project.json only for non-zero keys. Field list comes from `ferrite_build.SYSCFG_FIELDS` (labels: `MEMORY_LABELS` in `ferrite_designer.py`).
 - **Errors:** malformed entry → Code 8 (invalid system config); a pool the heap can't hold → Code 7 (insufficient memory).
 
+### Memory Report (MemDetail)
+- `ferrite_cli.py -p COMx memdetail` → per-pool table: heap (used/total, largest free block), CPU stack (+ peak), string pool bytes + slots, UART RX ring (waiting/size), widgets + extensions (live/cap, storage bytes), eval/call stack, callback queue, animations (each with the heap bytes it holds).
+- Protocol: host field 11 varint (`0x58`) → device field 6 payload (`0x32`): version u8 (=1) + count u8 + count × [id u8, used u32, capacity u32, extra u32] LE. Pool ids `protocol::mem_pool` = `MEM_POOLS` in `ferrite_cli.py` (keep in sync). capacity 0 = board doesn't report that pool (CLI prints n/a).
+- Gathered in `runtime::mem_detail` from `heap_stats`/`heap_total`/`stack_info` (PlatformRuntime), `UsartBackend::rx_stats` (nextion only), `StringPool::used_bytes/used_strings/heap_bytes`, `WidgetTree::mem_stats`, `Vm::mem_stats`. VM stack depths are the current values (≈0 between iterations), not high-water marks. `meminfo` is unchanged.
+
 ### User Files (RES_FILE)
 - **Purpose:** Arbitrary user data accessible from ferrite programs — config, level data, raw tables.
 - **Embedding:** `project.json` → `"files": [{"name": "cfg", "source": "data/cfg.bin"}]`

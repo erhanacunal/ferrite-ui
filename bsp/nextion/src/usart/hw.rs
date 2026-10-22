@@ -44,7 +44,7 @@ const CTL0_RBNEIE: u32 = 1 << 5;
 // The size is a power of two so wrap-around is a mask; u16 indices allow
 // up to 32 KB.
 
-const RX_BUF_DEFAULT: usize = 128;
+const RX_BUF_DEFAULT: usize = 512;
 const RX_BUF_MIN: usize = 16;
 const RX_BUF_MAX: usize = 32 * 1024;
 
@@ -149,6 +149,18 @@ impl UsartBackend for Hw {
 
     fn rx_read_byte(&self) -> Option<u8> {
         rx_read_byte()
+    }
+
+    fn rx_stats(&self) -> (usize, usize) {
+        unsafe {
+            if read_volatile(&raw const RX_BUF).is_null() {
+                return (0, 0);
+            }
+            let mask = read_volatile(&raw const RX_MASK);
+            let head = read_volatile(&raw const RX_HEAD);
+            let tail = read_volatile(&raw const RX_TAIL);
+            (head.wrapping_sub(tail) as usize & mask as usize, mask as usize + 1)
+        }
     }
 
     fn set_rx_capacity(&self, bytes: usize) -> bool {

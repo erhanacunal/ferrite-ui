@@ -90,6 +90,14 @@ impl PlatformRuntime for TdoY13Platform {
         (f1c100s::allocator::free_bytes(), 0)
     }
 
+    fn heap_total() -> usize {
+        // Same arena main.rs hands to `init_heap`: `_end` up to DRAM_END.
+        unsafe extern "C" {
+            static _end: u8;
+        }
+        crate::DRAM_END - core::ptr::addr_of!(_end) as usize
+    }
+
     fn boot(ctx: &mut Ctx<Self>, touch: &mut TouchImpl<Self::TouchB>) -> u8 {
         // CST8xx capacitive panel defaults. The controller already reports
         // coordinates in screen orientation (top=0, left=0), so no axis flip

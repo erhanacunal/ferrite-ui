@@ -152,6 +152,25 @@ impl StringPool {
         self.meta.len()
     }
 
+    /// Pool bytes in use (bump pointer — what `alloc` checks against).
+    pub fn used_bytes(&self) -> usize {
+        self.next as usize
+    }
+
+    /// String slots in use.
+    pub fn used_strings(&self) -> usize {
+        self.count as usize
+    }
+
+    /// Heap bytes held by the pool (buffer + per-string tables).
+    pub fn heap_bytes(&self) -> usize {
+        use core::mem::size_of;
+        self.buf.len()
+            + self.meta.len() * size_of::<StrMeta>()
+            + self.remap.len() * size_of::<u16>()
+            + self.interned.len() * size_of::<u16>()
+    }
+
     /// Allocate a string from a byte slice. Returns string ID (u16) or None if full.
     pub fn alloc(&mut self, data: &[u8]) -> Option<u16> {
         let len = data.len();

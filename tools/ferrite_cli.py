@@ -2,11 +2,12 @@
 """ferrite-cli — Host-side tool for communicating with ferrite-ui devices.
 
 Implements the USART protobuf protocol (see protocol.rs).
-Commands: ping, restart, meminfo, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime
+Commands: ping, restart, meminfo, memdetail, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime
 
 Usage:
     python ferrite_cli.py -p COM3 ping
     python ferrite_cli.py -p COM3 meminfo
+    python ferrite_cli.py -p COM3 memdetail                (per-pool memory usage)
     python ferrite_cli.py -p COM3 restart
     python ferrite_cli.py -p COM3 execute program.bin
     python ferrite_cli.py -p COM3 -l execute program.fxe   (execute + listen)
@@ -36,6 +37,7 @@ TAG_MEMINFO    = (7 << 3) | 0   # 0x38, varint
 TAG_TOUCHCAL   = (8 << 3) | 0   # 0x40, varint (start touch calibration)
 TAG_STACKINFO  = (9 << 3) | 0   # 0x48, varint (query stack usage)
 TAG_SETDATETIME = (10 << 3) | 2  # 0x52, payload (7B: year/month/day/weekday/hour/min/sec)
+TAG_MEMDETAIL  = (11 << 3) | 0   # 0x58, varint (query per-pool memory usage)
 
 CHUNK_SIZE = 4096  # Must match device sector buffer size
 
@@ -45,6 +47,24 @@ TAG_PONG     = (2 << 3) | 0   # 0x10, varint
 TAG_MEMINFO_RESP = (3 << 3) | 0  # 0x18, varint (free heap bytes)
 TAG_TOUCHCAL_RESP = (4 << 3) | 2  # 0x22, payload (calibration result, 9 bytes)
 TAG_STACKINFO_RESP = (5 << 3) | 2  # 0x2A, payload (used + free [+ peak], 8 or 12 bytes)
+TAG_MEMDETAIL_RESP = (6 << 3) | 2  # 0x32, payload (version + count + 13-byte entries)
+
+# MemDetail pool ids -> (name, unit, meaning of "extra"). Mirrors
+# protocol::mem_pool in ferrite-core/src/protocol.rs — keep in sync.
+#   unit "B" = bytes, "" = count. extra "heap" = heap bytes the pool holds.
+MEM_POOLS = {
+    1: ("heap", "B", "largest free"),
+    2: ("cpu stack", "B", "peak"),
+    3: ("string pool", "B", "heap"),
+    4: ("strings", "", None),
+    5: ("uart rx", "B", "heap"),
+    6: ("widgets", "", "heap"),
+    7: ("widget ext", "", "heap"),
+    8: ("eval stack", "", "heap"),
+    9: ("call stack", "", "heap"),
+    10: ("callback queue", "", "heap"),
+    11: ("animations", "", "heap"),
+}
 
 BAUD_RATE = 115200
 DEFAULT_TIMEOUT = 5.0  # seconds
@@ -195,6 +215,23 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             peak = int.from_bytes(payload[8:12], "little") if length >= 12 else 0
             return ("stackinfo", (used, free, peak))
 
+        if tag == TAG_MEMDETAIL_RESP:
+            length_bytes = bytearray()
+            while True:
+                b = ser.read(1)
+                if not b:
+                    ser.timeout = orig_timeout
+                    return ("timeout", None)
+                length_bytes.append(b[0])
+                if b[0] & 0x80 == 0:
+                    break
+            length, _ = decode_varint(bytes(length_bytes))
+            payload = ser.read(length)
+            ser.timeout = orig_timeout
+            if len(payload) < length:
+                return ("timeout", None)
+            return ("memdetail", parse_memdetail(payload))
+
         if tag == TAG_ERROR or tag == TAG_TOUCHCAL_RESP:
             # Read length varint
             length_bytes = bytearray()
@@ -273,6 +310,77 @@ def cmd_meminfo(ser: serial.Serial) -> bool:
         return False
     else:
         print("no response (timeout)", file=sys.stderr)
+        return False
+
+
+def parse_memdetail(payload: bytes) -> list[tuple[int, int, int, int]]:
+    """MemDetail payload -> [(pool id, used, capacity, extra), ...]."""
+    if len(payload) < 2:
+        return []
+    count = payload[1]
+    entries = []
+    for i in range(count):
+        off = 2 + i * 13
+        if off + 13 > len(payload):
+            break
+        pid = payload[off]
+        used, cap, extra = struct.unpack_from("<III", payload, off + 1)
+        entries.append((pid, used, cap, extra))
+    return entries
+
+
+def _fmt_amount(value: int, unit: str) -> str:
+    if unit != "B":
+        return str(value)
+    if value >= 1024:
+        return f"{value / 1024:.1f} KB"
+    return f"{value} B"
+
+
+def format_memdetail(entries) -> list[str]:
+    """Render MemDetail entries as a text table (one string per line)."""
+    lines = [f"{'pool':<16}{'used':>10}{'capacity':>12}{'use':>6}   extra",
+             "-" * 58]
+    pool_heap = 0
+    for pid, used, cap, extra in entries:
+        name, unit, extra_kind = MEM_POOLS.get(pid, (f"pool {pid}", "", "extra"))
+        if cap == 0:
+            # 0 capacity = this board does not report the pool.
+            lines.append(f"{name:<16}{'n/a':>10}{'n/a':>12}")
+            continue
+        pct = f"{100 * used / cap:.0f}%"
+        if extra_kind == "heap":
+            pool_heap += extra
+            extra_txt = f"{_fmt_amount(extra, 'B')} heap"
+        elif extra_kind == "largest free":
+            extra_txt = f"largest free block {_fmt_amount(extra, 'B')}"
+        elif extra_kind == "peak":
+            extra_txt = f"peak {_fmt_amount(extra, 'B')}" if extra else ""
+        else:
+            extra_txt = ""
+        lines.append(f"{name:<16}{_fmt_amount(used, unit):>10}"
+                     f"{_fmt_amount(cap, unit):>12}{pct:>6}   {extra_txt}".rstrip())
+    lines.append("-" * 58)
+    lines.append(f"heap held by the pools above: {_fmt_amount(pool_heap, 'B')}")
+    return lines
+
+
+def cmd_memdetail(ser: serial.Serial) -> bool:
+    """Query per-pool memory usage (heap, strings, UART, widgets, VM)."""
+    ser.write(build_varint_msg(TAG_MEMDETAIL))
+    ser.flush()
+
+    resp_type, resp_val = read_response(ser)
+    if resp_type == "memdetail":
+        for line in format_memdetail(resp_val):
+            print(line)
+        return True
+    elif resp_type == "error":
+        desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
+        print(f"error: code {resp_val} — {desc}", file=sys.stderr)
+        return False
+    else:
+        print("no response (timeout) — firmware may predate memdetail", file=sys.stderr)
         return False
 
 
@@ -559,6 +667,7 @@ def main():
     sub.add_parser("ping", help="Ping device (expects pong)")
     sub.add_parser("restart", help="Restart device")
     sub.add_parser("meminfo", help="Query free heap memory")
+    sub.add_parser("memdetail", help="Query per-pool memory usage (heap, strings, UART, widgets, VM)")
 
     p_exec = sub.add_parser("execute", help="Send bytecode for execution")
     p_exec.add_argument("file", help="Bytecode binary file")
@@ -592,6 +701,8 @@ def main():
             ok = cmd_restart(ser)
         elif args.command == "meminfo":
             ok = cmd_meminfo(ser)
+        elif args.command == "memdetail":
+            ok = cmd_memdetail(ser)
         elif args.command == "execute":
             ok = cmd_execute(ser, args.file)
         elif args.command == "writefs":

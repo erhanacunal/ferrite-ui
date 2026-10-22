@@ -377,6 +377,19 @@ impl WidgetTree {
         self.extensions.len()
     }
 
+    /// Diagnostics: `(live widgets, live extensions, widget storage bytes,
+    /// extension storage bytes)`. Destroyed slots waiting for reuse are not
+    /// live; storage counts allocated capacity.
+    pub fn mem_stats(&self) -> (usize, usize, usize, usize) {
+        use core::mem::size_of;
+        (
+            self.widgets.len() - self.widget_free.len(),
+            self.extensions.len() - self.ext_free.len(),
+            self.widgets.capacity() * size_of::<Widget>(),
+            self.extensions.capacity() * size_of::<WidgetExt>(),
+        )
+    }
+
     // --- Extension access ---
 
     /// Get extension for a widget (read-only). Returns None if not allocated.
