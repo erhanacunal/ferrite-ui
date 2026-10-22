@@ -305,10 +305,13 @@ def build(project_path: str, output_path: str | None) -> dict:
             device = ferrite_devices.device_spec(device_id)
             fs_base = device.get("fs_base", FS_BASE)
             screen = project.get("screen")
-            if screen is not None and tuple(screen) != device["screen"]:
-                dw, dh = device["screen"]
+            dw, dh = device["screen"]
+            # Portrait projects declare the rotated (logical) screen.
+            expected = (dh, dw) if project.get("portrait") else (dw, dh)
+            if screen is not None and tuple(screen) != expected:
                 print(f"warning: project screen {screen[0]}x{screen[1]} does not "
-                      f"match device '{device_id}' ({dw}x{dh})", file=sys.stderr)
+                      f"match device '{device_id}' ({expected[0]}x{expected[1]}"
+                      f"{' portrait' if project.get('portrait') else ''})", file=sys.stderr)
             render_mode = project.get("render_mode", device["render_mode"])
             if render_mode not in device["render_modes"]:
                 raise ValueError(

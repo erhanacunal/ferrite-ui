@@ -665,6 +665,9 @@ class DesignerModel(QWidget):
         self.device_id = device_id
         spec = device_spec(self.device_id)
         self.screen_w, self.screen_h = spec["screen"]
+        # Portrait: UI rotated 90° on the panel ("portrait": true in
+        # project.json) — the logical screen is the device screen swapped.
+        self.portrait = False
         self.root = WidgetNode("root", KIND_BASE)
         self.root.size_w = self.screen_w
         self.root.size_h = self.screen_h
@@ -691,8 +694,25 @@ class DesignerModel(QWidget):
     def set_device(self, device_id):
         self.device_id = device_id if device_id in load_devices() else DEFAULT_DEVICE_ID
         spec = device_spec(self.device_id)
-        self.screen_w, self.screen_h = spec["screen"]
+        self.screen_w, self.screen_h = self._logical_screen()
         self.render_mode = spec["render_mode"]
+
+    def _logical_screen(self):
+        """Device screen size, swapped in portrait mode."""
+        w, h = device_spec(self.device_id)["screen"]
+        return (h, w) if self.portrait else (w, h)
+
+    def set_portrait(self, on):
+        """Rotate the canvas between landscape and portrait. Widgets keep
+        their coordinates — the layout is the user's to adapt."""
+        on = bool(on)
+        if on == self.portrait:
+            return
+        self.portrait = on
+        self.screen_w, self.screen_h = self._logical_screen()
+        self.root.size_w = self.screen_w
+        self.root.size_h = self.screen_h
+        self.tree_changed.emit()
 
     def add_widget(self, kind, parent=None):
         if parent is None:
@@ -917,8 +937,11 @@ class DesignerModel(QWidget):
         return result
 
     def clear(self, device_id=None):
+        self.portrait = False
         if device_id is not None:
             self.set_device(device_id)
+        else:
+            self.screen_w, self.screen_h = self._logical_screen()
         spec = device_spec(self.device_id)
         self.root = WidgetNode("root", KIND_BASE)
         self.root.size_w = self.screen_w
@@ -954,6 +977,7 @@ class DesignerModel(QWidget):
             "include_dirs": self.include_dirs[:],
             "exec_mode": self.exec_mode,
             "render_mode": self.render_mode,
+            "portrait": self.portrait,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -969,7 +993,8 @@ class DesignerModel(QWidget):
         if self.device_id not in load_devices():
             self.device_id = DEFAULT_DEVICE_ID
         spec = device_spec(self.device_id)
-        self.screen_w, self.screen_h = tuple(screen) if screen else spec["screen"]
+        self.portrait = bool(data.get("portrait", False))
+        self.screen_w, self.screen_h = tuple(screen) if screen else self._logical_screen()
         if not has_render_mode:
             render_mode = spec["render_mode"]
         nodes = {}
@@ -1181,6 +1206,8 @@ class DesignerModel(QWidget):
             ] + prog_entries,
             "files": file_entries,
         }
+        if self.portrait:
+            proj["portrait"] = True
         json_path = os.path.join(build_dir, "project.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(proj, f, indent=2)
@@ -2700,6 +2727,14 @@ class ResourcePanel(QWidget):
         self.render_combo.addItems(device_spec(model.device_id)["render_modes"])
         self.render_combo.currentTextChanged.connect(lambda v: v and setattr(model, 'render_mode', v))
         em_row.addWidget(self.render_combo)
+        em_row.addSpacing(20)
+        self.portrait_check = QCheckBox("Portrait (rotate 90°)")
+        self.portrait_check.setToolTip(
+            "Rotate the UI 90° on the panel: the screen becomes "
+            "height x width (e.g. 480x800). Mount the panel with its right "
+            "edge at the top.")
+        self.portrait_check.toggled.connect(model.set_portrait)
+        em_row.addWidget(self.portrait_check)
         em_row.addStretch()
         layout.addLayout(em_row)
 
@@ -2746,6 +2781,9 @@ class ResourcePanel(QWidget):
         idx = self.render_combo.findText(self.model.render_mode)
         if idx >= 0:
             self.render_combo.setCurrentIndex(idx)
+        self.portrait_check.blockSignals(True)
+        self.portrait_check.setChecked(self.model.portrait)
+        self.portrait_check.blockSignals(False)
 
     def _add_font(self):
         dlg = AddFontDialog(self)
@@ -3929,6 +3967,8 @@ class DesignerWindow(QMainWindow):
         self._build_toolbar()
         self._build_menu()
         self.statusBar().showMessage(self._device_status())
+        self.resources.portrait_check.toggled.connect(
+            lambda _: self.statusBar().showMessage(self._device_status()))
 
         s = self._settings()
         if s.value("geometry"):
@@ -3938,7 +3978,9 @@ class DesignerWindow(QMainWindow):
 
     def _device_status(self):
         spec = device_spec(self.model.device_id)
-        return f"{spec['name']} - {self.model.screen_w}x{self.model.screen_h}, {spec['color_model']}"
+        portrait = " portrait" if self.model.portrait else ""
+        return (f"{spec['name']} - {self.model.screen_w}x{self.model.screen_h}{portrait}, "
+                f"{spec['color_model']}")
 
     def _set_window_title(self, path=None):
         spec = device_spec(self.model.device_id)

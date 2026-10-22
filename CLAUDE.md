@@ -111,6 +111,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - Done entirely in `LcdImpl` (all backends, sim included): rects/pixels are remapped + clipped to the logical screen; a `begin_pixels` stream opens one 1 px wide panel column window per logical row (`RotStream`), ~10 extra bus writes per streamed row. CMD 0x0D is not used — column-major writes give a transpose (mirror), not a rotation.
 - Touch: `lcd.touch_to_logical` in both `InputHandler`s. Raw `fpgaCmd`/`fpgaData` and boot-time screens (recovery, SD boot) stay in panel coordinates.
 - On-screen keyboard: the layout tables are an 800 px design, scaled to the screen width (`Keyboard::key_span`) and docked at the bottom (`Keyboard::top`); `focus_input` calls `set_screen(lcd.width(), lcd.height())`.
+- Designer: "Portrait (rotate 90°)" checkbox in the Resources panel → `DesignerModel.set_portrait` swaps the canvas to the device screen rotated; saved as `"portrait"` in the `.fui`, exported as `"portrait": true` + the rotated `"screen"` in project.json. `ferrite_build.py` checks a portrait project's screen against the rotated device screen.
 - `lib/modal.fl` sizes the backdrop from the root widget (`target(0); get(size_w/size_h)`) and centres the 400×200 box, so `showAlert`/`showConfirmation` work in both orientations. App `.fl` code should do the same instead of hard-coding 800×480.
 
 ### Render
