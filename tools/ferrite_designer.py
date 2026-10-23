@@ -106,6 +106,7 @@ _ICON_MAP = {
     "fa5s.sliders-h":           "Slider",
     "fa5s.check-square":        "CheckBoxChecked",
     "fa5s.dot-circle":          "RadioButton",
+    "fa5s.th-large":            "ButtonGroup",
     "fa5s.caret-square-down":   "ComboBox",
 }
 
@@ -185,11 +186,12 @@ KIND_BUTTON_GROUP = 17
 
 # KIND_NAMES and KIND_VALUES are parallel (combo index ↔ kind value); keep
 # them in lockstep.
-KIND_NAMES = ["Base", "Label", "Button", "Progress", "Slider", "Checkbox", "Radio", "Dropdown",
-              "Image", "Rectangle", "Circle", "Polygon", "Line", "Ellipse", "Button Group"]
+KIND_NAMES = ["Base", "Label", "Button", "Progress", "Slider", "Checkbox", "Radio",
+              "Button Group", "Dropdown", "Image", "Rectangle", "Circle", "Polygon", "Line",
+              "Ellipse"]
 KIND_VALUES = [KIND_BASE, KIND_LABEL, KIND_BUTTON, KIND_PROGRESS, KIND_SLIDER, KIND_CHECKBOX,
-               KIND_RADIO, KIND_DROPDOWN, KIND_IMAGE, KIND_RECTANGLE, KIND_CIRCLE, KIND_POLYGON,
-               KIND_LINE, KIND_ELLIPSE, KIND_BUTTON_GROUP]
+               KIND_RADIO, KIND_BUTTON_GROUP, KIND_DROPDOWN, KIND_IMAGE, KIND_RECTANGLE,
+               KIND_CIRCLE, KIND_POLYGON, KIND_LINE, KIND_ELLIPSE]
 KIND_PREFIXES = {
     KIND_BASE: "panel",
     KIND_LABEL: "lbl",
