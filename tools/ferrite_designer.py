@@ -1264,9 +1264,21 @@ class WidgetItem(QGraphicsItem):
         self._drag_orig_all = {}
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
+        # Cached so the scene's BSP index is told (prepareGeometryChange)
+        # *before* the rect changes. Reading node.size_* live would leave the
+        # item indexed under its old rect, and once rebuild() deletes it the
+        # next itemAt() dereferences freed memory (crash in Qt6Widgets).
+        self._rect = QRectF(0, 0, node.size_w, node.size_h)
 
     def boundingRect(self):
-        return QRectF(0, 0, self.node.size_w, self.node.size_h)
+        return self._rect
+
+    def sync_geometry(self):
+        """Pick up a size change of the node."""
+        rect = QRectF(0, 0, self.node.size_w, self.node.size_h)
+        if rect != self._rect:
+            self.prepareGeometryChange()
+            self._rect = rect
 
     def _paint_shape(self, painter, node, w, h):
         """Canvas preview for Circle/Polygon/Line shapes."""
@@ -1710,7 +1722,7 @@ class DesignerScene(QGraphicsScene):
         for node, item in self.items_map.items():
             ax, ay = node.abs_pos()
             item.setPos(ax, ay)
-            item.prepareGeometryChange()
+            item.sync_geometry()
             item.update()
         self._position_handles()
 
