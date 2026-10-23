@@ -2,7 +2,7 @@
 ///
 /// Pin ataması (Nextion donanımı):
 ///   PA9  = TX (AF push-pull, 50MHz)
-///   PA10 = RX (floating input)
+///   PA10 = RX (input pull-up, set in init_ports)
 ///
 /// 115200 baud, 8N1, no flow control.
 /// GPIO ve clock konfigürasyonu init_ports() tarafından yapılır.

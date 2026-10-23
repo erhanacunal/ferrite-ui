@@ -161,6 +161,11 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   }
   ```
 
+### USART RX Resync
+- The protocol has no frame markers: a stray byte that looks like a payload tag (noise, an aborted transfer) would leave `Protocol` swallowing every later byte as payload. The main loop calls `protocol.resync()` once the RX ring is drained, the parser is mid-message and no byte has arrived for `protocol::RX_RESYNC_MS` (500 ms). The timestamp is taken after `feed`, so a flash erase it triggers doesn't count as a stall.
+- Nextion: PA10 (USART0 RX) is input pull-up, not floating, so an unplugged line doesn't make noise.
+- Hosts: `ferrite_cli` `request()` resends once after a 0.6 s resync wait (`writefs` restarts from the header). The designer's device dialog retries ping and the writefs header, and so does its build-and-upload action.
+
 ### Recovery Mode
 - **Hold top-left corner for 3 seconds at boot** → recovery mode
 - Red progress bar fills to indicate progress, release to cancel

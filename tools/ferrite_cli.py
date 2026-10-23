@@ -269,12 +269,34 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
 # --- Commands ---
 
 
+# The device drops a message that stalls mid-frame for 500 ms
+# (protocol::RX_RESYNC_MS). After a timeout, waiting a bit longer than that
+# lets a device whose parser was stuck on stray bytes recover before a resend.
+RESYNC_WAIT = 0.6  # seconds
+
+
+def resync(ser: serial.Serial):
+    """Wait out the device's RX resync timeout and drop stale input."""
+    time.sleep(RESYNC_WAIT)
+    ser.reset_input_buffer()
+
+
+def request(ser: serial.Serial, msg: bytes) -> tuple[str, int | None]:
+    """Send `msg` and read the response. On a timeout, resync and resend once."""
+    for attempt in range(2):
+        ser.write(msg)
+        ser.flush()
+        resp = read_response(ser)
+        if resp[0] != "timeout" or attempt:
+            return resp
+        print("no response, resyncing and retrying...", file=sys.stderr)
+        resync(ser)
+    return resp
+
+
 def cmd_ping(ser: serial.Serial) -> bool:
     """Send ping and wait for pong."""
-    ser.write(build_varint_msg(TAG_PING))
-    ser.flush()
-
-    resp_type, resp_val = read_response(ser)
+    resp_type, resp_val = request(ser, build_varint_msg(TAG_PING))
     if resp_type == "pong":
         print("pong")
         return True
@@ -297,10 +319,7 @@ def cmd_restart(ser: serial.Serial) -> bool:
 
 def cmd_meminfo(ser: serial.Serial) -> bool:
     """Query free heap memory from device."""
-    ser.write(build_varint_msg(TAG_MEMINFO))
-    ser.flush()
-
-    resp_type, resp_val = read_response(ser)
+    resp_type, resp_val = request(ser, build_varint_msg(TAG_MEMINFO))
     if resp_type == "meminfo":
         print(f"free: {resp_val} bytes ({resp_val / 1024:.1f} KB)")
         return True
@@ -367,10 +386,7 @@ def format_memdetail(entries) -> list[str]:
 
 def cmd_memdetail(ser: serial.Serial) -> bool:
     """Query per-pool memory usage (heap, strings, UART, widgets, VM)."""
-    ser.write(build_varint_msg(TAG_MEMDETAIL))
-    ser.flush()
-
-    resp_type, resp_val = read_response(ser)
+    resp_type, resp_val = request(ser, build_varint_msg(TAG_MEMDETAIL))
     if resp_type == "memdetail":
         for line in format_memdetail(resp_val):
             print(line)
@@ -386,10 +402,7 @@ def cmd_memdetail(ser: serial.Serial) -> bool:
 
 def cmd_stackinfo(ser: serial.Serial) -> bool:
     """Query current stack usage from device."""
-    ser.write(build_varint_msg(TAG_STACKINFO))
-    ser.flush()
-
-    resp_type, resp_val = read_response(ser)
+    resp_type, resp_val = request(ser, build_varint_msg(TAG_STACKINFO))
     if resp_type == "stackinfo":
         used, free, peak = resp_val
         total = used + free
@@ -436,6 +449,9 @@ def cmd_writefs(ser: serial.Serial, path: str) -> bool:
       2. Wait for pong ACK
       3. For each chunk: send WriteChunk, wait for pong ACK
       4. Device restarts after final ACK
+
+    A timeout restarts the transfer from the header once, after a resync
+    pause, so a device whose parser was stuck on stray bytes recovers.
     """
     try:
         with open(path, "rb") as f:
@@ -444,6 +460,16 @@ def cmd_writefs(ser: serial.Serial, path: str) -> bool:
         print(f"file not found: {path}", file=sys.stderr)
         return False
 
+    result = _writefs_once(ser, data)
+    if result == "timeout":
+        print("retrying writefs from the header...", file=sys.stderr)
+        resync(ser)
+        result = _writefs_once(ser, data)
+    return result == "ok"
+
+
+def _writefs_once(ser: serial.Serial, data: bytes) -> str:
+    """One writefs transfer: "ok", "timeout" or "error"."""
     total_size = len(data)
     chunk_count = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
 
@@ -461,9 +487,9 @@ def cmd_writefs(ser: serial.Serial, path: str) -> bool:
         if resp_type == "error":
             desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
             print(f"error: code {resp_val} — {desc}", file=sys.stderr)
-        else:
-            print(f"no ACK for header (timeout)", file=sys.stderr)
-        return False
+            return "error"
+        print(f"no ACK for header (timeout)", file=sys.stderr)
+        return "timeout"
 
     # 3. Send chunks
     for i in range(chunk_count):
@@ -478,17 +504,17 @@ def cmd_writefs(ser: serial.Serial, path: str) -> bool:
         if resp_type == "error":
             desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
             print(f"\nerror: code {resp_val} — {desc}", file=sys.stderr)
-            return False
+            return "error"
         elif resp_type != "pong":
             print(f"\nno ACK for chunk {i + 1} (timeout)", file=sys.stderr)
-            return False
+            return "timeout"
 
         # Progress
         pct = (i + 1) * 100 // chunk_count
         print(f"\r  [{i + 1}/{chunk_count}] {pct}%", end="", flush=True)
 
     print(" done (device will restart)")
-    return True
+    return "ok"
 
 
 def cmd_send(ser: serial.Serial, data_args: list[str]) -> bool:
@@ -632,10 +658,7 @@ def cmd_settime(ser: serial.Serial, dt_str: str | None) -> bool:
     weekday = (now.weekday() + 1) % 7  # Python 0=Mon → RTC 0=Sun
 
     payload = bytes([year, now.month, now.day, weekday, now.hour, now.minute, now.second])
-    ser.write(build_payload_msg(TAG_SETDATETIME, payload))
-    ser.flush()
-
-    resp_type, resp_val = read_response(ser)
+    resp_type, resp_val = request(ser, build_payload_msg(TAG_SETDATETIME, payload))
     if resp_type == "pong":
         day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
         print(f"time set: {now.strftime('%Y-%m-%d %H:%M:%S')} ({day_names[weekday]})")

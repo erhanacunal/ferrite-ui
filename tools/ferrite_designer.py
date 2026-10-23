@@ -3643,6 +3643,10 @@ except ImportError:
 class DeviceDialog(QDialog):
     """Dialog for serial device communication — ping, upload, writefs."""
 
+    # The device drops a message stalled mid-frame for 500 ms
+    # (protocol::RX_RESYNC_MS); wait a bit longer before resending.
+    RESYNC_WAIT = 0.6
+
     def __init__(self, model, parent=None):
         super().__init__(parent)
         self.model = model
@@ -3827,42 +3831,48 @@ class DeviceDialog(QDialog):
 
     def _read_response(self, ser):
         """Read one protocol response. Returns (type_str, value)."""
-        import struct as st
-        import time
-        deadline = time.time() + ser.timeout
+        # Each read shrinks ser.timeout to what is left; restore it so the
+        # next call (or a retry) gets the full timeout again.
+        orig_timeout = ser.timeout
+        try:
+            import struct as st
+            import time
+            deadline = time.time() + ser.timeout
 
-        while time.time() < deadline:
-            remaining = max(0.1, deadline - time.time())
-            ser.timeout = remaining
-            b = ser.read(1)
-            if not b:
-                return ("timeout", None)
-            tag = b[0]
+            while time.time() < deadline:
+                remaining = max(0.1, deadline - time.time())
+                ser.timeout = remaining
+                b = ser.read(1)
+                if not b:
+                    return ("timeout", None)
+                tag = b[0]
 
-            if tag == 0x10:  # PONG
-                return ("pong", None)
-            elif tag == 0x0A:  # ERROR
-                lb = ser.read(1)
-                if lb:
-                    length = lb[0]
-                    data = ser.read(length)
-                    code = data[0] if data else 0
-                    return ("error", code)
-            elif tag == 0x18:  # MEMINFO_RESP
-                val = 0
-                shift = 0
-                while True:
-                    vb = ser.read(1)
-                    if not vb:
-                        break
-                    byte = vb[0]
-                    val |= (byte & 0x7F) << shift
-                    shift += 7
-                    if not (byte & 0x80):
-                        break
-                return ("meminfo", val)
-            # Skip unknown bytes (debug output)
-        return ("timeout", None)
+                if tag == 0x10:  # PONG
+                    return ("pong", None)
+                elif tag == 0x0A:  # ERROR
+                    lb = ser.read(1)
+                    if lb:
+                        length = lb[0]
+                        data = ser.read(length)
+                        code = data[0] if data else 0
+                        return ("error", code)
+                elif tag == 0x18:  # MEMINFO_RESP
+                    val = 0
+                    shift = 0
+                    while True:
+                        vb = ser.read(1)
+                        if not vb:
+                            break
+                        byte = vb[0]
+                        val |= (byte & 0x7F) << shift
+                        shift += 7
+                        if not (byte & 0x80):
+                            break
+                    return ("meminfo", val)
+                # Skip unknown bytes (debug output)
+            return ("timeout", None)
+        finally:
+            ser.timeout = orig_timeout
 
     def _ping(self):
         ser = self._open_serial()
@@ -3872,6 +3882,11 @@ class DeviceDialog(QDialog):
         self._log(f"Ping {ser.port}...")
         self._send_varint_msg(ser, 0x08)
         resp, val = self._read_response(ser)
+        if resp == "timeout":
+            self._log("No response — resyncing and retrying...")
+            self._resync(ser)
+            self._send_varint_msg(ser, 0x08)
+            resp, val = self._read_response(ser)
         if resp == "pong":
             self._log("PONG — device is alive")
             self._set_status(True)
@@ -3882,6 +3897,12 @@ class DeviceDialog(QDialog):
             self._log("TIMEOUT — no response")
             self._set_status(False)
         ser.close()
+
+    def _resync(self, ser):
+        """Wait out the device's RX resync timeout and drop stale input."""
+        import time
+        time.sleep(self.RESYNC_WAIT)
+        ser.reset_input_buffer()
 
     def _restart(self):
         ser = self._open_serial()
@@ -3923,8 +3944,14 @@ class DeviceDialog(QDialog):
         header = st.pack("<II", total, CHUNK_SIZE)
         self._send_payload_msg(ser, 0x22, header)
 
-        # Wait for ACK
+        # Wait for ACK (a parser stuck on stray bytes eats the first header:
+        # wait out its resync and send it again)
         resp, val = self._read_response(ser)
+        if resp == "timeout":
+            self._log("No ACK — resyncing and resending header...")
+            self._resync(ser)
+            self._send_payload_msg(ser, 0x22, header)
+            resp, val = self._read_response(ser)
         if resp != "pong":
             self._log(f"ERROR: Expected ACK, got {resp} (code {val})")
             ser.close()
@@ -4677,8 +4704,17 @@ class DesignerWindow(QMainWindow):
                 ser.write(bytes(msg))
                 ser.flush()
 
-                # Wait for ACK
+                # Wait for ACK. A device parser stuck on stray bytes eats the
+                # first header: wait out its 500 ms resync, send it again.
                 resp = self._wait_pong(ser)
+                if not resp:
+                    import time
+                    time.sleep(0.6)
+                    ser.reset_input_buffer()
+                    ser.timeout = 10.0  # _wait_pong shrinks it
+                    ser.write(bytes(msg))
+                    ser.flush()
+                    resp = self._wait_pong(ser)
                 if not resp:
                     self._upload_error = "Device did not ACK header"
                     ser.close()

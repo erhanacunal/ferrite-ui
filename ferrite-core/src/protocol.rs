@@ -36,6 +36,13 @@ const MAX_USER_MSG: usize = 64;
 /// Sector buffer size for flash writes (4KB = 1 erase sector)
 const FS_SECTOR_SIZE: usize = 4096;
 
+/// A message that stalls this long mid-frame (no byte arrived, RX ring empty)
+/// is abandoned: the parser goes back to `Idle`. The protocol has no frame
+/// markers, so without this a stray byte (noise on a floating RX line, an
+/// aborted host transfer) that looks like a payload tag would leave the
+/// parser swallowing every later byte as payload until reset.
+pub const RX_RESYNC_MS: u32 = 500;
+
 // --- RX State Machine ---
 
 #[derive(Clone, Copy)]
@@ -218,6 +225,19 @@ impl Protocol {
             datetime_buf: [0; 7],
             datetime_pos: 0,
         }
+    }
+
+    /// True between messages (waiting for a tag byte).
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, RxState::Idle)
+    }
+
+    /// Abandon a half-received message and wait for the next tag byte.
+    /// A partial program buffer is freed. A partial WriteFs transfer stays
+    /// abandoned: the host restarts it with a new header.
+    pub fn resync(&mut self) {
+        self.state = RxState::Idle;
+        self.program_buf = Vec::new();
     }
 
     /// Return program bytecode (valid after ProgramReady event).
@@ -644,5 +664,21 @@ mod memdetail_tests {
         let out = usart.backend().0.borrow().clone();
         assert_eq!(&out[..3], &[0x32, 0x80 | (145 & 0x7F), 145 >> 7]);
         assert_eq!(out.len(), 3 + 145);
+    }
+
+    #[test]
+    fn stray_payload_tag_swallows_commands_until_resync() {
+        let mut p = Protocol::new(0x1000);
+        let flash = crate::flash::FlashImpl::with_backend(crate::mock::MockFlash);
+        // Noise: a UserMessage tag (0x32) + a long length (0xFF 0x7F) …
+        for b in [0x32, 0xFF, 0x7F] {
+            p.feed(b, &flash);
+        }
+        assert!(!p.is_idle());
+        // … and a later ping is eaten as payload.
+        assert!(matches!(p.feed(0x08, &flash), RxEvent::None));
+        p.resync();
+        assert!(p.is_idle());
+        assert!(matches!(p.feed(0x08, &flash), RxEvent::Ping));
     }
 }

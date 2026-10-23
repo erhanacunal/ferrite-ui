@@ -272,6 +272,8 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
     // --- Main loop ---
     let mut input = <P::Input as InputHandler<P>>::new();
     let mut protocol = Protocol::new(P::FS_BASE);
+    // Time the last USART byte was taken from the RX ring (for resync).
+    let mut last_rx_ms = ctx.systick.millis();
 
     loop {
         // Resume a suspended showModal whose result is now ready.
@@ -294,6 +296,8 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
         //     program or filesystem can be flashed to recover) ---
         while let Some(byte) = ctx.usart.rx_read_byte() {
             let ev = protocol.feed(byte, &ctx.flash);
+            // After feed: a flash erase it triggered is not idle time.
+            last_rx_ms = ctx.systick.millis();
             if matches!(ev, RxEvent::None) {
                 continue;
             }
@@ -361,6 +365,13 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                 }
                 _ => {} // None handled above; extras consumed by on_extra_rx
             }
+        }
+        // Ring drained. A message stalled mid-frame is dropped, so a stray
+        // byte (RX noise, an aborted host transfer) can't wedge the parser.
+        if !protocol.is_idle()
+            && ctx.systick.millis().wrapping_sub(last_rx_ms) > protocol::RX_RESYNC_MS
+        {
+            protocol.resync();
         }
 
         // --- Input ---

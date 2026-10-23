@@ -188,8 +188,11 @@ fn init_ports() {
         val |= 0x3 << 0;
         val &= !(0xF << 4);
         val |= 0xB << 4;
+        // PA10 = USART0 RX: input with pull-up (ODR bit 10 set below), not
+        // floating. A floating RX line with no adapter attached picks up
+        // noise, and stray bytes can desync the USART protocol.
         val &= !(0xF << 8);
-        val |= 0x4 << 8;
+        val |= 0x8 << 8;
         val &= !(0xF << 12);
         val |= 0x3 << 12;
         val &= !(0xF << 16);
@@ -197,6 +200,7 @@ fn init_ports() {
         val &= !(0xF << 28);
         val |= 0x3 << 28;
         core::ptr::write_volatile(ctl1, val);
+        core::ptr::write_volatile((GPIOA + 0x10) as *mut u32, 1 << 10); // BOP: PA10 pull-up
 
         core::ptr::write_volatile(
             (GPIOA + 0x10) as *mut u32,
