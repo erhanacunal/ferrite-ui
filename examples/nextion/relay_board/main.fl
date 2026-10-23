@@ -7,7 +7,8 @@
 // Settings: add/delete buttons in the left list (a new button is selected),
 // name it, tick its relay channels on the right, optionally enter an image
 // number (0 = none, 1-4 = the sample icons in project.json), then OK. Cancel
-// drops the edits. Settings live in RAM only for now.
+// drops the edits. OK saves the buttons to the board's EEPROM, and they are
+// loaded again at startup. Relays always start off.
 //
 // Names are kept in widgets, not variables: strClear() only keeps strings a
 // widget shows. Committed names live in the button captions, names being
@@ -59,6 +60,18 @@ var ed_masks[10];
 var ed_images[10];
 var ed_active[10];
 var sel = -1;       // selected list row, -1 = none
+
+// --- Saved configuration (EEPROM) ---
+// header @0:        'R' 'B' version count sum_lo sum_hi
+// slot i @16 + 16i: name[12] name_len mask image (spare)
+// sum = 16-bit sum of all slot bytes. The header is written last, so a save
+// cut short by a power loss fails the checksum and the board starts with no
+// buttons instead of garbage.
+const CFG_VERSION = 1;
+const CFG_SLOT0   = 16;
+const CFG_SLOT    = 16;
+var cfg_hdr[6];
+var cfg_slot[16];
 
 // --- Widget ids ---
 var btns[10];
@@ -134,6 +147,84 @@ fn mask_text(m) -> string {
 // place, so an input must never share its string with another widget.
 fn copy_text(id) -> string {
     return concat(id, str(""));
+}
+
+// ============================================================
+// Saved configuration
+// ============================================================
+
+fn slot_addr(i) {
+    return CFG_SLOT0 + i * CFG_SLOT;
+}
+
+// Store the buttons in use: names come from the captions. Only changed bytes
+// are rewritten, so saving an unchanged setup costs no write cycles.
+fn save_config() {
+    if (eepromSize() == 0) {
+        return 0;
+    }
+    var sum = 0;
+    for (var i = 0; i < count; i++) {
+        target(captions[i]);
+        var t = get(text);
+        var n = strLen(t);
+        if (n > NAME_LEN) {
+            n = NAME_LEN;
+        }
+        for (var k = 0; k < NAME_LEN; k++) {
+            cfg_slot[k] = k < n ? strByte(t, k) : 0;
+        }
+        cfg_slot[12] = n;
+        cfg_slot[13] = masks[i];
+        cfg_slot[14] = images[i];
+        cfg_slot[15] = 0;
+        for (k = 0; k < CFG_SLOT; k++) {
+            sum += cfg_slot[k];
+        }
+        eepromWriteArr(slot_addr(i), cfg_slot, CFG_SLOT);
+    }
+    cfg_hdr[0] = 82;    // 'R'
+    cfg_hdr[1] = 66;    // 'B'
+    cfg_hdr[2] = CFG_VERSION;
+    cfg_hdr[3] = count;
+    cfg_hdr[4] = sum % 256;
+    cfg_hdr[5] = (sum / 256) % 256;
+    eepromWriteArr(0, cfg_hdr, 6);
+}
+
+// Restore the saved buttons. An erased chip, another program's data or a
+// checksum mismatch leaves the board empty.
+fn load_config() {
+    if (eepromSize() == 0) {
+        return 0;
+    }
+    eepromReadArr(0, cfg_hdr, 6);
+    var n = cfg_hdr[3];
+    if (cfg_hdr[0] != 82 || cfg_hdr[1] != 66 || cfg_hdr[2] != CFG_VERSION || n > MAX_BUTTONS) {
+        return 0;
+    }
+    var sum = 0;
+    for (var i = 0; i < n; i++) {
+        eepromReadArr(slot_addr(i), cfg_slot, CFG_SLOT);
+        if (cfg_slot[12] > NAME_LEN) {
+            return 0;
+        }
+        for (var k = 0; k < CFG_SLOT; k++) {
+            sum += cfg_slot[k];
+        }
+    }
+    if (sum % 65536 != cfg_hdr[4] + cfg_hdr[5] * 256) {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        eepromReadArr(slot_addr(i), cfg_slot, CFG_SLOT);
+        masks[i] = cfg_slot[13];
+        images[i] = cfg_slot[14];
+        active[i] = 0;
+        target(captions[i]);
+        set(text, arrToStr(cfg_slot, cfg_slot[12]));
+    }
+    count = n;
 }
 
 // ============================================================
@@ -424,6 +515,7 @@ fn on_ok(wid) {
         target(captions[i]);
         set(text, t);
     }
+    save_config();
     close_settings();
     layout_buttons();
     apply_relays();
@@ -635,6 +727,7 @@ fn setup() {
     }
 
     build_settings();
+    load_config();
 
     sel = -1;
     layout_buttons();

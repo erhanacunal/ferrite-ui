@@ -114,7 +114,7 @@ Hold the top-left corner for 3 seconds at boot. A red progress bar fills while h
 
 ### Relay Board
 
-Drives an 8-channel relay board from the user GPIO header ([examples/nextion/relay_board](examples/nextion/relay_board/)). Up to 10 buttons, laid out automatically in two rows of five; each button has a name, an optional image and a group of relays, and switches the group on and off. A relay stays on while any active button includes it. The settings page adds, deletes and edits buttons; settings are kept in RAM for now.
+Drives an 8-channel relay board from the user GPIO header ([examples/nextion/relay_board](examples/nextion/relay_board/)). Up to 10 buttons, laid out automatically in two rows of five; each button has a name, an optional image and a group of relays, and switches the group on and off. A relay stays on while any active button includes it. The settings page adds, deletes and edits buttons. OK saves them to the board's EEPROM, so they survive power cycles.
 
 | Main Page | Settings |
 |-----------|----------|
