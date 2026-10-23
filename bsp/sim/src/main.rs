@@ -21,6 +21,7 @@ use ferrite_core::widget::WidgetTree;
 
 // --- Concrete host backends (type aliases + free-fn constructors) ---
 mod backlight;
+mod eeprom;
 mod flash;
 mod gpio;
 mod lcd;
@@ -39,7 +40,7 @@ use touch::sim::MouseState;
 use touch::CalParams;
 
 fn main() {
-    let (fsimage_path, taps) = parse_args();
+    let (fsimage_path, taps, eeprom_path) = parse_args();
 
     systick::init();
 
@@ -97,6 +98,7 @@ fn main() {
         systick: systick::Systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
         gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::SimGpio::default()),
+        eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::SimEeprom::new(eeprom_path)),
         cursor_visible: false,
     });
 
@@ -105,14 +107,17 @@ fn main() {
     ferrite_core::runtime::run::<SimPlatform>(ctx, touch)
 }
 
-/// `--fsimage <path>` and any number of `--tap X,Y,MS` (scripted presses).
-fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>) {
+/// `--fsimage <path>`, any number of `--tap X,Y,MS` (scripted presses) and
+/// `--eeprom <path>` (file that keeps the virtual EEPROM across runs).
+fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>, Option<String>) {
     let mut fsimage = None;
+    let mut eeprom = None;
     let mut taps = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--fsimage" => fsimage = args.next(),
+            "--eeprom" => eeprom = args.next(),
             "--tap" => {
                 let spec = args.next().unwrap_or_default();
                 let parts: Vec<u32> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
@@ -124,7 +129,7 @@ fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>) {
             _ => {}
         }
     }
-    (fsimage, taps)
+    (fsimage, taps, eeprom)
 }
 
 fn load_flash(path: Option<&str>) -> Result<flash::Flash, String> {

@@ -1613,6 +1613,7 @@ mod mem_detail_tests {
             systick: SystickImpl::init(),
             audio: AudioImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
+            eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
             cursor_visible: false,
         }
     }

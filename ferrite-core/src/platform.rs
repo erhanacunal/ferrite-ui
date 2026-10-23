@@ -7,6 +7,7 @@
 /// `P: Platform`, giving it access to all hardware through a single parameter.
 use crate::audio::AudioBackend;
 use crate::backlight::BacklightBackend;
+use crate::eeprom::EepromBackend;
 use crate::flash::FlashBackend;
 use crate::gpio::GpioBackend;
 use crate::lcd::LcdBackend;
@@ -46,6 +47,9 @@ pub trait Platform {
     // User GPIO header (`pinMode`/`pinWrite`/`pinRead`); boards without one
     // use `ferrite_core::gpio::NoGpio`.
     type GpioB: GpioBackend;
+    // User-data EEPROM (`eepromRead`/`eepromWrite`/…); boards without one
+    // use `ferrite_core::eeprom::NoEeprom`.
+    type EepromB: EepromBackend;
 
     // --- Flash layout (Rust's stand-in for C-style per-board `#define`s) ---
     //

@@ -35,6 +35,7 @@ impl Platform for N32903Platform {
     type SystickB = crate::systick::N32903Systick;
     type AudioB = ferrite_core::audio::NoAudio;
     type GpioB = crate::gpio::HeaderGpio;
+    type EepromB = ferrite_core::eeprom::NoEeprom;
 
     // The "flash" is the SDRAM shadow of a NAND region (see flash/mod.rs), so
     // the default layout applies: config at 0x0000, resource FS from 0x1000.

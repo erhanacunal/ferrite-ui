@@ -11,7 +11,8 @@ Bare-metal HMI framework written in Rust for the Nextion NX8048K070 display.
   - Double buffer: swap via CMD 4/5, no tearing
 - **Touch:** XPT2046 (SPI)
 - **Flash:** W25Q256JVFQ 32MB (SPI) — UI bytecode, fonts, images stored here
-- **RTC:** AT8563T (I2C)
+- **RTC:** AT8563T (I2C, PC0/PC1)
+- **EEPROM:** 24C08 1 KB (same I2C bus as the RTC, 0x54–0x57)
 
 ## FPGA Protocol
 
@@ -160,6 +161,14 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
       fileClose(h);
   }
   ```
+
+### User EEPROM
+- **Backend:** `eeprom::EepromBackend` (`SIZE`, `read`, `write`) → `Platform::EepromB` → `ctx.eeprom` (`EepromImpl`: range checks, and it skips 16-byte chunks that already hold the data, to save write cycles and wear). Boards without one use `NoEeprom` (size 0).
+- **GD32 Nextion:** 24C08 (1 KB) on the RTC's I2C bus (SCL = PC0, SDA = PC1). The bit-bang moved to `bsp/nextion/src/i2c.rs`, which is shared with `rtc/hw.rs`. The A2 pin is at VCC, so the 4 × 256 B blocks answer at 0x54–0x57 (A0/A1 at GND, unused: on the 24C08 those bits select the block). The RTC is at 0x51. `eeprom/hw.rs` splits reads at block boundaries and writes into 16-byte pages, with bounded ACK polling after each page (`POLL_MAX`, ~30 ms, so a missing chip faults instead of hanging). No ISR uses the bus.
+- **Sim:** 1 KB `SimEeprom`, and `--eeprom <file>` loads it at start and saves it after each write. n32903 / tdo_y13 / epaper: `NoEeprom`.
+- **VM builtins:** `eepromSize()` (0xB3), `eepromRead(addr)` (0xB4), `eepromWrite(addr, value)` (0xB5, low byte), `eepromReadArr(addr, arr, count)` (0xB6), `eepromWriteArr(addr, arr, count)` (0xB7). Bad range, no EEPROM or a bus error → VM fault 16 (`EEPROM`). Bad array → 9, `count` > array length → 13. Opcodes are duplicated in `vm.rs` and `tools/ferrite_cc.py` (`Op`, `Builtin`, `OP_NAMES`, `_NO_ARG_OPS`), fault names in `ferrite_cli.py` `VM_FAULT_NAMES`. Keep them in sync.
+- **Examples:** `examples/nextion/eeprom_demo` (boot counter + reset). `examples/nextion/relay_board` saves its buttons on OK and loads them at startup (format in `main.fl`: header + 16-byte slots, checksummed, header written last).
+- `strByte(s, i)` (0xB8) returns byte `i` of a string, or -1 past the end. It is the counterpart of `arrToStr`, used to save names byte by byte.
 
 ### USART RX Resync
 - The protocol has no frame markers: a stray byte that looks like a payload tag (noise, an aborted transfer) would leave `Protocol` swallowing every later byte as payload. The main loop calls `protocol.resync()` once the RX ring is drained, the parser is mid-message and no byte has arrived for `protocol::RX_RESYNC_MS` (500 ms). The timestamp is taken after `feed`, so a flash erase it triggers doesn't count as a stall.

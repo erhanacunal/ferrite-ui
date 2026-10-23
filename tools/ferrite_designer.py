@@ -3324,6 +3324,8 @@ class FerriteSyntaxHighlighter(QSyntaxHighlighter):
                      "itof", "ftoi", "fneg", "fadd", "fsub", "fmul", "fdiv",
                      "setBrightness", "brightness",
                      "pinMode", "pinWrite", "pinRead",
+                     "eepromSize", "eepromRead", "eepromWrite",
+                     "eepromReadArr", "eepromWriteArr", "strByte",
                      "rtcRead", "rtcWrite", "sendUsart",
                      "fpgaCmd", "fpgaData", "beginFrame", "endFrame",
                      "layout"]

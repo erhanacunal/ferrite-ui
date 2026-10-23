@@ -107,6 +107,7 @@ pub extern "C" fn rust_main() -> ! {
         systick: systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
         gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::HeaderGpio),
+        eeprom: ferrite_core::eeprom::EepromImpl::none(),
         cursor_visible: false,
     });
     let touch = TouchImpl::with_backend(touch::new());

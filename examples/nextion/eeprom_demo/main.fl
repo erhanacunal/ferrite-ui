@@ -1,0 +1,109 @@
+// main.fl — EEPROM Demo (800x480)
+//
+// Counts how often the device has started. The count lives in the board's
+// EEPROM (24C08 on the GD32 Nextion), so it survives power cycles and
+// reflashing. Tap "Reset" to set it back to zero.
+//
+// EEPROM record at address 0 (4 bytes):
+//   0-1  magic 'F' 'E' — an erased chip (all 0xFF) starts counting from 0
+//   2-3  boot count, 16-bit little endian
+
+#include "core.fl"
+#include "color.fl"
+
+const ADDR_RECORD = 0;
+const MAGIC_0 = 70;  // 'F'
+const MAGIC_1 = 69;  // 'E'
+
+var rec[4] = [0, 0, 0, 0];
+var boots;
+var count_lbl;
+// set(on_click) wires file-scope widget variables.
+var reset_btn;
+
+fn save() {
+    rec[0] = MAGIC_0;
+    rec[1] = MAGIC_1;
+    rec[2] = boots % 256;
+    rec[3] = boots / 256;
+    eepromWriteArr(ADDR_RECORD, rec, 4);  // only changed bytes are rewritten
+}
+
+fn show_count() {
+    target(count_lbl);
+    set(text, sprintf("Boots: %d", boots));
+    sendUsart(sprintf("boots=%d\r\n", boots));
+    strClear();
+}
+
+fn on_reset(wid) {
+    boots = 0;
+    save();
+    show_count();
+}
+
+fn label(y, h, text, color) {
+    var l = alloc();
+    target(l);
+    set(kind, KIND_LABEL);
+    set(location, 0, y);
+    set(size, 800, h);
+    set(text, text);
+    set(text_color, color);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+    return l;
+}
+
+fn setup() {
+    label(30, 40, "EEPROM demo", WHITE);
+
+    if (eepromSize() == 0) {
+        label(200, 40, "This board has no EEPROM", RED);
+        return 0;
+    }
+    label(80, 30, sprintf("%d bytes", eepromSize()), LIGHT_GRAY);
+
+    count_lbl = alloc();
+    target(count_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 0, 170);
+    set(size, 800, 60);
+    set(text_color, GREEN);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+
+    reset_btn = alloc();
+    target(reset_btn);
+    set(location, 300, 300);
+    set(size, 200, 60);
+    set(bg_color, 0x2945);
+    set(press_color, 0x2C9F);
+    set(border_radius, 8);
+    set(clickable, ON);
+    set(on_click, @on_reset);
+    parent(0);
+    var l = alloc();
+    target(l);
+    set(kind, KIND_LABEL);
+    set(size, 200, 60);
+    set(text, "Reset");
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(reset_btn);
+
+    eepromReadArr(ADDR_RECORD, rec, 4);
+    if (rec[0] == MAGIC_0 && rec[1] == MAGIC_1) {
+        boots = rec[2] + rec[3] * 256;
+    } else {
+        boots = 0;
+    }
+    boots = (boots + 1) % 65536;
+    save();
+    show_count();
+    return 0;
+}
+
+fn loop() {
+    delay(100);
+}

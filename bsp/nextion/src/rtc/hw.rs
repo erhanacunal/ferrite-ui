@@ -1,24 +1,8 @@
-/// AT8563T Real-Time Clock — I2C bit-bang driver
+/// AT8563T Real-Time Clock — on the shared I2C bus (`crate::i2c`)
 ///
 /// PCF8563 compatible. I2C address: 0x51 (7-bit).
-///
-/// Pin assignment (Ghidra RE):
-///   PC0 = SCL (open-drain, 50MHz)
-///   PC1 = SDA (open-drain, 50MHz)
-///
-/// GPIO configured as open-drain output by init_ports() (CTL0 = 0x77).
-/// Both lines idle HIGH (external pull-ups). Initial state set in init_ports().
-///
-/// I2C bit-bang at ~100kHz (spin delays tuned for 108MHz sysclk).
 use super::{DateTime, RtcBackend};
-
-const GPIOC_BASE: u32 = 0x4001_1000;
-const GPIO_IDR: u32 = GPIOC_BASE + 0x08;
-const GPIO_BOP: u32 = GPIOC_BASE + 0x10;
-const GPIO_BC: u32 = GPIOC_BASE + 0x14;
-
-const SCL_PIN: u32 = 0;
-const SDA_PIN: u32 = 1;
+use crate::i2c;
 
 const I2C_ADDR: u8 = 0x51;
 
@@ -62,26 +46,26 @@ impl At8563 {
     }
 
     fn read_regs(&self, reg: u8, buf: &mut [u8]) {
-        i2c_start();
-        i2c_write_byte((I2C_ADDR << 1) | 0);
-        i2c_write_byte(reg);
-        i2c_start();
-        i2c_write_byte((I2C_ADDR << 1) | 1);
+        i2c::start();
+        i2c::write_byte((I2C_ADDR << 1) | 0);
+        i2c::write_byte(reg);
+        i2c::start();
+        i2c::write_byte((I2C_ADDR << 1) | 1);
         for i in 0..buf.len() {
             let last = i == buf.len() - 1;
-            buf[i] = i2c_read_byte(!last);
+            buf[i] = i2c::read_byte(!last);
         }
-        i2c_stop();
+        i2c::stop();
     }
 
     fn write_regs(&self, reg: u8, data: &[u8]) {
-        i2c_start();
-        i2c_write_byte((I2C_ADDR << 1) | 0);
-        i2c_write_byte(reg);
+        i2c::start();
+        i2c::write_byte((I2C_ADDR << 1) | 0);
+        i2c::write_byte(reg);
         for &b in data {
-            i2c_write_byte(b);
+            i2c::write_byte(b);
         }
-        i2c_stop();
+        i2c::stop();
     }
 }
 
@@ -135,119 +119,4 @@ fn bcd_to_bin(bcd: u8) -> u8 {
 #[inline]
 fn bin_to_bcd(bin: u8) -> u8 {
     ((bin / 10) << 4) | (bin % 10)
-}
-
-#[inline]
-fn i2c_delay() {
-    spin(80);
-}
-
-#[inline]
-fn scl_high() {
-    unsafe {
-        core::ptr::write_volatile(GPIO_BOP as *mut u32, 1 << SCL_PIN);
-    }
-}
-
-#[inline]
-fn scl_low() {
-    unsafe {
-        core::ptr::write_volatile(GPIO_BC as *mut u32, 1 << SCL_PIN);
-    }
-}
-
-#[inline]
-fn sda_high() {
-    unsafe {
-        core::ptr::write_volatile(GPIO_BOP as *mut u32, 1 << SDA_PIN);
-    }
-}
-
-#[inline]
-fn sda_low() {
-    unsafe {
-        core::ptr::write_volatile(GPIO_BC as *mut u32, 1 << SDA_PIN);
-    }
-}
-
-#[inline]
-fn sda_read() -> bool {
-    let idr = unsafe { core::ptr::read_volatile(GPIO_IDR as *const u32) };
-    idr & (1 << SDA_PIN) != 0
-}
-
-fn i2c_start() {
-    sda_high();
-    i2c_delay();
-    scl_high();
-    i2c_delay();
-    sda_low();
-    i2c_delay();
-    scl_low();
-    i2c_delay();
-}
-
-fn i2c_stop() {
-    sda_low();
-    i2c_delay();
-    scl_high();
-    i2c_delay();
-    sda_high();
-    i2c_delay();
-}
-
-fn i2c_write_byte(byte: u8) -> bool {
-    for i in (0..8).rev() {
-        if byte & (1 << i) != 0 {
-            sda_high();
-        } else {
-            sda_low();
-        }
-        i2c_delay();
-        scl_high();
-        i2c_delay();
-        scl_low();
-    }
-    sda_high();
-    i2c_delay();
-    scl_high();
-    i2c_delay();
-    let ack = !sda_read();
-    scl_low();
-    i2c_delay();
-    ack
-}
-
-fn i2c_read_byte(send_ack: bool) -> u8 {
-    sda_high();
-    let mut byte: u8 = 0;
-    for _ in 0..8 {
-        i2c_delay();
-        scl_high();
-        i2c_delay();
-        byte <<= 1;
-        if sda_read() {
-            byte |= 1;
-        }
-        scl_low();
-    }
-    if send_ack {
-        sda_low();
-    } else {
-        sda_high();
-    }
-    i2c_delay();
-    scl_high();
-    i2c_delay();
-    scl_low();
-    sda_high();
-    i2c_delay();
-    byte
-}
-
-#[inline]
-fn spin(cycles: u32) {
-    for _ in 0..cycles {
-        cortex_m::asm::nop();
-    }
 }

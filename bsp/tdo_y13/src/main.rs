@@ -121,6 +121,7 @@ fn ui_task(_: *mut ()) {
         systick: systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
         gpio: ferrite_core::gpio::GpioImpl::none(),
+        eeprom: ferrite_core::eeprom::EepromImpl::none(),
         cursor_visible: false,
     });
     let touch = TouchImpl::with_backend(touch::new());

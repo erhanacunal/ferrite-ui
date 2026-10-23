@@ -11,7 +11,8 @@ Bare-metal HMI framework written in Rust for the Nextion NX8048K070 display.
   - Double buffer: swap via CMD 4/5, no tearing
 - **Touch:** XPT2046 (SPI)
 - **Flash:** W25Q256JVFQ 32MB (SPI) — UI bytecode, fonts, images stored here
-- **RTC:** AT8563T (I2C)
+- **RTC:** AT8563T (I2C, PC0/PC1)
+- **EEPROM:** 24C08 1 KB (same I2C bus as the RTC, 0x54–0x57)
 
 ## FPGA Protocol
 
@@ -215,6 +216,14 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Pins 0..7, same numbers on every board:** GD32 Nextion PC2–PC9 (`bsp/nextion/src/user_gpio.rs`), N32903 GPD3, GPD2, GPB2–GPB6, GPA0 (`bsp/n32903/src/gpio`). Sim: 8 virtual pins that log to stdout. epaper / tdo_y13: `NoGpio`.
 - **VM builtins:** `pinMode(pin, mode)` (`OP_PIN_MODE` 0xB0), `pinWrite(pin, value)` (0xB1, non-zero = high), `pinRead(pin)` (0xB2 → 0/1). Modes: 0 input, 1 output push-pull, 2 input pull-up, 3 input pull-down (GD32 only). `lib/gpio.fl` has the `GPIO_*` constants and pin table.
 - Pins keep their power-on state until `pinMode`. Writing a non-output pin is ignored (on GD32 the ODR would flip an input's pull). Unknown pin / unsupported mode → VM fault 14 (`GPIO`). No pin-change callback: poll from `loop()`.
+
+### User EEPROM
+- **Backend:** `eeprom::EepromBackend` (`SIZE`, `read`, `write`) → `Platform::EepromB` → `ctx.eeprom` (`EepromImpl`: range checks, and it skips 16-byte chunks that already hold the data, to save write cycles and wear). Boards without one use `NoEeprom` (size 0).
+- **GD32 Nextion:** 24C08 (1 KB) on the RTC's I2C bus (SCL = PC0, SDA = PC1). The bit-bang moved to `bsp/nextion/src/i2c.rs`, which is shared with `rtc/hw.rs`. The A2 pin is at VCC, so the 4 × 256 B blocks answer at 0x54–0x57 (A0/A1 at GND, unused: on the 24C08 those bits select the block). The RTC is at 0x51. `eeprom/hw.rs` splits reads at block boundaries and writes into 16-byte pages, with bounded ACK polling after each page (`POLL_MAX`, ~30 ms, so a missing chip faults instead of hanging). No ISR uses the bus.
+- **Sim:** 1 KB `SimEeprom`, and `--eeprom <file>` loads it at start and saves it after each write. n32903 / tdo_y13 / epaper: `NoEeprom`.
+- **VM builtins:** `eepromSize()` (0xB3), `eepromRead(addr)` (0xB4), `eepromWrite(addr, value)` (0xB5, low byte), `eepromReadArr(addr, arr, count)` (0xB6), `eepromWriteArr(addr, arr, count)` (0xB7). Bad range, no EEPROM or a bus error → VM fault 16 (`EEPROM`). Bad array → 9, `count` > array length → 13. Opcodes are duplicated in `vm.rs` and `tools/ferrite_cc.py` (`Op`, `Builtin`, `OP_NAMES`, `_NO_ARG_OPS`), fault names in `ferrite_cli.py` `VM_FAULT_NAMES`. Keep them in sync.
+- **Examples:** `examples/nextion/eeprom_demo` (boot counter + reset). `examples/nextion/relay_board` saves its buttons on OK and loads them at startup (format in `main.fl`: header + 16-byte slots, checksummed, header written last).
+- `strByte(s, i)` (0xB8) returns byte `i` of a string, or -1 past the end. It is the counterpart of `arrToStr`, used to save names byte by byte.
 
 ### SD Card Boot
 - `ferrite_core::fat` (read-only FAT16/32, generic over `SdCardBackend`) + `ferrite_core::sdboot::sd_boot_check(ctx, sd, present)`: `EMPTY.BIN` → recovery, `PROGRAM.BIN` → copied to `P::FS_BASE`. The BSP detects/inits the card; `present` makes the progress text visible (n32903: `lcd::flush_cache`).

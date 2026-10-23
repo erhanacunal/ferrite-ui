@@ -982,6 +982,7 @@ NO_VALUE_BUILTINS = {
     'setDialogResult',
     'animate', 'stopAnim', 'stopAnimProp',
     'pinMode', 'pinWrite',
+    'eepromWrite', 'eepromReadArr', 'eepromWriteArr',
 }
 
 # Builtins whose return value is an array ID (so the variable must be in array_vars)
@@ -1723,7 +1724,7 @@ class CodeGen:
     _INT_RETURNING = {
         'ftoi', 'feq', 'fne', 'flt', 'fle', 'fgt', 'fge',
         'alloc', 'get', 'parseInt', 'strLen', 'strlen', 'strcmp',
-        'millis', 'brightness', 'pinRead',
+        'millis', 'brightness', 'pinRead', 'eepromSize', 'eepromRead', 'strByte',
         'arrFree', 'strFree', 'arrLen',
         'syscall',
     }
@@ -2872,6 +2873,15 @@ class CodeGen:
             self.asm.str_len()
             return
 
+        if name == 'strByte':
+            # strByte(s, i) → byte i of string s (0..255), or -1 past the end
+            if len(node.args) != 2:
+                raise CompileError("strByte() takes 2 arguments: str, index", node.line)
+            self._gen_expr(node.args[0])
+            self._gen_expr(node.args[1])
+            self.asm.builtin(Builtin.STR_BYTE)
+            return
+
         if name == 'strcmp':
             if len(node.args) != 2:
                 raise CompileError("strcmp() takes 2 arguments", node.line)
@@ -3095,6 +3105,46 @@ class CodeGen:
                 raise CompileError("pinRead() takes 1 argument: pin", node.line)
             self._gen_expr(node.args[0])
             self.asm.builtin(Builtin.PIN_READ)
+            return
+
+        if name == 'eepromSize':
+            # eepromSize() → bytes (0 on a board without an EEPROM)
+            if len(node.args) != 0:
+                raise CompileError("eepromSize() takes no arguments", node.line)
+            self.asm.builtin(Builtin.EEPROM_SIZE)
+            return
+
+        if name == 'eepromRead':
+            # eepromRead(addr) → byte 0..255
+            if len(node.args) != 1:
+                raise CompileError("eepromRead() takes 1 argument: addr", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.EEPROM_READ)
+            return
+
+        if name == 'eepromWrite':
+            # eepromWrite(addr, value) — stores the low byte of value
+            if len(node.args) != 2:
+                raise CompileError("eepromWrite() takes 2 arguments: addr, value", node.line)
+            self._gen_expr(node.args[0])
+            self._gen_expr(node.args[1])
+            self.asm.builtin(Builtin.EEPROM_WRITE)
+            return
+
+        if name in ('eepromReadArr', 'eepromWriteArr'):
+            # eepromReadArr(addr, arr, count)  — arr[0..count] = bytes at addr
+            # eepromWriteArr(addr, arr, count) — store low bytes of arr[0..count]
+            if len(node.args) != 3:
+                raise CompileError(f"{name}() takes 3 arguments: addr, arr, count", node.line)
+            self._gen_expr(node.args[0])
+            arg = node.args[1]
+            if isinstance(arg, VarRef) and arg.name in self.array_vars:
+                self.asm.load(self._var_slot(arg.name, node.line))
+            else:
+                self._gen_expr(arg)
+            self._gen_expr(node.args[2])
+            self.asm.builtin(Builtin.EEPROM_READ_ARR if name == 'eepromReadArr'
+                             else Builtin.EEPROM_WRITE_ARR)
             return
 
         if name == 'rtcRead':

@@ -863,6 +863,54 @@ nothing. A pin number the board doesn't have or an unsupported mode stops the
 program with VM fault 14 (`invalid gpio pin/mode`). There is no pin-change
 callback: poll `pinRead` from `loop()`.
 
+### EEPROM: eepromSize / eepromRead / eepromWrite / eepromReadArr / eepromWriteArr
+
+Store small amounts of data that survive power cycles and reflashing, such as
+settings, counters and calibration values. Addresses run from `0` to
+`eepromSize() - 1`. On the GD32 Nextion this is the on-board 24C08, which
+holds 1024 bytes. The simulator has a 1024-byte EEPROM too: run it with
+`--eeprom <file>` to keep the contents between runs. Other boards have none
+(`eepromSize()` returns 0).
+
+| Builtin | Result | Description |
+|---------|--------|-------------|
+| `eepromSize()` | int | Size in bytes, `0` if the board has no EEPROM |
+| `eepromRead(addr)` | int | One byte, `0..255` (an erased chip reads `255`) |
+| `eepromWrite(addr, value)` | — | Store the low byte of `value` |
+| `eepromReadArr(addr, arr, count)` | — | Fill `arr[0..count]` with the bytes at `addr` |
+| `eepromWriteArr(addr, arr, count)` | — | Store the low byte of each of `arr[0..count]` |
+
+```c
+var rec[4] = [0, 0, 0, 0];
+
+fn setup() {
+    if (eepromSize() == 0) { return 0; }    // board without an EEPROM
+    var level = eepromRead(10);
+    eepromWrite(10, level + 1);
+
+    eepromReadArr(0, rec, 4);              // 4 bytes from address 0
+    rec[2] = rec[2] + 1;
+    eepromWriteArr(0, rec, 4);
+}
+```
+
+- **Timing:** a write blocks the program while the chip stores it, up to
+  ~5 ms per 16-byte page. Bytes that already hold the same value are not
+  rewritten, so saving an unchanged record costs only a read. Group related
+  values and save them with one `eepromWriteArr`, not many `eepromWrite`
+  calls.
+- **Wear:** an EEPROM cell survives about a million writes. Save when a value
+  changes, not on every frame.
+- **Values are bytes:** store larger numbers in several bytes, e.g. a 16-bit
+  value as `v % 256` and `v / 256`.
+- **Errors:** an address range outside `0..eepromSize()-1`, a call on a board
+  without an EEPROM, or a chip that doesn't answer stops the program with VM
+  fault 16 (`eeprom error`). An invalid array is fault 9, and a `count`
+  longer than the array is fault 13.
+
+See `examples/nextion/eeprom_demo` for a boot counter that survives power
+cycles.
+
 ### fpgaCmd(cmd, data) / fpgaData(data)
 
 Send raw commands/data to the FPGA display controller. For advanced use only.
@@ -1027,6 +1075,7 @@ var n = itos(42);              // int → string "42"
 var f = ftos(3.14);            // float → string "3.14"
 var msg = concat(s, n);        // concatenate
 var len = strLen(s);           // byte length
+var c = strByte(s, 0);         // byte 0 → 72 ('H'); -1 past the end
 var val = parseInt(str("42")); // parse int
 var fv = parseFloat(str("3.14")); // parse float
 

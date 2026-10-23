@@ -23,7 +23,9 @@ use ferrite_core::widget::WidgetTree;
 
 // --- Concrete hardware backends (type aliases + free-fn constructors) ---
 mod backlight;
+mod eeprom;
 mod flash;
+mod i2c;
 mod lcd;
 mod rtc;
 mod sdcard;
@@ -302,6 +304,7 @@ fn build_ctx(gpio: Gpio) -> Box<Ctx<NextionPlatform>> {
         systick: systick::Systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
         gpio: ferrite_core::gpio::GpioImpl::with_backend(user_gpio::HeaderGpio),
+        eeprom: eeprom::init(),
         cursor_visible: false,
     })
 }

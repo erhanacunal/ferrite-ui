@@ -384,6 +384,12 @@ const OP_STOP_ANIM_PROP: u8 = 0xAF; // pop prop, pop widget → cancel that one 
 const OP_PIN_MODE: u8 = 0xB0; // pop mode, pop pin → configure user GPIO pin
 const OP_PIN_WRITE: u8 = 0xB1; // pop value, pop pin → drive output pin
 const OP_PIN_READ: u8 = 0xB2; // pop pin → push 0/1
+const OP_EEPROM_SIZE: u8 = 0xB3; // push EEPROM size in bytes (0 = none)
+const OP_EEPROM_READ: u8 = 0xB4; // pop addr → push byte 0..255
+const OP_EEPROM_WRITE: u8 = 0xB5; // pop value, pop addr → store low byte
+const OP_EEPROM_READ_ARR: u8 = 0xB6; // pop count, pop arr, pop addr → arr[0..count] = bytes
+const OP_EEPROM_WRITE_ARR: u8 = 0xB7; // pop count, pop arr, pop addr → store low bytes of arr[0..count]
+const OP_STR_BYTE: u8 = 0xB8; // pop index, pop str_id → push byte 0..255, or -1 past the end
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -446,6 +452,9 @@ pub mod fault {
     pub const GPIO: u8 = 14;
     /// Widget page (RES_PAGE) missing, truncated or malformed (OP_W_LOAD).
     pub const PAGE: u8 = 15;
+    /// EEPROM address range outside the chip, no EEPROM on the board, or an
+    /// I2C bus error.
+    pub const EEPROM: u8 = 16;
 
     /// Short human-readable name for the error screen.
     pub fn name(code: u8) -> &'static [u8] {
@@ -465,6 +474,7 @@ pub mod fault {
             BAD_OPERAND => b"bad operand",
             GPIO => b"invalid gpio pin/mode",
             PAGE => b"bad widget page",
+            EEPROM => b"eeprom error",
             _ => b"unknown fault",
         }
     }
@@ -2111,6 +2121,12 @@ impl Vm {
                 let id = self.pop() as u16;
                 self.push(ctx.strpool.len(id) as i32);
             }
+            OP_STR_BYTE => {
+                let (id, idx) = self.pop2();
+                let bytes = ctx.strpool.get(id as u16);
+                let b = usize::try_from(idx).ok().and_then(|i| bytes.get(i));
+                self.push(b.map_or(-1, |&b| b as i32));
+            }
             OP_STR_CMP => {
                 let (a, b) = self.pop2();
                 let (a, b) = (a as u16, b as u16);
@@ -2279,6 +2295,27 @@ impl Vm {
                     Some(level) => self.push(level),
                     None => self.fail(fault::GPIO),
                 }
+            }
+
+            // --- User EEPROM ---
+            OP_EEPROM_SIZE => self.push(ctx.eeprom.size()),
+            OP_EEPROM_READ => {
+                let addr = self.pop();
+                match ctx.eeprom.read_byte(addr) {
+                    Some(b) => self.push(b),
+                    None => self.fail(fault::EEPROM),
+                }
+            }
+            OP_EEPROM_WRITE => {
+                let (addr, value) = self.pop2();
+                if !ctx.eeprom.write_byte(addr, value) {
+                    self.fail(fault::EEPROM);
+                }
+            }
+            OP_EEPROM_READ_ARR | OP_EEPROM_WRITE_ARR => {
+                let count = self.pop();
+                let (addr, arr_id) = self.pop2();
+                self.eeprom_array(ctx, op == OP_EEPROM_WRITE_ARR, addr, arr_id, count);
             }
 
             // --- Animation engine ---
@@ -3134,6 +3171,53 @@ impl Vm {
 
     // --- Array operations ---
 
+    /// `eepromReadArr` / `eepromWriteArr`: move `count` bytes between the
+    /// EEPROM at `addr` and `arr[0..count]` (written bytes are the low byte
+    /// of each element). Bad array → BAD_ARRAY, `count` outside the array →
+    /// BAD_OPERAND, range outside the EEPROM or a bus error → EEPROM.
+    fn eeprom_array<P: Platform>(
+        &mut self,
+        ctx: &mut Ctx<P>,
+        write: bool,
+        addr: i32,
+        arr_id: i32,
+        count: i32,
+    ) {
+        let Some(pos) = self.find_array(arr_id) else {
+            return self.fail(fault::BAD_ARRAY);
+        };
+        if count < 0 || count as usize > self.arrays[pos].data.len() {
+            return self.fail(fault::BAD_OPERAND);
+        }
+        let count = count as usize;
+        if ctx.eeprom.range(addr, count).is_none() {
+            return self.fail(fault::EEPROM);
+        }
+        let mut buf = [0u8; crate::eeprom::CHUNK];
+        let mut done = 0;
+        while done < count {
+            let n = (count - done).min(buf.len());
+            let at = addr + done as i32;
+            let data = &mut self.arrays[pos].data[done..done + n];
+            let ok = if write {
+                for (b, &v) in buf.iter_mut().zip(data.iter()) {
+                    *b = v as u8;
+                }
+                ctx.eeprom.write(at, &buf[..n])
+            } else {
+                let ok = ctx.eeprom.read(at, &mut buf[..n]);
+                for (v, &b) in data.iter_mut().zip(buf.iter()) {
+                    *v = b as i32;
+                }
+                ok
+            };
+            if !ok {
+                return self.fail(fault::EEPROM);
+            }
+            done += n;
+        }
+    }
+
     fn find_array(&self, arr_id: i32) -> Option<usize> {
         if arr_id < 0 {
             return None;
@@ -3484,6 +3568,7 @@ mod anim_tests {
             systick: SystickImpl::init(),
             audio: AudioImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
+            eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
             cursor_visible: false,
         }
     }
@@ -3876,6 +3961,91 @@ mod anim_tests {
         let mut vm = cb_vm(&[OP_PUSH_I8, 0xFF, OP_PUSH_1, OP_PIN_WRITE, OP_HALT]);
         vm.tick(&mut ctx, 10);
         assert_eq!(vm.fault(), fault::GPIO);
+    }
+
+    #[test]
+    fn eeprom_byte_ops() {
+        // g0 = eepromSize(); eepromWrite(5, 0x1AB); g1 = eepromRead(5); HALT
+        let code = [
+            OP_EEPROM_SIZE, OP_STORE, 0,
+            OP_PUSH_I8, 5, OP_PUSH_I16, 0xAB, 0x01, OP_EEPROM_WRITE,
+            OP_PUSH_I8, 5, OP_EEPROM_READ, OP_STORE, 1,
+            OP_HALT,
+        ];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 100);
+        assert!(vm.state == VmState::Halted);
+        assert_eq!(vm.var_get(0), 64, "MockEeprom is 64 bytes");
+        assert_eq!(vm.var_get(1), 0xAB, "only the low byte is stored");
+    }
+
+    #[test]
+    fn eeprom_array_round_trip_across_chunks() {
+        // g2 = [100..120); eepromWriteArr(30, g2, 20);
+        // g3 = new arr[20]; eepromReadArr(30, g3, 20); HALT
+        let mut code = alloc::vec![OP_ARR_INIT, 20];
+        for v in 100i32..120 {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        code.extend_from_slice(&[
+            OP_STORE, 2,
+            OP_PUSH_I8, 30, OP_LOAD, 2, OP_PUSH_I8, 20, OP_EEPROM_WRITE_ARR,
+            OP_ARR_ALLOC, 20, OP_STORE, 3,
+            OP_PUSH_I8, 30, OP_LOAD, 3, OP_PUSH_I8, 20, OP_EEPROM_READ_ARR,
+            OP_HALT,
+        ]);
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 100);
+        assert!(vm.state == VmState::Halted, "fault {}", vm.fault());
+        let pos = vm.find_array(vm.var_get(3)).unwrap();
+        let want: Vec<i32> = (100..120).collect();
+        assert_eq!(vm.arrays[pos].data, want);
+    }
+
+    #[test]
+    fn str_byte_reads_bytes_and_minus_one_past_the_end() {
+        let mut ctx = mock_ctx();
+        let id = ctx.strpool.alloc(b"Hi").unwrap() as i8;
+        // g0 = strByte(s, 1); g1 = strByte(s, 2); g2 = strByte(s, -1)
+        let code = [
+            OP_PUSH_I8, id as u8, OP_PUSH_1, OP_STR_BYTE, OP_STORE, 0,
+            OP_PUSH_I8, id as u8, OP_PUSH_2, OP_STR_BYTE, OP_STORE, 1,
+            OP_PUSH_I8, id as u8, OP_PUSH_I8, 0xFF, OP_STR_BYTE, OP_STORE, 2,
+            OP_HALT,
+        ];
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 100);
+        assert!(vm.state == VmState::Halted);
+        assert_eq!(vm.var_get(0), b'i' as i32);
+        assert_eq!(vm.var_get(1), -1);
+        assert_eq!(vm.var_get(2), -1);
+    }
+
+    #[test]
+    fn eeprom_faults() {
+        let mut ctx = mock_ctx();
+        // eepromRead(64): past the end of the 64-byte EEPROM
+        let mut vm = cb_vm(&[OP_PUSH_I8, 64, OP_EEPROM_READ, OP_HALT]);
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.fault(), fault::EEPROM);
+        // eepromReadArr(0, arr[4], 5): count longer than the array
+        let mut vm = cb_vm(&[
+            OP_PUSH_0, OP_ARR_ALLOC, 4, OP_PUSH_I8, 5, OP_EEPROM_READ_ARR, OP_HALT,
+        ]);
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.fault(), fault::BAD_OPERAND);
+        // eepromWriteArr(62, arr[4], 4): range runs past the end
+        let mut vm = cb_vm(&[
+            OP_PUSH_I8, 62, OP_ARR_ALLOC, 4, OP_PUSH_I8, 4, OP_EEPROM_WRITE_ARR, OP_HALT,
+        ]);
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.fault(), fault::EEPROM);
+        // eepromReadArr(0, 99, 1): no such array
+        let mut vm = cb_vm(&[OP_PUSH_0, OP_PUSH_I8, 99, OP_PUSH_1, OP_EEPROM_READ_ARR, OP_HALT]);
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.fault(), fault::BAD_ARRAY);
     }
 
     #[test]

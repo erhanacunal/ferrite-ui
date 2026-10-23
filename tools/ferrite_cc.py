@@ -142,6 +142,14 @@ class Op:
     PIN_WRITE       = 0xB1  # pop value, pop pin → drive output
     PIN_READ        = 0xB2  # pop pin → push 0/1
 
+    # User EEPROM (addresses 0..eepromSize()-1)
+    EEPROM_SIZE      = 0xB3  # push size in bytes (0 = no EEPROM)
+    EEPROM_READ      = 0xB4  # pop addr → push byte 0..255
+    EEPROM_WRITE     = 0xB5  # pop value, pop addr → store low byte
+    EEPROM_READ_ARR  = 0xB6  # pop count, pop arr, pop addr → fill arr[0..count]
+    EEPROM_WRITE_ARR = 0xB7  # pop count, pop arr, pop addr → store arr[0..count]
+    STR_BYTE         = 0xB8  # pop index, pop str_id → byte 0..255 or -1 past the end
+
     # Float ops (all no-arg)
     ITOF = 0xC0
     FTOI = 0xC1
@@ -223,6 +231,12 @@ class Builtin:
     PIN_MODE = 48   # (pin, mode) → void
     PIN_WRITE = 49  # (pin, value) → void
     PIN_READ = 50   # (pin) → 0/1
+    EEPROM_SIZE = 51       # () → bytes (0 = none)
+    EEPROM_READ = 52       # (addr) → byte 0..255
+    EEPROM_WRITE = 53      # (addr, value) → void
+    EEPROM_READ_ARR = 54   # (addr, arr, count) → void
+    EEPROM_WRITE_ARR = 55  # (addr, arr, count) → void
+    STR_BYTE = 56          # (str_id, index) → byte 0..255, -1 past the end
 
 
 class Prop:
@@ -1053,6 +1067,8 @@ OP_NAMES = {
     0xAC: 'strCmp',
     0xAD: 'animate', 0xAE: 'stopAnim', 0xAF: 'stopAnimProp',
     0xB0: 'pinMode', 0xB1: 'pinWrite', 0xB2: 'pinRead',
+    0xB3: 'eepromSize', 0xB4: 'eepromRead', 0xB5: 'eepromWrite',
+    0xB6: 'eepromReadArr', 0xB7: 'eepromWriteArr', 0xB8: 'strByte',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -1092,6 +1108,7 @@ _NO_ARG_OPS = (
      if op not in (0x86, 0x88)} |
     {0xAD, 0xAE, 0xAF} |               # animate, stopAnim, stopAnimProp
     {0xB0, 0xB1, 0xB2} |               # pinMode, pinWrite, pinRead
+    set(range(0xB3, 0xB9)) |           # eepromSize .. eepromWriteArr, strByte
     set(range(0xC0, 0xCD))             # 0xC0-0xCC
 )
 

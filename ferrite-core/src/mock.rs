@@ -116,6 +116,29 @@ impl GpioBackend for MockGpio {
     }
 }
 
+/// 64-byte RAM EEPROM (erased = 0xFF).
+pub struct MockEeprom {
+    pub mem: core::cell::RefCell<[u8; 64]>,
+}
+impl Default for MockEeprom {
+    fn default() -> Self {
+        Self { mem: core::cell::RefCell::new([0xFF; 64]) }
+    }
+}
+impl crate::eeprom::EepromBackend for MockEeprom {
+    const SIZE: u16 = 64;
+    fn read(&self, addr: u16, buf: &mut [u8]) -> bool {
+        let a = addr as usize;
+        buf.copy_from_slice(&self.mem.borrow()[a..a + buf.len()]);
+        true
+    }
+    fn write(&self, addr: u16, data: &[u8]) -> bool {
+        let a = addr as usize;
+        self.mem.borrow_mut()[a..a + data.len()].copy_from_slice(data);
+        true
+    }
+}
+
 pub struct MockUsart;
 impl UsartBackend for MockUsart {
     fn write_byte(&self, _byte: u8) {}
@@ -161,4 +184,5 @@ impl Platform for MockPlatform {
     type SystickB = MockSystick;
     type AudioB = crate::audio::NoAudio;
     type GpioB = MockGpio;
+    type EepromB = MockEeprom;
 }

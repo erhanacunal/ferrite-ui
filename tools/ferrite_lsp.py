@@ -548,6 +548,12 @@ BUILTIN_SIGNATURES = {
     'pinMode':     {'sig': 'pinMode(pin, mode)', 'desc': 'Configure a user GPIO pin: GPIO_INPUT, GPIO_OUTPUT, GPIO_INPUT_PULLUP, GPIO_INPUT_PULLDOWN (gpio.fl).'},
     'pinWrite':    {'sig': 'pinWrite(pin, value)', 'desc': 'Drive an output pin: non-zero = high, 0 = low.'},
     'pinRead':     {'sig': 'pinRead(pin) -> int', 'desc': 'Read a GPIO pin level (0 or 1).'},
+    'strByte':     {'sig': 'strByte(str, index) -> int', 'desc': 'Byte `index` of a string (0..255), or -1 past the end. UTF-8 characters outside ASCII take 2-3 bytes.'},
+    'eepromSize':  {'sig': 'eepromSize() -> int', 'desc': 'EEPROM size in bytes (0 if the board has none).'},
+    'eepromRead':  {'sig': 'eepromRead(addr) -> int', 'desc': 'Read one EEPROM byte (0..255). Bad address or bus error → VM fault 16.'},
+    'eepromWrite': {'sig': 'eepromWrite(addr, value)', 'desc': 'Store the low byte of value. Unchanged bytes are not rewritten. Blocks up to ~5 ms per write.'},
+    'eepromReadArr': {'sig': 'eepromReadArr(addr, arr, count)', 'desc': 'Read count EEPROM bytes into arr[0..count].'},
+    'eepromWriteArr': {'sig': 'eepromWriteArr(addr, arr, count)', 'desc': 'Store the low byte of arr[0..count] at addr. Only changed 16-byte chunks are written (~5 ms each).'},
 }
 
 PROP_DOCS = {

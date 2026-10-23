@@ -5,6 +5,7 @@
 /// chooses concrete hardware by supplying `P`. Allocated on the heap via Box in main.
 use crate::audio::AudioImpl;
 use crate::backlight::BacklightImpl;
+use crate::eeprom::EepromImpl;
 use crate::flash::FlashImpl;
 use crate::gpio::GpioImpl;
 use crate::lcd::LcdImpl;
@@ -33,5 +34,6 @@ pub struct Ctx<P: Platform> {
     pub systick: SystickImpl<P::SystickB>,
     pub audio: AudioImpl<P::AudioB>,
     pub gpio: GpioImpl<P::GpioB>,
+    pub eeprom: EepromImpl<P::EepromB>,
     pub cursor_visible: bool,
 }

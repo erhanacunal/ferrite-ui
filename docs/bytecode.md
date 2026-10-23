@@ -257,6 +257,12 @@ Builtins are single-byte opcodes. Operands are passed on the stack unless noted.
 | `0xB0` | `pinMode` | pop `mode`, pop `pin`; configure a user GPIO pin (fault 14 on unknown pin / unsupported mode) |
 | `0xB1` | `pinWrite` | pop `value`, pop `pin`; drive an output pin (non-zero = high) |
 | `0xB2` | `pinRead` | pop `pin`; push its level `0`/`1` |
+| `0xB3` | `eepromSize` | push the EEPROM size in bytes (`0` = no EEPROM) |
+| `0xB4` | `eepromRead` | pop `addr`; push the byte `0..255` (fault 16 on a bad address / bus error) |
+| `0xB5` | `eepromWrite` | pop `value`, pop `addr`; store the low byte of `value` |
+| `0xB6` | `eepromReadArr` | pop `count`, `arr`, `addr`; fill `arr[0..count]` (fault 9 bad array, 13 `count` > length, 16 range / bus) |
+| `0xB7` | `eepromWriteArr` | pop `count`, `arr`, `addr`; store the low byte of each of `arr[0..count]` |
+| `0xB8` | `strByte` | pop `index`, pop `str_id`; push the byte `0..255`, or `-1` past the end |
 
 `sprintf` has an inline `u8 argc` byte (number of format arguments after the format string). Stack layout before execution: `[... fmt, arg0, arg1, ..., argN-1]` (fmt pushed first).
 

@@ -97,6 +97,7 @@ VM_FAULT_NAMES = {
     13: "bad operand",
     14: "invalid gpio pin/mode",
     15: "bad widget page",
+    16: "eeprom error",
 }
 
 
