@@ -1,0 +1,571 @@
+// main.fl — Smart home panel (800x480)
+//
+// Four rooms in the sidebar (a Button Group). The selected room shows a
+// climate dial with its target temperature, a light switch with brightness
+// and the blinds position. The scene buttons along the bottom set every room
+// at once.
+//
+// There is no real heating: each room's temperature drifts towards its
+// target by 0.1 degrees a second. Room N's light drives user GPIO pin N
+// (on/off only), so LEDs or relays on the header follow the switches.
+//
+// Temperatures are kept in tenths of a degree. The fonts are Ubuntu Regular
+// (fonts/Ubuntu-R.ttf), converted with tools/ferrite_font_converter.py:
+//   resource fonts/Ubuntu-R.ttf 13 --bpp 2 --font-id 1 -r "32-126,0xB0"
+//   resource fonts/Ubuntu-R.ttf 18 --bpp 2 --font-id 2 -r "32-126,0xB0"
+//   resource fonts/Ubuntu-R.ttf 44 --bpp 2 --font-id 3 -r "32,0x25,0x2D,0x2E,0x30-0x3A,0x43,0xB0"
+
+#include "core.fl"
+#include "color.fl"
+#include "gpio.fl"
+
+// The rooms' widgets are built by one helper, so the compiler's alloc()-site
+// count is too low; give the real totals (widgets + root, extensions).
+#hint_widgets 72 70
+
+const ROOMS = 4;
+
+const FONT_SMALL = 1;
+const FONT_TEXT  = 2;
+const FONT_BIG   = 3;
+
+const BG       = 0x0883;    // RGB 14,18,26
+const SIDEBAR  = 0x10C4;    // 20,26,36
+const CARD     = 0x1905;    // 28,34,46
+const CARD_HI  = 0x2988;    // 40,48,64
+const SELECTED = 0x320C;    // 48,64,96
+const DIM      = 0x8CB5;    // 140,150,170
+const ACCENT   = 0xFD84;    // 255,176,32  (lights)
+const HEAT     = 0xFB85;    // 255,112,40
+const COOL     = 0x451F;    // 64,160,255
+const HOLD     = 0x3E4F;    // 60,200,120
+const SHADE    = 0x7D3F;    // 120,164,255 (blinds)
+
+const SET_MIN = 150;        // target range, tenths of a degree
+const SET_MAX = 280;
+const DIAL_LO = 100;        // dial scale: 10.0 .. 30.0 degrees
+const DIAL_HI = 300;
+
+// --- Room state ---
+var light_on[4];
+var bright[4];      // 0-100 %
+var setp[4];        // target, tenths of a degree
+var temp[4];        // current, tenths of a degree
+var blind[4];       // 0 = closed, 100 = open
+var room = 0;       // selected room
+
+var last_tick = 0;
+var last_min = -1;
+
+// --- Widget ids ---
+var room_status[4];
+var rooms[4];
+var room_title;
+var clock_lbl;
+var date_lbl;
+var dial;
+var temp_lbl;
+var state_lbl;
+var target_lbl;
+var bright_lbl;
+var blind_lbl;
+
+// set(on_click) is wired per file-scope widget variable, so every clickable
+// widget has its own variable assigned straight from alloc().
+var room0; var room1; var room2; var room3;
+var light_btn;
+var bright_sl;
+var blind_sl;
+var minus_btn;
+var plus_btn;
+var open_btn;
+var close_btn;
+var scene0; var scene1; var scene2; var scene3;
+
+// ============================================================
+// Helpers
+// ============================================================
+
+// Label at (x, y) in its parent. Leaves it targeted for parent().
+fn label_init(l: widget, x, y, w, h, font, color, align, text) {
+    target(l);
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+    set(font_id, font);
+    set(text_color, color);
+    set(text_align, align);
+    set(text, text);
+}
+
+// Rounded card on the main area.
+fn card_init(c: widget, x, y, w, h) {
+    target(c);
+    set(location, x, y);
+    set(size, w, h);
+    set(bg_color, CARD);
+    set(border_radius, 14);
+    parent(0);
+}
+
+// Flat rounded button with a centered caption. Styles the current target
+// (alloc() leaves the new widget targeted); the caller does parent().
+fn style_button(x, y, w, h, color, text) {
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+    set(bg_color, color);
+    set(press_color, SELECTED);
+    set(border_radius, h / 2);
+    set(font_id, FONT_TEXT);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(text, text);
+    set(clickable, ON);
+}
+
+// Horizontal slider. Styles the current target.
+fn style_slider(x, y, w, color) {
+    set(kind, KIND_SLIDER);
+    set(location, x, y);
+    set(size, w, 28);
+    set(bg_color, CARD_HI);
+    set(press_color, color);
+    set(border_color, WHITE);
+    set(border_radius, 8);
+    set(clickable, ON);
+}
+
+fn room_name(i) -> string {
+    if (i == 0) { return str("Living Room"); }
+    if (i == 1) { return str("Kitchen"); }
+    if (i == 2) { return str("Bedroom"); }
+    return str("Bathroom");
+}
+
+fn day_name(d) -> string {
+    if (d == 0) { return str("Sun"); }
+    if (d == 1) { return str("Mon"); }
+    if (d == 2) { return str("Tue"); }
+    if (d == 3) { return str("Wed"); }
+    if (d == 4) { return str("Thu"); }
+    if (d == 5) { return str("Fri"); }
+    return str("Sat");
+}
+
+// "21.5°" from tenths of a degree (never negative here).
+fn deg_text(t) -> string {
+    return sprintf("%d.%d°", t / 10, t % 10);
+}
+
+fn clamp(v, lo, hi) {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// ============================================================
+// View
+// ============================================================
+
+fn show_room_status(i) {
+    target(room_status[i]);
+    if (light_on[i]) {
+        set(text, sprintf("%s   Light %d%%", deg_text(temp[i]), bright[i]));
+    } else {
+        set(text, sprintf("%s   Light off", deg_text(temp[i])));
+    }
+    dirty();
+}
+
+fn show_climate() {
+    var t = temp[room];
+    var color = HOLD;
+    target(state_lbl);
+    if (t < setp[room]) {
+        color = HEAT;
+        set(text, "Heating");
+    } else {
+        if (t > setp[room]) {
+            color = COOL;
+            set(text, "Cooling");
+        } else {
+            set(text, "Holding");
+        }
+    }
+    set(text_color, color);
+    dirty();
+
+    target(dial);
+    set(value, clamp((t - DIAL_LO) * 100 / (DIAL_HI - DIAL_LO), 0, 100));
+    set(press_color, color);
+    dirty();
+    target(temp_lbl);
+    set(text, deg_text(t));
+    dirty();
+    target(target_lbl);
+    set(text, concat(str("Target "), deg_text(setp[room])));
+    dirty();
+}
+
+fn show_light() {
+    var on = light_on[room];
+    target(light_btn);
+    set(text, on ? "ON" : "OFF");
+    set(bg_color, on ? ACCENT : CARD_HI);
+    set(text_color, on ? BLACK : WHITE);
+    dirty();
+    target(bright_sl);
+    set(value, bright[room]);
+    set(press_color, on ? ACCENT : DIM);
+    dirty();
+    target(bright_lbl);
+    set(text, sprintf("%d%%", bright[room]));
+    dirty();
+}
+
+fn show_blind() {
+    target(blind_sl);
+    set(value, blind[room]);
+    dirty();
+    target(blind_lbl);
+    if (blind[room] == 0) {
+        set(text, "Closed");
+    } else {
+        set(text, sprintf("%d%% open", blind[room]));
+    }
+    dirty();
+}
+
+fn show_all() {
+    target(room_title);
+    set(text, room_name(room));
+    dirty();
+    show_climate();
+    show_light();
+    show_blind();
+    for (var i = 0; i < ROOMS; i++) {
+        show_room_status(i);
+    }
+    render();
+    // Drop the temporaries; strClear() keeps the texts widgets show.
+    strClear();
+}
+
+fn update_clock() {
+    var now = rtcRead();
+    if (now[1] == last_min) {
+        return 0;
+    }
+    last_min = now[1];
+    target(clock_lbl);
+    set(text, sprintf("%d:%d%d", now[2], now[1] / 10, now[1] % 10));
+    dirty();
+    target(date_lbl);
+    set(text, sprintf("%s %d.%d.20%d%d", day_name(now[4]), now[3], now[5],
+                      now[6] / 10, now[6] % 10));
+    dirty();
+}
+
+// Room N's light drives user GPIO pin N.
+fn apply_lights() {
+    for (var i = 0; i < ROOMS; i++) {
+        pinWrite(i, light_on[i]);
+    }
+}
+
+// ============================================================
+// Handlers
+// ============================================================
+
+fn on_room(wid) {
+    for (var i = 0; i < ROOMS; i++) {
+        if (rooms[i] == wid) {
+            room = i;
+        }
+    }
+    show_all();
+}
+
+fn on_light(wid) {
+    light_on[room] = !light_on[room];
+    apply_lights();
+    show_all();
+}
+
+fn on_bright(wid, val) {
+    bright[room] = val;
+    // Dragging the brightness switches the light on.
+    if (!light_on[room] && val > 0) {
+        light_on[room] = 1;
+        apply_lights();
+    }
+    show_light();
+    show_room_status(room);
+    render();
+    strClear();
+}
+
+fn on_blind(wid, val) {
+    blind[room] = val;
+    show_blind();
+    render();
+    strClear();
+}
+
+fn on_minus(wid) {
+    setp[room] = clamp(setp[room] - 5, SET_MIN, SET_MAX);
+    show_all();
+}
+
+fn on_plus(wid) {
+    setp[room] = clamp(setp[room] + 5, SET_MIN, SET_MAX);
+    show_all();
+}
+
+fn on_open(wid) {
+    blind[room] = 100;
+    show_all();
+}
+
+fn on_close(wid) {
+    blind[room] = 0;
+    show_all();
+}
+
+// Scenes: 0 = all off, 1 = morning, 2 = evening, 3 = away.
+fn apply_scene(s) {
+    for (var i = 0; i < ROOMS; i++) {
+        if (s == 0) {
+            light_on[i] = 0;
+        }
+        if (s == 1) {
+            light_on[i] = 0;
+            blind[i] = 100;
+            setp[i] = i == 3 ? 230 : 215;
+        }
+        if (s == 2) {
+            light_on[i] = i < 2 ? 1 : 0;
+            bright[i] = 60;
+            blind[i] = 0;
+            setp[i] = i == 2 ? 190 : 210;
+        }
+        if (s == 3) {
+            light_on[i] = 0;
+            blind[i] = 0;
+            setp[i] = 170;
+        }
+    }
+    apply_lights();
+    show_all();
+}
+
+fn on_scene(wid) {
+    if (wid == scene0) { apply_scene(0); }
+    if (wid == scene1) { apply_scene(1); }
+    if (wid == scene2) { apply_scene(2); }
+    if (wid == scene3) { apply_scene(3); }
+}
+
+// ============================================================
+// Setup
+// ============================================================
+
+// Sidebar entry: room name + a status line under it. The labels share the
+// button's background, so they follow its selected colour.
+fn make_room(b: widget, i) {
+    target(b);
+    set(kind, KIND_BUTTON_GROUP);
+    set(location, 12, 80 + i * 84);
+    set(size, 176, 72);
+    set(bg_color, SIDEBAR);
+    set(press_color, SELECTED);
+    set(border_radius, 12);
+    set(clickable, ON);
+    set(group_id, 1);
+    parent(0);
+    rooms[i] = b;
+
+    var name = alloc();
+    label_init(name, 14, 10, 150, 28, FONT_TEXT, WHITE, ALIGN_LEFT, room_name(i));
+    set(bg_color, SIDEBAR);
+    parent(b);
+    var status = alloc();
+    label_init(status, 14, 38, 150, 22, FONT_SMALL, DIM, ALIGN_LEFT, str(""));
+    set(bg_color, SIDEBAR);
+    parent(b);
+    room_status[i] = status;
+}
+
+fn build_climate() {
+    var c = alloc();
+    card_init(c, 212, 112, 284, 290);
+    var title = alloc();
+    label_init(title, 18, 12, 200, 28, FONT_TEXT, WHITE, ALIGN_LEFT, str("Climate"));
+    parent(c);
+
+    // Ring dial: the needle is drawn in the card colour (hidden), and the
+    // current temperature sits in its centre.
+    dial = alloc();
+    target(dial);
+    set(kind, KIND_GAUGE);
+    set(location, 52, 40);
+    set(size, 180, 180);
+    set(bg_color, CARD);
+    set(border_color, CARD_HI);
+    set(text_color, CARD);
+    parent(c);
+
+    temp_lbl = alloc();
+    label_init(temp_lbl, 52, 96, 180, 56, FONT_BIG, WHITE, ALIGN_CENTER, str(""));
+    parent(c);
+    state_lbl = alloc();
+    label_init(state_lbl, 52, 184, 180, 24, FONT_SMALL, HOLD, ALIGN_CENTER, str(""));
+    parent(c);
+
+    minus_btn = alloc();
+    style_button(16, 228, 52, 48, CARD_HI, "-");
+    set(on_click, @on_minus);
+    parent(c);
+    target_lbl = alloc();
+    label_init(target_lbl, 72, 228, 140, 48, FONT_TEXT, WHITE, ALIGN_CENTER, str(""));
+    parent(c);
+    plus_btn = alloc();
+    style_button(216, 228, 52, 48, CARD_HI, "+");
+    set(on_click, @on_plus);
+    parent(c);
+}
+
+fn build_lights() {
+    var c = alloc();
+    card_init(c, 508, 112, 280, 136);
+    var title = alloc();
+    label_init(title, 18, 12, 150, 40, FONT_TEXT, WHITE, ALIGN_LEFT, str("Lights"));
+    parent(c);
+    light_btn = alloc();
+    style_button(170, 12, 92, 40, CARD_HI, "OFF");
+    set(on_click, @on_light);
+    parent(c);
+
+    var lbl = alloc();
+    label_init(lbl, 18, 60, 150, 24, FONT_SMALL, DIM, ALIGN_LEFT, str("Brightness"));
+    parent(c);
+    bright_lbl = alloc();
+    label_init(bright_lbl, 170, 60, 92, 24, FONT_SMALL, DIM, ALIGN_RIGHT, str(""));
+    parent(c);
+    bright_sl = alloc();
+    style_slider(18, 92, 244, ACCENT);
+    set(on_click, @on_bright);
+    parent(c);
+}
+
+fn build_blinds() {
+    var c = alloc();
+    card_init(c, 508, 260, 280, 142);
+    var title = alloc();
+    label_init(title, 18, 12, 120, 28, FONT_TEXT, WHITE, ALIGN_LEFT, str("Blinds"));
+    parent(c);
+    blind_lbl = alloc();
+    label_init(blind_lbl, 140, 12, 122, 28, FONT_SMALL, DIM, ALIGN_RIGHT, str(""));
+    parent(c);
+    blind_sl = alloc();
+    style_slider(18, 52, 244, SHADE);
+    set(on_click, @on_blind);
+    parent(c);
+
+    open_btn = alloc();
+    style_button(18, 94, 118, 36, CARD_HI, "Open");
+    set(on_click, @on_open);
+    parent(c);
+    close_btn = alloc();
+    style_button(144, 94, 118, 36, CARD_HI, "Close");
+    set(on_click, @on_close);
+    parent(c);
+}
+
+fn setup() {
+    target(0);
+    set(bg_color, BG);
+
+    light_on[0] = 1; bright[0] = 80;  setp[0] = 215; temp[0] = 204; blind[0] = 70;
+    light_on[1] = 0; bright[1] = 100; setp[1] = 200; temp[1] = 196; blind[1] = 100;
+    light_on[2] = 0; bright[2] = 40;  setp[2] = 190; temp[2] = 201; blind[2] = 20;
+    light_on[3] = 1; bright[3] = 60;  setp[3] = 230; temp[3] = 230; blind[3] = 0;
+    for (var i = 0; i < ROOMS; i++) {
+        pinMode(i, GPIO_OUTPUT);
+    }
+    apply_lights();
+
+    // Sidebar
+    var side = alloc();
+    target(side);
+    set(size, 200, 480);
+    set(bg_color, SIDEBAR);
+    parent(0);
+    var home = alloc();
+    label_init(home, 24, 20, 160, 36, FONT_TEXT, WHITE, ALIGN_LEFT, str("My Home"));
+    parent(side);
+
+    room0 = alloc(); make_room(room0, 0); target(room0); set(on_click, @on_room);
+    room1 = alloc(); make_room(room1, 1); target(room1); set(on_click, @on_room);
+    room2 = alloc(); make_room(room2, 2); target(room2); set(on_click, @on_room);
+    room3 = alloc(); make_room(room3, 3); target(room3); set(on_click, @on_room);
+    target(room0);
+    set(checked, 1);
+
+    // Header: room name, clock and date
+    room_title = alloc();
+    label_init(room_title, 216, 16, 300, 48, FONT_TEXT, WHITE, ALIGN_LEFT, str(""));
+    parent(0);
+    clock_lbl = alloc();
+    label_init(clock_lbl, 588, 8, 200, 56, FONT_BIG, WHITE, ALIGN_RIGHT, str(""));
+    parent(0);
+    date_lbl = alloc();
+    label_init(date_lbl, 588, 64, 200, 24, FONT_SMALL, DIM, ALIGN_RIGHT, str(""));
+    parent(0);
+
+    build_climate();
+    build_lights();
+    build_blinds();
+
+    // Scenes
+    scene0 = alloc();
+    style_button(212, 416, 135, 52, CARD, "All off");
+    set(on_click, @on_scene);
+    parent(0);
+    scene1 = alloc();
+    style_button(359, 416, 135, 52, CARD, "Morning");
+    set(on_click, @on_scene);
+    parent(0);
+    scene2 = alloc();
+    style_button(506, 416, 135, 52, CARD, "Evening");
+    set(on_click, @on_scene);
+    parent(0);
+    scene3 = alloc();
+    style_button(653, 416, 135, 52, CARD, "Away");
+    set(on_click, @on_scene);
+    parent(0);
+
+    update_clock();
+    show_all();
+    last_tick = millis();
+    return 0;
+}
+
+fn loop() {
+    if (millis() - last_tick >= 1000) {
+        last_tick += 1000;
+        // Every room drifts 0.1 degree a second towards its target.
+        for (var i = 0; i < ROOMS; i++) {
+            if (temp[i] < setp[i]) {
+                temp[i] += 1;
+            }
+            if (temp[i] > setp[i]) {
+                temp[i] -= 1;
+            }
+        }
+        update_clock();
+        show_all();
+    }
+    delay(100);
+}

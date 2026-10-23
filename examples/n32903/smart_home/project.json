@@ -1,0 +1,19 @@
+{
+    "device": "n32903",
+    "screen_width": 800,
+    "screen_height": 480,
+    "include_dirs": ["../../../lib"],
+    "render_mode": "buffered",
+    "fonts": [
+        {"name": "ubuntu13", "font_id": 1, "file": "fonts/ubuntu13.font"},
+        {"name": "ubuntu18", "font_id": 2, "file": "fonts/ubuntu18.font"},
+        {"name": "ubuntu44", "font_id": 3, "file": "fonts/ubuntu44.font"}
+    ],
+    "programs": [
+        {
+            "name": "main",
+            "source": "main.fl",
+            "exec_mode": "ram"
+        }
+    ]
+}

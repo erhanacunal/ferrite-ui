@@ -120,7 +120,15 @@ Drives an 8-channel relay board from the user GPIO header ([examples/nextion/rel
 |-----------|----------|
 | ![Relay Board](docs/images/relay_board_main.png) | ![Relay Board Settings](docs/images/relay_board_settings.png) |
 
-Example projects live under [examples/](examples/), including clock, widget demo, touch test, brick breaker, gradient demo, gauge, scroll list, text input, printer menu, dropdown, GPIO, and relay board demos.
+### Smart Home Panel
+
+A smart home control panel for the N32903 ([examples/n32903/smart_home](examples/n32903/smart_home/)). Four rooms in the sidebar; the selected room shows a climate dial with its target temperature, a light switch with brightness and the blinds position, and the scene buttons (All off, Morning, Evening, Away) set every room at once. The temperatures are simulated (each room drifts towards its target), and room N's light switches user GPIO pin N. Text uses anti-aliased Ubuntu fonts (2 bpp).
+
+| Living Room | Evening Scene |
+|-------------|---------------|
+| ![Smart Home](docs/images/smart_home_living.png) | ![Smart Home Evening Scene](docs/images/smart_home_evening.png) |
+
+Example projects live under [examples/](examples/), including clock, widget demo, touch test, brick breaker, gradient demo, gauge, scroll list, text input, printer menu, dropdown, GPIO, relay board, and smart home panel demos.
 
 ## Ferrite Language
 
