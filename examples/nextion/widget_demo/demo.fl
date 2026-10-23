@@ -11,7 +11,7 @@ var panel1;         // tab panels
 var panel2;
 var panel3;
 var panel4;
-var tab1;           // tab buttons
+var tab1;           // tab buttons (KIND_BUTTON_GROUP, group TAB_GROUP)
 var tab2;
 var tab3;
 var tab4;
@@ -41,6 +41,11 @@ var slider2;
 var r3;
 
 // ── Tab Switching ──
+// The tabs are one button group: a tap selects the tab and deselects the
+// others, and the selected one is drawn with press_color. Only the panels
+// are switched here.
+
+const TAB_GROUP = 1;
 
 fn hide_show(idx, on) {
     if (idx == 0) {
@@ -59,17 +64,6 @@ fn hide_show(idx, on) {
 fn switch_tab(idx) {
     critical();
     hide_show(active_tab, OFF);
-
-    target(tab1); set(bg_color, 0x2945); dirty();
-    target(tab2); set(bg_color, 0x2945); dirty();
-    target(tab3); set(bg_color, 0x2945); dirty();
-    target(tab4); set(bg_color, 0x2945); dirty();
-
-    if (idx == 0) { target(tab1); }
-    if (idx == 1) { target(tab2); }
-    if (idx == 2) { target(tab3); }
-    if (idx == 3) { target(tab4); }
-    set(bg_color, 0x2C9F); dirty();
     active_tab = idx;
     hide_show(idx, ON);
     render();
@@ -239,11 +233,13 @@ fn setup() {
     set(bg_color, 0x0841);
     parent(0);
 
-    // Tab buttons (on_click → on_tab)
+    // Tab buttons: one button group (on_click → on_tab). group_id before checked.
     tab1 = alloc(); target(tab1);
+    set(kind, KIND_BUTTON_GROUP);
     set(size, 200, 50);
-    set(bg_color, 0x2C9F); set(press_color, 0x2C9F);
+    set(bg_color, 0x2945); set(press_color, 0x2C9F);  // press_color = selected
     set(border, 0, 1, 0, 0); set(border_color, DARK_GRAY);
+    set(group_id, TAB_GROUP); set(checked, ON);
     set(clickable, ON); set(on_click, @on_tab);
     parent(bar);
     var l = alloc(); target(l);
@@ -252,10 +248,12 @@ fn setup() {
     parent(tab1);
 
     tab2 = alloc(); target(tab2);
+    set(kind, KIND_BUTTON_GROUP);
     set(location, 200, 0);
     set(size, 200, 50);
-    set(bg_color, 0x2945); set(press_color, 0x2C9F);
+    set(bg_color, 0x2945); set(press_color, 0x2C9F);  // press_color = selected
     set(border, 0, 1, 0, 0); set(border_color, DARK_GRAY);
+    set(group_id, TAB_GROUP);
     set(clickable, ON); set(on_click, @on_tab);
     parent(bar);
     l = alloc(); target(l);
@@ -264,10 +262,12 @@ fn setup() {
     parent(tab2);
 
     tab3 = alloc(); target(tab3);
+    set(kind, KIND_BUTTON_GROUP);
     set(location, 400, 0);
     set(size, 200, 50);
-    set(bg_color, 0x2945); set(press_color, 0x2C9F);
+    set(bg_color, 0x2945); set(press_color, 0x2C9F);  // press_color = selected
     set(border, 0, 1, 0, 0); set(border_color, DARK_GRAY);
+    set(group_id, TAB_GROUP);
     set(clickable, ON); set(on_click, @on_tab);
     parent(bar);
     l = alloc(); target(l);
@@ -276,10 +276,12 @@ fn setup() {
     parent(tab3);
 
     tab4 = alloc(); target(tab4);
+    set(kind, KIND_BUTTON_GROUP);
     set(location, 600, 0);
     set(size, 200, 50);
-    set(bg_color, 0x2945); set(press_color, 0x2C9F);
+    set(bg_color, 0x2945); set(press_color, 0x2C9F);  // press_color = selected
     set(border, 0, 1, 0, 0); set(border_color, DARK_GRAY);
+    set(group_id, TAB_GROUP);
     set(clickable, ON); set(on_click, @on_tab);
     parent(bar);
     l = alloc(); target(l);
