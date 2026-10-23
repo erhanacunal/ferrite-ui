@@ -1308,24 +1308,12 @@ impl FullInput {
             ctx.tree.mark_dirty(clicked_id);
         }
 
-        // Radio: uncheck siblings, check self.
-        if clicked_id.is_some() && ctx.tree.get(clicked_id).kind == widget::KIND_RADIO {
-            let parent = ctx.tree.get(clicked_id).parent;
-            if parent.is_some() {
-                let mut sib = ctx.tree.get(parent).first_child;
-                while sib.is_some() {
-                    if sib != clicked_id
-                        && ctx.tree.get(sib).kind == widget::KIND_RADIO
-                        && ctx.tree.get(sib).flags & widget::FLAG_CHECKED != 0
-                    {
-                        ctx.tree.get_mut(sib).flags &= !widget::FLAG_CHECKED;
-                        ctx.tree.mark_dirty(sib);
-                    }
-                    sib = ctx.tree.get(sib).next_sibling;
-                }
-            }
-            ctx.tree.get_mut(clicked_id).flags |= widget::FLAG_CHECKED;
-            ctx.tree.mark_dirty(clicked_id);
+        // Radio / button group: select this one, deselect the rest of its
+        // group (radio group_id 0 = sibling radios).
+        if clicked_id.is_some()
+            && matches!(ctx.tree.get(clicked_id).kind, widget::KIND_RADIO | widget::KIND_BUTTON_GROUP)
+        {
+            ctx.tree.select_in_group(clicked_id);
         }
 
         // Input: reposition cursor on tap.

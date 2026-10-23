@@ -7,9 +7,9 @@ use crate::proto::{
     self, PROP_ALPHA, PROP_BG_COLOR, PROP_BORDER_B, PROP_BORDER_COLOR, PROP_BORDER_EDGES,
     PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_RADIUS, PROP_BORDER_T, PROP_CHECKED, PROP_CLICKABLE,
     PROP_CLIP_CHILDREN, PROP_CURSOR_POS, PROP_ENABLED, PROP_FONT_ID, PROP_GRADIENT_COLOR,
-    PROP_GRADIENT_DIR, PROP_GRAPH_ARR, PROP_GRAPH_COUNT, PROP_GRAPH_FLAGS, PROP_IMAGE_ID,
-    PROP_KIND, PROP_LOC_X, PROP_LOC_Y, PROP_LOCATION, PROP_MARGIN, PROP_MARGIN_B, PROP_MARGIN_L,
-    PROP_MARGIN_R, PROP_MARGIN_T, PROP_MAX_LENGTH, PROP_MULTI_LINE, PROP_ON_CHANGE, PROP_ON_CLICK,
+    PROP_GRADIENT_DIR, PROP_GRAPH_ARR, PROP_GRAPH_COUNT, PROP_GRAPH_FLAGS, PROP_GROUP_ID,
+    PROP_IMAGE_ID, PROP_KIND, PROP_LOC_X, PROP_LOC_Y, PROP_LOCATION, PROP_MAX_LENGTH,
+    PROP_MULTI_LINE, PROP_ON_CHANGE, PROP_ON_CLICK,
     PROP_ON_PAINT, PROP_ON_TAP, PROP_PADDING, PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R,
     PROP_PADDING_T, PROP_PRESS_COLOR, PROP_SCROLL_Y, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W,
     PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VALUE, PROP_VISIBLE,
@@ -20,7 +20,8 @@ use crate::strpool::StringPool;
 use crate::types::{Edges, Offset, Size};
 use crate::widget::{
     FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_HAS_ON_CLICK,
-    FLAG_HAS_ON_PAINT, FLAG_HAS_ON_TAP, FLAG_MULTI_LINE, FLAG_VISIBLE, WidgetExt, WidgetId,
+    FLAG_HAS_ON_PAINT, FLAG_HAS_ON_TAP, FLAG_MULTI_LINE, FLAG_VISIBLE, KIND_BUTTON_GROUP, KIND_RADIO,
+    WidgetExt, WidgetId,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -2741,6 +2742,19 @@ impl Vm {
             _ => 0,
         };
         if flag != 0 {
+            // Checking a group button, or a radio with a group_id, unchecks
+            // the rest of its group. Radios in group 0 keep the plain flag.
+            if flag == FLAG_CHECKED
+                && val != 0
+                && match ctx.tree.get(target).kind {
+                    KIND_BUTTON_GROUP => true,
+                    KIND_RADIO => ctx.tree.group_id(target) != 0,
+                    _ => false,
+                }
+            {
+                ctx.tree.select_in_group(target);
+                return;
+            }
             set_flag(&mut ctx.tree.get_mut(target).flags, flag, val != 0);
             if flag & (FLAG_VISIBLE | FLAG_ENABLED) != 0 {
                 ctx.tree.mark_dirty(target);
@@ -2798,10 +2812,6 @@ impl Vm {
         // Extension fields (allocate on demand)
         if let Some(ext) = ctx.tree.ensure_ext(target) {
             match prop_id {
-                PROP_MARGIN_T => ext.margin.top = val as u8,
-                PROP_MARGIN_R => ext.margin.right = val as u8,
-                PROP_MARGIN_B => ext.margin.bottom = val as u8,
-                PROP_MARGIN_L => ext.margin.left = val as u8,
                 PROP_BORDER_T => ext.border.top = val as u8,
                 PROP_BORDER_R => ext.border.right = val as u8,
                 PROP_BORDER_B => ext.border.bottom = val as u8,
@@ -2823,6 +2833,7 @@ impl Vm {
                 PROP_GRADIENT_COLOR => ext.gradient_color = val as u16,
                 PROP_GRADIENT_DIR => ext.gradient_dir = val as u8,
                 PROP_ALPHA => ext.alpha = val as u8,
+                PROP_GROUP_ID => ext.group_id = val as u8,
                 // KIND_GRAPH props share storage with value/max_length/image_id;
                 // safe because a single widget kind is exclusive.
                 PROP_GRAPH_ARR => ext.value = val as i16,
@@ -2897,10 +2908,6 @@ impl Vm {
             PROP_BORDER_COLOR => w.border_color as i32,
             PROP_KIND => w.kind as i32,
             // Extension fields (return defaults when no extension)
-            PROP_MARGIN_T => e.margin.top as i32,
-            PROP_MARGIN_R => e.margin.right as i32,
-            PROP_MARGIN_B => e.margin.bottom as i32,
-            PROP_MARGIN_L => e.margin.left as i32,
             PROP_BORDER_T => e.border.top as i32,
             PROP_BORDER_R => e.border.right as i32,
             PROP_BORDER_B => e.border.bottom as i32,
@@ -2927,6 +2934,7 @@ impl Vm {
             PROP_GRADIENT_COLOR => e.gradient_color as i32,
             PROP_GRADIENT_DIR => e.gradient_dir as i32,
             PROP_ALPHA => e.alpha as i32,
+            PROP_GROUP_ID => e.group_id as i32,
             PROP_GRAPH_ARR => e.value as i32,
             PROP_GRAPH_COUNT => e.max_length as i32,
             PROP_GRAPH_FLAGS => e.image_id as i32,
@@ -3111,10 +3119,6 @@ impl Vm {
         // Extension fields
         if let Some(ext) = ctx.tree.ensure_ext(self.target) {
             match prop_id {
-                PROP_MARGIN if count >= 4 => {
-                    ext.margin =
-                        Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);
-                }
                 PROP_BORDER_EDGES if count >= 4 => {
                     ext.border =
                         Edges::new(vals[0] as u8, vals[1] as u8, vals[2] as u8, vals[3] as u8);

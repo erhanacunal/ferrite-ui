@@ -961,7 +961,6 @@ class Parser:
 COMPOUND_SCALARS = {
     Prop.LOCATION: [Prop.LOC_X, Prop.LOC_Y],
     Prop.SIZE: [Prop.SIZE_W, Prop.SIZE_H],
-    Prop.MARGIN: [Prop.MARGIN_T, Prop.MARGIN_R, Prop.MARGIN_B, Prop.MARGIN_L],
     Prop.BORDER_EDGES: [Prop.BORDER_T, Prop.BORDER_R, Prop.BORDER_B, Prop.BORDER_L],
     Prop.PADDING: [Prop.PADDING_T, Prop.PADDING_R, Prop.PADDING_B, Prop.PADDING_L],
 }

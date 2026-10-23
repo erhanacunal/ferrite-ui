@@ -58,17 +58,19 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **WidgetId:** `u8` index, `0xFF` = NONE sentinel
 - **Split struct: Widget (18B base) + WidgetExt (32B on-demand)**
   - **Widget (base):** tree links, flags, kind, location, size, background_color, border_color, ext index
-  - **WidgetExt:** margin/border/padding edges, text fields, press_color, border_radius, image_id, callbacks, value
+  - **WidgetExt:** group_id (+ 3 reserved bytes, the former margin), border/padding edges, text fields, press_color, border_radius, image_id, callbacks, value
   - Extensions allocated lazily via `ensure_ext()` — pure containers stay at 18B
-  - Accessed via `WidgetTree` accessor methods: `tree.margin(id)`, `tree.press_color(id)`, etc.
+  - Accessed via `WidgetTree` accessor methods: `tree.border(id)`, `tree.press_color(id)`, etc.
 - **Box model (CSS border-box style):**
-  - `margin` → outer spacing (not included in size)
   - `border` → border line (included in size)
   - `padding` → inner spacing (included in size)
   - `location` → relative offset from parent content area
   - `size` → border box dimensions
 - **Flags:** `VISIBLE` (0x01), `ENABLED` (0x02), `CLICKABLE` (0x04), `DIRTY` (0x08), `PRESSED` (0x10), `CHECKED` (0x20)
 - **Widget types:** `KIND_BASE` (0, container), `KIND_LABEL` (1, text), `KIND_BUTTON` (2, clickable container), `KIND_PROGRESS` (3, progress bar), `KIND_SLIDER` (4, slider), `KIND_CHECKBOX` (5, checkbox), `KIND_RADIO` (6, radio button), `KIND_INPUT` (7, text input), `KIND_GAUGE` (8, gauge), `KIND_DROPDOWN` (9, dropdown)
+- **Button Group:** `KIND_BUTTON_GROUP` (17) — exclusive toggle button. Widgets of this kind with the same `group_id` (`PROP_GROUP_ID` 0x32, `WidgetExt.group_id`, tree-wide) form one group; only one is CHECKED. A tap or `set(checked, 1)` → `WidgetTree::select_in_group`. Re-tapping the selected one keeps it selected. Selected = drawn with `press_color` (`render::shows_press`). Set `group_id` before `checked`. Kind number is in `widget.rs`, `tools/ferrite_designer.py`, `lib/core.fl`.
+- **Radio groups:** `KIND_RADIO` uses the same `group_id` via `select_in_group`, with one difference: `group_id` 0 (the default) = sibling radios with group 0 (the original behaviour), ≠ 0 = tree-wide like Button Group. `set(checked, 1)` enforces the group only for ≠ 0. Radio and Button Group groups are separate even with equal ids. The designer mirrors this in `DesignerModel.enforce_exclusive_group`.
+- **Margin removed:** prop ids 0x10–0x13 / 0x42 are reserved, and its 4 `WidgetExt` bytes became `group_id` + `_reserved[3]`.
 - **Label:** text_color, font_id, text_align (LEFT/CENTER/RIGHT), text (from StringPool)
 - **Button:** press_color (background when pressed), accepts child widgets
 - **Color:** RGB565 (`background_color`, `border_color`, `text_color`, `press_color`)
@@ -240,7 +242,7 @@ ferrite-ui/
 - [x] Rust no_std skeleton setup
 - [x] GPIO driver ported to Rust
 - [x] Clip region implementation
-- [x] Widget system (core: nested widgets, border, margin, padding, dirty redraw)
+- [x] Widget system (core: nested widgets, border, padding, dirty redraw)
 - [x] XPT2046 touch driver (SPI bit-bang, Z-pressure, median filter, debounce)
 - [x] Bytecode interpreter (37 opcodes, protobuf tag, varint/zigzag, property R/W, Builder)
 - [x] Flash driver (W25Q256 SPI bit-bang, 4-byte addr, read/write/erase, VM integration)

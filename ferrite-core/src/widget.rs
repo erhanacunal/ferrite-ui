@@ -64,6 +64,10 @@ pub const KIND_CIRCLE: u8 = 13;
 pub const KIND_POLYGON: u8 = 14;
 pub const KIND_LINE: u8 = 15;
 pub const KIND_ELLIPSE: u8 = 16;
+/// Toggle button in an exclusive group: widgets of this kind with the same
+/// `group_id` form one group, and at most one of them is CHECKED (drawn with
+/// `press_color`). See `WidgetTree::select_in_group`.
+pub const KIND_BUTTON_GROUP: u8 = 17;
 
 // --- Text Alignment ---
 
@@ -187,13 +191,16 @@ impl Widget {
     }
 }
 
-// --- WidgetExt (36 bytes) ---
+// --- WidgetExt ---
 
 /// Extension data for widgets that need edges, text, callbacks, etc.
 /// Allocated on demand -- simple containers skip this entirely.
 pub struct WidgetExt {
-    // Box model edges (12 bytes)
-    pub margin: Edges,
+    // Button group (4 bytes — the former margin edges)
+    pub group_id: u8, // KIND_BUTTON_GROUP: exclusive selection group
+    pub _reserved: [u8; 3],
+
+    // Box model edges (8 bytes)
     pub border: Edges,
     pub padding: Edges,
 
@@ -236,7 +243,8 @@ impl WidgetExt {
     /// Default extension with all fields at their zero/default values.
     /// Used as fallback when a widget has no extension allocated.
     pub const DEFAULT: Self = Self {
-        margin: Edges::ZERO,
+        group_id: 0,
+        _reserved: [0; 3],
         border: Edges::ZERO,
         padding: Edges::ZERO,
         text_color: 0xFFFF,
@@ -436,10 +444,6 @@ impl WidgetTree {
 
     // --- Convenience accessors (return defaults when no extension) ---
 
-    pub fn margin(&self, id: WidgetId) -> Edges {
-        self.ext(id).map_or(Edges::ZERO, |e| e.margin)
-    }
-
     pub fn border(&self, id: WidgetId) -> Edges {
         self.ext(id).map_or(Edges::ZERO, |e| e.border)
     }
@@ -534,9 +538,8 @@ impl WidgetTree {
     /// that ancestor's scroll_y (stored in ext.value).
     pub fn absolute_rect(&self, id: WidgetId) -> Rect {
         let w = &self.widgets[id.index()];
-        let m = self.margin(id);
-        let mut x = w.location.x + m.left as i16;
-        let mut y = w.location.y + m.top as i16;
+        let mut x = w.location.x;
+        let mut y = w.location.y;
 
         let max = self.widgets.len();
         let mut depth = 0usize;
@@ -547,15 +550,14 @@ impl WidgetTree {
                 break;
             }
             let p = &self.widgets[pid.index()];
-            let pm = self.margin(pid);
             if p.kind == KIND_DROPDOWN {
-                x += p.location.x + pm.left as i16;
-                y += p.location.y + pm.top as i16;
+                x += p.location.x;
+                y += p.location.y;
             } else {
                 let pb = self.border(pid);
                 let pp = self.padding(pid);
-                x += p.location.x + pm.left as i16 + pb.left as i16 + pp.left as i16;
-                y += p.location.y + pm.top as i16 + pb.top as i16 + pp.top as i16;
+                x += p.location.x + pb.left as i16 + pp.left as i16;
+                y += p.location.y + pb.top as i16 + pp.top as i16;
             }
             // Scroll offset: shift children by -scroll_y
             if p.flags & FLAG_CLIP_CHILDREN != 0 {
@@ -626,8 +628,7 @@ impl WidgetTree {
         let mut guard = 0usize;
         while child.is_some() {
             let c = &self.widgets[child.index()];
-            let cm = self.margin(child);
-            let bottom = c.location.y + cm.top as i16 + c.size.h as i16 + cm.bottom as i16;
+            let bottom = c.location.y + c.size.h as i16;
             if bottom > max_bottom {
                 max_bottom = bottom;
             }
@@ -759,6 +760,44 @@ impl WidgetTree {
         self.dfs_valid = false;
     }
 
+    /// Selection group of a KIND_BUTTON_GROUP / KIND_RADIO widget (0 without
+    /// an extension).
+    pub fn group_id(&self, id: WidgetId) -> u8 {
+        self.ext(id).map_or(0, |e| e.group_id)
+    }
+
+    /// Check `id` (a KIND_BUTTON_GROUP or KIND_RADIO widget) and uncheck every
+    /// other live widget of the same kind in its group, so at most one per
+    /// group is selected. A group is all widgets of that kind with the same
+    /// `group_id`, anywhere in the tree — except radios with `group_id` 0,
+    /// whose group is their sibling radios with `group_id` 0 (the original
+    /// radio behaviour). Button groups and radios never share a group.
+    /// Changed widgets are marked dirty; re-selecting keeps `id` checked.
+    pub fn select_in_group(&mut self, id: WidgetId) {
+        let kind = self.widgets[id.index()].kind;
+        let parent = self.widgets[id.index()].parent;
+        let group = self.group_id(id);
+        let siblings_only = kind == KIND_RADIO && group == 0;
+        for i in 0..self.widgets.len() {
+            let other = WidgetId(i as u16);
+            let w = &self.widgets[i];
+            if other == id
+                || w.kind != kind
+                || w.flags & (FLAG_CHECKED | FLAG_DESTROYED) != FLAG_CHECKED
+                || (siblings_only && w.parent != parent)
+                || self.group_id(other) != group
+            {
+                continue;
+            }
+            self.widgets[i].flags &= !FLAG_CHECKED;
+            self.mark_dirty(other);
+        }
+        if self.widgets[id.index()].flags & FLAG_CHECKED == 0 {
+            self.widgets[id.index()].flags |= FLAG_CHECKED;
+            self.mark_dirty(id);
+        }
+    }
+
     /// Mark widget and all descendants as dirty in both buffers.
     pub fn mark_dirty(&mut self, id: WidgetId) {
         if id.is_none() || id.index() >= self.widgets.len() {
@@ -865,5 +904,70 @@ mod limit_tests {
         // 0 = compile-time maximum; oversized values clamp to it.
         tree.set_limits(0, 5000);
         assert_eq!(tree.limits(), (MAX_WIDGETS, MAX_EXTENSIONS));
+    }
+
+    #[test]
+    fn select_in_group_keeps_one_checked_per_group() {
+        let mut tree = WidgetTree::new();
+        let mk = |tree: &mut WidgetTree, group: u8| {
+            let id = tree.alloc().unwrap();
+            tree.get_mut(id).kind = KIND_BUTTON_GROUP;
+            tree.ensure_ext(id).unwrap().group_id = group;
+            id
+        };
+        let a = mk(&mut tree, 1);
+        let b = mk(&mut tree, 1);
+        let other = mk(&mut tree, 2);
+        let checked = |tree: &WidgetTree, id: WidgetId| tree.get(id).flags & FLAG_CHECKED != 0;
+
+        tree.select_in_group(other);
+        tree.select_in_group(a);
+        assert!(checked(&tree, a) && !checked(&tree, b) && checked(&tree, other));
+
+        tree.select_in_group(b);
+        assert!(!checked(&tree, a) && checked(&tree, b) && checked(&tree, other));
+
+        // Re-selecting the selected button keeps it selected.
+        tree.select_in_group(b);
+        assert!(checked(&tree, b));
+    }
+
+    #[test]
+    fn radio_group_zero_is_siblings_nonzero_is_tree_wide() {
+        let mut tree = WidgetTree::new();
+        let p1 = tree.alloc().unwrap();
+        let p2 = tree.alloc().unwrap();
+        let radio = |tree: &mut WidgetTree, parent: WidgetId, group: u8| {
+            let id = tree.alloc().unwrap();
+            tree.get_mut(id).kind = KIND_RADIO;
+            tree.ensure_ext(id).unwrap().group_id = group;
+            tree.add_child(parent, id);
+            id
+        };
+        let checked = |tree: &WidgetTree, id: WidgetId| tree.get(id).flags & FLAG_CHECKED != 0;
+
+        // group 0: per parent, as before.
+        let a1 = radio(&mut tree, p1, 0);
+        let a2 = radio(&mut tree, p1, 0);
+        let b1 = radio(&mut tree, p2, 0);
+        tree.select_in_group(b1);
+        tree.select_in_group(a1);
+        tree.select_in_group(a2);
+        assert!(!checked(&tree, a1) && checked(&tree, a2) && checked(&tree, b1));
+
+        // group 5: across parents, independent of the group-0 radios.
+        let g1 = radio(&mut tree, p1, 5);
+        let g2 = radio(&mut tree, p2, 5);
+        tree.select_in_group(g1);
+        tree.select_in_group(g2);
+        assert!(!checked(&tree, g1) && checked(&tree, g2));
+        assert!(checked(&tree, a2) && checked(&tree, b1));
+
+        // A button group with the same id is a separate group.
+        let btn = tree.alloc().unwrap();
+        tree.get_mut(btn).kind = KIND_BUTTON_GROUP;
+        tree.ensure_ext(btn).unwrap().group_id = 5;
+        tree.select_in_group(btn);
+        assert!(checked(&tree, btn) && checked(&tree, g2));
     }
 }

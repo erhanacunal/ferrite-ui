@@ -180,14 +180,16 @@ KIND_CIRCLE = 13
 KIND_POLYGON = 14
 KIND_LINE = 15
 KIND_ELLIPSE = 16
+# Exclusive toggle button: one CHECKED per group_id, drawn with press_color.
+KIND_BUTTON_GROUP = 17
 
 # KIND_NAMES and KIND_VALUES are parallel (combo index ↔ kind value); keep
 # them in lockstep.
 KIND_NAMES = ["Base", "Label", "Button", "Progress", "Slider", "Checkbox", "Radio", "Dropdown",
-              "Image", "Rectangle", "Circle", "Polygon", "Line", "Ellipse"]
+              "Image", "Rectangle", "Circle", "Polygon", "Line", "Ellipse", "Button Group"]
 KIND_VALUES = [KIND_BASE, KIND_LABEL, KIND_BUTTON, KIND_PROGRESS, KIND_SLIDER, KIND_CHECKBOX,
                KIND_RADIO, KIND_DROPDOWN, KIND_IMAGE, KIND_RECTANGLE, KIND_CIRCLE, KIND_POLYGON,
-               KIND_LINE, KIND_ELLIPSE]
+               KIND_LINE, KIND_ELLIPSE, KIND_BUTTON_GROUP]
 KIND_PREFIXES = {
     KIND_BASE: "panel",
     KIND_LABEL: "lbl",
@@ -203,6 +205,7 @@ KIND_PREFIXES = {
     KIND_POLYGON: "poly",
     KIND_LINE: "line",
     KIND_ELLIPSE: "ellipse",
+    KIND_BUTTON_GROUP: "btngrp",
 }
 
 KIND_ICON_NAMES = {
@@ -220,6 +223,7 @@ KIND_ICON_NAMES = {
     KIND_POLYGON:  "fa5s.draw-polygon",
     KIND_LINE:     "fa5s.slash",
     KIND_ELLIPSE:  "fa5s.egg",
+    KIND_BUTTON_GROUP: "fa5s.th-large",
 }
 
 
@@ -586,7 +590,6 @@ class WidgetNode:
         self.size_w = 100
         self.size_h = 40
 
-        self.margin = [0, 0, 0, 0]
         self.border = [0, 0, 0, 0]
         self.padding = [0, 0, 0, 0]
 
@@ -608,6 +611,7 @@ class WidgetNode:
         self.checked = False
         self.multi_line = False
         self.image_id = 0
+        self.group_id = 0  # KIND_BUTTON_GROUP selection group
 
         self.on_click = ""
         self.on_tap = ""
@@ -641,7 +645,7 @@ class WidgetNode:
             "parent": self.parent.name if self.parent else None,
             "loc_x": self.loc_x, "loc_y": self.loc_y,
             "size_w": self.size_w, "size_h": self.size_h,
-            "margin": self.margin[:], "border": self.border[:],
+            "border": self.border[:],
             "padding": self.padding[:],
             "bg_color": self.bg_color, "border_color": self.border_color,
             "border_radius": self.border_radius,
@@ -651,7 +655,7 @@ class WidgetNode:
             "visible": self.visible, "enabled": self.enabled,
             "clickable": self.clickable,
             "value": self.value, "checked": self.checked, "multi_line": self.multi_line,
-            "image_id": self.image_id,
+            "image_id": self.image_id, "group_id": self.group_id,
             "on_click": self.on_click, "on_tap": self.on_tap, "on_paint": self.on_paint,
         }
 
@@ -661,10 +665,11 @@ class WidgetNode:
         for key in ("loc_x", "loc_y", "size_w", "size_h", "bg_color", "border_color",
                      "border_radius", "text_color", "press_color", "alpha", "text",
                      "font_id", "text_align", "visible", "enabled", "clickable", "value",
-                     "checked", "multi_line", "image_id", "on_click", "on_tap", "on_paint"):
+                     "checked", "multi_line", "image_id", "group_id",
+                     "on_click", "on_tap", "on_paint"):
             if key in d:
                 setattr(n, key, d[key])
-        for key in ("margin", "border", "padding"):
+        for key in ("border", "padding"):  # old files' "margin" is ignored
             if key in d:
                 setattr(n, key, list(d[key]))
         return n
@@ -797,6 +802,14 @@ class DesignerModel(QWidget):
             node.border_color = 0xFFFF
             node.text_color = 0xFFFF
             node.clickable = True
+        elif kind == KIND_BUTTON_GROUP:
+            node.size_w = 120
+            node.size_h = 50
+            node.text = "Option"
+            node.text_align = 1
+            node.bg_color = 0x2104
+            node.press_color = 0x001F
+            node.clickable = True
         elif kind == KIND_RECTANGLE:
             node.size_w = 120
             node.size_h = 80
@@ -832,7 +845,7 @@ class DesignerModel(QWidget):
             node.text_color = 0x0000
             if kind == KIND_LABEL:
                 node.bg_color = 0x0000  # transparent in generated Ferrite code
-            elif kind in (KIND_BUTTON, KIND_DROPDOWN):
+            elif kind in (KIND_BUTTON, KIND_DROPDOWN, KIND_BUTTON_GROUP):
                 node.bg_color = 0xBDF7
                 node.press_color = 0x7BEF
             elif kind in (KIND_PROGRESS, KIND_SLIDER):
@@ -940,6 +953,19 @@ class DesignerModel(QWidget):
 
     def notify_changed(self):
         self.changed.emit()
+
+    def enforce_exclusive_group(self, node):
+        """Mirror the device: a checked Button Group / Radio widget unchecks
+        the others of its kind with the same group_id (radios with group_id 0:
+        only their sibling radios with group_id 0)."""
+        if node.kind not in (KIND_BUTTON_GROUP, KIND_RADIO) or not node.checked:
+            return
+        siblings_only = node.kind == KIND_RADIO and node.group_id == 0
+        for w in self.widgets:
+            if (w is not node and w.kind == node.kind
+                    and w.group_id == node.group_id
+                    and (not siblings_only or w.parent is node.parent)):
+                w.checked = False
 
     def snap(self, val):
         if self.snap_to_grid:
@@ -1323,7 +1349,9 @@ class WidgetItem(QGraphicsItem):
 
         # Background
         bg = rgb565_to_qcolor(node.bg_color)
-        if node.bg_color == 0 and node is not self.model.root:
+        if node.kind == KIND_BUTTON_GROUP and node.checked and node.press_color != 0:
+            bg = rgb565_to_qcolor(node.press_color)
+        elif node.bg_color == 0 and node is not self.model.root:
             bg = QColor(0, 0, 0, 0)
         elif node.alpha < 255 and device_spec(self.model.device_id)["caps"].get("alpha"):
             bg.setAlpha(node.alpha)
@@ -2061,7 +2089,6 @@ class PropertyEditor(QScrollArea):
         # Box model
         g = self._group("Box Model")
         self._add_edges(g, "border", "Border")
-        self._add_edges(g, "margin", "Margin")
         self._add_edges(g, "padding", "Padding")
 
         # Text
@@ -2077,6 +2104,7 @@ class PropertyEditor(QScrollArea):
         self._add_bool(g, "clickable", "Clickable")
         self._add_int(g, "value", "Value", 0, 100)
         self._add_bool(g, "checked", "Checked")
+        self._add_int(g, "group_id", "Group ID", 0, 255)
         self._add_bool(g, "multi_line", "Multi-line")
         self._add_resource_combo(g, "image_id", "Image", "images")
 
@@ -2244,7 +2272,11 @@ class PropertyEditor(QScrollArea):
             new_parent = self.model.find_by_name(parent_name)
             if new_parent and new_parent is not node.parent:
                 self.model.reparent(node, new_parent)
-        elif attr in ("border", "margin", "padding"):
+        elif attr in ("checked", "group_id"):
+            setattr(node, attr, value)
+            self.model.enforce_exclusive_group(node)
+            self.model.notify_changed()
+        elif attr in ("border", "padding"):
             setattr(node, attr, list(value))
             self.model.notify_changed()
         elif attr in ("bg_color", "border_color", "text_color", "press_color"):
@@ -2317,7 +2349,6 @@ class PropertyEditor(QScrollArea):
             alpha_label.setVisible(has_alpha)
 
         self._set_editor("border", node.border)
-        self._set_editor("margin", node.margin)
         self._set_editor("padding", node.padding)
 
         self._refresh_resource_combos()
@@ -2333,6 +2364,7 @@ class PropertyEditor(QScrollArea):
         self._set_editor("checked", node.checked)
         self._set_editor("multi_line", node.multi_line)
         self._set_editor("image_id", node.image_id)
+        self._set_editor("group_id", node.group_id)
 
         self._set_editor("on_click", node.on_click)
         self._set_editor("on_tap", node.on_tap)
@@ -3110,8 +3142,6 @@ def generate_designer_fl(model):
 
         if any(v > 0 for v in node.border):
             lines.append(f"    {node.name}.border = [{node.border[0]}, {node.border[1]}, {node.border[2]}, {node.border[3]}];")
-        if any(v > 0 for v in node.margin):
-            lines.append(f"    {node.name}.margin = [{node.margin[0]}, {node.margin[1]}, {node.margin[2]}, {node.margin[3]}];")
         if any(v > 0 for v in node.padding):
             lines.append(f"    {node.name}.padding = [{node.padding[0]}, {node.padding[1]}, {node.padding[2]}, {node.padding[3]}];")
 
@@ -3131,6 +3161,9 @@ def generate_designer_fl(model):
             lines.append(f"    {node.name}.clickable = 1;")
         if node.value != 0:
             lines.append(f"    {node.name}.value = {node.value};")
+        # group_id before checked: checking a group button unchecks its group.
+        if node.group_id != 0:
+            lines.append(f"    {node.name}.group_id = {node.group_id};")
         if node.checked:
             lines.append(f"    {node.name}.checked = 1;")
         if node.multi_line:

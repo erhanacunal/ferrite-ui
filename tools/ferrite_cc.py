@@ -243,10 +243,7 @@ class Prop:
     NEXT_SIBLING = 0x0D
     KIND = 0x0E
     TEXT_COLOR = 0x0F
-    MARGIN_T = 0x10
-    MARGIN_R = 0x11
-    MARGIN_B = 0x12
-    MARGIN_L = 0x13
+    # 0x10-0x13: reserved (former margin edges; margin removed)
     BORDER_T = 0x14
     BORDER_R = 0x15
     BORDER_B = 0x16
@@ -278,10 +275,11 @@ class Prop:
     GRAPH_FLAGS = 0x2F     # bit 0: 0=spline / 1=linear, bit 1: fill area
     MULTI_LINE = 0x30     # label: split text by \n, 0=off 1=on
     ALPHA = 0x31           # background opacity 0-255 (alpha-capable devices)
+    GROUP_ID = 0x32        # KIND_BUTTON_GROUP: exclusive selection group
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
-    MARGIN = 0x42
+    # 0x42: reserved (former margin compound)
     BORDER_EDGES = 0x43
     PADDING = 0x44
     TEXT = 0x45
@@ -1071,7 +1069,6 @@ PROP_NAMES = {
     0x0A: 'FLAGS', 0x0B: 'PARENT', 0x0C: 'FIRST_CHILD', 0x0D: 'NEXT_SIBLING',
     0x0E: 'KIND', 0x0F: 'TEXT_COLOR',
     0x1C: 'FONT_ID', 0x1D: 'TEXT_ALIGN', 0x1E: 'PRESS_COLOR',
-    0x10: 'MARGIN_T', 0x11: 'MARGIN_R', 0x12: 'MARGIN_B', 0x13: 'MARGIN_L',
     0x14: 'BORDER_T', 0x15: 'BORDER_R', 0x16: 'BORDER_B', 0x17: 'BORDER_L',
     0x18: 'PADDING_T', 0x19: 'PADDING_R', 0x1A: 'PADDING_B', 0x1B: 'PADDING_L',
     0x1F: 'IMAGE_ID',
@@ -1080,8 +1077,8 @@ PROP_NAMES = {
     0x29: 'SCROLL_Y', 0x2A: 'CLIP_CHILDREN',
     0x2B: 'GRADIENT_COLOR', 0x2C: 'GRADIENT_DIR',
     0x2D: 'GRAPH_ARR', 0x2E: 'GRAPH_COUNT', 0x2F: 'GRAPH_FLAGS',
-    0x30: 'MULTI_LINE', 0x31: 'ALPHA',
-    0x40: 'LOCATION', 0x41: 'SIZE', 0x42: 'MARGIN',
+    0x30: 'MULTI_LINE', 0x31: 'ALPHA', 0x32: 'GROUP_ID',
+    0x40: 'LOCATION', 0x41: 'SIZE',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
 
@@ -1325,13 +1322,8 @@ PROP_MAP = {
     'location': (Prop.LOCATION, True),
     'pos': (Prop.LOCATION, True),
     'size': (Prop.SIZE, True),
-    'margin': (Prop.MARGIN, True),
     'border': (Prop.BORDER_EDGES, True),
     'padding': (Prop.PADDING, True),
-    'margin_top': (Prop.MARGIN_T, False),
-    'margin_right': (Prop.MARGIN_R, False),
-    'margin_bottom': (Prop.MARGIN_B, False),
-    'margin_left': (Prop.MARGIN_L, False),
     'border_top': (Prop.BORDER_T, False),
     'border_right': (Prop.BORDER_R, False),
     'border_bottom': (Prop.BORDER_B, False),
@@ -1366,6 +1358,7 @@ PROP_MAP = {
     'graph_flags': (Prop.GRAPH_FLAGS, False),
     'multi_line': (Prop.MULTI_LINE, False),
     'alpha': (Prop.ALPHA, False),
+    'group_id': (Prop.GROUP_ID, False),
     'text': (Prop.TEXT, True),
     'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }

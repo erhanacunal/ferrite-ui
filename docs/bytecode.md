@@ -313,7 +313,7 @@ Scalar properties are used by `W_SET` and `W_GET`.
 | `0x09` | `BORDER_COLOR` | RGB565 |
 | `0x0E` | `KIND` | widget kind |
 | `0x0F` | `TEXT_COLOR` | RGB565 |
-| `0x10..0x13` | `MARGIN_T/R/B/L` | edge fields |
+| `0x10..0x13` | reserved | former `MARGIN_T/R/B/L` (margin removed) |
 | `0x14..0x17` | `BORDER_T/R/B/L` | edge fields |
 | `0x18..0x1B` | `PADDING_T/R/B/L` | edge fields |
 | `0x1C` | `FONT_ID` | font resource id |
@@ -333,6 +333,7 @@ Scalar properties are used by `W_SET` and `W_GET`.
 | `0x2A` | `CLIP_CHILDREN` | scroll/clip flag |
 | `0x2B` | `GRADIENT_COLOR` | RGB565 gradient end color |
 | `0x2C` | `GRADIENT_DIR` | `0=none`, `1=horizontal`, `2=vertical` |
+| `0x32` | `GROUP_ID` | Button Group selection group (u8) |
 
 Compound properties are used by `W_SET_LEN`:
 
@@ -340,7 +341,7 @@ Compound properties are used by `W_SET_LEN`:
 | --- | --- | --- |
 | `0x40` | `LOCATION` | two packed ZigZag varints: `x`, `y` |
 | `0x41` | `SIZE` | two packed ZigZag varints: `w`, `h` |
-| `0x42` | `MARGIN` | four packed ZigZag varints: `top`, `right`, `bottom`, `left` |
+| `0x42` | reserved | former `MARGIN` compound (margin removed) |
 | `0x43` | `BORDER_EDGES` | four packed ZigZag varints |
 | `0x44` | `PADDING` | four packed ZigZag varints |
 | `0x45` | `TEXT` | UTF-8 bytes; allocated in `StringPool` |
@@ -359,6 +360,7 @@ Compound properties are used by `W_SET_LEN`:
 | `7` | Input |
 | `8` | Gauge |
 | `9` | Dropdown |
+| `17` | Button Group |
 
 ## Disassembly
 

@@ -26,10 +26,7 @@ pub const PROP_FLAGS: u8 = 0x0A;
 pub const PROP_PARENT: u8 = 0x0B;
 pub const PROP_FIRST_CHILD: u8 = 0x0C;
 pub const PROP_NEXT_SIBLING: u8 = 0x0D;
-pub const PROP_MARGIN_T: u8 = 0x10;
-pub const PROP_MARGIN_R: u8 = 0x11;
-pub const PROP_MARGIN_B: u8 = 0x12;
-pub const PROP_MARGIN_L: u8 = 0x13;
+// 0x10-0x13: reserved (former margin top/right/bottom/left; margin removed)
 pub const PROP_BORDER_T: u8 = 0x14;
 pub const PROP_BORDER_R: u8 = 0x15;
 pub const PROP_BORDER_B: u8 = 0x16;
@@ -64,11 +61,12 @@ pub const PROP_GRAPH_COUNT: u8 = 0x2E;
 pub const PROP_GRAPH_FLAGS: u8 = 0x2F;
 pub const PROP_MULTI_LINE: u8 = 0x30;
 pub const PROP_ALPHA: u8 = 0x31;
+pub const PROP_GROUP_ID: u8 = 0x32; // KIND_BUTTON_GROUP selection group
 
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;
 pub const PROP_SIZE: u8 = 0x41;
-pub const PROP_MARGIN: u8 = 0x42;
+// 0x42: reserved (former margin compound)
 pub const PROP_BORDER_EDGES: u8 = 0x43;
 pub const PROP_PADDING: u8 = 0x44;
 pub const PROP_TEXT: u8 = 0x45;

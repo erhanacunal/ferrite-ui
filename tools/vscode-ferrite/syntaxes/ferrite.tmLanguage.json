@@ -180,7 +180,7 @@
             "patterns": [
                 {
                     "name": "meta.property.ferrite",
-                    "match": "(?<=\\.)\\b(?:loc_[xy]|size_[wh]|width|height|visible|enabled|clickable|bg_color|background_color|border_color|flags|location|pos|size|margin|border|padding|margin_top|margin_right|margin_bottom|margin_left|border_top|border_right|border_bottom|border_left|padding_top|padding_right|padding_bottom|padding_left|kind|text_color|font_id|text_align|press_color|image_id|on_click|on_paint|on_tap|border_radius|radius|value|checked|max_length|cursor_pos|on_change|scroll_y|clip_children|gradient_color|gradient_dir|graph_arr|graph_array|graph_count|graph_flags|multi_line|alpha|text|text_id)\\b"
+                    "match": "(?<=\\.)\\b(?:loc_[xy]|size_[wh]|width|height|visible|enabled|clickable|bg_color|background_color|border_color|flags|location|pos|size|border|padding|border_top|border_right|border_bottom|border_left|padding_top|padding_right|padding_bottom|padding_left|kind|text_color|font_id|text_align|press_color|image_id|on_click|on_paint|on_tap|border_radius|radius|value|checked|max_length|cursor_pos|on_change|scroll_y|clip_children|gradient_color|gradient_dir|graph_arr|graph_array|graph_count|graph_flags|multi_line|alpha|group_id|text|text_id)\\b"
                 }
             ]
         }

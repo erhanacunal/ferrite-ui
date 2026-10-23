@@ -437,7 +437,7 @@ lbl.text = "OK";         // W_SET only
 btn.bg_color = 0xF800;   // W_TARGET(btn) + W_SET (target switched back)
 ```
 
-Compound properties (location, size, margin, border, padding) require `[...]` array syntax. Reading compound properties directly is not supported — use the individual components instead:
+Compound properties (location, size, border, padding) require `[...]` array syntax. Reading compound properties directly is not supported — use the individual components instead:
 
 ```c
 var w = btn.width;       // OK: reads size_w
@@ -475,7 +475,8 @@ set(text_align, 1);           // 0=left, 1=center, 2=right
 set(press_color, 0x7BEF);     // pressed highlight color
 set(image_id, 1);             // background image from flash
 set(value, 50);               // progress/slider value (0-100)
-set(checked, 1);              // checkbox/radio checked state (0 or 1)
+set(checked, 1);              // checkbox/radio/button-group checked state (0 or 1)
+set(group_id, 2);             // button group / radio: exclusive selection group id
 set(on_click, 1);             // click callback func_id
 set(on_paint, 2);             // custom paint callback func_id
 set(on_tap, 3);               // tap-with-coords callback func_id
@@ -486,7 +487,6 @@ set(on_tap, 3);               // tap-with-coords callback func_id
 ```c
 set(location, 100, 50);         // x, y
 set(size, 200, 60);             // width, height
-set(margin, 5, 5, 5, 5);       // top, right, bottom, left
 set(border, 2, 2, 2, 2);       // top, right, bottom, left
 set(padding, 10, 10, 10, 10);  // top, right, bottom, left
 ```
@@ -494,7 +494,6 @@ set(padding, 10, 10, 10, 10);  // top, right, bottom, left
 **Individual edge properties:**
 
 ```c
-set(margin_top, 10);
 set(border_left, 3);
 set(padding_bottom, 8);
 ```
@@ -607,7 +606,12 @@ Widgets with `kind=5` (checkbox) or `kind=6` (radio) display a check/radio indic
 - `press_color`: indicator fill color when checked (defaults to `text_color` if 0)
 - `border_radius`: when > 0, checkbox uses rounded indicator box
 
-**Checkbox** toggles on each tap (on/off). **Radio** buttons auto-uncheck siblings — tapping a radio unchecks all other `kind=6` widgets under the same parent, then checks itself.
+**Checkbox** toggles on each tap (on/off). **Radio** buttons are exclusive within their group, chosen by `group_id`:
+
+- `group_id = 0` (default): the group is the sibling radios with `group_id` 0. Tapping a radio unchecks the other `kind=6` widgets under the same parent, then checks itself.
+- `group_id` ≠ 0: the group is every radio with that `group_id`, under any parent, so one group can span containers. `set(checked, 1)` from code also unchecks the rest of the group, so set `group_id` before `checked`.
+
+Radios and Button Group widgets (kind 17) never share a group, even with the same `group_id`.
 
 ```c
 // Checkbox
@@ -643,6 +647,49 @@ r2.text_color = 0xFFFF;
 r2.press_color = 0x001F;
 r2.clickable = 1;
 parent(0);
+```
+
+### Button Group
+
+Widgets with `kind=17` (`KIND_BUTTON_GROUP` in `lib/core.fl`) are toggle buttons in an exclusive group: all Button Group widgets with the same `group_id` form one group, wherever they sit in the tree, and only one of them is selected (`checked`) at a time.
+
+- Tapping a button selects it and deselects the others in its group. Tapping the selected one keeps it selected.
+- `set(checked, 1)` from code does the same. Set `group_id` **before** `checked`, otherwise the button deselects the members of group 0.
+- The selected button is drawn with `press_color` as its background, like a pressed button. Children with the same `bg_color` follow it.
+- `on_click` fires as usual. Read `get(checked)` or the widget id to see which button was chosen.
+
+```c
+#include "core.fl"
+
+var day;
+var week;
+
+fn setup() {
+    day = alloc();
+    day.kind = KIND_BUTTON_GROUP;
+    day.location = [20, 20];
+    day.size = [120, 50];
+    day.bg_color = 0x2104;
+    day.press_color = 0x001F;   // background while selected
+    day.text = "Day";
+    day.text_align = 1;
+    day.clickable = 1;
+    day.group_id = 1;           // before checked
+    day.checked = 1;
+    parent(0);
+
+    week = alloc();
+    week.kind = KIND_BUTTON_GROUP;
+    week.location = [150, 20];
+    week.size = [120, 50];
+    week.bg_color = 0x2104;
+    week.press_color = 0x001F;
+    week.text = "Week";
+    week.text_align = 1;
+    week.clickable = 1;
+    week.group_id = 1;
+    parent(0);
+}
 ```
 
 Read checked state in callbacks:

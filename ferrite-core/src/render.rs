@@ -9,7 +9,7 @@ use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
     FLAG_HAS_ON_PAINT, FLAG_PAINTED, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
     KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_PROGRESS,
-    KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
+    KIND_BUTTON_GROUP, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
 };
 
 /// Screen-bounds rect: the panel size from `LcdBackend::WIDTH`/`HEIGHT`,
@@ -576,8 +576,8 @@ fn shows_behind(tree: &WidgetTree, id: WidgetId) -> bool {
 /// its rounded corners, already shows through, and a filled copy would be a
 /// square box over it.
 fn effective_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
-    // This widget is pressed and has a press_color
-    if widget.flags & FLAG_PRESSED != 0 && ext.press_color != 0 {
+    // This widget is pressed (or a selected group button) and has a press_color
+    if shows_press(widget) && ext.press_color != 0 {
         return ext.press_color;
     }
     if widget.background_color == 0 && (widget.kind == KIND_LABEL || widget.kind == KIND_IMAGE) {
@@ -591,7 +591,7 @@ fn effective_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
     while pid.is_some() {
         let p = tree.get(pid);
         let p_ext = tree.ext(pid).unwrap_or(&WidgetExt::DEFAULT);
-        if p.flags & FLAG_PRESSED != 0 && p_ext.press_color != 0 {
+        if shows_press(p) && p_ext.press_color != 0 {
             if widget.background_color == p.background_color {
                 return p_ext.press_color;
             }
@@ -605,6 +605,13 @@ fn effective_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
     }
 
     widget.background_color
+}
+
+/// Pressed, or a selected (CHECKED) KIND_BUTTON_GROUP widget: both are
+/// drawn with `press_color`.
+fn shows_press(w: &Widget) -> bool {
+    w.flags & FLAG_PRESSED != 0
+        || (w.kind == KIND_BUTTON_GROUP && w.flags & FLAG_CHECKED != 0)
 }
 
 /// Walk up the widget tree to find the actual visible background color for

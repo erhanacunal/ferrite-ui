@@ -14,6 +14,8 @@ const KIND_GAUGE    = 8;
 const KIND_DROPDOWN = 9;
 const KIND_GRAPH    = 10;
 const KIND_IMAGE    = 11;
+// 12-16: shape widgets (lib/shapes.fl)
+const KIND_BUTTON_GROUP = 17;  // exclusive toggle button: one selected per group_id
 
 // Text alignment
 const ALIGN_LEFT   = 0;

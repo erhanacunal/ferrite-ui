@@ -697,7 +697,6 @@ class AnalysisResult:
 
 # Property IDs that live in WidgetExt (require extension allocation)
 _EXT_SCALAR_PROPS = {
-    0x10, 0x11, 0x12, 0x13,  # MARGIN_T/R/B/L
     0x14, 0x15, 0x16, 0x17,  # BORDER_T/R/B/L
     0x18, 0x19, 0x1A, 0x1B,  # PADDING_T/R/B/L
     0x0F,  # TEXT_COLOR
@@ -710,9 +709,9 @@ _EXT_SCALAR_PROPS = {
     0x22,  # ON_TAP
     0x23,  # BORDER_RADIUS
     0x24,  # VALUE
+    0x32,  # GROUP_ID
 }
 _EXT_COMPOUND_PROPS = {
-    0x42,  # MARGIN
     0x43,  # BORDER_EDGES
     0x44,  # PADDING
     0x45,  # TEXT
