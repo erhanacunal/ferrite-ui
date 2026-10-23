@@ -62,7 +62,7 @@ HAL: [f1c100s_rs](https://github.com/erhanacunal/f1c100s_rs) (git submodule `ven
 ## Features
 
 - **Widget system** -- HTML-like tree structure with CSS box model, split-struct design (20B base + 36B extension on demand)
-- **Widget types** -- Base (container), Label, Button, Progress, Slider, Checkbox, Radio, Text Input, Gauge, Dropdown
+- **Widget types** -- Base (container), Label, Button, Progress, Slider, Checkbox, Radio, Button Group, Text Input, Gauge, Dropdown, Graph, Image, and shapes (Rectangle, Circle, Polygon, Line, Ellipse)
 - **Dirty redraw** -- Two-pass clip-based painter's algorithm (erase hidden, then draw visible)
 - **Double buffering** -- FPGA back/front buffer swap, dual-buffer dirty tracking (only changed widgets redrawn per buffer)
 - **E-paper render mode** -- Dirty partial-update path with `flush_dirty()` for ED047TC1 panels (no tearing, driven via RMT)
@@ -170,6 +170,41 @@ while (true) {
 See [docs/ferrite-lang.md](docs/ferrite-lang.md) for the full language reference and [examples/](examples/) for complete programs.
 See [docs/protocol.md](docs/protocol.md) for the USART protocol reference used by `tools/ferrite_cli.py`.
 See [docs/bytecode.md](docs/bytecode.md) for the VM image format, opcode, and widget property reference.
+
+## Designer
+
+`tools/ferrite_designer.py` is a visual layout tool (`pip install PySide6`). It edits a `.fui` project, generates the layout code (`main.designer.fl`), builds the flash image and uploads it over USART.
+
+```sh
+python tools/ferrite_designer.py               # new project (asks for the device)
+python tools/ferrite_designer.py app.fui       # open a project
+```
+
+### Widget palette
+
+The widget toolbar adds one widget per button, in this order. A new widget goes into the selected widget, or into the root if nothing is selected. The **Kind** dropdown in the property panel lists the same widgets.
+
+| Palette | Kind | Notes |
+|---------|------|-------|
+| Base | 0 | Container. Paints only its `bg_color` and border. |
+| Label | 1 | Text with `text_color`, font and alignment. A `bg_color` of 0 is transparent. |
+| Button | 2 | Clickable container that shows `press_color` while held. It can hold child widgets, e.g. a label. |
+| Progress | 3 | Bar showing `value` 0–100, filled with `press_color`. |
+| Slider | 4 | Draggable `value` 0–100. `on_click` receives `(widget_id, value)`. |
+| Checkbox | 5 | Toggles `checked` on each tap. |
+| Radio | 6 | One `checked` per group. With `group_id` 0 the group is the sibling radios, with any other value it is every radio with that `group_id`. |
+| Button Group | 17 | Toggle button: one selected per `group_id`, anywhere in the tree, drawn with `press_color`. Use it for tabs and segmented controls. Set `group_id` before `checked` in code. |
+| Dropdown | 9 | Expandable list. Its child widgets are the options, and tapping one copies its text into the dropdown. |
+| Image | 11 | Shows an image resource (Resources panel → `image_id`). |
+| Rectangle | 12 | Filled with `bg_color`, outlined with `border_color` at the border width. |
+| Circle | 13 | Circle inscribed in the widget box, filled and outlined like Rectangle. |
+| Polygon | 14 | Points come from `text` as `"x,y x,y …"`, relative to the widget's top-left corner. |
+| Line | 15 | Diagonal of the widget box, drawn in `border_color` at the border width. |
+| Ellipse | 16 | Ellipse filling the whole widget box. |
+
+Text Input (7), Gauge (8) and Graph (10) are not in the palette yet. Create them in `.fl` code (`lib/core.fl` has the `KIND_*` constants).
+
+The rest of the toolbar deletes the selection, changes its z-order, toggles grid snap, generates code (Ctrl+G), builds the flash image (Ctrl+B) and uploads it to the device on the selected serial port (Ctrl+U).
 
 ## Toolchain
 
