@@ -7,7 +7,7 @@
         {
             "name": "main",
             "source": "fpga_stream_probe.fl",
-            "exec_mode": "ram"
+            "exec_mode": "flash"
         }
     ]
 }

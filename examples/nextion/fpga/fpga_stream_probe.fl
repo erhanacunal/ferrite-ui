@@ -20,8 +20,8 @@
 // Gray (0x4208) backdrops are drawn with reg 0 so unwritten pixels show.
 // Screen holds 15 s, then repeats.
 
-var REG = 0x09;
-var MODE = 0x0001;
+var REG = 0x80;
+var MODE = 0x00FF;
 var HOLD = 15000;
 var LX = 160;      // reference column x
 var RX = 420;      // reg 0x0001 column x
