@@ -2,8 +2,8 @@
 /// survives a power cycle: settings, counters, calibration).
 ///
 /// Addresses run `0..SIZE` on every board. The backend talks to the chip (GD32
-/// Nextion: 24C08 on the RTC's I2C bus) and handles its page and block
-/// boundaries. [`EepromImpl`] adds the range checks the VM needs and skips
+/// Nextion: 24C08 on the RTC's I2C bus; N32903: an area of the BY25Q40 SPI
+/// NOR flash) and handles its page and block boundaries. [`EepromImpl`] adds the range checks the VM needs and skips
 /// chunks whose contents already match, which saves write cycles and wear.
 /// Boards without an EEPROM use [`NoEeprom`] (size 0: every access fails).
 
@@ -15,9 +15,21 @@ pub trait EepromBackend {
     /// `false` on a bus error (chip missing / not answering).
     fn read(&self, addr: u16, buf: &mut [u8]) -> bool;
 
-    /// Write `data` starting at `addr` (`addr + data.len() <= SIZE`) and wait
-    /// until the chip has stored it. `false` on a bus error or timeout.
+    /// Write `data` starting at `addr` (`addr + data.len() <= SIZE`).
+    /// `false` on a bus error or timeout. A backend may only buffer the data
+    /// (flash-backed boards keep a RAM copy) and store it in [`flush`]; later
+    /// reads must return it either way.
+    ///
+    /// [`flush`]: EepromBackend::flush
     fn write(&self, addr: u16, data: &[u8]) -> bool;
+
+    /// Store buffered writes. The runtime calls this once per main-loop pass
+    /// and before a reset, so all writes made by one callback cost a single
+    /// commit (one sector erase on flash). `false` if storing failed.
+    /// Backends that write through (the 24C08) keep the default.
+    fn flush(&self) -> bool {
+        true
+    }
 }
 
 /// Backend for boards without an EEPROM.
@@ -88,6 +100,12 @@ impl<B: EepromBackend> EepromImpl<B> {
             a += chunk.len() as u16;
         }
         true
+    }
+
+    /// Store buffered writes (see [`EepromBackend::flush`]).
+    #[inline]
+    pub fn flush(&self) -> bool {
+        self.be.flush()
     }
 
     /// `eepromRead(addr)` → byte 0..255, or `None` (bad address / bus error).

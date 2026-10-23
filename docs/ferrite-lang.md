@@ -867,10 +867,13 @@ callback: poll `pinRead` from `loop()`.
 
 Store small amounts of data that survive power cycles and reflashing, such as
 settings, counters and calibration values. Addresses run from `0` to
-`eepromSize() - 1`. On the GD32 Nextion this is the on-board 24C08, which
-holds 1024 bytes. The simulator has a 1024-byte EEPROM too: run it with
-`--eeprom <file>` to keep the contents between runs. Other boards have none
-(`eepromSize()` returns 0).
+`eepromSize() - 1`. Boards with one have 1024 bytes:
+- GD32 Nextion: the on-board 24C08 EEPROM.
+- N32903: a 4 KB sector at the end of the on-board BY25Q40 SPI flash, used
+  as an EEPROM.
+- Simulator: run it with `--eeprom <file>` to keep the contents between runs.
+
+Other boards have none (`eepromSize()` returns 0).
 
 | Builtin | Result | Description |
 |---------|--------|-------------|
@@ -894,13 +897,18 @@ fn setup() {
 }
 ```
 
-- **Timing:** a write blocks the program while the chip stores it, up to
-  ~5 ms per 16-byte page. Bytes that already hold the same value are not
+- **Timing:** on the GD32 Nextion, a write blocks the program while the chip
+  stores it, up to ~5 ms per 16-byte page. On the N32903 a write only
+  updates a RAM copy, and the firmware stores it after the current callback
+  or `loop()` pass. That takes one flash sector erase (~50–400 ms, during
+  which the screen doesn't update) when a bit has to go from 0 back to 1.
+  All the writes in one callback share that one erase. Bytes that already hold the same value are not
   rewritten, so saving an unchanged record costs only a read. Group related
   values and save them with one `eepromWriteArr`, not many `eepromWrite`
   calls.
-- **Wear:** an EEPROM cell survives about a million writes. Save when a value
-  changes, not on every frame.
+- **Wear:** an EEPROM cell survives about a million writes. The N32903's
+  flash sector survives about 100,000 erases. Save when a value changes, not
+  on every frame.
 - **Values are bytes:** store larger numbers in several bytes, e.g. a 16-bit
   value as `v % 256` and `v / 256`.
 - **Errors:** an address range outside `0..eepromSize()-1`, a call on a board

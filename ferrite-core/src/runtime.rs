@@ -306,7 +306,10 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
             }
             match ev {
                 RxEvent::Ping => protocol::send_pong(&ctx.usart),
-                RxEvent::Restart => P::reset(),
+                RxEvent::Restart => {
+                    ctx.eeprom.flush();
+                    P::reset()
+                }
                 RxEvent::MemInfo => {
                     let (free, _largest) = P::heap_stats();
                     protocol::send_meminfo(&ctx.usart, free as u32);
@@ -349,6 +352,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                 RxEvent::FsWriteComplete => {
                     protocol::send_pong(&ctx.usart);
                     ctx.usart.flush();
+                    ctx.eeprom.flush();
                     P::reset();
                 }
                 RxEvent::UserMessage => {
@@ -404,6 +408,10 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
         if error_code == 0 {
             error_code = check_vm_fault(&mut ctx, &vm);
         }
+
+        // --- Commit EEPROM writes made this pass (one erase on flash-backed
+        //     boards for a whole save; no-op on write-through chips) ---
+        ctx.eeprom.flush();
 
         // --- End-of-frame hook (host window pump / present; no-op on device) ---
         P::frame_end(&mut ctx);
