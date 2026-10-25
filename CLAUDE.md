@@ -172,7 +172,11 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - `0x002000+`: Resource data (packed)
 - **Entry format (32B):** name[16] + kind(1) + pad(3) + offset(4) + size(4) + reserved(4)
 - **Resource types:** Font=0, Image=1, Program=2, Page=3, File=4, SysCfg=5
-- **API:** `mount()`, `find(name)`, `read_resource()`, `count_by_kind()`, `find_nth_by_kind()`, `verify_checksum()`
+- **API:** `mount()`, `find(name)`, `read_resource()`, `count_by_kind()`, `find_nth_by_kind()`, `verify()`
+- **Checksum (FS v3):** CRC-32 (IEEE = `zlib.crc32`, nibble table) of header bytes 0..12 + table + data up to the furthest resource end — the whole image except the checksum field. `mount` still accepts v2 (table byte sum); older firmware rejects v3 images (BadVersion), so update firmware before uploading images built by the new tools.
+  - Checked after every `writefs` (before the pong; a bad image → error reply 9 + Code 9 screen, no reboot, so the host can resend) and after SD `PROGRAM.BIN` flashing.
+  - At boot only where `Platform::VERIFY_FS_ON_BOOT` (n32903, sim: RAM-shadowed, a few ms). Off on Nextion: the bit-banged SPI reads ~125 KB/s, ~8 s per MB.
+  - `ferrite_build.py` writes it (`fs_checksum`), `--disasm` and `ferrite_analyze.py` check it.
 - **RAM cost:** 12 bytes (header cache only — table stays in flash)
 
 ### System Config (RES_SYSCFG)
@@ -379,7 +383,7 @@ ferrite-ui/                  (workspace root — virtual manifest + shared relea
 - [x] Embedded font (FreeMono9pt7b, in ROM, no flash required)
 - [x] USART protobuf protocol (ping/pong, execute, restart, fs write, meminfo, stackinfo)
 - [x] Startup sequence (backlight → display → recovery check → font → fs → vm)
-- [x] Error protocol (display + USART, 8 error codes)
+- [x] Error protocol (display + USART, 9 error codes; 9 = flash image corrupted)
 - [x] RES_SYSCFG — per-image pool sizes (UART RX, strpool, VM stacks, anim/widget caps), heap-allocated at boot
 - [x] Touch event → VM callback (on_click, on_tap, on_paint, on_touch_down/up/move)
 - [x] Touch gestures (swipe left/right/up/down, long press — global callbacks OnSwipe=10, OnLongPress=11)

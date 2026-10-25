@@ -46,6 +46,8 @@ pub const ERR_PROGRAM_ERROR: u8 = 6;
 pub const ERR_INSUFFICIENT_MEMORY: u8 = 7;
 /// The image's RES_SYSCFG entry is malformed (bad kind/size/magic/version).
 pub const ERR_BAD_SYSCFG: u8 = 8;
+/// The flash image doesn't match its header checksum (`Fs::verify`).
+pub const ERR_BAD_IMAGE: u8 = 9;
 /// Recovery mode — skip program load, suppress the error screen.
 pub const ERR_EMPTY_RUN: u8 = 0xFE;
 
@@ -225,6 +227,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
     // --- Mount flash filesystem ---
     if error_code == 0 {
         match fs::Fs::mount(&ctx.flash, P::FS_BASE) {
+            Ok(f) if P::VERIFY_FS_ON_BOOT && !f.verify(&ctx.flash) => error_code = ERR_BAD_IMAGE,
             Ok(f) => ctx.fs = Some(f),
             Err(_) => error_code = ERR_NO_FILESYSTEM,
         }
@@ -350,6 +353,17 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                 }
                 RxEvent::FsChunkDone => protocol::send_pong(&ctx.usart),
                 RxEvent::FsWriteComplete => {
+                    // Check the image before rebooting into it: on a bad
+                    // upload the host gets the error and can resend.
+                    let ok = fs::Fs::mount(&ctx.flash, P::FS_BASE)
+                        .is_ok_and(|f| f.verify(&ctx.flash));
+                    if !ok {
+                        ctx.fs = None;
+                        error_code = ERR_BAD_IMAGE;
+                        protocol::send_error(&ctx.usart, error_code);
+                        show_error(&mut ctx, error_code, None);
+                        continue;
+                    }
                     protocol::send_pong(&ctx.usart);
                     ctx.usart.flush();
                     ctx.eeprom.flush();
@@ -797,6 +811,7 @@ fn error_description(code: u8) -> &'static [u8] {
         6 => b"program execution error",
         7 => b"insufficient memory",
         8 => b"invalid system config",
+        9 => b"flash image corrupted",
         _ => b"error",
     }
 }

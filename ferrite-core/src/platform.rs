@@ -90,4 +90,10 @@ pub trait Platform {
     /// where that flash is slow to reach (SPI NOR: a command + address per
     /// read) and RAM is plentiful; off on the small RAM boards.
     const CACHE_FONT_BITMAPS: bool = false;
+
+    /// Check the whole flash image against its CRC (`Fs::verify`) at every
+    /// boot; a mismatch shows error 9 instead of running a corrupt program.
+    /// `writefs` and SD flashing always verify. Off by default: it reads
+    /// the entire image, ~8 s per MB on the bit-banged Nextion SPI.
+    const VERIFY_FS_ON_BOOT: bool = false;
 }

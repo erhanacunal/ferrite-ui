@@ -78,6 +78,7 @@ ERROR_DESCRIPTIONS = {
     6: "program execution error",
     7: "insufficient memory",
     8: "invalid system config",
+    9: "flash image corrupted",
 }
 
 # VM fault codes (error 6 detail) — keep in sync with `vm::fault` in vm.rs

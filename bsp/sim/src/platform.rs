@@ -41,6 +41,8 @@ impl Platform for SimPlatform {
 
     // Software JPEG decoder (sim/src/jpeg.rs).
     const CAPS: u32 = CAP_JPEG;
+
+    const VERIFY_FS_ON_BOOT: bool = true;
 }
 
 // --- Host window state (thread-local; minifb Window is !Send) ---

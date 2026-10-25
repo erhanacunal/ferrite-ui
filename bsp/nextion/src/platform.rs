@@ -212,7 +212,8 @@ fn recovery_hold(ctx: &mut Ctx<NextionPlatform>, cal: &CalParams) -> bool {
 }
 
 /// SD card boot (EMPTY.BIN → recovery, PROGRAM.BIN → flash update), see
-/// `ferrite_core::sdboot`. Returns `ERR_EMPTY_RUN` for recovery, otherwise 0.
+/// `ferrite_core::sdboot`. Returns `ERR_EMPTY_RUN` for recovery,
+/// `ERR_BAD_IMAGE` for a PROGRAM.BIN that fails its check, otherwise 0.
 fn sd_boot_check(ctx: &Ctx<NextionPlatform>) -> u8 {
     if !sdcard::probe() {
         return 0; // no SD card — continue normal boot

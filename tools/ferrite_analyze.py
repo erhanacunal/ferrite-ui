@@ -19,6 +19,7 @@ import argparse
 import json
 import struct
 import sys
+import zlib
 import os
 
 # Add tools directory to path for imports
@@ -267,7 +268,8 @@ DEFAULT_FS_BASE = 0x1000       # default FS header offset
 FS_HEADER_SIZE = 16            # header bytes
 FS_ENTRY_SIZE = 32             # resource table entry bytes
 FS_MAGIC = b"FERR"             # magic bytes
-FS_VERSION = 2                 # current version
+FS_VERSION = 3                 # current version (full-image CRC-32)
+FS_VERSIONS = (2, 3)           # v2 = table byte sum, still mounted
 
 # Resource types
 RES_FONT = 0
@@ -288,6 +290,19 @@ _RES_TYPE_NAMES = {
 
 # Resource flags
 RES_FLAG_FLASH_EXEC = 0x01
+
+
+def _checksum_ok(data, hdr_off, header, entries, fs_base):
+    """Check the header checksum the way `Fs::verify` (fs.rs) does: v3 =
+    CRC-32 of header[0:12] + table + data up to the furthest resource end,
+    v2 = byte sum of the table."""
+    table_start = hdr_off + FS_HEADER_SIZE
+    table_end = table_start + header['resource_count'] * FS_ENTRY_SIZE
+    if header['version'] == 2:
+        return (sum(data[table_start:table_end]) & 0xFFFFFFFF) == header['checksum']
+    end = max([table_end] + [hdr_off + e['offset'] - fs_base + e['size'] for e in entries])
+    crc = zlib.crc32(data[hdr_off:hdr_off + 12])
+    return zlib.crc32(data[table_start:end], crc) == header['checksum']
 
 
 def parse_flash_header(data, base=DEFAULT_FS_BASE):
@@ -311,9 +326,9 @@ def parse_flash_header(data, base=DEFAULT_FS_BASE):
         )
 
     version = struct.unpack_from('<H', hdr, 4)[0]
-    if version != FS_VERSION:
+    if version not in FS_VERSIONS:
         raise ValueError(
-            f"Unsupported flash FS version {version} (expected {FS_VERSION})"
+            f"Unsupported flash FS version {version} (expected one of {FS_VERSIONS})"
         )
 
     screen_w = struct.unpack_from('<H', hdr, 6)[0]
@@ -440,6 +455,8 @@ def analyze_flash_image(data, base=DEFAULT_FS_BASE, exec_mode=None):
     # Add file_offset to each entry (offset within the binary file)
     for e in entries:
         e['file_offset'] = e['offset'] - fs_base
+
+    header['checksum_ok'] = _checksum_ok(data, hdr_off, header, entries, fs_base)
 
     # Categorize resources
     by_kind = {}
@@ -1125,7 +1142,8 @@ def format_flash_report(result, verbose=False):
     lines.append(f"  FS version:          {header['version']}")
     lines.append(f"  Screen:              {header['screen_w']} x {header['screen_h']}")
     lines.append(f"  Resource count:      {header['resource_count']}")
-    lines.append(f"  Checksum:            0x{header['checksum']:08X}")
+    lines.append(f"  Checksum:            0x{header['checksum']:08X} "
+                 f"({'ok' if header.get('checksum_ok') else 'BAD'})")
 
     # -- Resource summary --
     lines.append("")
@@ -1288,6 +1306,7 @@ def format_flash_json(result):
             'screen_h': header['screen_h'],
             'resource_count': header['resource_count'],
             'checksum': f"0x{header['checksum']:08X}",
+            'checksum_ok': header.get('checksum_ok', False),
             'flash_used': flash['flash_used'],
             'flash_total': flash['flash_total'],
             'file_size': flash['file_size'],

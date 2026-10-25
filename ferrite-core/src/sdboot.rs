@@ -3,7 +3,8 @@
 /// With a FAT16/FAT32 card in the slot at boot:
 /// - `EMPTY.BIN` in the root → recovery mode (returns `ERR_EMPTY_RUN`)
 /// - `PROGRAM.BIN` in the root → copied to the resource flash at
-///   `P::FS_BASE` (the same image `writefs` uploads), then normal boot
+///   `P::FS_BASE` (the same image `writefs` uploads) and checked against
+///   its CRC (`ERR_BAD_IMAGE` if it doesn't match), then normal boot
 ///
 /// The BSP detects and initializes the card; this module does the rest and
 /// releases the bus when done.
@@ -12,13 +13,15 @@ extern crate alloc;
 use crate::ctx::Ctx;
 use crate::fat::Fat;
 use crate::platform::Platform;
-use crate::runtime::ERR_EMPTY_RUN;
+use crate::fs::Fs;
+use crate::runtime::{ERR_BAD_IMAGE, ERR_EMPTY_RUN};
 use crate::sdcard::SdCardImpl;
 use crate::systick::SystickBackend;
 use crate::types::COLOR_WHITE;
 
 /// Run the SD boot actions on an initialized card. Returns `ERR_EMPTY_RUN`
-/// for recovery, otherwise 0. `present` makes what was just drawn visible
+/// for recovery, `ERR_BAD_IMAGE` if the copied image fails its check,
+/// otherwise 0. `present` makes what was just drawn visible
 /// (cached frame buffers need a write-back; direct-to-panel boards pass a
 /// no-op).
 pub fn sd_boot_check<P: Platform>(
@@ -116,17 +119,15 @@ pub fn sd_boot_check<P: Platform>(
 
     sd.release_bus();
 
+    let ok = Fs::mount(&ctx.flash, dest_base).is_ok_and(|f| f.verify(&ctx.flash));
+    let (text, x, color, code): (&[u8], i16, u16, u8) = if ok {
+        (b"SD: flash complete!", 270, 0x07E0, 0)
+    } else {
+        (b"SD: image check failed!", 240, 0xF800, ERR_BAD_IMAGE)
+    };
     ctx.lcd.fill_rect(0, 200, 800, 60, 0x0000);
-    font.draw_str(
-        &ctx.lcd,
-        &ctx.flash,
-        b"SD: flash complete!",
-        270,
-        220,
-        0x07E0,
-        Some(0x0000),
-    );
+    font.draw_str(&ctx.lcd, &ctx.flash, text, x, 220, color, Some(0x0000));
     present();
     P::SystickB::delay_ms(1000);
-    0
+    code
 }

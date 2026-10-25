@@ -44,6 +44,9 @@ impl Platform for N32903Platform {
     // Hardware JPEG decoder. Mirrored in tools/devices/n32903.json (caps.jpeg).
     const CAPS: u32 = CAP_JPEG;
 
+    // The image is checked in the SDRAM shadow, so a CRC pass costs a few ms.
+    const VERIFY_FS_ON_BOOT: bool = true;
+
     // 8 MB SDRAM — allow richer multi-widget animated scenes.
     const ANIM_SLOTS: usize = 32;
 }

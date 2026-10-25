@@ -4,6 +4,7 @@
 Flash FS layout (W25Q256):
   0x000000 - 0x000FFF : Reserved (4KB)
   0x001000 - 0x00100F : Header (16B: magic + version + screen + count + checksum)
+                        v3 checksum = CRC-32 (zlib) of header[0:12] + image[16:]
   0x001010 - 0x001FFF : Resource Table (max 127 × 32B)
   0x002000+            : Resource data (packed)
 
@@ -54,6 +55,7 @@ JSON format:
 import json
 import struct
 import sys
+import zlib
 from pathlib import Path
 
 # ferrite_cc ve ferrite_img'den import
@@ -66,6 +68,7 @@ MAGIC = b"FERR"
 FS_BASE = 0x1000       # Sector 0 reserved for ConfigStore
 HEADER_OFFSET = 0x0000  # Relative to FS image start (written at FS_BASE in flash)
 HEADER_SIZE = 16
+FS_VERSION = 3         # v3: full-image CRC-32; v2: table byte sum (fs.rs)
 TABLE_OFFSET = HEADER_OFFSET + HEADER_SIZE  # 0x10
 ENTRY_SIZE = 32
 MAX_RESOURCES = 1000
@@ -202,7 +205,6 @@ def build_fs(project: dict, resources: list[tuple[str, int, bytes, int]],
         raise ValueError(f"Too many resources: {len(resources)} (max {MAX_RESOURCES})")
 
     screen = project.get("screen", [800, 480])
-    version = project.get("version", 2)
     count = len(resources)
 
     # Data starts right after the resource table (relative to image start)
@@ -232,17 +234,14 @@ def build_fs(project: dict, resources: list[tuple[str, int, bytes, int]],
         table.extend(entry)
         data_blob.extend(data)
 
-    # Checksum: additive sum of table bytes
-    checksum = sum(table) & 0xFFFFFFFF
-
-    # Header (16 bytes)
+    # Header (16 bytes); the checksum covers everything but itself
     header = bytearray(HEADER_SIZE)
     header[0:4] = MAGIC
-    struct.pack_into("<H", header, 4, version)
+    struct.pack_into("<H", header, 4, FS_VERSION)
     struct.pack_into("<H", header, 6, screen[0])
     struct.pack_into("<H", header, 8, screen[1])
     struct.pack_into("<H", header, 10, count)
-    struct.pack_into("<I", header, 12, checksum)
+    struct.pack_into("<I", header, 12, fs_checksum(header, table + data_blob))
 
     # Full binary — header + table + data, no gaps
     binary = bytearray()
@@ -502,6 +501,31 @@ def build(project_path: str, output_path: str | None) -> dict:
 
 # --- Image dump (--disasm) ---
 
+def fs_checksum(header: bytes, rest: bytes) -> int:
+    """v3 header checksum: CRC-32 of header[0:12] + everything after the
+    header (table + resource data). Same as `Fs::verify` in fs.rs."""
+    return zlib.crc32(rest, zlib.crc32(header[:12]))
+
+
+def fs_checksum_ok(binary: bytes) -> bool:
+    """Check an FS image (v2 table sum or v3 CRC) against its header."""
+    version, count, checksum = struct.unpack_from("<H4xHI", binary, 4)
+    if version == 2:
+        table = binary[TABLE_OFFSET:TABLE_OFFSET + count * ENTRY_SIZE]
+        return (sum(table) & 0xFFFFFFFF) == checksum
+    # Like the firmware, hash up to the end of the furthest resource, so
+    # padding after the image (a flash dump) doesn't count. Offsets are
+    # absolute; the first resource's data starts right after the table.
+    table_end = TABLE_OFFSET + count * ENTRY_SIZE
+    end = table_end
+    entries = [struct.unpack_from("<II", binary, TABLE_OFFSET + i * ENTRY_SIZE + 20)
+               for i in range(count)]
+    if entries:
+        fs_base = entries[0][0] - table_end
+        end = max([end] + [off - fs_base + size for off, size in entries])
+    return fs_checksum(binary, binary[HEADER_SIZE:end]) == checksum
+
+
 def dump_fs(binary: bytes, symbols: dict | None = None) -> str:
     """Describe every resource of a flash FS image; programs are
     disassembled with their widget page blocks inline. `symbols` maps a
@@ -522,7 +546,7 @@ def dump_fs(binary: bytes, symbols: dict | None = None) -> str:
     fs_base = entries[0][2] - (TABLE_OFFSET + count * ENTRY_SIZE) if entries else FS_BASE
     data = {(name, kind): binary[off - fs_base:off - fs_base + size]
             for name, kind, off, size, _ in entries}
-    sum_ok = (sum(table) & 0xFFFFFFFF) == checksum
+    sum_ok = fs_checksum_ok(binary)
 
     out = [f"; ferrite FS v{version}, screen {scr_w}x{scr_h}, {count} resources, "
            f"base 0x{fs_base:X}, {len(binary)} bytes, checksum {'ok' if sum_ok else 'BAD'}",
