@@ -20,6 +20,7 @@ use ferrite_core::strpool::StringPool;
 use ferrite_core::widget::WidgetTree;
 
 // --- Concrete host backends (type aliases + free-fn constructors) ---
+mod audio;
 mod backlight;
 mod eeprom;
 mod flash;
@@ -41,7 +42,7 @@ use touch::sim::MouseState;
 use touch::CalParams;
 
 fn main() {
-    let (fsimage_path, taps, eeprom_path) = parse_args();
+    let (fsimage_path, taps, eeprom_path, audio_out) = parse_args();
 
     systick::init();
 
@@ -97,7 +98,7 @@ fn main() {
         rtc: rtc::init(),
         usart: usart::init(),
         systick: systick::Systick::handle(),
-        audio: ferrite_core::audio::AudioImpl::none(),
+        audio: ferrite_core::audio::AudioImpl::with_backend(audio::SimAudio::new(audio_out)),
         jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
         gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::SimGpio::default()),
         eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::SimEeprom::new(eeprom_path)),
@@ -109,17 +110,20 @@ fn main() {
     ferrite_core::runtime::run::<SimPlatform>(ctx, touch)
 }
 
-/// `--fsimage <path>`, any number of `--tap X,Y,MS` (scripted presses) and
-/// `--eeprom <path>` (file that keeps the virtual EEPROM across runs).
-fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>, Option<String>) {
+/// `--fsimage <path>`, any number of `--tap X,Y,MS` (scripted presses),
+/// `--eeprom <path>` (file that keeps the virtual EEPROM across runs) and
+/// `--audio-out <path.wav>` (records the audio output).
+fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>, Option<String>, Option<String>) {
     let mut fsimage = None;
     let mut eeprom = None;
+    let mut audio_out = None;
     let mut taps = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--fsimage" => fsimage = args.next(),
             "--eeprom" => eeprom = args.next(),
+            "--audio-out" => audio_out = args.next(),
             "--tap" => {
                 let spec = args.next().unwrap_or_default();
                 let parts: Vec<u32> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
@@ -131,7 +135,7 @@ fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>, Option<String>) 
             _ => {}
         }
     }
-    (fsimage, taps, eeprom)
+    (fsimage, taps, eeprom, audio_out)
 }
 
 fn load_flash(path: Option<&str>) -> Result<flash::Flash, String> {

@@ -4,7 +4,7 @@
 
 use ferrite_core::config::{self, ConfigStore};
 use ferrite_core::ctx::Ctx;
-use ferrite_core::platform::{CAP_JPEG, Platform};
+use ferrite_core::platform::{CAP_AUDIO, CAP_JPEG, Platform};
 use ferrite_core::protocol::{self, RxEvent};
 use ferrite_core::render;
 use ferrite_core::sdboot;
@@ -33,7 +33,7 @@ impl Platform for N32903Platform {
     type SdCardB = crate::sdcard::SicSd;
     type UsartB = crate::usart::HwUart;
     type SystickB = crate::systick::N32903Systick;
-    type AudioB = ferrite_core::audio::NoAudio;
+    type AudioB = crate::audio::SpuAudio;
     type JpegB = crate::jpeg::HwJpeg;
     type GpioB = crate::gpio::HeaderGpio;
     type EepromB = crate::eeprom::SpiNorEeprom;
@@ -41,8 +41,9 @@ impl Platform for N32903Platform {
     // The "flash" is the SDRAM shadow of a NAND region (see flash/mod.rs), so
     // the default layout applies: config at 0x0000, resource FS from 0x1000.
 
-    // Hardware JPEG decoder. Mirrored in tools/devices/n32903.json (caps.jpeg).
-    const CAPS: u32 = CAP_JPEG;
+    // SPU audio DAC + hardware JPEG decoder. Mirrored in
+    // tools/devices/n32903.json (caps.audio, caps.jpeg).
+    const CAPS: u32 = CAP_AUDIO | CAP_JPEG;
 
     // The image is checked in the SDRAM shadow, so a CRC pass costs a few ms.
     const VERIFY_FS_ON_BOOT: bool = true;

@@ -1,0 +1,142 @@
+// main.fl — Audio demo (800x480, N32903)
+//
+// Plays the project's sounds through the SPU DAC:
+//   Beep — "tone" (22.05 kHz, 440 Hz, 0.25 s) once
+//   Tone — the same sound looped until Stop
+//   Stop, Vol -, Vol + — stop / output volume in steps of 10 %
+// The status line shows whether a sound is playing and the volume.
+
+#include "core.fl"
+#include "color.fl"
+
+var vol = 80;
+var shown = -1;   // last status drawn: playing * 1000 + volume
+var status_lbl;
+// set(on_click) wires file-scope widget variables.
+var beep_btn;
+var tone_btn;
+var stop_btn;
+var down_btn;
+var up_btn;
+
+fn button(b: widget, x, y, text) {
+    target(b);
+    set(location, x, y);
+    set(size, 200, 70);
+    set(bg_color, 0x2945);
+    set(press_color, 0x2C9F);
+    set(border_radius, 8);
+    set(clickable, ON);
+    parent(0);
+    var l = alloc();
+    target(l);
+    set(kind, KIND_LABEL);
+    set(size, 200, 70);
+    set(text, text);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(b);
+}
+
+fn report(what, ok) {
+    if (ok == 0) {
+        target(status_lbl);
+        set(text, sprintf("%s: no sound (board without audio?)", what));
+        strClear();
+        shown = -1;
+    }
+    sendUsart(sprintf("%s -> %d\r\n", what, ok));
+    strClear();
+}
+
+fn on_beep(wid) {
+    report("beep", playSound("tone"));
+}
+
+fn on_tone(wid) {
+    report("tone", playSound("tone", 1));
+}
+
+fn on_stop(wid) {
+    stopSound();
+}
+
+fn on_down(wid) {
+    vol = vol - 10;
+    if (vol < 0) {
+        vol = 0;
+    }
+    setVolume(vol);
+}
+
+fn on_up(wid) {
+    vol = vol + 10;
+    if (vol > 100) {
+        vol = 100;
+    }
+    setVolume(vol);
+}
+
+fn setup() {
+    var title = alloc();
+    target(title);
+    set(kind, KIND_LABEL);
+    set(location, 0, 30);
+    set(size, 800, 40);
+    set(text, "Audio demo");
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+
+    status_lbl = alloc();
+    target(status_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 0, 100);
+    set(size, 800, 40);
+    set(text_color, GREEN);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+
+    beep_btn = alloc();
+    button(beep_btn, 70, 200, "Beep");
+    target(beep_btn);
+    set(on_click, @on_beep);
+
+    tone_btn = alloc();
+    button(tone_btn, 300, 200, "Tone (loop)");
+    target(tone_btn);
+    set(on_click, @on_tone);
+
+    stop_btn = alloc();
+    button(stop_btn, 530, 200, "Stop");
+    target(stop_btn);
+    set(on_click, @on_stop);
+
+    down_btn = alloc();
+    button(down_btn, 185, 320, "Vol -");
+    target(down_btn);
+    set(on_click, @on_down);
+
+    up_btn = alloc();
+    button(up_btn, 415, 320, "Vol +");
+    target(up_btn);
+    set(on_click, @on_up);
+
+    setVolume(vol);
+    return 0;
+}
+
+fn loop() {
+    var state = soundPlaying() * 1000 + vol;
+    if (state != shown) {
+        shown = state;
+        target(status_lbl);
+        if (soundPlaying()) {
+            set(text, sprintf("playing, volume %d%%", vol));
+        } else {
+            set(text, sprintf("idle, volume %d%%", vol));
+        }
+        strClear();
+    }
+    delay(50);
+}

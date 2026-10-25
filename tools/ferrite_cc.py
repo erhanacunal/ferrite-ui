@@ -150,6 +150,12 @@ class Op:
     EEPROM_WRITE_ARR = 0xB7  # pop count, pop arr, pop addr → store arr[0..count]
     STR_BYTE         = 0xB8  # pop index, pop str_id → byte 0..255 or -1 past the end
 
+    # Sound (RES_SOUND resources; boards with caps.audio)
+    SOUND_PLAY       = 0xB9  # pop looping, pop name str_id → push 1 started / 0
+    SOUND_STOP       = 0xBA  # stop the playing sound
+    SOUND_VOLUME     = 0xBB  # pop volume 0..100
+    SOUND_PLAYING    = 0xBC  # push 1 while a sound plays, else 0
+
     # Float ops (all no-arg)
     ITOF = 0xC0
     FTOI = 0xC1
@@ -237,6 +243,10 @@ class Builtin:
     EEPROM_READ_ARR = 54   # (addr, arr, count) → void
     EEPROM_WRITE_ARR = 55  # (addr, arr, count) → void
     STR_BYTE = 56          # (str_id, index) → byte 0..255, -1 past the end
+    SOUND_PLAY = 57        # (name_str_id, looping) → 1 started / 0
+    SOUND_STOP = 58        # () → void
+    SOUND_VOLUME = 59      # (volume 0..100) → void
+    SOUND_PLAYING = 60     # () → 1 / 0
 
 
 class Prop:
@@ -1069,6 +1079,7 @@ OP_NAMES = {
     0xB0: 'pinMode', 0xB1: 'pinWrite', 0xB2: 'pinRead',
     0xB3: 'eepromSize', 0xB4: 'eepromRead', 0xB5: 'eepromWrite',
     0xB6: 'eepromReadArr', 0xB7: 'eepromWriteArr', 0xB8: 'strByte',
+    0xB9: 'playSound', 0xBA: 'stopSound', 0xBB: 'setVolume', 0xBC: 'soundPlaying',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -1108,7 +1119,7 @@ _NO_ARG_OPS = (
      if op not in (0x86, 0x88)} |
     {0xAD, 0xAE, 0xAF} |               # animate, stopAnim, stopAnimProp
     {0xB0, 0xB1, 0xB2} |               # pinMode, pinWrite, pinRead
-    set(range(0xB3, 0xB9)) |           # eepromSize .. eepromWriteArr, strByte
+    set(range(0xB3, 0xBD)) |           # eepromSize .. strByte, playSound .. soundPlaying
     set(range(0xC0, 0xCD))             # 0xC0-0xCC
 )
 

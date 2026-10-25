@@ -34,6 +34,7 @@ use ferrite_core::widget::WidgetTree;
 use n32903_rs::aic::{self, LocalIntState};
 use n32903_rs::cache::{self, CacheMode};
 
+mod audio;
 mod backlight;
 mod eeprom;
 mod flash;
@@ -107,7 +108,7 @@ pub extern "C" fn rust_main() -> ! {
         rtc: RtcImpl::with_backend(rtc::new()),
         usart: UsartImpl::with_backend(usart::new()),
         systick: systick::handle(),
-        audio: ferrite_core::audio::AudioImpl::none(),
+        audio: ferrite_core::audio::AudioImpl::with_backend(audio::new()),
         jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::init()),
         gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::HeaderGpio),
         eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::init()),

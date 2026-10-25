@@ -1,0 +1,13 @@
+{
+    "device": "n32903",
+    "screen_width": 800,
+    "screen_height": 480,
+    "include_dirs": ["../../../lib"],
+    "render_mode": "dirty",
+    "sounds": [
+        {"name": "tone", "source": "assets/tone.wav"}
+    ],
+    "programs": [
+        {"name": "main", "source": "main.fl", "exec_mode": "ram"}
+    ]
+}

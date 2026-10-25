@@ -263,6 +263,10 @@ Builtins are single-byte opcodes. Operands are passed on the stack unless noted.
 | `0xB6` | `eepromReadArr` | pop `count`, `arr`, `addr`; fill `arr[0..count]` (fault 9 bad array, 13 `count` > length, 16 range / bus) |
 | `0xB7` | `eepromWriteArr` | pop `count`, `arr`, `addr`; store the low byte of each of `arr[0..count]` |
 | `0xB8` | `strByte` | pop `index`, pop `str_id`; push the byte `0..255`, or `-1` past the end |
+| `0xB9` | `playSound` | pop `looping`, pop `str_id` (a `RES_SOUND` name); start it, replacing the playing sound; push `1`, or `0` if missing / no audio |
+| `0xBA` | `stopSound` | stop the playing sound |
+| `0xBB` | `setVolume` | pop `percent`; output volume, clamped to `0..100` |
+| `0xBC` | `soundPlaying` | push `1` until the playing sound has been output, else `0` |
 
 `sprintf` has an inline `u8 argc` byte (number of format arguments after the format string). Stack layout before execution: `[... fmt, arg0, arg1, ..., argN-1]` (fmt pushed first).
 

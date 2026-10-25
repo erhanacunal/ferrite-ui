@@ -983,6 +983,7 @@ NO_VALUE_BUILTINS = {
     'animate', 'stopAnim', 'stopAnimProp',
     'pinMode', 'pinWrite',
     'eepromWrite', 'eepromReadArr', 'eepromWriteArr',
+    'stopSound', 'setVolume',
 }
 
 # Builtins whose return value is an array ID (so the variable must be in array_vars)
@@ -1725,6 +1726,7 @@ class CodeGen:
         'ftoi', 'feq', 'fne', 'flt', 'fle', 'fgt', 'fge',
         'alloc', 'get', 'parseInt', 'strLen', 'strlen', 'strcmp',
         'millis', 'brightness', 'pinRead', 'eepromSize', 'eepromRead', 'strByte',
+        'playSound', 'soundPlaying',
         'arrFree', 'strFree', 'arrLen',
         'syscall',
     }
@@ -2871,6 +2873,35 @@ class CodeGen:
                 raise CompileError(f"{name}() takes 1 argument", node.line)
             self._gen_expr(node.args[0])
             self.asm.str_len()
+            return
+
+        if name == 'playSound':
+            # playSound(name [, loop]) → 1 if the sound started, 0 if it is
+            # missing or the board has no audio. Replaces the playing sound.
+            if len(node.args) not in (1, 2):
+                raise CompileError("playSound() takes 1-2 arguments: name [, loop]", node.line)
+            self._gen_expr(node.args[0])
+            if len(node.args) == 2:
+                self._gen_expr(node.args[1])
+            else:
+                self.asm.push(0)
+            self.asm.builtin(Builtin.SOUND_PLAY)
+            return
+
+        if name in ('stopSound', 'soundPlaying'):
+            # stopSound() — stop the playing sound
+            # soundPlaying() → 1 until the playing sound has been output
+            if len(node.args) != 0:
+                raise CompileError(f"{name}() takes no arguments", node.line)
+            self.asm.builtin(Builtin.SOUND_STOP if name == 'stopSound' else Builtin.SOUND_PLAYING)
+            return
+
+        if name == 'setVolume':
+            # setVolume(percent) — audio output volume 0..100
+            if len(node.args) != 1:
+                raise CompileError("setVolume() takes 1 argument: percent", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.SOUND_VOLUME)
             return
 
         if name == 'strByte':

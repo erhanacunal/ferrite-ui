@@ -16,7 +16,7 @@
 /// byte sum of the table only. See [`Fs::verify`].
 ///
 /// Resources are accessed by name (null-terminated ASCII, max 15 chars).
-/// Kind: Font=0, Image=1, Program=2, Page=3, File=4, SysCfg=5
+/// Kind: Font=0, Image=1, Program=2, Page=3, File=4, SysCfg=5, Sound=6
 use crate::flash::{FlashBackend, FlashImpl};
 
 // --- Layout constants ---
@@ -61,6 +61,8 @@ pub const RES_PAGE: u8 = 3;
 pub const RES_FILE: u8 = 4;
 /// System configuration record (pool sizes) — see [`crate::syscfg`].
 pub const RES_SYSCFG: u8 = 5;
+/// PCM16 sound (header + samples) — see [`crate::audio::SOUND_HEADER`].
+pub const RES_SOUND: u8 = 6;
 /// `Fs::find_kind` wildcard.
 pub const RES_ANY: u8 = 0xFF;
 

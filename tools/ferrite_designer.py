@@ -3336,6 +3336,7 @@ class FerriteSyntaxHighlighter(QSyntaxHighlighter):
                      "pinMode", "pinWrite", "pinRead",
                      "eepromSize", "eepromRead", "eepromWrite",
                      "eepromReadArr", "eepromWriteArr", "strByte",
+                     "playSound", "stopSound", "setVolume", "soundPlaying",
                      "rtcRead", "rtcWrite", "sendUsart",
                      "fpgaCmd", "fpgaData", "beginFrame", "endFrame",
                      "layout"]

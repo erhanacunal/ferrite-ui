@@ -8,6 +8,6 @@
   "render_modes": ["dirty", "buffered"],
   "default_render_mode": "dirty",
   "widgets": ["base", "label", "button", "progress", "slider", "checkbox", "radio", "input", "gauge", "dropdown", "image"],
-  "caps": { "alpha": true, "audio": false, "video": false, "jpeg": true, "image_alpha": true },
+  "caps": { "alpha": true, "audio": true, "video": false, "jpeg": true, "image_alpha": true },
   "defaults": { "root_bg": "0x0000", "text_color": "0xFFFF" }
 }

@@ -919,6 +919,47 @@ fn setup() {
 See `examples/nextion/eeprom_demo` for a boot counter that survives power
 cycles.
 
+### Sound: playSound / stopSound / setVolume / soundPlaying
+
+Play WAV files listed under `"sounds"` in `project.json` on boards with an
+audio output (`caps.audio`: the N32903's DAC; the simulator plays silently
+in real time and `--audio-out <file.wav>` records what it played):
+
+```json
+"sounds": [
+    {"name": "beep", "source": "assets/beep.wav"}
+]
+```
+
+The build accepts PCM WAV files (8/16/24/32-bit, mono or stereo, any sample
+rate) and stores them as 16-bit PCM in flash, about 96 KB per second of
+48 kHz mono. Names are up to 15 characters.
+
+| Builtin | Result | Description |
+|---------|--------|-------------|
+| `playSound(name [, loop])` | int | Start the sound, replacing the one playing. `loop` ≠ 0 repeats it until `stopSound()`. `1` if it started, `0` if the sound is missing or the board has no audio |
+| `stopSound()` | — | Stop the playing sound |
+| `setVolume(percent)` | — | Output volume, `0..100` |
+| `soundPlaying()` | int | `1` until the last sample of the sound has been output, then `0` |
+
+```c
+fn on_click(wid) {
+    playSound("beep");
+}
+
+fn setup() {
+    setVolume(80);
+    playSound("music", 1);       // loops until stopSound()
+}
+```
+
+One sound plays at a time. The firmware streams it from flash between
+`loop()` passes, so it keeps playing while the program runs. Anything that
+keeps the main loop from running for more than ~0.7 s makes it drop out:
+a flash sector erase, or a `delay` in `setup()` (which busy-waits; `delay`
+in `loop()` and callbacks is fine). On the N32903 the first `playSound`
+after power-up takes ~0.75 s longer while the DAC powers up.
+
 ### fpgaCmd(cmd, data) / fpgaData(data)
 
 Send raw commands/data to the FPGA display controller. For advanced use only.

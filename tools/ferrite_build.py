@@ -35,12 +35,19 @@ JSON format:
     "files": [
       {"name": "config", "source": "data/config.bin"}
     ],
+    "sounds": [
+      {"name": "beep", "source": "assets/beep.wav"}
+    ],
     "memory": {
       "strpool_bytes": 4096, "max_strings": 96, "uart_rx_bytes": 512,
       "max_widgets": 200, "max_ext": 150,
       "eval_stack": 32, "call_stack": 12, "cb_queue": 16, "anim_slots": 8
     }
   }
+
+  "sounds" are PCM WAV files (8/16/24/32-bit, mono or stereo, any rate),
+  stored as 16-bit PCM and played with playSound(name) on boards with
+  caps.audio.
 
   "widget_page": true moves static widget setup out of the program into a
   RES_PAGE resource with the program's name (see docs/bytecode.md). Set it
@@ -55,6 +62,7 @@ JSON format:
 import json
 import struct
 import sys
+import wave
 import zlib
 from pathlib import Path
 
@@ -79,12 +87,13 @@ RES_PROGRAM = 2
 RES_PAGE = 3
 RES_FILE = 4
 RES_SYSCFG = 5
+RES_SOUND = 6
 
 # Resource flags (stored in entry reserved[0], byte 28)
 RES_FLAG_FLASH_EXEC = 0x01
 
 KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE",
-              RES_FILE: "FILE", RES_SYSCFG: "SYSCFG"}
+              RES_FILE: "FILE", RES_SYSCFG: "SYSCFG", RES_SOUND: "SOUND"}
 
 # --- Image conversion (shared encoder in ferrite_img.py) ---
 
@@ -156,6 +165,29 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
 
 # RES_SYSCFG record — keep in sync with ferrite-core/src/syscfg.rs.
 SYSCFG_NAME = "sys"
+
+# RES_SOUND header (audio.rs SOUND_HEADER): magic "SN", version, channels,
+# sample rate u32 LE; PCM16 LE samples (interleaved when stereo) follow.
+SOUND_MAGIC = b"SN"
+SOUND_VERSION = 1
+
+
+def convert_sound(source_path: str) -> bytes:
+    """PCM WAV file → RES_SOUND resource (samples converted to 16-bit)."""
+    with wave.open(source_path, "rb") as w:
+        channels, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+        frames = w.readframes(w.getnframes())
+    if channels not in (1, 2):
+        raise ValueError(f"{source_path}: {channels} channels (1 or 2 supported)")
+    if width == 2:
+        pcm = frames
+    elif width == 1:  # unsigned 8-bit
+        pcm = b"".join(struct.pack("<h", (b - 128) << 8) for b in frames)
+    elif width in (3, 4):  # keep the top 16 bits of each LE sample
+        pcm = b"".join(frames[i + width - 2:i + width] for i in range(0, len(frames), width))
+    else:
+        raise ValueError(f"{source_path}: {8 * width}-bit samples not supported")
+    return SOUND_MAGIC + bytes([SOUND_VERSION, channels]) + struct.pack("<I", rate) + pcm
 SYSCFG_MAGIC = 0x4353  # "SC" LE
 SYSCFG_VERSION = 1
 # key -> (struct offset, struct format, max value)
@@ -467,6 +499,19 @@ def build(project_path: str, output_path: str | None) -> dict:
         data = source.read_bytes()
         resources.append((name, RES_FILE, data, 0))
 
+    # 5b. Sounds — WAV → RES_SOUND (16-bit PCM), played by playSound(name).
+    sounds = project.get("sounds", [])
+    if sounds and device and not device["caps"].get("audio"):
+        print(f"  warning: device has no audio output (caps.audio); "
+              f"playSound() will return 0", file=sys.stderr)
+    for snd in sounds:
+        name = snd["name"]
+        if len(name.encode("ascii")) > 15:
+            print(f"Error: sound name '{name}' exceeds 15 chars", file=sys.stderr)
+            sys.exit(1)
+        data = convert_sound(str(project_dir / snd["source"]))
+        resources.append((name, RES_SOUND, data, 0))
+
     # 6. System configuration — optional "memory" block sizes the runtime pools.
     memory = project.get("memory")
     if memory is not None:
@@ -582,6 +627,11 @@ def dump_fs(binary: bytes, symbols: dict | None = None) -> str:
         elif kind == RES_FONT and len(blob) >= 4:
             glyphs, y_adv, font_id = struct.unpack_from("<HBB", blob)
             out.append(f"; font_id {font_id}, {glyphs} glyphs, line height {y_adv}")
+        elif kind == RES_SOUND and len(blob) >= 8:
+            channels, rate = blob[3], struct.unpack_from("<I", blob, 4)[0]
+            frames = (len(blob) - 8) // (2 * max(channels, 1))
+            out.append(f"; {rate} Hz, {'stereo' if channels == 2 else 'mono'}, "
+                       f"{frames} frames ({frames / max(rate, 1):.2f} s)")
         elif kind == RES_SYSCFG:
             fields = [f"{key}={struct.unpack_from(fmt, blob, off)[0]}"
                       for key, (off, fmt, _max) in SYSCFG_FIELDS.items()
@@ -601,8 +651,9 @@ def show_info(project_path: str):
     images = project.get("images", [])
     programs = project.get("programs", [])
     files = project.get("files", [])
+    sounds = project.get("sounds", [])
 
-    total_res = len(fonts) + len(images) + len(programs) + len(files)
+    total_res = len(fonts) + len(images) + len(programs) + len(files) + len(sounds)
 
     print(f"Project: {project_path}")
     print(f"Screen:  {screen[0]}×{screen[1]}")
@@ -610,6 +661,7 @@ def show_info(project_path: str):
     print(f"Images:  {len(images)}")
     print(f"Programs:{len(programs)}")
     print(f"Files:   {len(files)}")
+    print(f"Sounds:  {len(sounds)}")
     print(f"Total:   {total_res} resources")
 
     if total_res > MAX_RESOURCES:

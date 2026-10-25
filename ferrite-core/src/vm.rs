@@ -390,6 +390,10 @@ const OP_EEPROM_WRITE: u8 = 0xB5; // pop value, pop addr → store low byte
 const OP_EEPROM_READ_ARR: u8 = 0xB6; // pop count, pop arr, pop addr → arr[0..count] = bytes
 const OP_EEPROM_WRITE_ARR: u8 = 0xB7; // pop count, pop arr, pop addr → store low bytes of arr[0..count]
 const OP_STR_BYTE: u8 = 0xB8; // pop index, pop str_id → push byte 0..255, or -1 past the end
+const OP_SOUND_PLAY: u8 = 0xB9; // pop looping, pop str_id (RES_SOUND name) → push 1 started / 0
+const OP_SOUND_STOP: u8 = 0xBA; // stop the playing sound
+const OP_SOUND_VOLUME: u8 = 0xBB; // pop volume 0..100 → output volume
+const OP_SOUND_PLAYING: u8 = 0xBC; // push 1 while a sound plays, else 0
 
 // Float ops (all no-arg)
 const OP_ITOF: u8 = 0xC0;
@@ -2317,6 +2321,23 @@ impl Vm {
                 let (addr, arr_id) = self.pop2();
                 self.eeprom_array(ctx, op == OP_EEPROM_WRITE_ARR, addr, arr_id, count);
             }
+
+            // --- Sound (RES_SOUND resources, streamed by runtime's audio pump) ---
+            OP_SOUND_PLAY => {
+                let (str_id, looping) = self.pop2();
+                let name = ctx.strpool.get(str_id as u16);
+                let ok = match ctx.fs.as_ref() {
+                    Some(fs) => ctx.audio.play(fs, &ctx.flash, name, looping != 0),
+                    None => false,
+                };
+                self.push(ok as i32);
+            }
+            OP_SOUND_STOP => ctx.audio.stop(),
+            OP_SOUND_VOLUME => {
+                let vol = self.pop().clamp(0, 100) as u8;
+                ctx.audio.set_volume(vol);
+            }
+            OP_SOUND_PLAYING => self.push(ctx.audio.playing() as i32),
 
             // --- Animation engine ---
             OP_ANIMATE => {

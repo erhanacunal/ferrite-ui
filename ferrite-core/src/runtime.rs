@@ -344,6 +344,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                 }
                 RxEvent::FsReady => {
                     vm.reset();
+                    ctx.audio.stop();
                     ctx.tree.clear();
                     ctx.strpool.clear();
                     ctx.images.clear();
@@ -407,6 +408,9 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
             let now = ctx.systick.millis();
             vm.tick_animations(&mut ctx, now);
         }
+
+        // --- Stream the playing sound (if any) into the audio backend ---
+        ctx.audio.pump(&ctx.flash);
 
         // --- Render (on_paint runs inside, for the widgets it drew) ---
         if error_code == 0 {
@@ -606,6 +610,7 @@ fn reload_program<P: PlatformRuntime>(
     ctx.tree.clear();
     ctx.strpool.clear();
     vm.reset();
+    ctx.audio.stop();
     input.reset(ctx);
     ctx.cursor_visible = false;
 

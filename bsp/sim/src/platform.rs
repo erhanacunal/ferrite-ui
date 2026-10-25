@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 
-use ferrite_core::platform::{CAP_JPEG, Platform};
+use ferrite_core::platform::{CAP_AUDIO, CAP_JPEG, Platform};
 
 use ferrite_core::ctx::Ctx;
 use ferrite_core::runtime::{FullInput, PlatformRuntime};
@@ -34,13 +34,14 @@ impl Platform for SimPlatform {
     type SdCardB = crate::sdcard::sim::FileSd;
     type UsartB = crate::usart::sim::Stdio;
     type SystickB = crate::systick::SimSystick;
-    type AudioB = ferrite_core::audio::NoAudio;
+    type AudioB = crate::audio::SimAudio;
     type JpegB = crate::jpeg::SoftJpeg;
     type GpioB = crate::gpio::SimGpio;
     type EepromB = crate::eeprom::SimEeprom;
 
-    // Software JPEG decoder (sim/src/jpeg.rs).
-    const CAPS: u32 = CAP_JPEG;
+    // Software JPEG decoder (sim/src/jpeg.rs) + silent real-time audio
+    // output (sim/src/audio.rs).
+    const CAPS: u32 = CAP_AUDIO | CAP_JPEG;
 
     const VERIFY_FS_ON_BOOT: bool = true;
 }
