@@ -175,7 +175,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **API:** `mount()`, `find(name)`, `read_resource()`, `count_by_kind()`, `find_nth_by_kind()`, `verify()`
 - **Checksum (FS v3):** CRC-32 (IEEE = `zlib.crc32`, nibble table) of header bytes 0..12 + table + data up to the furthest resource end — the whole image except the checksum field. `mount` still accepts v2 (table byte sum); older firmware rejects v3 images (BadVersion), so update firmware before uploading images built by the new tools.
   - Checked after every `writefs` (before the pong; a bad image → error reply 9 + Code 9 screen, no reboot, so the host can resend) and after SD `PROGRAM.BIN` flashing.
-  - At boot only where `Platform::VERIFY_FS_ON_BOOT` (n32903, sim: RAM-shadowed, a few ms). Off on Nextion: the bit-banged SPI reads ~125 KB/s, ~8 s per MB.
+  - At boot only where `Platform::VERIFY_FS_ON_BOOT`: n32903, sim (RAM-shadowed, a few ms), tdo_y13 (50 MHz SPI NOR, ~0.2 s per MB). Off on Nextion: the bit-banged SPI reads ~125 KB/s, ~8 s per MB.
   - `ferrite_build.py` writes it (`fs_checksum`), `--disasm` and `ferrite_analyze.py` check it.
 - **RAM cost:** 12 bytes (header cache only — table stays in flash)
 

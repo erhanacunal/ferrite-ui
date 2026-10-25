@@ -55,7 +55,7 @@ pub unsafe fn init() {
     use f1c100s::spi_flash::SpiFlash;
 
     let spi = spi::spi0();
-    spi.configure(SpiMode::Mode0, BitOrder::MsbFirst, ChipSelect::Ss0, 10_000_000);
+    spi.configure(SpiMode::Mode0, BitOrder::MsbFirst, ChipSelect::Ss0, 50_000_000);
 
     let spi_ref: &'static _ = Box::leak(Box::new(spi));
     unsafe { FLASH = Some(SpiFlash::new(spi_ref)) };

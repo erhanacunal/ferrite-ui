@@ -49,6 +49,9 @@ impl Platform for TdoY13Platform {
     // Resources live on SPI NOR (one SPI transaction per read): keep glyph
     // bitmaps in SDRAM instead of reading them for every glyph drawn.
     const CACHE_FONT_BITMAPS: bool = true;
+
+    // CRC the FS image at boot: SPI0 runs at 50 MHz, so ~0.2 s per MB.
+    const VERIFY_FS_ON_BOOT: bool = true;
 }
 
 impl PlatformRuntime for TdoY13Platform {
