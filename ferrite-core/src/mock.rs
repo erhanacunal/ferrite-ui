@@ -183,6 +183,7 @@ impl Platform for MockPlatform {
     type UsartB = MockUsart;
     type SystickB = MockSystick;
     type AudioB = crate::audio::NoAudio;
+    type JpegB = crate::jpeg::NoJpeg;
     type GpioB = MockGpio;
     type EepromB = MockEeprom;
 }

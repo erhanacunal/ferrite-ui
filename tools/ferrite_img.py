@@ -16,6 +16,10 @@ Modes:
   0 = Raw RGB565
   1 = RLE RGB565 (PackBits)
   2 = Indexed + RLE (palette + PackBits)
+  3 = JPEG — baseline 4:2:0 stream, only for devices with caps.jpeg (a
+      hardware decoder; the firmware decodes it once, at image load). Always
+      re-encoded here: the decoders take baseline, 3-component streams with
+      the standard Huffman table layout. Alpha is flattened onto black.
 
 Alpha (flags bit 2, only for devices with caps.image_alpha):
   Pixel units widen from 2 to 3 bytes (RGB565 LE + alpha u8) in raw/RLE
@@ -31,8 +35,10 @@ Usage:
   python ferrite_img.py info image.fi
   python ferrite_img.py input.png output.fi --max-colors 64
   python ferrite_img.py input.png output.fi --alpha
+  python ferrite_img.py photo.jpg output.fi --mode jpeg [--quality 85]
 """
 
+import io
 import struct
 import sys
 from pathlib import Path
@@ -49,9 +55,13 @@ MAGIC = 0x4649
 MODE_RAW = 0
 MODE_RLE = 1
 MODE_INDEXED_RLE = 2
+MODE_JPEG = 3
 FLAG_ALPHA = 0x04  # flags bit 2 — pixel/palette units carry an alpha byte
 
-MODE_NAMES = {MODE_RAW: "raw", MODE_RLE: "rle", MODE_INDEXED_RLE: "indexed_rle"}
+MODE_NAMES = {MODE_RAW: "raw", MODE_RLE: "rle", MODE_INDEXED_RLE: "indexed_rle",
+              MODE_JPEG: "jpeg"}
+
+DEFAULT_JPEG_QUALITY = 85
 
 
 # --- RGB565 conversion ---
@@ -251,6 +261,31 @@ def build_fi(
     return out
 
 
+def encode_jpeg(img: Image.Image, quality: int = DEFAULT_JPEG_QUALITY) -> bytes:
+    """Baseline 4:2:0 JPEG stream the hardware decoders accept: three
+    components, standard Huffman table layout, no progressive scan, no
+    metadata. Transparent pixels are flattened onto black."""
+    if not 1 <= quality <= 100:
+        raise ValueError(f"JPEG quality must be 1-100, got {quality}")
+    if img.mode in ("RGBA", "LA") or "transparency" in img.info:
+        rgba = img.convert("RGBA")
+        rgb = Image.new("RGB", rgba.size, (0, 0, 0))
+        rgb.paste(rgba, mask=rgba.split()[3])
+    else:
+        rgb = img.convert("RGB")
+    buf = io.BytesIO()
+    rgb.save(buf, "JPEG", quality=quality, subsampling=2, progressive=False,
+             optimize=False)
+    return buf.getvalue()
+
+
+def build_fi_jpeg(width: int, height: int, stream: bytes) -> bytearray:
+    """FI header (mode 3, no palette) + the JPEG stream."""
+    out = bytearray(struct.pack("<HHHBB", MAGIC, width, height, MODE_JPEG, 0))
+    out.extend(stream)
+    return out
+
+
 # --- Main converter ---
 
 def _ordered_unique(values: list[int]) -> list[int]:
@@ -267,6 +302,7 @@ def convert_bytes(
     mode: str = "auto",
     max_colors: int = 256,
     want_alpha: bool = False,
+    quality: int = DEFAULT_JPEG_QUALITY,
 ) -> tuple[bytes, dict]:
     """Convert a PIL image to FI binary. Shared core for the CLI and
     ferrite_build.
@@ -274,8 +310,25 @@ def convert_bytes(
     `want_alpha` opts the image into FI alpha encoding (gate it on the
     target device's caps.image_alpha); the alpha plane is only emitted
     when the source actually contains non-opaque pixels.
+
+    `mode="jpeg"` (gate it on caps.jpeg) stores a JPEG stream at `quality`;
+    alpha and colour limits don't apply to it.
     """
     width, height = img.size
+    raw_size = width * height * 2
+
+    if mode == "jpeg":
+        fi_data = build_fi_jpeg(width, height, encode_jpeg(img, quality))
+        return bytes(fi_data), {
+            "width": width,
+            "height": height,
+            "mode": MODE_NAMES[MODE_JPEG],
+            "colors": 0,
+            "alpha": False,
+            "raw_size": raw_size,
+            "fi_size": len(fi_data),
+            "ratio": len(fi_data) / raw_size * 100 if raw_size > 0 else 0,
+        }
 
     # Pixel units: rgb565, or rgb565 | (alpha << 16) when alpha is active.
     has_alpha = False
@@ -342,7 +395,6 @@ def convert_bytes(
         palette = unique[:256]
 
     # Encode
-    raw_size = width * height * 2
     fi_data = build_fi(width, height, pixels, chosen_mode, palette, has_alpha)
 
     stats = {
@@ -364,11 +416,13 @@ def convert(
     mode: str = "auto",
     max_colors: int = 256,
     want_alpha: bool = False,
+    quality: int = DEFAULT_JPEG_QUALITY,
 ) -> dict:
     """PNG → FI file conversion."""
     img = Image.open(input_path)
     fi_data, stats = convert_bytes(
-        img, mode=mode, max_colors=max_colors, want_alpha=want_alpha
+        img, mode=mode, max_colors=max_colors, want_alpha=want_alpha,
+        quality=quality,
     )
     Path(output_path).write_bytes(fi_data)
     return stats
@@ -431,6 +485,7 @@ def main():
     mode = "auto"
     max_colors = 256
     want_alpha = False
+    quality = DEFAULT_JPEG_QUALITY
 
     i = 2
     while i < len(args):
@@ -443,17 +498,23 @@ def main():
         elif args[i] == "--alpha":
             want_alpha = True
             i += 1
+        elif args[i] == "--quality" and i + 1 < len(args):
+            quality = int(args[i + 1])
+            i += 2
         else:
             print(f"Unknown option: {args[i]}")
             return
 
     stats = convert(input_path, output_path, mode=mode, max_colors=max_colors,
-                    want_alpha=want_alpha)
+                    want_alpha=want_alpha, quality=quality)
 
     print(f"Converted: {input_path} → {output_path}")
     print(f"  Size: {stats['width']}×{stats['height']}")
-    print(f"  Mode: {stats['mode']} ({stats['colors']} unique colors"
-          f"{', alpha' if stats['alpha'] else ''})")
+    if stats["mode"] == "jpeg":
+        print(f"  Mode: jpeg (quality {quality})")
+    else:
+        print(f"  Mode: {stats['mode']} ({stats['colors']} unique colors"
+              f"{', alpha' if stats['alpha'] else ''})")
     print(f"  Raw:  {stats['raw_size']} bytes")
     print(f"  FI:   {stats['fi_size']} bytes ({stats['ratio']:.1f}%)")
 

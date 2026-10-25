@@ -138,6 +138,7 @@ fn main() -> ! {
         usart: usart::init(),
         systick: systick::Systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
+        jpeg: ferrite_core::jpeg::JpegImpl::none(),
         gpio: ferrite_core::gpio::GpioImpl::none(),
         eeprom: ferrite_core::eeprom::EepromImpl::none(),
         cursor_visible: false,

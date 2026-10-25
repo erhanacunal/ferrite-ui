@@ -24,6 +24,7 @@ mod backlight;
 mod eeprom;
 mod flash;
 mod gpio;
+mod jpeg;
 mod lcd;
 mod rtc;
 mod sdcard;
@@ -97,6 +98,7 @@ fn main() {
         usart: usart::init(),
         systick: systick::Systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
+        jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::SoftJpeg),
         gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::SimGpio::default()),
         eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::SimEeprom::new(eeprom_path)),
         cursor_visible: false,

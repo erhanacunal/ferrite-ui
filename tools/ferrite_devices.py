@@ -13,8 +13,9 @@ NOTE: ``caps`` entries mirror per-board Rust constants and must be kept
 in sync by hand:
   - caps.alpha / caps.image_alpha  <->  LcdBackend::HAS_ALPHA in the
     BSP's lcd backend (ferrite-core/src/lcd.rs trait)
-  - caps.audio / caps.video        <->  Platform::CAPS bits
-    (ferrite-core/src/platform.rs)
+  - caps.audio / caps.video / caps.jpeg  <->  Platform::CAPS bits
+    (ferrite-core/src/platform.rs); caps.jpeg also lets images use
+    "mode": "jpeg" (FI mode 3)
 """
 
 import json
@@ -42,7 +43,7 @@ _FALLBACK = {
         "text_color": 0xFFFF,
         "widgets": ["base", "label", "button", "progress", "slider",
                     "checkbox", "radio", "input", "gauge", "dropdown", "image"],
-        "caps": {"alpha": False, "audio": False, "video": False,
+        "caps": {"alpha": False, "audio": False, "video": False, "jpeg": False,
                  "image_alpha": False},
         "fs_base": 0x1000,
     },
@@ -60,7 +61,7 @@ _FALLBACK = {
         "text_color": 0x0000,
         "widgets": ["base", "label", "button", "progress", "slider",
                     "checkbox", "radio", "input", "gauge", "dropdown", "image"],
-        "caps": {"alpha": False, "audio": False, "video": False,
+        "caps": {"alpha": False, "audio": False, "video": False, "jpeg": False,
                  "image_alpha": False},
         "fs_base": 0x1000,
     },

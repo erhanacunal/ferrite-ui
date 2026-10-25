@@ -1,0 +1,82 @@
+// main.fl — JPEG demo (N32903, 800x480)
+//
+// Both images are "mode": "jpeg" resources: the build tool stores them as
+// baseline JPEG and the JPEG engine decodes each one once, when its
+// image_id is first set (the rings image only on the first tap). A
+// full-screen backdrop sits behind a framed picture; tapping the picture
+// swaps it. The clock label redraws every second over the backdrop.
+
+#include "core.fl"
+#include "color.fl"
+
+var frame;
+var clock_lbl;
+var showing_fractal = 1;
+var last_tick = 0;
+var seconds = 0;
+
+fn on_frame(wid) {
+    showing_fractal = !showing_fractal;
+    target(frame);
+    if (showing_fractal) { set(image_id, 2); } else { set(image_id, 3); }
+}
+
+fn setup() {
+    var bg = alloc();
+    target(bg);
+    set(kind, KIND_IMAGE);
+    set(location, 0, 0);
+    set(size, 800, 480);
+    set(image_id, 1);
+    parent(0);
+
+    var title = alloc();
+    target(title);
+    set(kind, KIND_LABEL);
+    set(location, 0, 24);
+    set(size, 800, 40);
+    set(text, "Hardware JPEG decode");
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+
+    // 320x240 picture in a 4 px frame; the image is centred in it.
+    frame = alloc();
+    target(frame);
+    set(kind, KIND_IMAGE);
+    set(location, 60, 100);
+    set(size, 328, 248);
+    set(border, 4, 4, 4, 4);
+    set(border_color, WHITE);
+    set(bg_color, BLACK);
+    set(image_id, 2);
+    set(clickable, ON);
+    set(on_click, @on_frame);
+    parent(0);
+
+    clock_lbl = alloc();
+    target(clock_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 60, 370);
+    set(size, 328, 40);
+    set(bg_color, 0x2945);
+    set(text_color, YELLOW);
+    set(text_align, ALIGN_CENTER);
+    set(text, "0 s");
+    parent(0);
+
+    last_tick = millis();
+    render();
+    return 0;
+}
+
+fn loop() {
+    var now = millis();
+    if (now - last_tick >= 1000) {
+        last_tick = now;
+        seconds = seconds + 1;
+        target(clock_lbl);
+        set(text, sprintf("%d s", seconds));
+        strClear();
+    }
+}

@@ -1123,13 +1123,16 @@ class DesignerModel(QWidget):
                 try:
                     s_path = os.path.join(proj_dir, i_entry["source"])
                     s_b64 = base64.b64encode(open(s_path, "rb").read()).decode("ascii")
-                    self.images.append({
+                    img = {
                         "name": i_entry["name"], "image_id": i_entry["image_id"],
                         "source_name": os.path.basename(i_entry["source"]),
                         "mode": i_entry.get("mode", "auto"),
                         "max_colors": i_entry.get("max_colors", 256),
                         "data_b64": s_b64,
-                    })
+                    }
+                    if "quality" in i_entry:
+                        img["quality"] = i_entry["quality"]
+                    self.images.append(img)
                 except Exception:
                     pass
 
@@ -1220,12 +1223,15 @@ class DesignerModel(QWidget):
             src_name = img.get("source_name", f"{name}.png")
             with open(os.path.join(build_dir, src_name), "wb") as f:
                 f.write(base64.b64decode(img["data_b64"]))
-            image_entries.append({
+            entry = {
                 "name": name, "image_id": img["image_id"],
                 "source": src_name,
                 "mode": img.get("mode", "auto"),
                 "max_colors": img.get("max_colors", 256),
-            })
+            }
+            if "quality" in img:
+                entry["quality"] = img["quality"]
+            image_entries.append(entry)
 
         # Extra programs — extract .fl sources
         prog_entries = []
@@ -2985,7 +2991,7 @@ class ResourcePanel(QWidget):
             self.model.notify_changed()
 
     def _add_image(self):
-        source, _ = QFileDialog.getOpenFileName(self, "Image (PNG)", "", "Images (*.png *.jpg *.bmp)")
+        source, _ = QFileDialog.getOpenFileName(self, "Image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
         if not source:
             return
         name = os.path.splitext(os.path.basename(source))[0]
@@ -2994,10 +3000,14 @@ class ResourcePanel(QWidget):
         while iid in used_ids:
             iid += 1
         data_b64 = base64.b64encode(open(source, "rb").read()).decode("ascii")
+        spec = device_spec(self.model.device_id)
+        # Photos stay JPEG on boards with a hardware decoder (FI mode 3).
+        is_jpeg = source.lower().endswith((".jpg", ".jpeg"))
+        mode = "jpeg" if is_jpeg and spec["caps"].get("jpeg") else "auto"
         self.model.images.append({
             "name": name, "image_id": iid,
             "source_name": os.path.basename(source),
-            "mode": "auto", "max_colors": device_spec(self.model.device_id)["image_max_colors"],
+            "mode": mode, "max_colors": spec["image_max_colors"],
             "data_b64": data_b64,
         })
         self.model._res_gen += 1

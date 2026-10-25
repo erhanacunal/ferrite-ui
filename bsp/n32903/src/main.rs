@@ -38,6 +38,7 @@ mod backlight;
 mod eeprom;
 mod flash;
 mod gpio;
+mod jpeg;
 mod lcd;
 mod rtc;
 mod sdcard;
@@ -107,6 +108,7 @@ pub extern "C" fn rust_main() -> ! {
         usart: UsartImpl::with_backend(usart::new()),
         systick: systick::handle(),
         audio: ferrite_core::audio::AudioImpl::none(),
+        jpeg: ferrite_core::jpeg::JpegImpl::with_backend(jpeg::init()),
         gpio: ferrite_core::gpio::GpioImpl::with_backend(gpio::HeaderGpio),
         eeprom: ferrite_core::eeprom::EepromImpl::with_backend(eeprom::init()),
         cursor_visible: false,

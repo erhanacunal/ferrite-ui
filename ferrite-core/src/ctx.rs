@@ -8,6 +8,7 @@ use crate::backlight::BacklightImpl;
 use crate::eeprom::EepromImpl;
 use crate::flash::FlashImpl;
 use crate::gpio::GpioImpl;
+use crate::jpeg::JpegImpl;
 use crate::lcd::LcdImpl;
 use crate::platform::Platform;
 use crate::rtc::RtcImpl;
@@ -33,6 +34,7 @@ pub struct Ctx<P: Platform> {
     pub usart: UsartImpl<P::UsartB>,
     pub systick: SystickImpl<P::SystickB>,
     pub audio: AudioImpl<P::AudioB>,
+    pub jpeg: JpegImpl<P::JpegB>,
     pub gpio: GpioImpl<P::GpioB>,
     pub eeprom: EepromImpl<P::EepromB>,
     pub cursor_visible: bool,

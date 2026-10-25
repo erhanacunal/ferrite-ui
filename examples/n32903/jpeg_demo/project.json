@@ -1,0 +1,15 @@
+{
+    "device": "n32903",
+    "screen_width": 800,
+    "screen_height": 480,
+    "include_dirs": ["../../../lib"],
+    "render_mode": "dirty",
+    "images": [
+        {"name": "sunset", "image_id": 1, "source": "assets/sunset.jpg", "mode": "jpeg", "quality": 85},
+        {"name": "fractal", "image_id": 2, "source": "assets/fractal.jpg", "mode": "jpeg", "quality": 85},
+        {"name": "rings", "image_id": 3, "source": "assets/rings.jpg", "mode": "jpeg", "quality": 85}
+    ],
+    "programs": [
+        {"name": "main", "source": "main.fl", "exec_mode": "ram"}
+    ]
+}

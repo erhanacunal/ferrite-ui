@@ -8,7 +8,7 @@
 ///     [2..4] width: u16 LE
 ///     [4..6] height: u16 LE
 ///     [6]    flags: u8
-///            bit 0-1: mode (0=raw, 1=rle, 2=indexed_rle)
+///            bit 0-1: mode (0=raw, 1=rle, 2=indexed_rle, 3=jpeg)
 ///            bit 2: has_alpha — pixel/palette units carry an alpha byte
 ///     [7]    colors: u8 — palette color count (indexed mode, 0=256)
 ///     [8]    image_id: u8 — unique ID (0 = no image, 1-254 = user images)
@@ -21,6 +21,10 @@
 ///   Raw (0): RGB565 pixel array (width × height × 2 bytes)
 ///   RLE (1): PackBits RLE compressed RGB565
 ///   Indexed+RLE (2): Palette + PackBits RLE compressed indices
+///   JPEG (3): baseline JPEG stream (4:2:0 / 4:2:2 / 4:4:4, 3 components),
+///     for boards with a JPEG decoder (`Platform::JpegB`, `CAP_JPEG`). It is
+///     decoded once when the image is loaded (`ImageList::find_or_load`)
+///     into an RGB565 buffer on the heap, then drawn from RAM. Never alpha.
 ///
 /// Alpha (bit 2): raw/RLE units widen to 3 bytes (RGB565 LE + alpha u8);
 ///   indexed palette entries widen instead, the index stream is unchanged.
@@ -33,6 +37,7 @@
 use crate::flash::{FlashBackend, FlashImpl};
 extern crate alloc;
 use crate::fs::{Fs, RES_IMAGE, ResourceEntry};
+use crate::jpeg::{AlignedBuf, BUF_ALIGN, JpegBackend, JpegImpl};
 use alloc::vec;
 use crate::lcd::{LcdBackend, LcdImpl};
 
@@ -49,12 +54,18 @@ const MAX_PALETTE: usize = 256;
 const MODE_RAW: u8 = 0;
 const MODE_RLE: u8 = 1;
 const MODE_INDEXED_RLE: u8 = 2;
+const MODE_JPEG: u8 = 3;
+
+/// Row pitch / row count granularity of decoded JPEG pixels (the largest
+/// MCU the decoders write whole).
+const JPEG_MCU: u16 = 16;
 
 /// Flags bit 2 — units carry an alpha byte.
 const FLAG_ALPHA: u8 = 0x04;
 
 /// Image metadata from flash. Pixel data is streamed during drawing.
-/// RAM cost: ~22 bytes (palette stays in flash, read to stack during draw).
+/// RAM cost: ~32 bytes (palette stays in flash, read to stack during draw),
+/// plus the decoded pixels of a JPEG image.
 pub struct Image {
     pub image_id: u8,
     pub width: u16,
@@ -65,6 +76,9 @@ pub struct Image {
     palette_addr: u32,
     data_addr: u32,
     data_size: u32,
+    /// Decoded RGB565 pixels (JPEG only), `stride` per row.
+    pixels: Option<AlignedBuf>,
+    stride: u16,
 }
 
 impl Image {
@@ -80,6 +94,8 @@ impl Image {
             palette_addr: 0,
             data_addr: 0,
             data_size: 0,
+            pixels: None,
+            stride: 0,
         }
     }
 
@@ -141,7 +157,65 @@ impl Image {
             palette_addr,
             data_addr,
             data_size,
+            pixels: None,
+            stride: 0,
         })
+    }
+
+    /// Decode a JPEG image (mode 3) into its RGB565 pixel cache. Other modes
+    /// draw straight from flash: nothing to do. `false` when there is no
+    /// decoder, not enough heap, or the stream does not decode.
+    fn decode_jpeg<F: FlashBackend, J: JpegBackend>(
+        &mut self,
+        flash: &FlashImpl<F>,
+        jpeg: &JpegImpl<J>,
+    ) -> bool {
+        if self.mode != MODE_JPEG {
+            return true;
+        }
+        if !jpeg.available() || self.width == 0 || self.height == 0 {
+            return false;
+        }
+        // Zero padding after the stream: decoders may read ahead.
+        let len = self.data_size as usize;
+        let Some(mut src) = AlignedBuf::new(len + BUF_ALIGN) else {
+            return false;
+        };
+        flash.read(self.data_addr, &mut src.bytes_mut()[..len]);
+        let stride = self.width.next_multiple_of(JPEG_MCU);
+        let rows = self.height.next_multiple_of(JPEG_MCU);
+        let Some(mut px) = AlignedBuf::new(stride as usize * rows as usize * 2) else {
+            return false;
+        };
+        if !jpeg.decode_rgb565(src.bytes(), px.u16s_mut(), stride) {
+            return false;
+        }
+        self.stride = stride;
+        self.pixels = Some(px);
+        true
+    }
+
+    /// Copy part of the decoded pixels: image rect (sx, sy, sw, sh) to the
+    /// screen at (dx, dy). The caller keeps the rect inside the image.
+    fn draw_decoded<B: LcdBackend>(
+        &self,
+        lcd: &LcdImpl<B>,
+        dx: u16,
+        dy: u16,
+        sx: u16,
+        sy: u16,
+        sw: u16,
+        sh: u16,
+    ) {
+        let Some(px) = &self.pixels else {
+            return;
+        };
+        let px = px.u16s();
+        lcd.begin_pixels(dx, dy, sw, sh);
+        for row in sy..sy + sh {
+            let start = row as usize * self.stride as usize + sx as usize;
+            lcd.write_pixels(&px[start..start + sw as usize]);
+        }
     }
 
     /// Search flash for an image with the given image_id and load it.
@@ -184,6 +258,19 @@ impl Image {
         let Some(win) = self.window(lcd, x, y) else {
             return;
         };
+
+        if self.mode == MODE_JPEG {
+            self.draw_decoded(
+                lcd,
+                x + win.x0 as u16,
+                y + win.y0 as u16,
+                win.x0 as u16,
+                win.y0 as u16,
+                (win.x1 - win.x0) as u16,
+                (win.y1 - win.y0) as u16,
+            );
+            return;
+        }
 
         if self.has_alpha {
             // Alpha images blend per positioned pixel — the streaming
@@ -256,8 +343,8 @@ impl Image {
     }
 
     /// Draw a region of the image (sprite sheet, atlas usage).
-    /// Only supported in raw mode — RLE has no random access. Alpha images
-    /// are not supported here yet (full `draw` only).
+    /// Only supported in raw and JPEG mode — RLE has no random access. Alpha
+    /// images are not supported here yet (full `draw` only).
     pub fn draw_region<B: LcdBackend, F: FlashBackend>(
         &self,
         lcd: &LcdImpl<B>,
@@ -269,6 +356,15 @@ impl Image {
         sw: u16,
         sh: u16,
     ) {
+        if self.mode == MODE_JPEG {
+            // Clamp to the image: the pixels are a slice, not flash.
+            let sw = sw.min(self.width.saturating_sub(sx));
+            let sh = sh.min(self.height.saturating_sub(sy));
+            if sw != 0 && sh != 0 {
+                self.draw_decoded(lcd, dx, dy, sx, sy, sw, sh);
+            }
+            return;
+        }
         if sw == 0 || sh == 0 || self.mode != MODE_RAW || self.has_alpha {
             return;
         }
@@ -585,8 +681,11 @@ impl ImageList {
         }
     }
 
-    /// Remove all loaded images.
+    /// Remove all loaded images (and free decoded JPEG pixels).
     pub fn clear(&mut self) {
+        for img in &mut self.images[..self.count as usize] {
+            *img = Image::empty();
+        }
         self.count = 0;
     }
 
@@ -611,12 +710,14 @@ impl ImageList {
     }
 
     /// Find an image by image_id. If not already loaded, search flash
-    /// filesystem and load it. Returns true if the image is now available.
-    pub fn find_or_load<F: FlashBackend>(
+    /// filesystem and load it (decoding a JPEG image). Returns true if the
+    /// image is now available.
+    pub fn find_or_load<F: FlashBackend, J: JpegBackend>(
         &mut self,
         image_id: u8,
         fs: &Fs,
         flash: &FlashImpl<F>,
+        jpeg: &JpegImpl<J>,
     ) -> bool {
         if image_id == 0 {
             return false;
@@ -624,8 +725,11 @@ impl ImageList {
         if self.find(image_id).is_some() {
             return true;
         }
-        if let Some(image) = Image::load_by_id(fs, flash, image_id) {
-            return self.add(image);
+        if (self.count as usize) >= MAX_IMAGES {
+            return false;
+        }
+        if let Some(mut image) = Image::load_by_id(fs, flash, image_id) {
+            return image.decode_jpeg(flash, jpeg) && self.add(image);
         }
         false
     }
@@ -928,8 +1032,133 @@ mod tests {
             palette_addr: pal_addr,
             data_addr,
             data_size: data.len() as u32 - data_addr,
+            pixels: None,
+            stride: 0,
         };
         (img, data)
+    }
+
+    /// Stand-in decoder: checks it got the stream, writes pixel
+    /// `y * 64 + x` for the image area, and counts calls.
+    struct FakeJpeg {
+        stream: Vec<u8>,
+        w: u16,
+        h: u16,
+        calls: core::cell::Cell<u32>,
+        fail: bool,
+    }
+
+    impl JpegBackend for FakeJpeg {
+        fn decode_rgb565(&self, src: &[u8], out: &mut [u16], stride: u16) -> bool {
+            self.calls.set(self.calls.get() + 1);
+            assert_eq!(&src[..self.stream.len()], &self.stream[..]);
+            assert!(src[self.stream.len()..].iter().all(|&b| b == 0), "padding");
+            assert_eq!(src.as_ptr() as usize % BUF_ALIGN, 0);
+            assert_eq!(out.as_ptr() as usize % BUF_ALIGN, 0);
+            assert!(stride >= self.w.next_multiple_of(16));
+            assert!(out.len() >= stride as usize * self.h.next_multiple_of(16) as usize);
+            for y in 0..self.h as usize {
+                for x in 0..self.w as usize {
+                    out[y * stride as usize + x] = (y * 64 + x) as u16;
+                }
+            }
+            !self.fail
+        }
+    }
+
+    /// (JPEG-mode image, flash, decoder) whose stream sits at offset 5.
+    fn make_jpeg(iw: u16, ih: u16, fail: bool) -> (Image, FlashImpl<MemFlash>, JpegImpl<FakeJpeg>) {
+        let stream: Vec<u8> = (0..37u8).map(|i| i.wrapping_mul(7) | 1).collect();
+        let mut data = vec![0xEEu8; 5];
+        data.extend(&stream);
+        data.extend([0xEE; 9]); // next resource: must not reach the decoder
+        let img = Image {
+            image_id: 1,
+            width: iw,
+            height: ih,
+            mode: MODE_JPEG,
+            has_alpha: false,
+            palette_count: 0,
+            palette_addr: 0,
+            data_addr: 5,
+            data_size: stream.len() as u32,
+            pixels: None,
+            stride: 0,
+        };
+        let jpeg = JpegImpl::with_backend(FakeJpeg { stream, w: iw, h: ih, calls: 0.into(), fail });
+        (img, FlashImpl::with_backend(MemFlash(data)), jpeg)
+    }
+
+    #[test]
+    fn jpeg_decodes_once_then_draws_from_ram() {
+        let (mut img, flash, jpeg) = make_jpeg(23, 17, false);
+        assert!(img.decode_jpeg(&flash, &jpeg));
+        assert_eq!(jpeg.backend().calls.get(), 1);
+        let (x, y) = (4u16, 6u16);
+        let full = render(&img, &flash, x, y, None);
+        for py in 0..H {
+            for px in 0..W {
+                let inside = (x as usize..x as usize + 23).contains(&px) && (y as usize..y as usize + 17).contains(&py);
+                let want = if inside { ((py - y as usize) * 64 + px - x as usize) as u16 } else { SENTINEL };
+                assert_eq!(full[py * W + px], want, "px=({px},{py})");
+            }
+        }
+        // Drawing never decodes again.
+        let _ = render(&img, &flash, 0, 0, Some(Rect::new(5, 3, 10, 7)));
+        assert_eq!(jpeg.backend().calls.get(), 1);
+    }
+
+    #[test]
+    fn jpeg_clipped_draw_matches_masked_full_draw() {
+        let (mut img, flash, jpeg) = make_jpeg(23, 17, false);
+        assert!(img.decode_jpeg(&flash, &jpeg));
+        for &(x, y) in &[(4u16, 6u16), (0, 0), (30, 28)] {
+            let full = render(&img, &flash, x, y, None);
+            for sc in &[Rect::new(5, 3, 10, 7), Rect::new(13, 9, 1, 1), Rect::new(-5, -5, 12, 12), Rect::new(40, 30, 30, 30)] {
+                let got = render(&img, &flash, x, y, Some(*sc));
+                for py in 0..H {
+                    for px in 0..W {
+                        let p = Rect::new(px as i16, py as i16, 1, 1);
+                        let want = if p.intersects(sc) { full[py * W + px] } else { SENTINEL };
+                        assert_eq!(got[py * W + px], want, "at=({x},{y}) px=({px},{py})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jpeg_draw_region_is_clamped_to_the_image() {
+        let (mut img, flash, jpeg) = make_jpeg(23, 17, false);
+        assert!(img.decode_jpeg(&flash, &jpeg));
+        let lcd = LcdImpl::with_backend(FbLcd {
+            px: RefCell::new(vec![SENTINEL; W * H]),
+            cur: RefCell::new(crate::fb::StreamCursor::new()),
+        });
+        // Asks for 10×10 from (20, 15): only 3×2 exist.
+        img.draw_region(&lcd, &flash, 1, 2, 20, 15, 10, 10);
+        img.draw_region(&lcd, &flash, 0, 0, 30, 0, 5, 5); // fully outside: nothing
+        let px = lcd.backend().px.borrow();
+        for py in 0..H {
+            for pxx in 0..W {
+                let inside = (1..4).contains(&pxx) && (2..4).contains(&py);
+                let want = if inside { ((15 + py - 2) * 64 + 20 + pxx - 1) as u16 } else { SENTINEL };
+                assert_eq!(px[py * W + pxx], want, "px=({pxx},{py})");
+            }
+        }
+    }
+
+    #[test]
+    fn jpeg_without_decoder_or_failing_decode_does_not_load() {
+        let (mut img, flash, _) = make_jpeg(23, 17, false);
+        assert!(!img.decode_jpeg(&flash, &JpegImpl::none()));
+        assert!(img.pixels.is_none());
+        let (mut img, flash, jpeg) = make_jpeg(23, 17, true);
+        assert!(!img.decode_jpeg(&flash, &jpeg));
+        assert!(img.pixels.is_none());
+        // Other modes need no decoder.
+        let (mut img, data) = make(MODE_RLE, false, 4, 4);
+        assert!(img.decode_jpeg(&FlashImpl::with_backend(MemFlash(data)), &JpegImpl::none()));
     }
 
     fn render(img: &Image, flash: &FlashImpl<MemFlash>, x: u16, y: u16, sc: Option<Rect>) -> Vec<u16> {

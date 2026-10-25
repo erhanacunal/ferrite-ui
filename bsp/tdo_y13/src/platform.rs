@@ -30,6 +30,7 @@ impl Platform for TdoY13Platform {
     // F1C100s has a built-in audio codec — switch to a real backend (and set
     // CAP_AUDIO + devices.json caps.audio) when the audio milestone lands.
     type AudioB = ferrite_core::audio::NoAudio;
+    type JpegB = ferrite_core::jpeg::NoJpeg;
     type GpioB = ferrite_core::gpio::NoGpio;
     type EepromB = ferrite_core::eeprom::NoEeprom;
 

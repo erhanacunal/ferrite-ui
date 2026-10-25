@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 
-use ferrite_core::platform::Platform;
+use ferrite_core::platform::{CAP_JPEG, Platform};
 
 use ferrite_core::ctx::Ctx;
 use ferrite_core::runtime::{FullInput, PlatformRuntime};
@@ -35,8 +35,12 @@ impl Platform for SimPlatform {
     type UsartB = crate::usart::sim::Stdio;
     type SystickB = crate::systick::SimSystick;
     type AudioB = ferrite_core::audio::NoAudio;
+    type JpegB = crate::jpeg::SoftJpeg;
     type GpioB = crate::gpio::SimGpio;
     type EepromB = crate::eeprom::SimEeprom;
+
+    // Software JPEG decoder (sim/src/jpeg.rs).
+    const CAPS: u32 = CAP_JPEG;
 }
 
 // --- Host window state (thread-local; minifb Window is !Send) ---

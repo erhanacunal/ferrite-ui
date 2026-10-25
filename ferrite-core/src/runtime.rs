@@ -1620,6 +1620,7 @@ mod mem_detail_tests {
             usart: UsartImpl::with_backend(MockUsart),
             systick: SystickImpl::init(),
             audio: AudioImpl::none(),
+            jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
             cursor_visible: false,

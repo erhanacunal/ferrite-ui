@@ -25,7 +25,8 @@ JSON format:
       {"name": "sans12", "font_id": 1, "header": "assets/sans12.bin", "data": "assets/sans12_bmp.bin"}
     ],
     "images": [
-      {"name": "logo", "image_id": 1, "source": "assets/logo.png", "mode": "auto", "max_colors": 256}
+      {"name": "logo", "image_id": 1, "source": "assets/logo.png", "mode": "auto", "max_colors": 256},
+      {"name": "photo", "image_id": 2, "source": "assets/photo.jpg", "mode": "jpeg", "quality": 85}
     ],
     "programs": [
       {"name": "main", "source": "main.fl", "exec_mode": "ram|flash", "widget_page": false}
@@ -85,19 +86,23 @@ KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_
 # --- Image conversion (shared encoder in ferrite_img.py) ---
 
 def convert_image(source_path: str, mode: str = "auto", max_colors: int = 256,
-                  want_alpha: bool = False) -> bytes:
+                  want_alpha: bool = False, quality: int | None = None) -> bytes:
     """PNG → FI binary via the shared ferrite_img encoder.
 
     `want_alpha` comes from the target device's caps.image_alpha; alpha is
-    only emitted when the source actually has non-opaque pixels.
+    only emitted when the source actually has non-opaque pixels. `quality`
+    applies to mode "jpeg" (None = the encoder default).
     """
     # Deferred import keeps the PIL dependency lazy (as before); ferrite_img
     # itself reports a clear error and exits when Pillow is missing.
     import ferrite_img
 
     img = ferrite_img.Image.open(source_path)
+    if quality is None:
+        quality = ferrite_img.DEFAULT_JPEG_QUALITY
     fi_data, _stats = ferrite_img.convert_bytes(
-        img, mode=mode, max_colors=max_colors, want_alpha=want_alpha)
+        img, mode=mode, max_colors=max_colors, want_alpha=want_alpha,
+        quality=quality)
     return fi_data
 
 
@@ -395,9 +400,17 @@ def build(project_path: str, output_path: str | None) -> dict:
         # Alpha encoding only for devices that can blend (caps.image_alpha);
         # legacy projects (no device key) never emit it.
         want_alpha = bool(device and device["caps"].get("image_alpha"))
+        # JPEG images need a hardware decoder (caps.jpeg); elsewhere they
+        # fall back to the lossless encoder. Legacy projects (no device key)
+        # keep what they ask for.
+        if mode == "jpeg" and device and not device["caps"].get("jpeg"):
+            print(f"  warning: image '{name}': device has no JPEG decoder "
+                  f"(caps.jpeg), encoding with mode \"auto\"", file=sys.stderr)
+            mode = "auto"
 
         fi_data = bytearray(convert_image(str(source), mode=mode, max_colors=max_colors,
-                                          want_alpha=want_alpha))
+                                          want_alpha=want_alpha,
+                                          quality=image.get("quality")))
         if want_alpha and len(fi_data) >= 7 and fi_data[6] & 0x04:
             print(f"  note: image '{name}' encoded with alpha (FI flags bit 2)")
         # FI header is 8 bytes; extend to 9 by inserting image_id at byte 8
@@ -538,7 +551,7 @@ def dump_fs(binary: bytes, symbols: dict | None = None) -> str:
                     out += ["        " + l for l in disassemble_page_block(blob, b)]
         elif kind == RES_IMAGE and len(blob) >= 9:
             _magic, w, h, fl, colors = struct.unpack_from("<HHHBB", blob)
-            mode = ("raw", "rle", "indexed+rle")[fl & 3] if fl & 3 < 3 else f"mode {fl & 3}"
+            mode = ("raw", "rle", "indexed+rle", "jpeg")[fl & 3]
             alpha = ", alpha" if fl & 0x04 else ""
             pal = f", {colors or 256} colors" if fl & 3 == 2 else ""
             out.append(f"; image_id {blob[8]}, {w}x{h}, {mode}{pal}{alpha}")

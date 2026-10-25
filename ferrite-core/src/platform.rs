@@ -10,6 +10,7 @@ use crate::backlight::BacklightBackend;
 use crate::eeprom::EepromBackend;
 use crate::flash::FlashBackend;
 use crate::gpio::GpioBackend;
+use crate::jpeg::JpegBackend;
 use crate::lcd::LcdBackend;
 use crate::rtc::RtcBackend;
 use crate::sdcard::SdCardBackend;
@@ -23,13 +24,15 @@ use crate::usart::UsartBackend;
 // (`P::CAPS & CAP_AUDIO != 0` folds to a constant). Alpha blending is NOT
 // here — it lives on `LcdBackend::HAS_ALPHA`, next to the blend methods.
 // Each bit must be mirrored in the board's `tools/devices/<id>.json`
-// (`caps.audio` / `caps.video`) so the designer and build tools agree
+// (`caps.audio` / `caps.video` / `caps.jpeg`) so the designer and build tools agree
 // with the firmware.
 
 /// Board has a real audio output backend (`Platform::AudioB` is not `NoAudio`).
 pub const CAP_AUDIO: u32 = 1 << 0;
 /// Reserved: board can stream video resources.
 pub const CAP_VIDEO: u32 = 1 << 1;
+/// Board decodes JPEG images (`Platform::JpegB` is not `NoJpeg`).
+pub const CAP_JPEG: u32 = 1 << 2;
 
 pub trait Platform {
     type LcdB: LcdBackend;
@@ -44,6 +47,9 @@ pub trait Platform {
     type SystickB: SystickBackend;
     // Boards without audio hardware use `ferrite_core::audio::NoAudio`.
     type AudioB: AudioBackend;
+    // JPEG image decoder (FI mode 3); boards without one use
+    // `ferrite_core::jpeg::NoJpeg`.
+    type JpegB: JpegBackend;
     // User GPIO header (`pinMode`/`pinWrite`/`pinRead`); boards without one
     // use `ferrite_core::gpio::NoGpio`.
     type GpioB: GpioBackend;

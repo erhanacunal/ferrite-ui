@@ -227,6 +227,13 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Examples:** `examples/nextion/eeprom_demo` (boot counter + reset; `examples/n32903/eeprom_demo` builds the same source for the N32903). `examples/nextion/relay_board` saves its buttons on OK and loads them at startup (format in `main.fl`: header + 16-byte slots, checksummed, header written last).
 - `strByte(s, i)` (0xB8) returns byte `i` of a string, or -1 past the end. It is the counterpart of `arrToStr`, used to save names byte by byte.
 
+### Device Features (CAPS)
+- **Pattern for optional hardware** (audio, JPEG, later video): a backend trait in ferrite-core with a null impl (`NoAudio`, `NoJpeg`), a `Platform::*B` slot, an `*Impl<B>` field in `Ctx`, and a `Platform::CAPS` bit (`CAP_AUDIO`, `CAP_VIDEO` reserved, `CAP_JPEG`). Every board fills the slot; boards without the hardware use the null impl, which compiles away (Nextion flash unchanged in practice). Several boards can share one feature through their own backends.
+- `CAPS` bits are mirrored in `tools/devices/<id>.json` `caps.*` (+ the `_FALLBACK` table in `ferrite_devices.py`) — keep in sync. The build tools gate features on them.
+- **JPEG (`CAP_JPEG`, `caps.jpeg`):** FI image mode 3 = FI header + baseline JPEG stream. `ferrite_img.py` always re-encodes (`"mode": "jpeg"`, `"quality"` 1–100, default 85) to baseline 4:2:0, 3 components, standard Huffman tables, alpha flattened onto black. On a device without `caps.jpeg`, `ferrite_build` warns and falls back to `"auto"`. The designer defaults `.jpg`/`.jpeg` imports to `"jpeg"` on such devices.
+  - Firmware: `ImageList::find_or_load` decodes once, at image load (`Image::decode_jpeg`), into an `AlignedBuf` (32-byte aligned, whole cache lines, stride/rows rounded up to 16) on the heap; drawing (`draw`/`draw_region`, scissored) copies from it. Out of heap / bad stream → the image doesn't load. `ImageList::clear` frees the buffers. RAM = stride × rows × 2 per image (800×480 = 750 KB), so RAM-rich boards only.
+  - N32903: `n32903_rs::jpeg` (HAL port of the vendor `JPEG/Src/jpegcodec.c`, polled, decode only: packet RGB565/RGB555/YUV422/ARGB8888, stride, down-scale, `probe` stream check, bounded waits, cache maintenance) ← `bsp/n32903/src/jpeg` (`HwJpeg`). Sim: `bsp/sim/src/jpeg.rs` (`jpeg-decoder` crate, accepts only what the engine accepts). Example: `examples/n32903/jpeg_demo`.
+
 ### SD Card Boot
 - `ferrite_core::fat` (read-only FAT16/32, generic over `SdCardBackend`) + `ferrite_core::sdboot::sd_boot_check(ctx, sd, present)`: `EMPTY.BIN` → recovery, `PROGRAM.BIN` → copied to `P::FS_BASE`. The BSP detects/inits the card; `present` makes the progress text visible (n32903: `lcd::flush_cache`).
 - **Nextion:** SPI SD (`sdcard/hw.rs`, PC13 CS).
@@ -365,6 +372,7 @@ ferrite-ui/                  (workspace root — virtual manifest + shared relea
 - [x] Font rendering (Adafruit GFX compatible, header in RAM, bitmap read from flash)
 - [x] Widget types (Label, Button, Progress, Slider, Checkbox, Radio)
 - [x] Image format (FI: raw/rle/indexed+rle, streaming decode, Python converter)
+- [x] JPEG images (FI mode 3, N32903 hardware decoder + sim; `CAP_JPEG`)
 - [x] Backlight PWM (TIMER0_CH0, PA8, 10kHz, 0-100%)
 - [x] USART0 RX interrupt + 128B ring buffer
 - [x] Interrupt vector table (device.x + irq.rs)

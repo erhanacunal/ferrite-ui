@@ -2657,7 +2657,7 @@ impl Vm {
         }
         if prop_id == PROP_IMAGE_ID {
             if let Some(fs) = ctx.fs.as_ref() {
-                ctx.images.find_or_load(val as u8, fs, &ctx.flash);
+                ctx.images.find_or_load(val as u8, fs, &ctx.flash, &ctx.jpeg);
             }
         }
         // A property write that changes appearance schedules a redraw, so
@@ -3567,6 +3567,7 @@ mod anim_tests {
             usart: UsartImpl::with_backend(MockUsart),
             systick: SystickImpl::init(),
             audio: AudioImpl::none(),
+            jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
             cursor_visible: false,

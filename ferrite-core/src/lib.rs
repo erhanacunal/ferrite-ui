@@ -13,6 +13,7 @@ pub mod eeprom;
 pub mod flash;
 pub mod gfx_glyph;
 pub mod gpio;
+pub mod jpeg;
 pub mod lcd;
 #[cfg(feature = "mock")]
 pub mod mock;

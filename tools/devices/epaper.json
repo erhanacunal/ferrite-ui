@@ -8,6 +8,6 @@
   "render_modes": ["epaper"],
   "default_render_mode": "epaper",
   "widgets": ["base", "label", "button", "progress", "slider", "checkbox", "radio", "input", "gauge", "dropdown", "image"],
-  "caps": { "alpha": false, "audio": false, "video": false, "image_alpha": false },
+  "caps": { "alpha": false, "audio": false, "video": false, "jpeg": false, "image_alpha": false },
   "defaults": { "root_bg": "0xFFFF", "text_color": "0x0000" }
 }

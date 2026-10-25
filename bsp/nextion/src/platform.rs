@@ -38,6 +38,7 @@ impl Platform for NextionPlatform {
     type UsartB = crate::usart::hw::Hw;
     type SystickB = crate::systick::Gd32Systick;
     type AudioB = ferrite_core::audio::NoAudio;
+    type JpegB = ferrite_core::jpeg::NoJpeg;
     type GpioB = crate::user_gpio::HeaderGpio;
     type EepromB = crate::eeprom::hw::At24c08;
 }
