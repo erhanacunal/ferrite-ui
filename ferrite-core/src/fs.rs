@@ -61,7 +61,7 @@ pub const RES_PAGE: u8 = 3;
 pub const RES_FILE: u8 = 4;
 /// System configuration record (pool sizes) — see [`crate::syscfg`].
 pub const RES_SYSCFG: u8 = 5;
-/// PCM16 sound (header + samples) — see [`crate::audio::SOUND_HEADER`].
+/// PCM16 sound (header + samples) — see `audio::SOUND_HEADER` (`audio` feature).
 pub const RES_SOUND: u8 = 6;
 /// `Fs::find_kind` wildcard.
 pub const RES_ANY: u8 = 0xFF;

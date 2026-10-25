@@ -24,13 +24,11 @@ impl Platform for TdoY13Platform {
     type TouchB = crate::touch::CstTouch;
     type BacklightB = crate::backlight::PwmBl;
     type RtcB = crate::rtc::StubRtc;
-    type SdCardB = crate::sdcard::StubSd;
     type UsartB = crate::usart::HwUart;
     type SystickB = crate::systick::F1cSystick;
-    // F1C100s has a built-in audio codec — switch to a real backend (and set
-    // CAP_AUDIO + devices.json caps.audio) when the audio milestone lands.
-    type AudioB = ferrite_core::audio::NoAudio;
-    type JpegB = ferrite_core::jpeg::NoJpeg;
+    // F1C100s has a built-in audio codec — enable ferrite-core's `audio`
+    // feature with a real `AudioB` (and set CAP_AUDIO + devices.json
+    // caps.audio) when the audio milestone lands.
     type GpioB = ferrite_core::gpio::NoGpio;
     type EepromB = ferrite_core::eeprom::NoEeprom;
 

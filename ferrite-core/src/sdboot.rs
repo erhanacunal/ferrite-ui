@@ -15,7 +15,7 @@ use crate::fat::Fat;
 use crate::platform::Platform;
 use crate::fs::Fs;
 use crate::runtime::{ERR_BAD_IMAGE, ERR_EMPTY_RUN};
-use crate::sdcard::SdCardImpl;
+use crate::sdcard::{SdCardBackend, SdCardImpl};
 use crate::systick::SystickBackend;
 use crate::types::COLOR_WHITE;
 
@@ -24,9 +24,9 @@ use crate::types::COLOR_WHITE;
 /// otherwise 0. `present` makes what was just drawn visible
 /// (cached frame buffers need a write-back; direct-to-panel boards pass a
 /// no-op).
-pub fn sd_boot_check<P: Platform>(
+pub fn sd_boot_check<P: Platform, S: SdCardBackend>(
     ctx: &Ctx<P>,
-    sd: &SdCardImpl<P::SdCardB>,
+    sd: &SdCardImpl<S>,
     present: fn(),
 ) -> u8 {
     let font = ctx.fonts.embedded();

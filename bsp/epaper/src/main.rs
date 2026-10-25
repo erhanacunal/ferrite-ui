@@ -35,6 +35,7 @@ mod backlight;
 mod flash;
 mod lcd;
 mod rtc;
+#[cfg(feature = "sdcard")]
 mod sdcard;
 mod systick;
 mod touch;
@@ -137,8 +138,6 @@ fn main() -> ! {
         rtc: rtc::init(),
         usart: usart::init(),
         systick: systick::Systick::handle(),
-        audio: ferrite_core::audio::AudioImpl::none(),
-        jpeg: ferrite_core::jpeg::JpegImpl::none(),
         gpio: ferrite_core::gpio::GpioImpl::none(),
         eeprom: ferrite_core::eeprom::EepromImpl::none(),
         cursor_visible: false,

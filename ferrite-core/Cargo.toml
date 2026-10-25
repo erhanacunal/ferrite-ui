@@ -37,6 +37,23 @@ strpool_large = []
 # RAM-rich BSPs (`bsp-tdo-y13`, `bsp-n32903`) and the sim.
 wide_code = []
 
+# --- Optional device features, selected by the BSP that has the hardware ---
+# Off = the module, its `Platform` backend slot, its `Ctx` field and its VM
+# opcodes are not compiled at all (programs using them fault with
+# "bad opcode" / their resources don't load). Keep the board's `Platform::CAPS`
+# and `tools/devices/<id>.json` caps in sync with what the BSP enables.
+#
+# Sound playback: `audio` module, `Platform::AudioB`, `Ctx::audio`, the
+# playSound/stopSound/setVolume/soundPlaying opcodes (0xB9–0xBC).
+audio = []
+# JPEG images (FI mode 3): `jpeg` module, `Platform::JpegB`, `Ctx::jpeg`.
+# Without it a mode-3 image does not load.
+jpeg = []
+# SD card block-device trait (`sdcard`) + read-only FAT reader (`fat`).
+sdcard = []
+# Boot-time SD actions (`sdboot`: EMPTY.BIN → recovery, PROGRAM.BIN → flash).
+sdboot = ["sdcard"]
+
 [dependencies]
 libm = "0.2"
 # Used only by `heap.rs` under the `epaper` feature (allocator is BSP-provided).

@@ -28,6 +28,7 @@ mod flash;
 mod i2c;
 mod lcd;
 mod rtc;
+#[cfg(feature = "sdboot")]
 mod sdcard;
 mod stack;
 mod systick;
@@ -302,8 +303,6 @@ fn build_ctx(gpio: Gpio) -> Box<Ctx<NextionPlatform>> {
         rtc: rtc::init(),
         usart: usart::init(),
         systick: systick::Systick::handle(),
-        audio: ferrite_core::audio::AudioImpl::none(),
-        jpeg: ferrite_core::jpeg::JpegImpl::none(),
         gpio: ferrite_core::gpio::GpioImpl::with_backend(user_gpio::HeaderGpio),
         eeprom: eeprom::init(),
         cursor_visible: false,

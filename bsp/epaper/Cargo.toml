@@ -7,6 +7,11 @@ edition = "2024"
 name = "ferrite-ui"
 path = "src/main.rs"
 
+[features]
+# SPI SD card driver (src/sdcard). Nothing on this board uses it yet (no SD
+# boot), so it is off by default.
+sdcard = ["ferrite-core/sdcard"]
+
 [dependencies]
 ferrite-core = { path = "../../ferrite-core", features = ["epaper"] }
 esp-hal = { version = "1.1.0", features = ["esp32s3", "unstable"] }

@@ -161,6 +161,20 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
         raise CompileError(f"{source_path}: {e}") from e
 
 
+# Builtins whose opcodes exist only in firmware built with ferrite-core's
+# `audio` feature (caps.audio); elsewhere they fault with "bad opcode".
+AUDIO_BUILTINS = ("playSound", "stopSound", "setVolume", "soundPlaying")
+
+
+def used_builtins(source_path: str, include_dirs, names) -> set[str]:
+    """Which of `names` the program calls (after `#include` expansion)."""
+    from ferrite_lang import preprocess, tokenize
+    source = Path(source_path).read_text(encoding="utf-8")
+    toks = tokenize(preprocess(source, source_path, include_dirs))
+    return {t.value for t, nxt in zip(toks, toks[1:])
+            if t.type == "IDENT" and t.value in names and nxt.type == "("}
+
+
 # --- Flash filesystem builder ---
 
 # RES_SYSCFG record — keep in sync with ferrite-core/src/syscfg.rs.
@@ -470,6 +484,14 @@ def build(project_path: str, output_path: str | None) -> dict:
     for prog in project.get("programs", []):
         name = prog["name"]
         source = project_dir / prog["source"]
+        if device and not device["caps"].get("audio"):
+            used = used_builtins(str(source), include_dirs, AUDIO_BUILTINS)
+            if used:
+                print(f"Error: {prog['source']}: {', '.join(sorted(used))} need a "
+                      f"device with audio output (caps.audio); "
+                      f"the firmware has no sound opcodes",
+                      file=sys.stderr)
+                sys.exit(1)
         image_data = compile_program(str(source), include_dirs=include_dirs,
                                      render_mode=render_mode,
                                      widget_page=prog.get("widget_page", widget_page),
@@ -503,7 +525,7 @@ def build(project_path: str, output_path: str | None) -> dict:
     sounds = project.get("sounds", [])
     if sounds and device and not device["caps"].get("audio"):
         print(f"  warning: device has no audio output (caps.audio); "
-              f"playSound() will return 0", file=sys.stderr)
+              f"the sounds are stored but can't be played", file=sys.stderr)
     for snd in sounds:
         name = snd["name"]
         if len(name.encode("ascii")) > 15:

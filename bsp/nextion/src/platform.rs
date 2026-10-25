@@ -11,11 +11,15 @@ use ferrite_core::runtime::{ERR_EMPTY_RUN, FullInput, PlatformRuntime};
 use ferrite_core::strpool::StringPool;
 use ferrite_core::types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
 use ferrite_core::vm::Vm;
-use ferrite_core::{config, protocol, render, sdboot};
+use ferrite_core::{config, protocol, render};
+#[cfg(feature = "sdboot")]
+use ferrite_core::sdboot;
 
 use crate::gpio::Gpio;
 use crate::systick::delay_ms;
-use crate::{sdcard, touch};
+use crate::touch;
+#[cfg(feature = "sdboot")]
+use crate::sdcard;
 
 // === Device syscalls (GPIOB / FPGA bus poking from Ferrite programs) ===
 
@@ -34,11 +38,8 @@ impl Platform for NextionPlatform {
     type TouchB = crate::touch::hw::XptTouch;
     type BacklightB = crate::backlight::hw::Pwm;
     type RtcB = crate::rtc::hw::At8563;
-    type SdCardB = crate::sdcard::hw::SpiSd;
     type UsartB = crate::usart::hw::Hw;
     type SystickB = crate::systick::Gd32Systick;
-    type AudioB = ferrite_core::audio::NoAudio;
-    type JpegB = ferrite_core::jpeg::NoJpeg;
     type GpioB = crate::user_gpio::HeaderGpio;
     type EepromB = crate::eeprom::hw::At24c08;
 }
@@ -140,7 +141,10 @@ impl PlatformRuntime for NextionPlatform {
         }
 
         // SD card boot: flash PROGRAM.BIN or enter recovery via EMPTY.BIN.
-        sd_boot_check(ctx)
+        #[cfg(feature = "sdboot")]
+        return sd_boot_check(ctx);
+        #[cfg(not(feature = "sdboot"))]
+        0
     }
 
     fn on_extra_rx(
@@ -214,6 +218,7 @@ fn recovery_hold(ctx: &mut Ctx<NextionPlatform>, cal: &CalParams) -> bool {
 /// SD card boot (EMPTY.BIN → recovery, PROGRAM.BIN → flash update), see
 /// `ferrite_core::sdboot`. Returns `ERR_EMPTY_RUN` for recovery,
 /// `ERR_BAD_IMAGE` for a PROGRAM.BIN that fails its check, otherwise 0.
+#[cfg(feature = "sdboot")]
 fn sd_boot_check(ctx: &Ctx<NextionPlatform>) -> u8 {
     if !sdcard::probe() {
         return 0; // no SD card — continue normal boot

@@ -549,7 +549,7 @@ BUILTIN_SIGNATURES = {
     'pinWrite':    {'sig': 'pinWrite(pin, value)', 'desc': 'Drive an output pin: non-zero = high, 0 = low.'},
     'pinRead':     {'sig': 'pinRead(pin) -> int', 'desc': 'Read a GPIO pin level (0 or 1).'},
     'strByte':     {'sig': 'strByte(str, index) -> int', 'desc': 'Byte `index` of a string (0..255), or -1 past the end. UTF-8 characters outside ASCII take 2-3 bytes.'},
-    'playSound':   {'sig': 'playSound(name [, loop]) -> int', 'desc': 'Play a sound resource ("sounds" in project.json), replacing the playing one. loop != 0 repeats it until stopSound(). Returns 1 if it started, 0 if missing or the board has no audio.'},
+    'playSound':   {'sig': 'playSound(name [, loop]) -> int', 'desc': 'Play a sound resource ("sounds" in project.json), replacing the playing one. loop != 0 repeats it until stopSound(). Returns 1 if it started, 0 if the sound is missing. Boards with audio (caps.audio) only: elsewhere the build fails.'},
     'stopSound':   {'sig': 'stopSound()', 'desc': 'Stop the playing sound.'},
     'setVolume':   {'sig': 'setVolume(percent)', 'desc': 'Audio output volume, 0..100.'},
     'soundPlaying': {'sig': 'soundPlaying() -> int', 'desc': '1 while a sound is playing (until its last sample is output), else 0.'},

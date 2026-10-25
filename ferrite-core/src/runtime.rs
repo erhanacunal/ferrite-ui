@@ -344,6 +344,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                 }
                 RxEvent::FsReady => {
                     vm.reset();
+                    #[cfg(feature = "audio")]
                     ctx.audio.stop();
                     ctx.tree.clear();
                     ctx.strpool.clear();
@@ -410,6 +411,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
         }
 
         // --- Stream the playing sound (if any) into the audio backend ---
+        #[cfg(feature = "audio")]
         ctx.audio.pump(&ctx.flash);
 
         // --- Render (on_paint runs inside, for the widgets it drew) ---
@@ -610,6 +612,7 @@ fn reload_program<P: PlatformRuntime>(
     ctx.tree.clear();
     ctx.strpool.clear();
     vm.reset();
+    #[cfg(feature = "audio")]
     ctx.audio.stop();
     input.reset(ctx);
     ctx.cursor_visible = false;
@@ -1612,6 +1615,7 @@ mod mock_runtime {
 #[cfg(all(test, feature = "mock"))]
 mod mem_detail_tests {
     use super::*;
+    #[cfg(feature = "audio")]
     use crate::audio::AudioImpl;
     use crate::backlight::BacklightImpl;
     use crate::flash::FlashImpl;
@@ -1639,7 +1643,9 @@ mod mem_detail_tests {
             rtc: RtcImpl::with_backend(MockRtc),
             usart: UsartImpl::with_backend(MockUsart),
             systick: SystickImpl::init(),
+            #[cfg(feature = "audio")]
             audio: AudioImpl::none(),
+            #[cfg(feature = "jpeg")]
             jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),

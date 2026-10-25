@@ -11,6 +11,7 @@ use crate::gpio::{GpioBackend, MODE_INPUT_PULLDOWN, MODE_INPUT_PULLUP, MODE_OUTP
 use crate::lcd::LcdBackend;
 use crate::platform::Platform;
 use crate::rtc::{DateTime, RtcBackend};
+#[cfg(feature = "sdcard")]
 use crate::sdcard::{CardType, SdCardBackend, SdError};
 use crate::systick::SystickBackend;
 use crate::touch::{CalParams, TouchBackend};
@@ -75,7 +76,9 @@ impl RtcBackend for MockRtc {
     fn clear_vl_flag(&self) {}
 }
 
+#[cfg(feature = "sdcard")]
 pub struct MockSdCard;
+#[cfg(feature = "sdcard")]
 impl SdCardBackend for MockSdCard {
     fn card_type(&self) -> CardType {
         CardType::SdHc
@@ -179,10 +182,11 @@ impl Platform for MockPlatform {
     type TouchB = MockTouch;
     type BacklightB = MockBacklight;
     type RtcB = MockRtc;
-    type SdCardB = MockSdCard;
     type UsartB = MockUsart;
     type SystickB = MockSystick;
+    #[cfg(feature = "audio")]
     type AudioB = crate::audio::NoAudio;
+    #[cfg(feature = "jpeg")]
     type JpegB = crate::jpeg::NoJpeg;
     type GpioB = MockGpio;
     type EepromB = MockEeprom;

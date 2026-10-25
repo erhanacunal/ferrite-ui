@@ -390,9 +390,15 @@ const OP_EEPROM_WRITE: u8 = 0xB5; // pop value, pop addr → store low byte
 const OP_EEPROM_READ_ARR: u8 = 0xB6; // pop count, pop arr, pop addr → arr[0..count] = bytes
 const OP_EEPROM_WRITE_ARR: u8 = 0xB7; // pop count, pop arr, pop addr → store low bytes of arr[0..count]
 const OP_STR_BYTE: u8 = 0xB8; // pop index, pop str_id → push byte 0..255, or -1 past the end
+// Sound opcodes exist only with the `audio` feature; elsewhere they are
+// bad opcodes.
+#[cfg(feature = "audio")]
 const OP_SOUND_PLAY: u8 = 0xB9; // pop looping, pop str_id (RES_SOUND name) → push 1 started / 0
+#[cfg(feature = "audio")]
 const OP_SOUND_STOP: u8 = 0xBA; // stop the playing sound
+#[cfg(feature = "audio")]
 const OP_SOUND_VOLUME: u8 = 0xBB; // pop volume 0..100 → output volume
+#[cfg(feature = "audio")]
 const OP_SOUND_PLAYING: u8 = 0xBC; // push 1 while a sound plays, else 0
 
 // Float ops (all no-arg)
@@ -2323,6 +2329,7 @@ impl Vm {
             }
 
             // --- Sound (RES_SOUND resources, streamed by runtime's audio pump) ---
+            #[cfg(feature = "audio")]
             OP_SOUND_PLAY => {
                 let (str_id, looping) = self.pop2();
                 let name = ctx.strpool.get(str_id as u16);
@@ -2332,11 +2339,14 @@ impl Vm {
                 };
                 self.push(ok as i32);
             }
+            #[cfg(feature = "audio")]
             OP_SOUND_STOP => ctx.audio.stop(),
+            #[cfg(feature = "audio")]
             OP_SOUND_VOLUME => {
                 let vol = self.pop().clamp(0, 100) as u8;
                 ctx.audio.set_volume(vol);
             }
+            #[cfg(feature = "audio")]
             OP_SOUND_PLAYING => self.push(ctx.audio.playing() as i32),
 
             // --- Animation engine ---
@@ -2678,7 +2688,10 @@ impl Vm {
         }
         if prop_id == PROP_IMAGE_ID {
             if let Some(fs) = ctx.fs.as_ref() {
+                #[cfg(feature = "jpeg")]
                 ctx.images.find_or_load(val as u8, fs, &ctx.flash, &ctx.jpeg);
+                #[cfg(not(feature = "jpeg"))]
+                ctx.images.find_or_load(val as u8, fs, &ctx.flash);
             }
         }
         // A property write that changes appearance schedules a redraw, so
@@ -3571,6 +3584,7 @@ mod anim_tests {
     use crate::image::ImageList;
     use crate::strpool::StringPool;
     use crate::widget::WidgetTree;
+    #[cfg(feature = "audio")]
     use crate::audio::AudioImpl;
     use crate::gpio::GpioImpl;
 
@@ -3587,7 +3601,9 @@ mod anim_tests {
             rtc: RtcImpl::with_backend(MockRtc),
             usart: UsartImpl::with_backend(MockUsart),
             systick: SystickImpl::init(),
+            #[cfg(feature = "audio")]
             audio: AudioImpl::none(),
+            #[cfg(feature = "jpeg")]
             jpeg: crate::jpeg::JpegImpl::none(),
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
@@ -4131,6 +4147,15 @@ mod anim_tests {
         let vm = run_code(&[0xFF]);
         assert_eq!(vm.fault(), fault::BAD_OPCODE);
         assert_eq!(vm.fault_pc(), 0);
+    }
+
+    #[cfg(not(feature = "audio"))]
+    #[test]
+    fn sound_ops_are_bad_opcodes_without_audio() {
+        for op in 0xB9..=0xBC {
+            let vm = run_code(&[op]);
+            assert_eq!(vm.fault(), fault::BAD_OPCODE, "op {op:#x}");
+        }
     }
 
     #[test]

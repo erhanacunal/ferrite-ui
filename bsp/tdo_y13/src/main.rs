@@ -41,7 +41,6 @@ mod backlight;
 mod flash;
 mod lcd;
 mod rtc;
-mod sdcard;
 mod systick;
 mod touch;
 mod usart;
@@ -119,8 +118,6 @@ fn ui_task(_: *mut ()) {
         rtc: RtcImpl::with_backend(rtc::new()),
         usart: UsartImpl::with_backend(usart::new()),
         systick: systick::handle(),
-        audio: ferrite_core::audio::AudioImpl::none(),
-        jpeg: ferrite_core::jpeg::JpegImpl::none(),
         gpio: ferrite_core::gpio::GpioImpl::none(),
         eeprom: ferrite_core::eeprom::EepromImpl::none(),
         cursor_visible: false,

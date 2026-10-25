@@ -7,18 +7,21 @@ extern crate std;
 
 // --- HAL backend traits + generic wrappers + Platform ---
 
+#[cfg(feature = "audio")]
 pub mod audio;
 pub mod backlight;
 pub mod eeprom;
 pub mod flash;
 pub mod gfx_glyph;
 pub mod gpio;
+#[cfg(feature = "jpeg")]
 pub mod jpeg;
 pub mod lcd;
 #[cfg(feature = "mock")]
 pub mod mock;
 pub mod platform;
 pub mod rtc;
+#[cfg(feature = "sdcard")]
 pub mod sdcard;
 pub mod systick;
 pub mod touch;
@@ -31,6 +34,7 @@ pub mod config;
 pub mod fb;
 pub mod ctx;
 pub mod embedded_font;
+#[cfg(feature = "sdcard")]
 pub mod fat;
 pub mod font;
 pub mod fs;
@@ -41,6 +45,7 @@ pub mod proto;
 pub mod protocol;
 pub mod render;
 pub mod runtime;
+#[cfg(feature = "sdboot")]
 pub mod sdboot;
 pub mod strpool;
 pub mod syscfg;

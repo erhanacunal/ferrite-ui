@@ -31,7 +31,6 @@ impl Platform for SimPlatform {
     type TouchB = crate::touch::sim::MouseTouch;
     type BacklightB = crate::backlight::sim::StubBacklight;
     type RtcB = crate::rtc::sim::SystemRtc;
-    type SdCardB = crate::sdcard::sim::FileSd;
     type UsartB = crate::usart::sim::Stdio;
     type SystickB = crate::systick::SimSystick;
     type AudioB = crate::audio::SimAudio;

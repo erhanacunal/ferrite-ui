@@ -232,7 +232,16 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - `strByte(s, i)` (0xB8) returns byte `i` of a string, or -1 past the end. It is the counterpart of `arrToStr`, used to save names byte by byte.
 
 ### Device Features (CAPS)
-- **Pattern for optional hardware** (audio, JPEG, later video): a backend trait in ferrite-core with a null impl (`NoAudio`, `NoJpeg`), a `Platform::*B` slot, an `*Impl<B>` field in `Ctx`, and a `Platform::CAPS` bit (`CAP_AUDIO`, `CAP_VIDEO` reserved, `CAP_JPEG`). Every board fills the slot; boards without the hardware use the null impl, which compiles away (Nextion flash unchanged in practice). Several boards can share one feature through their own backends.
+- **Pattern for optional hardware** (audio, JPEG, later video): a ferrite-core cargo feature gating a backend trait (null impl `NoAudio`/`NoJpeg` for tests), a `Platform::*B` slot, an `*Impl<B>` field in `Ctx`, the VM opcodes / runtime calls that use it, and a `Platform::CAPS` bit (`CAP_AUDIO`, `CAP_VIDEO` reserved, `CAP_JPEG`). Several boards can share one feature through their own backends.
+- **ferrite-core features** — a BSP enables only what its board has; with a feature off the code is not compiled at all:
+  - `audio`: `audio` module, `Platform::AudioB`, `Ctx::audio`, sound opcodes 0xB9–0xBC (else bad opcode, fault 2), the `pump` / `stop` calls in `runtime`.
+  - `jpeg`: `jpeg` module, `Platform::JpegB`, `Ctx::jpeg`, the FI mode-3 paths in `image.rs` (else a mode-3 image doesn't load). `ImageList::find_or_load` takes the `&JpegImpl` argument only with it.
+  - `sdcard`: `sdcard` (block-device trait) + `fat`. There is no `Platform::SdCardB` slot: the BSP owns its card driver and passes it to `sdboot`.
+  - `sdboot` (implies `sdcard`): `sdboot::sd_boot_check::<P, S>`.
+  - Enabled by: nextion `sdboot` (BSP feature `sdboot`, default on; `--no-default-features` drops it, −5 KB), n32903 `audio` + `jpeg` + `sdboot`, sim `audio` + `jpeg`, epaper none (BSP feature `sdcard`, off: its SD driver is unused), tdo_y13 none.
+  - A BSP's `Platform` impl / `Ctx` literal must match the features it enables, so don't build several BSPs in one cargo invocation (`--workspace`): feature unification would turn on `audio` for every member.
+  - Tests: `cargo test -p ferrite-core --features host,mock --target x86_64-pc-windows-msvc` (features off), and again with `,audio,jpeg,sdboot` added.
+  - `ferrite_build` fails a program that calls `playSound`/`stopSound`/`setVolume`/`soundPlaying` when the device lacks `caps.audio` (`AUDIO_BUILTINS`).
 - `CAPS` bits are mirrored in `tools/devices/<id>.json` `caps.*` (+ the `_FALLBACK` table in `ferrite_devices.py`) — keep in sync. The build tools gate features on them.
 - **JPEG (`CAP_JPEG`, `caps.jpeg`):** FI image mode 3 = FI header + baseline JPEG stream. `ferrite_img.py` always re-encodes (`"mode": "jpeg"`, `"quality"` 1–100, default 85) to baseline 4:2:0, 3 components, standard Huffman tables, alpha flattened onto black. On a device without `caps.jpeg`, `ferrite_build` warns and falls back to `"auto"`. The designer defaults `.jpg`/`.jpeg` imports to `"jpeg"` on such devices.
   - Firmware: `ImageList::find_or_load` decodes once, at image load (`Image::decode_jpeg`), into an `AlignedBuf` (32-byte aligned, whole cache lines, stride/rows rounded up to 16) on the heap; drawing (`draw`/`draw_region`, scissored) copies from it. Out of heap / bad stream → the image doesn't load. `ImageList::clear` frees the buffers. RAM = stride × rows × 2 per image (800×480 = 750 KB), so RAM-rich boards only.
@@ -244,7 +253,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - Sim: `bsp/sim/src/audio.rs` (`SimAudio`): silent, consumes at the sample rate, logs start/stop, `--audio-out out.wav` records the output. Example: `examples/n32903/audio_demo`.
 
 ### SD Card Boot
-- `ferrite_core::fat` (read-only FAT16/32, generic over `SdCardBackend`) + `ferrite_core::sdboot::sd_boot_check(ctx, sd, present)`: `EMPTY.BIN` → recovery, `PROGRAM.BIN` → copied to `P::FS_BASE`. The BSP detects/inits the card; `present` makes the progress text visible (n32903: `lcd::flush_cache`).
+- `ferrite_core::fat` (read-only FAT16/32, generic over `SdCardBackend`, `sdcard` feature) + `ferrite_core::sdboot::sd_boot_check(ctx, sd, present)` (`sdboot` feature): `EMPTY.BIN` → recovery, `PROGRAM.BIN` → copied to `P::FS_BASE`. The BSP detects/inits the card; `present` makes the progress text visible (n32903: `lcd::flush_cache`).
 - **Nextion:** SPI SD (`sdcard/hw.rs`, PC13 CS).
 - **N32903:** the driver is in the HAL submodule, `n32903_rs::sd`: a Rust port of Nuvoton's N3290x SD driver (SDLoader `sd.c`), with init on any of the 3 SD ports, multi-block DMA read/write and card size from the CSD. SD cards only, no MMC. The HAL is meant to be a port of the vendor C library, so new peripheral drivers go there and the BSP only adapts them. `bsp/n32903/src/sdcard` adapts it: port 0 (GPE2–GPE7), plus a 32-byte-aligned bounce buffer because DMA needs cache-line alignment. There is no card-detect pin, so `init()` is the probe (~100 ms without a card). The SD host shares the FMI and DMAC with NAND: each op sets FMICR itself, and the FMI is never reset (that drops the NAND config). After an update, `flash::flush()` writes the shadow to NAND.
 

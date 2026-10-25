@@ -28,7 +28,6 @@ mod gpio;
 mod jpeg;
 mod lcd;
 mod rtc;
-mod sdcard;
 mod systick;
 mod touch;
 mod usart;

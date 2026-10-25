@@ -3,11 +3,13 @@
 /// Generic over `P: Platform` (ferrite-core): the hardware-backed fields use the
 /// platform's associated backend types, so the framework is written once and a BSP
 /// chooses concrete hardware by supplying `P`. Allocated on the heap via Box in main.
+#[cfg(feature = "audio")]
 use crate::audio::AudioImpl;
 use crate::backlight::BacklightImpl;
 use crate::eeprom::EepromImpl;
 use crate::flash::FlashImpl;
 use crate::gpio::GpioImpl;
+#[cfg(feature = "jpeg")]
 use crate::jpeg::JpegImpl;
 use crate::lcd::LcdImpl;
 use crate::platform::Platform;
@@ -33,7 +35,9 @@ pub struct Ctx<P: Platform> {
     pub rtc: RtcImpl<P::RtcB>,
     pub usart: UsartImpl<P::UsartB>,
     pub systick: SystickImpl<P::SystickB>,
+    #[cfg(feature = "audio")]
     pub audio: AudioImpl<P::AudioB>,
+    #[cfg(feature = "jpeg")]
     pub jpeg: JpegImpl<P::JpegB>,
     pub gpio: GpioImpl<P::GpioB>,
     pub eeprom: EepromImpl<P::EepromB>,

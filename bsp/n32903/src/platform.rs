@@ -30,7 +30,6 @@ impl Platform for N32903Platform {
     type TouchB = crate::touch::AdcTouch;
     type BacklightB = crate::backlight::PwmBl;
     type RtcB = crate::rtc::At8563;
-    type SdCardB = crate::sdcard::SicSd;
     type UsartB = crate::usart::HwUart;
     type SystickB = crate::systick::N32903Systick;
     type AudioB = crate::audio::SpuAudio;

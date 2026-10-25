@@ -5,15 +5,16 @@
 ///
 /// The framework (`Ctx`, `Vm`, `render`, etc.) is then generic over
 /// `P: Platform`, giving it access to all hardware through a single parameter.
+#[cfg(feature = "audio")]
 use crate::audio::AudioBackend;
 use crate::backlight::BacklightBackend;
 use crate::eeprom::EepromBackend;
 use crate::flash::FlashBackend;
 use crate::gpio::GpioBackend;
+#[cfg(feature = "jpeg")]
 use crate::jpeg::JpegBackend;
 use crate::lcd::LcdBackend;
 use crate::rtc::RtcBackend;
-use crate::sdcard::SdCardBackend;
 use crate::systick::SystickBackend;
 use crate::touch::TouchBackend;
 use crate::usart::UsartBackend;
@@ -27,11 +28,11 @@ use crate::usart::UsartBackend;
 // (`caps.audio` / `caps.video` / `caps.jpeg`) so the designer and build tools agree
 // with the firmware.
 
-/// Board has a real audio output backend (`Platform::AudioB` is not `NoAudio`).
+/// Board has a real audio output backend (`audio` feature, `Platform::AudioB`).
 pub const CAP_AUDIO: u32 = 1 << 0;
 /// Reserved: board can stream video resources.
 pub const CAP_VIDEO: u32 = 1 << 1;
-/// Board decodes JPEG images (`Platform::JpegB` is not `NoJpeg`).
+/// Board decodes JPEG images (`jpeg` feature, `Platform::JpegB`).
 pub const CAP_JPEG: u32 = 1 << 2;
 
 pub trait Platform {
@@ -42,13 +43,14 @@ pub trait Platform {
     type TouchB: TouchBackend;
     type BacklightB: BacklightBackend;
     type RtcB: RtcBackend;
-    type SdCardB: SdCardBackend;
     type UsartB: UsartBackend;
     type SystickB: SystickBackend;
-    // Boards without audio hardware use `ferrite_core::audio::NoAudio`.
+    // Sound output — only with the `audio` feature, which a BSP enables
+    // when its board has audio hardware (`NoAudio` is a placeholder).
+    #[cfg(feature = "audio")]
     type AudioB: AudioBackend;
-    // JPEG image decoder (FI mode 3); boards without one use
-    // `ferrite_core::jpeg::NoJpeg`.
+    // JPEG image decoder (FI mode 3) — only with the `jpeg` feature.
+    #[cfg(feature = "jpeg")]
     type JpegB: JpegBackend;
     // User GPIO header (`pinMode`/`pinWrite`/`pinRead`); boards without one
     // use `ferrite_core::gpio::NoGpio`.

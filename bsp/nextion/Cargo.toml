@@ -10,6 +10,12 @@ path = "src/main.rs"
 # Depends on the device-agnostic framework lib with NO device features: the BSP
 # owns every concrete backend and the global allocator comes from ferrite-core's
 # heap module (active on non-epaper targets).
+[features]
+# SD card boot (EMPTY.BIN → recovery, PROGRAM.BIN → flash update) over the
+# SPI SD slot. Drop it (`--no-default-features`) to save flash.
+default = ["sdboot"]
+sdboot = ["ferrite-core/sdboot"]
+
 [dependencies]
 ferrite-core = { path = "../../ferrite-core" }
 cortex-m = "0.7"
