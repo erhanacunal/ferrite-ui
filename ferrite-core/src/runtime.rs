@@ -324,8 +324,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                     protocol::send_pong(&ctx.usart);
                 }
                 RxEvent::ProgramReady => {
-                    error_code = reload_program(&mut ctx, &mut vm, &mut input, &protocol);
-                    protocol.free_program();
+                    error_code = reload_program(&mut ctx, &mut vm, &mut input, &mut protocol);
                     if error_code != 0 {
                         show_error(&mut ctx, error_code, None);
                     } else {
@@ -499,7 +498,7 @@ fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
         if let Some(fs) = ctx.fs.as_ref() {
             fs.read_resource(&ctx.flash, &entry, 0, &mut img);
         }
-        if !vm.load_ram_owned(img) {
+        if vm.load_ram_owned(img).is_err() {
             err = ERR_PROGRAM_ERROR;
         }
     }
@@ -599,7 +598,7 @@ fn reload_program<P: PlatformRuntime>(
     ctx: &mut Ctx<P>,
     vm: &mut Vm,
     input: &mut P::Input,
-    protocol: &Protocol,
+    protocol: &mut Protocol,
 ) -> u8 {
     ctx.objs.clear();
     vm.reset();
@@ -610,8 +609,7 @@ fn reload_program<P: PlatformRuntime>(
 
     alloc_root(ctx);
 
-    let prog = protocol.program_code();
-    if !vm.load_ram(prog) {
+    if let Err(prog) = vm.load_ram_owned(protocol.take_program()) {
         vm.load_raw(prog);
     }
     apply_orientation(ctx, vm);

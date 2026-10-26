@@ -882,15 +882,16 @@ impl Vm {
     /// Load a VM image from RAM bytes. Parses the image header and keeps
     /// opcodes in a Vec<u8>. Returns false if the header is invalid.
     pub fn load_ram(&mut self, image: &[u8]) -> bool {
-        self.load_ram_owned(image.to_vec())
+        self.load_ram_owned(image.to_vec()).is_ok()
     }
 
     /// Like `load_ram`, but takes the image buffer and strips the header in
-    /// place, so loading needs no second copy of the program.
-    pub fn load_ram_owned(&mut self, mut image: Vec<u8>) -> bool {
+    /// place, so loading needs no second copy of the program. On failure the
+    /// buffer comes back unchanged.
+    pub fn load_ram_owned(&mut self, mut image: Vec<u8>) -> Result<(), Vec<u8>> {
         if let Some((funcs, opcode_start, gc, rm, hint, wide, portrait)) = parse_image_header(&image) {
             if !code_addressable(wide, image.len() - opcode_start) {
-                return false;
+                return Err(image);
             }
             image.drain(..opcode_start);
             let opcodes = image;
@@ -903,9 +904,9 @@ impl Vm {
             self.render_mode = self.forced_render_mode.unwrap_or(rm);
             self.portrait = portrait;
             self.tree_hint = hint;
-            true
+            Ok(())
         } else {
-            false
+            Err(image)
         }
     }
 
@@ -966,8 +967,8 @@ impl Vm {
     }
 
     /// Load raw bytecode (no image header). Used for page bytecode.
-    pub fn load_raw(&mut self, data: &[u8]) {
-        self.code = VmCode::Ram(data.to_vec());
+    pub fn load_raw(&mut self, data: Vec<u8>) {
+        self.code = VmCode::Ram(data);
         self.tree_hint = None;
         self.wide_addr = false;
         self.functions.clear();
@@ -4321,6 +4322,25 @@ mod anim_tests {
         let mut vm = Vm::new();
         let flash = FlashImpl::with_backend(RomFlash(img.clone()));
         assert!(!vm.load_flash(flash, 0, img.len()));
+    }
+
+    #[test]
+    fn load_ram_owned_keeps_the_buffer() {
+        let mut vm = Vm::new();
+        let img = image(0, &[OP_PUSH_1, OP_HALT]);
+        let ptr = img.as_ptr();
+        assert!(vm.load_ram_owned(img).is_ok());
+        // Header stripped in place: same allocation, opcodes only.
+        match &vm.code {
+            VmCode::Ram(code) => {
+                assert_eq!(code.as_slice(), &[OP_PUSH_1, OP_HALT]);
+                assert_eq!(code.as_ptr(), ptr);
+            }
+            _ => panic!("expected RAM code"),
+        }
+        // A bad header hands the buffer back untouched (raw-bytecode fallback).
+        let raw = alloc::vec![0xFFu8, 1, 2];
+        assert_eq!(vm.load_ram_owned(raw.clone()), Err(raw));
     }
 
     #[test]

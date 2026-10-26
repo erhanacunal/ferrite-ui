@@ -240,15 +240,10 @@ impl Protocol {
         self.program_buf = Vec::new();
     }
 
-    /// Return program bytecode (valid after ProgramReady event).
-    pub fn program_code(&self) -> &[u8] {
-        &self.program_buf
-    }
-
-    /// Free the program buffer, returning heap memory.
-    /// Call after copying program to code_buf.
-    pub fn free_program(&mut self) {
-        self.program_buf = Vec::new();
+    /// Hand over the received program (valid after ProgramReady event),
+    /// leaving the buffer empty. The VM keeps it, so loading makes no copy.
+    pub fn take_program(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.program_buf)
     }
 
     /// Pre-allocate 4KB sector buffer for flash writes.
