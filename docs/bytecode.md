@@ -360,7 +360,7 @@ Compound properties are used by `W_SET_LEN`:
 | `0x42` | reserved | former `MARGIN` compound (margin removed) |
 | `0x43` | `BORDER_EDGES` | four packed ZigZag varints |
 | `0x44` | `PADDING` | four packed ZigZag varints |
-| `0x45` | `TEXT` | UTF-8 bytes; allocated in `StringPool` |
+| `0x45` | `TEXT` | UTF-8 bytes; allocated as a string object in the object pool |
 
 ## Widget Kinds
 

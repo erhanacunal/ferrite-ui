@@ -18,8 +18,7 @@ use ferrite_core::ctx::Ctx;
 use ferrite_core::font::FontList;
 use ferrite_core::heap;
 use ferrite_core::image::ImageList;
-use ferrite_core::strpool::StringPool;
-use ferrite_core::widget::WidgetTree;
+use ferrite_core::pool::ObjPool;
 
 // --- Concrete hardware backends (type aliases + free-fn constructors) ---
 mod backlight;
@@ -294,10 +293,9 @@ fn build_ctx(gpio: Gpio) -> Box<Ctx<NextionPlatform>> {
     Box::new(Ctx::<NextionPlatform> {
         lcd: lcd::new(gpio),
         flash: flash::init(),
-        tree: WidgetTree::new(),
         fonts: FontList::new(),
         images: ImageList::new(),
-        strpool: StringPool::new(),
+        objs: ObjPool::new(),
         fs: None,
         backlight: backlight::init(),
         rtc: rtc::init(),

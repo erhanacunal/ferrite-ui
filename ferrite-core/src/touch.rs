@@ -169,8 +169,8 @@ impl<B: TouchBackend> TouchImpl<B> {
     }
 }
 
-// Hit test — pure widget-tree logic (WidgetTree lives in this crate).
-pub fn hit_test(tree: &mut crate::widget::WidgetTree, x: u16, y: u16) -> crate::widget::WidgetId {
+// Hit test — pure widget-tree logic (ObjPool lives in this crate).
+pub fn hit_test(tree: &mut crate::pool::ObjPool, x: u16, y: u16) -> crate::widget::WidgetId {
     use crate::widget::FLAG_CLICKABLE;
     let dfs = tree.dfs_order();
     let mut result = crate::widget::WidgetId::NONE;

@@ -26,10 +26,9 @@ use ferrite_core::font::FontList;
 use ferrite_core::image::ImageList;
 use ferrite_core::lcd::LcdImpl;
 use ferrite_core::rtc::RtcImpl;
-use ferrite_core::strpool::StringPool;
+use ferrite_core::pool::ObjPool;
 use ferrite_core::touch::TouchImpl;
 use ferrite_core::usart::UsartImpl;
-use ferrite_core::widget::WidgetTree;
 
 use n32903_rs::aic::{self, LocalIntState};
 use n32903_rs::cache::{self, CacheMode};
@@ -99,10 +98,9 @@ pub extern "C" fn rust_main() -> ! {
     let ctx = Box::new(Ctx::<N32903Platform> {
         lcd: LcdImpl::with_backend(lcd::new()),
         flash: FlashImpl::with_backend(flash::new()),
-        tree: WidgetTree::new(),
         fonts: FontList::new(),
         images: ImageList::new(),
-        strpool: StringPool::new(),
+        objs: ObjPool::new(),
         fs: None,
         backlight: BacklightImpl::with_backend(backlight::new()),
         rtc: RtcImpl::with_backend(rtc::new()),

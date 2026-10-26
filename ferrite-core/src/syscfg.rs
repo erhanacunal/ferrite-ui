@@ -12,13 +12,12 @@
 ///
 /// Layout (little-endian, 32 bytes):
 ///   0  u16  magic "SC"
-///   2  u8   version (1)
+///   2  u8   version (2)
 ///   3  u8   reserved
-///   4  u32  strpool_bytes   string pool buffer
-///   8  u16  max_strings     string pool slots
+///   4  u32  arena_bytes     object pool arena (widgets, strings, arrays)
+///   8  u16  max_objects     object pool pointers (≤ pool::MAX_OBJECTS)
 ///  10  u16  uart_rx_bytes   USART RX ring (rounded up to a power of two)
-///  12  u16  max_widgets     widget cap (≤ widget::MAX_WIDGETS)
-///  14  u16  max_ext         widget extension cap (≤ widget::MAX_EXTENSIONS)
+///  12  ..   reserved (0)
 ///  16  u8   eval_stack      VM evaluation stack depth
 ///  17  u8   call_stack      VM call stack depth
 ///  18  u8   cb_queue        VM callback queue length
@@ -38,16 +37,14 @@ pub const SYSCFG_NAME: &[u8] = b"sys";
 pub const SYSCFG_SIZE: usize = 32;
 
 const MAGIC: u16 = 0x4353; // "SC" LE
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// Pool sizes requested by the image. 0 in any field = platform default.
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct SysCfg {
-    pub strpool_bytes: u32,
-    pub max_strings: u16,
+    pub arena_bytes: u32,
+    pub max_objects: u16,
     pub uart_rx_bytes: u16,
-    pub max_widgets: u16,
-    pub max_ext: u16,
     pub eval_stack: u8,
     pub call_stack: u8,
     pub cb_queue: u8,
@@ -76,11 +73,9 @@ impl SysCfg {
             return Err(SysCfgError::BadVersion);
         }
         Ok(Self {
-            strpool_bytes: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-            max_strings: u16_at(8),
+            arena_bytes: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            max_objects: u16_at(8),
             uart_rx_bytes: u16_at(10),
-            max_widgets: u16_at(12),
-            max_ext: u16_at(14),
             eval_stack: b[16],
             call_stack: b[17],
             cb_queue: b[18],
@@ -127,8 +122,6 @@ mod tests {
         b[4..8].copy_from_slice(&4096u32.to_le_bytes());
         b[8..10].copy_from_slice(&96u16.to_le_bytes());
         b[10..12].copy_from_slice(&512u16.to_le_bytes());
-        b[12..14].copy_from_slice(&200u16.to_le_bytes());
-        b[14..16].copy_from_slice(&150u16.to_le_bytes());
         b[16] = 32;
         b[17] = 12;
         b[18] = 16;
@@ -142,11 +135,9 @@ mod tests {
         assert_eq!(
             cfg,
             SysCfg {
-                strpool_bytes: 4096,
-                max_strings: 96,
+                arena_bytes: 4096,
+                max_objects: 96,
                 uart_rx_bytes: 512,
-                max_widgets: 200,
-                max_ext: 150,
                 eval_stack: 32,
                 call_stack: 12,
                 cb_queue: 16,
@@ -159,7 +150,7 @@ mod tests {
     fn parse_rejects_bad_records() {
         let mut b = record();
         assert_eq!(SysCfg::parse(&b[..16]), Err(SysCfgError::BadEntry));
-        b[2] = 2;
+        b[2] = 1;
         assert_eq!(SysCfg::parse(&b), Err(SysCfgError::BadVersion));
         b[0] = 0;
         assert_eq!(SysCfg::parse(&b), Err(SysCfgError::BadMagic));

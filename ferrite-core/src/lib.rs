@@ -47,6 +47,7 @@ pub mod render;
 pub mod runtime;
 #[cfg(feature = "sdboot")]
 pub mod sdboot;
+pub mod pool;
 pub mod strpool;
 pub mod syscfg;
 pub mod types;
@@ -65,9 +66,9 @@ fn _mock_instantiation_guard() {
     use crate::mock::{MockFlash, MockLcd, MockPlatform as M};
     let _: fn(&keyboard::Keyboard, &lcd::Lcd, &font::FontList, &flash::Flash) =
         keyboard::Keyboard::draw::<MockLcd, MockFlash>;
-    let _: fn(&mut ctx::Ctx<M>, &vm::Vm) = render::render_dirty::<M>;
-    let _: fn(&mut ctx::Ctx<M>, &vm::Vm) = render::render_all::<M>;
-    let _: fn(&mut ctx::Ctx<M>, &vm::Vm) -> render::PaintList =
+    let _: fn(&mut ctx::Ctx<M>) = render::render_dirty::<M>;
+    let _: fn(&mut ctx::Ctx<M>) = render::render_all::<M>;
+    let _: fn(&mut ctx::Ctx<M>) -> render::PaintList =
         render::render_buffered_content::<M>;
     let _: fn(&mut vm::Vm, &mut ctx::Ctx<M>, &render::PaintList) = vm::Vm::run_paint::<M>;
     let _: fn(&mut ctx::Ctx<M>) -> bool = render::buffered_has_dirty::<M>;

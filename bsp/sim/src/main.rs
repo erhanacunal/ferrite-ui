@@ -16,8 +16,7 @@ use ferrite_core::ctx::Ctx;
 use ferrite_core::font::FontList;
 use ferrite_core::fs::{self as ferrite_fs, Fs};
 use ferrite_core::image::ImageList;
-use ferrite_core::strpool::StringPool;
-use ferrite_core::widget::WidgetTree;
+use ferrite_core::pool::ObjPool;
 
 // --- Concrete host backends (type aliases + free-fn constructors) ---
 mod audio;
@@ -88,10 +87,9 @@ fn main() {
     let ctx = Box::new(Ctx::<SimPlatform> {
         lcd: lcd::new(fb.clone()),
         flash,
-        tree: WidgetTree::new(),
         fonts: FontList::new(),
         images: ImageList::new(),
-        strpool: StringPool::new(),
+        objs: ObjPool::new(),
         fs: None,
         backlight: backlight::new(),
         rtc: rtc::init(),

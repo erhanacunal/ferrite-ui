@@ -7,7 +7,7 @@
         {
             "name": "main",
             "source": "main.fl",
-            "exec_mode": "ram"
+            "exec_mode": "flash"
         }
     ]
 }

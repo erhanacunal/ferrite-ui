@@ -12,7 +12,7 @@ use ferrite_core::platform::{CAP_AUDIO, CAP_JPEG, Platform};
 
 use ferrite_core::ctx::Ctx;
 use ferrite_core::runtime::{FullInput, PlatformRuntime};
-use ferrite_core::strpool::StringPool;
+use ferrite_core::pool::ObjPool;
 use ferrite_core::types::{COLOR_BLACK, COLOR_WHITE};
 
 use minifb::{Key, MouseButton, MouseMode, Window};
@@ -93,7 +93,7 @@ impl PlatformRuntime for SimPlatform {
         std::process::exit(0)
     }
 
-    fn syscall(id: u8, _args: &[i32], _strpool: &StringPool) -> Option<i32> {
+    fn syscall(id: u8, _args: &[i32], _strpool: &ObjPool) -> Option<i32> {
         match id {
             0x00 => Some(systick::millis() as i32), // SYS_UPTIME
             _ => None,

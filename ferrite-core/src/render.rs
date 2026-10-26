@@ -2,14 +2,14 @@ use crate::clip::ClipRegion;
 use crate::ctx::Ctx;
 use crate::lcd::{self};
 use crate::types::{Color, Edges, Offset, Rect};
-use crate::vm::Vm;
+use crate::pool::ObjPool;
 use crate::lcd::{LcdBackend, LcdImpl, Underlay};
 use crate::platform::Platform;
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
     FLAG_HAS_ON_PAINT, FLAG_PAINTED, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
     KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_PROGRESS,
-    KIND_BUTTON_GROUP, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, WidgetTree,
+    KIND_BUTTON_GROUP, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId,
 };
 
 /// Screen-bounds rect: the panel size from `LcdBackend::WIDTH`/`HEIGHT`,
@@ -24,9 +24,9 @@ fn screen_rect<B: LcdBackend>(lcd: &LcdImpl<B>) -> Rect {
 /// Check if the back buffer has any dirty widgets.
 pub fn buffered_has_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
     let buf = ctx.lcd.back_buf();
-    ctx.tree.ensure_dfs();
-    for i in 0..ctx.tree.dfs_len() {
-        if ctx.tree.get(ctx.tree.dfs_at(i)).is_dirty_buf(buf) {
+    ctx.objs.ensure_dfs();
+    for i in 0..ctx.objs.dfs_len() {
+        if ctx.objs.get(ctx.objs.dfs_at(i)).is_dirty_buf(buf) {
             return true;
         }
     }
@@ -70,10 +70,10 @@ impl PaintList {
 /// Dirty-mode counterpart of the list `render_buffered_content` returns: the
 /// dirty on_paint widgets, collected *before* `render_dirty` clears the flags.
 pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
-    ctx.tree.ensure_dfs();
-    for i in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(i);
-        let w = ctx.tree.get(id);
+    ctx.objs.ensure_dfs();
+    for i in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(i);
+        let w = ctx.objs.get(id);
         if w.is_dirty() && w.flags & FLAG_HAS_ON_PAINT != 0 {
             out.push(id);
         }
@@ -89,51 +89,51 @@ pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
 /// `on_paint` for the returned widgets in between (`Vm::run_paint`): their
 /// custom drawing belongs to this back buffer, on top of the background just
 /// drawn — painting after the swap would reach only one of the two buffers.
-pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) -> PaintList {
+pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
     let mut paint = PaintList::new();
     let buf = ctx.lcd.back_buf();
-    ctx.tree.ensure_dfs();
+    ctx.objs.ensure_dfs();
     // Whole-screen clip for the unclipped Pass-2 draws (built once).
     let full = ClipRegion::from_rect(screen_rect(&ctx.lcd));
 
     // Pass 1: for each dirty widget whose rect in THIS buffer is stale,
     // redraw everything behind it clipped to the stale rect.
-    for i in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(i);
-        let w = ctx.tree.get(id);
+    for i in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(i);
+        let w = ctx.objs.get(id);
         if !w.is_dirty_buf(buf) {
             continue;
         }
-        let stale = buf_prev_rect(&ctx.tree, id, buf);
+        let stale = buf_prev_rect(&ctx.objs, id, buf);
         if stale.is_empty() {
             continue;
         }
         let current = if w.is_visible() {
-            ctx.tree.absolute_rect(id)
+            ctx.objs.absolute_rect(id)
         } else {
             Rect::new(0, 0, 0, 0)
         };
         if stale == current {
             continue;
         } // rect unchanged — no trail to clean
-        redraw_behind(ctx, vm, i, stale);
+        redraw_behind(ctx, i, stale);
     }
 
     // Pass 2: draw dirty visible widgets at their current rect
-    clear_painted(&mut ctx.tree);
-    for i in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(i);
-        let w = ctx.tree.get(id);
-        if !w.is_dirty_buf(buf) || !ctx.tree.is_tree_visible(id) {
+    clear_painted(&mut ctx.objs);
+    for i in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(i);
+        let w = ctx.objs.get(id);
+        if !w.is_dirty_buf(buf) || !ctx.objs.is_tree_visible(id) {
             continue;
         }
 
-        let abs = ctx.tree.absolute_rect(id);
+        let abs = ctx.objs.absolute_rect(id);
 
         // Viewport clipping for children of scroll containers
-        let sp = ctx.tree.scroll_parent(id);
+        let sp = ctx.objs.scroll_parent(id);
         if sp.is_some() {
-            let viewport = ctx.tree.scroll_viewport(sp);
+            let viewport = ctx.objs.scroll_viewport(sp);
             if abs.x < viewport.x
                 || abs.y < viewport.y
                 || abs.right() > viewport.right()
@@ -146,96 +146,70 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) -> PaintL
         // Translucent widgets and transparent labels must not blend over
         // their own previous output in this buffer — restore what is behind
         // them first, unless this pass already repainted all of it.
-        if ctx.lcd.has_alpha() && shows_behind(&ctx.tree, id) && !behind_is_fresh(&ctx.tree, 0, i, &abs)
+        if ctx.lcd.has_alpha() && shows_behind(&ctx.objs, id) && !behind_is_fresh(&ctx.objs, 0, i, &abs)
         {
-            redraw_behind(ctx, vm, i, abs);
+            redraw_behind(ctx, i, abs);
         }
-        draw_widget(ctx, vm, id, &abs, &full);
-        ctx.tree.get_mut(id).flags |= FLAG_RENDERED | FLAG_PAINTED;
-        if ctx.tree.get(id).flags & FLAG_HAS_ON_PAINT != 0 {
+        draw_widget(ctx, id, &abs, &full);
+        ctx.objs.get_mut(id).flags |= FLAG_RENDERED | FLAG_PAINTED;
+        if ctx.objs.get(id).flags & FLAG_HAS_ON_PAINT != 0 {
             paint.push(id);
         }
     }
 
     // Draw scrollbars on top
-    for i in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(i);
-        if ctx.tree.get(id).flags & FLAG_CLIP_CHILDREN != 0
-            && ctx.tree.get(id).is_dirty_buf(buf)
-            && ctx.tree.is_tree_visible(id)
+    for i in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(i);
+        if ctx.objs.get(id).flags & FLAG_CLIP_CHILDREN != 0
+            && ctx.objs.get(id).is_dirty_buf(buf)
+            && ctx.objs.is_tree_visible(id)
         {
-            let abs = ctx.tree.absolute_rect(id);
+            let abs = ctx.objs.absolute_rect(id);
             draw_scrollbar(ctx, id, &abs);
         }
     }
 
-    clear_painted(&mut ctx.tree);
+    clear_painted(&mut ctx.objs);
 
     // Record this buffer's state and clear its dirty flag for each widget.
-    for i in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(i);
-        if ctx.tree.get(id).is_dirty_buf(buf) {
-            let drawn_rect = if ctx.tree.is_tree_visible(id) {
-                ctx.tree.absolute_rect(id)
+    for i in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(i);
+        if ctx.objs.get(id).is_dirty_buf(buf) {
+            let drawn_rect = if ctx.objs.is_tree_visible(id) {
+                ctx.objs.absolute_rect(id)
             } else {
                 Rect::new(0, 0, 0, 0)
             };
-            set_buf_prev_rect(&mut ctx.tree, id, buf, drawn_rect);
+            set_buf_prev_rect(&mut ctx.objs, id, buf, drawn_rect);
         }
-        ctx.tree.get_mut(id).clear_dirty_buf(buf);
+        ctx.objs.get_mut(id).clear_dirty_buf(buf);
     }
     paint
 }
 
 /// Read this widget's prev_rect for the given buffer index (0=A, 1=B).
-fn buf_prev_rect(tree: &WidgetTree, id: WidgetId, buf: u8) -> Rect {
-    match tree.ext(id) {
-        Some(ext) if buf == 0 => ext.prev_rect_a,
-        Some(ext) => ext.prev_rect_b,
-        None => Rect::new(0, 0, 0, 0),
-    }
+fn buf_prev_rect(tree: &ObjPool, id: WidgetId, buf: u8) -> Rect {
+    tree.prev_rect(id, buf)
 }
 
-/// Store this widget's drawn rect for the given buffer. Allocates ext on
-/// demand — returns silently if the widget isn't visible AND the stored
-/// rect would be empty (nothing to track).
-fn set_buf_prev_rect(tree: &mut WidgetTree, id: WidgetId, buf: u8, rect: Rect) {
-    // Skip if both old and new are empty — nothing to remember.
-    if rect.is_empty() {
-        if tree
-            .ext(id)
-            .map(|e| {
-                if buf == 0 {
-                    e.prev_rect_a.is_empty()
-                } else {
-                    e.prev_rect_b.is_empty()
-                }
-            })
-            .unwrap_or(true)
-        {
-            return;
-        }
-    }
-    if let Some(ext) = tree.ensure_ext(id) {
-        if buf == 0 {
-            ext.prev_rect_a = rect;
-        } else {
-            ext.prev_rect_b = rect;
-        }
-    }
+/// Store this widget's drawn rect for the given buffer. Adds the widget's
+/// prev-rect section on demand; an empty rect with nothing stored yet is
+/// skipped (nothing to track).
+fn set_buf_prev_rect(tree: &mut ObjPool, id: WidgetId, buf: u8, rect: Rect) {
+    tree.set_prev_rect(id, buf, rect);
 }
 
 /// Redraw widgets that sit behind widget `target_idx` (earlier in DFS order),
 /// clipped to `stale`. Used to restore pixels under a moved/hidden widget.
 /// Reads the DFS order from the tree cache — ensure_dfs must have been called
 /// before entering the enclosing render loop.
-fn redraw_behind<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm, target_idx: usize, stale: Rect) {
+fn redraw_behind<P: Platform>(ctx: &mut Ctx<P>, target_idx: usize, stale: Rect) {
     let mut clip = ClipRegion::from_rect(stale);
     clip.clip_to_bounds(&screen_rect(&ctx.lcd));
     if clip.is_empty() {
         return;
     }
-    redraw_behind_region(ctx, vm, target_idx, &clip, &stale);
+    redraw_behind_region(ctx, target_idx, &clip, &stale);
 }
 
 /// `redraw_behind` over a prebuilt clip region (`bounds` is its enclosing
@@ -245,21 +219,20 @@ fn redraw_behind<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm, target_idx: usize, stal
 /// output and accumulates toward solid a little more every frame.
 fn redraw_behind_region<P: Platform>(
     ctx: &mut Ctx<P>,
-    vm: &Vm,
     target_idx: usize,
     clip: &ClipRegion,
     bounds: &Rect,
 ) {
     for i in 0..target_idx {
-        let uid = ctx.tree.dfs_at(i);
-        if !ctx.tree.is_tree_visible(uid) {
+        let uid = ctx.objs.dfs_at(i);
+        if !ctx.objs.is_tree_visible(uid) {
             continue;
         }
-        let u_abs = ctx.tree.absolute_rect(uid);
+        let u_abs = ctx.objs.absolute_rect(uid);
         if !u_abs.intersects(bounds) {
             continue;
         }
-        draw_widget(ctx, vm, uid, &u_abs, clip);
+        draw_widget(ctx, uid, &u_abs, clip);
     }
 }
 
@@ -267,65 +240,65 @@ fn redraw_behind_region<P: Platform>(
 
 /// Draw the entire widget tree from scratch (initial draw or full redraw).
 /// Iterative DFS using cached order — no recursion, no stack growth.
-pub fn render_all<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
-    render_all_iterative(ctx, vm);
+pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
+    render_all_iterative(ctx);
     clear_all_dirty(ctx);
 }
 
 /// Iterative full redraw: walk DFS order, skip invisible subtrees.
 /// Children of scroll containers are clipped to the viewport.
-fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
-    ctx.tree.ensure_dfs();
+fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>) {
+    ctx.objs.ensure_dfs();
     // Whole-screen clip for the full redraw — built once, reused for every
     // widget so we don't pay region setup in the per-widget loop.
     let full = ClipRegion::from_rect(screen_rect(&ctx.lcd));
     let mut i = 0;
-    while i < ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(i);
-        if !ctx.tree.is_tree_visible(id) {
+    while i < ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(i);
+        if !ctx.objs.is_tree_visible(id) {
             // Skip entire subtree of this invisible widget
             let mut end = i + 1;
-            while end < ctx.tree.dfs_len() && ctx.tree.is_descendant(ctx.tree.dfs_at(end), id) {
+            while end < ctx.objs.dfs_len() && ctx.objs.is_descendant(ctx.objs.dfs_at(end), id) {
                 end += 1;
             }
             i = end;
             continue;
         }
-        let abs = ctx.tree.absolute_rect(id);
+        let abs = ctx.objs.absolute_rect(id);
 
         // Viewport clipping for children of scroll containers
-        let sp = ctx.tree.scroll_parent(id);
+        let sp = ctx.objs.scroll_parent(id);
         if sp.is_some() {
-            let viewport = ctx.tree.scroll_viewport(sp);
+            let viewport = ctx.objs.scroll_viewport(sp);
             // Only draw if FULLY inside viewport (text can't be partially clipped)
             if abs.x >= viewport.x
                 && abs.y >= viewport.y
                 && abs.right() <= viewport.right()
                 && abs.bottom() <= viewport.bottom()
             {
-                draw_widget(ctx, vm, id, &abs, &full);
-                ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
+                draw_widget(ctx, id, &abs, &full);
+                ctx.objs.get_mut(id).flags |= FLAG_RENDERED;
             } else {
                 // Outside or partially visible — skip entire subtree
                 let mut end = i + 1;
-                while end < ctx.tree.dfs_len() && ctx.tree.is_descendant(ctx.tree.dfs_at(end), id) {
+                while end < ctx.objs.dfs_len() && ctx.objs.is_descendant(ctx.objs.dfs_at(end), id) {
                     end += 1;
                 }
                 i = end;
                 continue;
             }
         } else {
-            draw_widget(ctx, vm, id, &abs, &full);
-            ctx.tree.get_mut(id).flags |= FLAG_RENDERED;
+            draw_widget(ctx, id, &abs, &full);
+            ctx.objs.get_mut(id).flags |= FLAG_RENDERED;
         }
         i += 1;
     }
 
     // Draw scrollbars on top of all children
-    for i in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(i);
-        if ctx.tree.get(id).flags & FLAG_CLIP_CHILDREN != 0 && ctx.tree.is_tree_visible(id) {
-            let abs = ctx.tree.absolute_rect(id);
+    for i in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(i);
+        if ctx.objs.get(id).flags & FLAG_CLIP_CHILDREN != 0 && ctx.objs.is_tree_visible(id) {
+            let abs = ctx.objs.absolute_rect(id);
             draw_scrollbar(ctx, id, &abs);
         }
     }
@@ -338,12 +311,12 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
 /// Two-pass approach: erase invisible widgets first, then draw visible ones.
 /// This prevents hidden panels from overwriting visible siblings that share
 /// the same screen area (e.g. tab panels stacked at the same position).
-pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
-    ctx.tree.ensure_dfs();
+pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
+    ctx.objs.ensure_dfs();
 
     let mut has_dirty = false;
-    for i in 0..ctx.tree.dfs_len() {
-        if ctx.tree.get(ctx.tree.dfs_at(i)).is_dirty() {
+    for i in 0..ctx.objs.dfs_len() {
+        if ctx.objs.get(ctx.objs.dfs_at(i)).is_dirty() {
             has_dirty = true;
             break;
         }
@@ -357,18 +330,18 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
     // Without this gate, an animated widget on a hidden page (e.g. a progress
     // bar still being ticked by loop()) would repaint its stale rect every
     // frame with the ancestor bg, overwriting whatever sibling page is shown.
-    for di in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(di);
-        if !ctx.tree.get(id).is_dirty() {
+    for di in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(di);
+        if !ctx.objs.get(id).is_dirty() {
             continue;
         }
-        if !ctx.tree.is_tree_visible(id) {
-            if ctx.tree.get(id).flags & FLAG_RENDERED != 0 {
-                let abs = ctx.tree.absolute_rect(id);
+        if !ctx.objs.is_tree_visible(id) {
+            if ctx.objs.get(id).flags & FLAG_RENDERED != 0 {
+                let abs = ctx.objs.absolute_rect(id);
                 if !abs.is_empty() {
-                    erase_widget_area(&ctx.tree, &ctx.lcd, id, abs);
+                    erase_widget_area(&ctx.objs, &ctx.lcd, id, abs);
                 }
-                ctx.tree.get_mut(id).flags &= !FLAG_RENDERED;
+                ctx.objs.get_mut(id).flags &= !FLAG_RENDERED;
             }
         }
     }
@@ -376,25 +349,25 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
     // Pass 1b: for each dirty visible widget whose rect in buffer A is stale,
     // redraw everything behind it clipped to the stale rect (restores pixels
     // hidden by the widget's previous position).
-    for di in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(di);
-        let w = ctx.tree.get(id);
+    for di in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(di);
+        let w = ctx.objs.get(id);
         if !w.is_dirty() {
             continue;
         }
-        let stale = buf_prev_rect(&ctx.tree, id, 0);
+        let stale = buf_prev_rect(&ctx.objs, id, 0);
         if stale.is_empty() {
             continue;
         }
         let current = if w.is_visible() {
-            ctx.tree.absolute_rect(id)
+            ctx.objs.absolute_rect(id)
         } else {
             Rect::new(0, 0, 0, 0)
         };
         if stale == current {
             continue;
         }
-        redraw_behind(ctx, vm, di, stale);
+        redraw_behind(ctx, di, stale);
     }
 
     // Pass 2: draw dirty visible widgets with clipping. A dirty widget is
@@ -402,30 +375,30 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
     // that subtree: `mark_dirty` marks every descendant too, so visiting them
     // again would redraw each nested level once more (a label three levels
     // deep was drawn four times).
-    clear_painted(&mut ctx.tree);
+    clear_painted(&mut ctx.objs);
     let mut di = 0;
-    while di < ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(di);
+    while di < ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(di);
 
-        if !ctx.tree.get(id).is_dirty() || !ctx.tree.is_tree_visible(id) {
+        if !ctx.objs.get(id).is_dirty() || !ctx.objs.is_tree_visible(id) {
             di += 1;
             continue;
         }
 
         // Find subtree end: contiguous descendants after di
         let mut sub_end = di + 1;
-        while sub_end < ctx.tree.dfs_len() && ctx.tree.is_descendant(ctx.tree.dfs_at(sub_end), id) {
+        while sub_end < ctx.objs.dfs_len() && ctx.objs.is_descendant(ctx.objs.dfs_at(sub_end), id) {
             sub_end += 1;
         }
 
         // Collect occluder rects: visible widgets after this subtree in DFS
         let mut occluders = [Rect::new(0, 0, 0, 0); 32];
         let mut occ_count: usize = 0;
-        let abs = ctx.tree.absolute_rect(id);
+        let abs = ctx.objs.absolute_rect(id);
 
-        for j in sub_end..ctx.tree.dfs_len() {
-            if ctx.tree.is_tree_visible(ctx.tree.dfs_at(j)) {
-                let other_abs = ctx.tree.absolute_rect(ctx.tree.dfs_at(j));
+        for j in sub_end..ctx.objs.dfs_len() {
+            if ctx.objs.is_tree_visible(ctx.objs.dfs_at(j)) {
+                let other_abs = ctx.objs.absolute_rect(ctx.objs.dfs_at(j));
                 if abs.intersects(&other_abs) && occ_count < 32 {
                     occluders[occ_count] = other_abs;
                     occ_count += 1;
@@ -435,20 +408,20 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
 
         // Flat iteration over dirty widget + its descendants
         for si in di..sub_end {
-            let sid = ctx.tree.dfs_at(si);
-            if !ctx.tree.is_tree_visible(sid) {
+            let sid = ctx.objs.dfs_at(si);
+            if !ctx.objs.is_tree_visible(sid) {
                 continue;
             }
 
-            let sabs = ctx.tree.absolute_rect(sid);
+            let sabs = ctx.objs.absolute_rect(sid);
 
             let mut clip = ClipRegion::from_rect(sabs);
             clip.clip_to_bounds(&screen_rect(&ctx.lcd));
 
             // Viewport clipping for children of scroll containers
-            let sp = ctx.tree.scroll_parent(sid);
+            let sp = ctx.objs.scroll_parent(sid);
             if sp.is_some() {
-                let viewport = ctx.tree.scroll_viewport(sp);
+                let viewport = ctx.objs.scroll_viewport(sp);
                 // Only draw if fully inside viewport (text can't be partially clipped)
                 if sabs.x < viewport.x
                     || sabs.y < viewport.y
@@ -471,25 +444,25 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
                 // they share its occluder list, so they were painted
                 // everywhere this widget's clip reaches.
                 if ctx.lcd.has_alpha()
-                    && shows_behind(&ctx.tree, sid)
-                    && !behind_is_fresh(&ctx.tree, di, si, &sabs)
+                    && shows_behind(&ctx.objs, sid)
+                    && !behind_is_fresh(&ctx.objs, di, si, &sabs)
                 {
-                    redraw_behind_region(ctx, vm, si, &clip, &sabs);
+                    redraw_behind_region(ctx, si, &clip, &sabs);
                 }
-                draw_widget(ctx, vm, sid, &sabs, &clip);
-                ctx.tree.get_mut(sid).flags |= FLAG_RENDERED | FLAG_PAINTED;
+                draw_widget(ctx, sid, &sabs, &clip);
+                ctx.objs.get_mut(sid).flags |= FLAG_RENDERED | FLAG_PAINTED;
             }
         }
         di = sub_end;
     }
-    clear_painted(&mut ctx.tree);
+    clear_painted(&mut ctx.objs);
 
     // Draw scrollbars on top of all children (only for dirty scroll containers)
-    for di in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(di);
-        let w = ctx.tree.get(id);
-        if w.flags & FLAG_CLIP_CHILDREN != 0 && w.is_dirty() && ctx.tree.is_tree_visible(id) {
-            let abs = ctx.tree.absolute_rect(id);
+    for di in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(di);
+        let w = ctx.objs.get(id);
+        if w.flags & FLAG_CLIP_CHILDREN != 0 && w.is_dirty() && ctx.objs.is_tree_visible(id) {
+            let abs = ctx.objs.absolute_rect(id);
             draw_scrollbar(ctx, id, &abs);
         }
     }
@@ -498,7 +471,7 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>, vm: &Vm) {
 }
 
 /// Clear the per-pass `FLAG_PAINTED` marks.
-fn clear_painted(tree: &mut WidgetTree) {
+fn clear_painted(tree: &mut ObjPool) {
     for i in 0..tree.dfs_len() {
         let id = tree.dfs_at(i);
         tree.get_mut(id).flags &= !FLAG_PAINTED;
@@ -512,7 +485,7 @@ fn clear_painted(tree: &mut WidgetTree) {
 /// Walks back from `idx` (down to `lo`) over the visible widgets that touch
 /// `rect`: every one must be `FLAG_PAINTED`, until one is found that paints
 /// all of `rect` opaquely — nothing behind that one can show through.
-fn behind_is_fresh(tree: &WidgetTree, lo: usize, idx: usize, rect: &Rect) -> bool {
+fn behind_is_fresh(tree: &ObjPool, lo: usize, idx: usize, rect: &Rect) -> bool {
     for k in (lo..idx).rev() {
         let id = tree.dfs_at(k);
         if !tree.is_tree_visible(id) {
@@ -535,9 +508,9 @@ fn behind_is_fresh(tree: &WidgetTree, lo: usize, idx: usize, rect: &Rect) -> boo
 /// Does `draw_widget` paint every pixel of `rect` opaquely for `id` (whose
 /// absolute rect is `abs`)? True for a solid, square-cornered widget with a
 /// background: its border strips plus background fill tile its whole rect.
-fn covers_opaquely(tree: &WidgetTree, id: WidgetId, abs: &Rect, rect: &Rect) -> bool {
+fn covers_opaquely(tree: &ObjPool, id: WidgetId, abs: &Rect, rect: &Rect) -> bool {
     let w = tree.get(id);
-    let ext = tree.ext(id).unwrap_or(&WidgetExt::DEFAULT);
+    let ext = &tree.ext(id);
     if is_freeform_shape(w.kind) || ext.border_radius != 0 || ext.alpha < 255 {
         return false;
     }
@@ -554,16 +527,16 @@ fn covers_opaquely(tree: &WidgetTree, id: WidgetId, abs: &Rect, rect: &Rect) -> 
 /// drawn straight over the content behind it on readback backends), or an
 /// anti-aliased outline — rounded corners and freeform shapes blend their
 /// edge pixels over what is behind (only asked on readback backends).
-fn shows_behind(tree: &WidgetTree, id: WidgetId) -> bool {
+fn shows_behind(tree: &ObjPool, id: WidgetId) -> bool {
     if tree.alpha(id) < 255 {
         return true;
     }
     let w = tree.get(id);
-    if is_freeform_shape(w.kind) || tree.ext(id).is_some_and(|e| e.border_radius != 0) {
+    if is_freeform_shape(w.kind) || tree.border_radius(id) != 0 {
         return true;
     }
     w.kind == KIND_LABEL
-        && effective_bg(tree, w, tree.ext(id).unwrap_or(&WidgetExt::DEFAULT)) == 0
+        && effective_bg(tree, w, &tree.ext(id)) == 0
 }
 
 // --- Drawing ---
@@ -575,7 +548,7 @@ fn shows_behind(tree: &WidgetTree, id: WidgetId) -> bool {
 /// image without a background paints none): the pressed parent's fill, with
 /// its rounded corners, already shows through, and a filled copy would be a
 /// square box over it.
-fn effective_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
+fn effective_bg(tree: &ObjPool, widget: &Widget, ext: &WidgetExt) -> Color {
     // This widget is pressed (or a selected group button) and has a press_color
     if shows_press(widget) && ext.press_color != 0 {
         return ext.press_color;
@@ -590,7 +563,7 @@ fn effective_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt) -> Color {
     let mut depth = 0usize;
     while pid.is_some() {
         let p = tree.get(pid);
-        let p_ext = tree.ext(pid).unwrap_or(&WidgetExt::DEFAULT);
+        let p_ext = &tree.ext(pid);
         if shows_press(p) && p_ext.press_color != 0 {
             if widget.background_color == p.background_color {
                 return p_ext.press_color;
@@ -619,7 +592,7 @@ fn shows_press(w: &Widget) -> bool {
 /// "transparent" — the text sits on its parent's filled background.  This
 /// function resolves that parent colour so anti-aliased glyphs blend
 /// correctly instead of blending against black.
-fn resolved_text_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt, fallback: Color) -> Color {
+fn resolved_text_bg(tree: &ObjPool, widget: &Widget, ext: &WidgetExt, fallback: Color) -> Color {
     // If this widget has a non-zero background, use it directly (after
     // factoring in press state).
     let bg = effective_bg(tree, widget, ext);
@@ -634,7 +607,7 @@ fn resolved_text_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt, fallbac
     let mut depth = 0usize;
     while pid.is_some() {
         let p = tree.get(pid);
-        let p_ext = tree.ext(pid).unwrap_or(&WidgetExt::DEFAULT);
+        let p_ext = &tree.ext(pid);
         let ancestor_bg = effective_bg(tree, p, p_ext);
         if ancestor_bg != 0 {
             return ancestor_bg;
@@ -659,16 +632,15 @@ fn resolved_text_bg(tree: &WidgetTree, widget: &Widget, ext: &WidgetExt, fallbac
 /// for going through the clip.
 fn draw_widget<P: Platform>(
     ctx: &Ctx<P>,
-    vm: &Vm,
     id: WidgetId,
     abs: &Rect,
     clip: &ClipRegion,
 ) {
-    let widget = ctx.tree.get(id);
-    let ext = ctx.tree.ext(id).unwrap_or(&WidgetExt::DEFAULT);
+    let widget = ctx.objs.get(id);
+    let ext = &ctx.objs.ext(id);
     let b = ext.border;
     let r = ext.border_radius;
-    let bg_color = effective_bg(&ctx.tree, widget, ext);
+    let bg_color = effective_bg(&ctx.objs, widget, ext);
     // Freeform shapes (circle/polygon/line) paint their own fill + stroke
     // below, so neutralize the default rectangular background/border here:
     // zero the border edges and skip the bg fill. The shape draws read the
@@ -680,18 +652,18 @@ fn draw_widget<P: Platform>(
     // See draw_widget — background opacity, blending-capable backends only.
     let alpha = if ctx.lcd.has_alpha() { ext.alpha } else { 255 };
     let gdir = if bg_color == widget.background_color {
-        ctx.tree.gradient_dir(id)
+        ctx.objs.gradient_dir(id)
     } else {
         0
     };
     let gcol = if gdir != 0 {
-        ctx.tree.gradient_color(id)
+        ctx.objs.gradient_color(id)
     } else {
         0
     };
     // Write-only backends anti-alias against known colours: what is behind
     // this widget, and (for its contents) its own background.
-    let back = backdrop(&ctx.tree, widget, P::DEFAULT_BG_COLOR);
+    let back = backdrop(&ctx.objs, widget, P::DEFAULT_BG_COLOR);
     let content_bg = if draw_bg { bg_color } else { back };
     if ctx.lcd.wants_underlay() {
         ctx.lcd.set_underlay(Some(Underlay::solid(back)));
@@ -847,7 +819,7 @@ fn draw_widget<P: Platform>(
             }
             ctx.lcd.set_scissor(None);
         } else {
-            let bg = resolved_text_bg(&ctx.tree, widget, ext, P::DEFAULT_BG_COLOR);
+            let bg = resolved_text_bg(&ctx.objs, widget, ext, P::DEFAULT_BG_COLOR);
             draw_label_text(ctx, widget, abs, ext, Some(bg));
         }
     }
@@ -884,7 +856,7 @@ fn draw_widget<P: Platform>(
     // below; pixel writes are cheap so we just bound to inner).
     if widget.kind == KIND_GRAPH {
         let inner = inner_rect(abs, &b);
-        draw_graph(&ctx.lcd, vm, widget, &inner, ext);
+        draw_graph(&ctx.lcd, &ctx.objs, widget, &inner, ext);
     }
 
     // Image widget — draw image centered in content area
@@ -924,12 +896,12 @@ fn draw_widget<P: Platform>(
 /// Colour painted behind widget `w`: its nearest ancestor that paints a
 /// background (the `draw_bg` rule in `draw_widget`), else `fallback`. What
 /// anti-aliased edges mix against on write-only backends.
-fn backdrop(tree: &WidgetTree, w: &Widget, fallback: Color) -> Color {
+fn backdrop(tree: &ObjPool, w: &Widget, fallback: Color) -> Color {
     let mut pid = w.parent;
     let mut depth = 0usize;
     while pid.is_some() {
         let p = tree.get(pid);
-        let bg = effective_bg(tree, p, tree.ext(pid).unwrap_or(&WidgetExt::DEFAULT));
+        let bg = effective_bg(tree, p, &tree.ext(pid));
         if !is_freeform_shape(p.kind) && (bg != 0 || (p.kind != KIND_LABEL && p.kind != KIND_IMAGE)) {
             return bg;
         }
@@ -1068,7 +1040,7 @@ fn draw_polygon_shape<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ex
     if ext.text_id == 0xFFFF {
         return;
     }
-    let text = ctx.strpool.get(ext.text_id);
+    let text = ctx.objs.str_get(ext.text_id);
     let mut pts = [Offset { x: 0, y: 0 }; lcd::MAX_POLY_POINTS];
     let n = parse_points(text, &mut pts);
     if n < 2 {
@@ -1191,7 +1163,7 @@ fn draw_label_text<P: Platform>(
     if ext.text_id == 0xFFFF || ext.font_id == 0xFF {
         return;
     }
-    let text = ctx.strpool.get(ext.text_id);
+    let text = ctx.objs.str_get(ext.text_id);
     if text.is_empty() {
         return;
     }
@@ -1313,13 +1285,13 @@ fn draw_input_text<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: 
     let lh = font.line_height() as i16;
     let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
 
-    let bg_color = effective_bg(&ctx.tree, widget, ext);
+    let bg_color = effective_bg(&ctx.objs, widget, ext);
     let bg = if bg_color == 0 { None } else { Some(bg_color) };
 
     // Draw text if present
     let has_text = ext.text_id != 0xFFFF && ext.font_id != 0xFF;
     if has_text {
-        let text = ctx.strpool.get(ext.text_id);
+        let text = ctx.objs.str_get(ext.text_id);
         if !text.is_empty() {
             font.draw_str(&ctx.lcd, &ctx.flash, text, cx, ty, ext.text_color, bg);
         }
@@ -1330,7 +1302,7 @@ fn draw_input_text<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: 
         let cursor_pos = ext.value.max(0) as usize;
         let mut cursor_x = cx;
         if has_text {
-            let text = ctx.strpool.get(ext.text_id);
+            let text = ctx.objs.str_get(ext.text_id);
             let end = cursor_pos.min(text.len());
             let mut byte_pos = 0;
             while byte_pos < end {
@@ -1382,11 +1354,11 @@ fn draw_dropdown<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &W
     let text_w = cw.saturating_sub(arrow_w + 4);
     let lh = font.line_height() as i16;
     let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
-    let bg_color = effective_bg(&ctx.tree, widget, ext);
+    let bg_color = effective_bg(&ctx.objs, widget, ext);
     let bg = if bg_color == 0 { None } else { Some(bg_color) };
 
     if ext.text_id != 0xFFFF && text_w > 0 {
-        let text = ctx.strpool.get(ext.text_id);
+        let text = ctx.objs.str_get(ext.text_id);
         if !text.is_empty() {
             font.draw_str(&ctx.lcd, &ctx.flash, text, cx, ty, ext.text_color, bg);
         }
@@ -1532,7 +1504,7 @@ const GRAPH_FLAG_FILL: u8 = 1 << 1;
 
 fn draw_graph<B: LcdBackend>(
     lcd: &LcdImpl<B>,
-    vm: &Vm,
+    objs: &ObjPool,
     _widget: &Widget,
     inner: &Rect,
     ext: &WidgetExt,
@@ -1542,7 +1514,7 @@ fn draw_graph<B: LcdBackend>(
     }
 
     let arr_id = ext.value as u16;
-    let samples = match vm.array_slice(arr_id) {
+    let samples = match objs.arr(arr_id) {
         Some(s) if !s.is_empty() => s,
         _ => return,
     };
@@ -1710,13 +1682,13 @@ const SCROLLBAR_MIN_THUMB: u16 = 16; // minimum thumb height
 
 /// Draw scrollbar on the right side of a scroll container.
 fn draw_scrollbar<P: Platform>(ctx: &Ctx<P>, id: WidgetId, _abs: &Rect) {
-    let content_h = ctx.tree.content_height(id);
-    let cr = ctx.tree.content_rect(id);
+    let content_h = ctx.objs.content_height(id);
+    let cr = ctx.objs.content_rect(id);
     if cr.h == 0 || content_h <= cr.h {
         return; // no scrollbar needed — all content fits
     }
 
-    let scroll_y = ctx.tree.value(id).max(0) as u32;
+    let scroll_y = ctx.objs.value(id).max(0) as u32;
     let ch = content_h as u32;
     let vh = cr.h as u32;
 
@@ -1879,7 +1851,7 @@ fn fill_rounded_rect_blend_screen<B: LcdBackend>(
 /// Erase the area of a widget that is becoming invisible by repainting the
 /// nearest ancestor background.  Handles both solid and gradient ancestors so
 /// a gradient parent is not corrupted by a solid-color erase rectangle.
-fn erase_widget_area<B: LcdBackend>(tree: &WidgetTree, lcd: &LcdImpl<B>, id: WidgetId, abs: Rect) {
+fn erase_widget_area<B: LcdBackend>(tree: &ObjPool, lcd: &LcdImpl<B>, id: WidgetId, abs: Rect) {
     let mut pid = tree.get(id).parent;
     let max = tree.count();
     let mut depth = 0usize;
@@ -2060,10 +2032,10 @@ fn draw_check_indicator<B: LcdBackend>(
 }
 
 fn clear_all_dirty<P: Platform>(ctx: &mut Ctx<P>) {
-    ctx.tree.ensure_dfs();
-    for i in 0..ctx.tree.dfs_len() {
-        let id = ctx.tree.dfs_at(i);
-        ctx.tree.get_mut(id).clear_dirty();
+    ctx.objs.ensure_dfs();
+    for i in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(i);
+        ctx.objs.get_mut(id).clear_dirty();
     }
 }
 
@@ -2074,12 +2046,12 @@ mod tests {
 
     /// Pressed, background-less rounded button ("Ghost") with a full-size
     /// transparent label child.
-    fn ghost(tree: &mut WidgetTree) -> (WidgetId, WidgetId) {
-        let button = tree.alloc().unwrap();
+    fn ghost(tree: &mut ObjPool) -> (WidgetId, WidgetId) {
+        let button = tree.alloc_widget().unwrap();
         tree.get_mut(button).kind = KIND_BASE;
         tree.get_mut(button).flags |= FLAG_PRESSED;
-        tree.ensure_ext(button).unwrap().press_color = 0x2C9F;
-        let label = tree.alloc().unwrap();
+        tree.update_ext(button, |e| e.press_color = 0x2C9F);
+        let label = tree.alloc_widget().unwrap();
         tree.get_mut(label).kind = KIND_LABEL;
         tree.add_child(button, label);
         (button, label)
@@ -2087,25 +2059,25 @@ mod tests {
 
     #[test]
     fn transparent_label_does_not_inherit_press_color() {
-        let mut tree = WidgetTree::new();
+        let mut tree = ObjPool::new();
         let (button, label) = ghost(&mut tree);
-        let ext = tree.ext(label).unwrap_or(&WidgetExt::DEFAULT);
+        let ext = &tree.ext(label);
         // No fill of its own: the button's rounded press fill shows through.
         assert_eq!(effective_bg(&tree, tree.get(label), ext), 0);
         // Text without readback still blends against the press color.
         assert_eq!(resolved_text_bg(&tree, tree.get(label), ext, 0), 0x2C9F);
-        let bext = tree.ext(button).unwrap();
+        let bext = &tree.ext(button);
         assert_eq!(effective_bg(&tree, tree.get(button), bext), 0x2C9F);
     }
 
     #[test]
     fn same_bg_container_still_inherits_press_color() {
-        let mut tree = WidgetTree::new();
+        let mut tree = ObjPool::new();
         let (button, _) = ghost(&mut tree);
-        let inner = tree.alloc().unwrap();
+        let inner = tree.alloc_widget().unwrap();
         tree.get_mut(inner).kind = KIND_BASE;
         tree.add_child(button, inner);
-        let ext = tree.ext(inner).unwrap_or(&WidgetExt::DEFAULT);
+        let ext = &tree.ext(inner);
         assert_eq!(effective_bg(&tree, tree.get(inner), ext), 0x2C9F);
     }
 }

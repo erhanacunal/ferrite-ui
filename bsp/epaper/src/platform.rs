@@ -7,7 +7,7 @@ use ferrite_core::touch::TouchImpl;
 
 use ferrite_core::ctx::Ctx;
 use ferrite_core::runtime::{BasicInput, PlatformRuntime};
-use ferrite_core::strpool::StringPool;
+use ferrite_core::pool::ObjPool;
 use ferrite_core::types::{COLOR_BLACK, COLOR_WHITE};
 use ferrite_core::vm::{RenderMode, Vm};
 use ferrite_core::{render};
@@ -101,7 +101,7 @@ impl PlatformRuntime for EpaperPlatform {
         unsafe { esp_restart() }
     }
 
-    fn syscall(id: u8, args: &[i32], _strpool: &StringPool) -> Option<i32> {
+    fn syscall(id: u8, args: &[i32], _strpool: &ObjPool) -> Option<i32> {
         let _ = args;
         match id {
             SYS_UPTIME => Some(systick::millis() as i32),
@@ -144,7 +144,7 @@ impl PlatformRuntime for EpaperPlatform {
         // EPaper mode draws only on explicit `render()`; other modes get a full
         // initial frame so the panel is verifiable even without a program.
         if vm.render_mode != RenderMode::EPaper {
-            render::render_all(ctx, vm);
+            render::render_all(ctx);
             ctx.lcd.flush_dirty();
         }
     }

@@ -1,8 +1,10 @@
 extern crate alloc;
 
+use crate::pool::{ObjPool, T_WIDGET};
 use crate::render::SCROLLBAR_W;
 use crate::types::{Color, Edges, Offset, Rect, Size};
 use alloc::vec::Vec;
+use core::mem::{align_of, size_of};
 
 // --- Flags (u16) ---
 
@@ -25,8 +27,9 @@ pub const FLAG_DIRTY_AB: u16 = FLAG_DIRTY_A | FLAG_DIRTY_B;
 /// (e.g. a progress bar on a hidden tab that keeps marking itself dirty).
 pub const FLAG_RENDERED: u16 = 1 << 9;
 
-/// Widget slot has been freed via `destroy_subtree` and is eligible for
-/// reuse by `alloc`. Treated as not-visible by `is_tree_visible`.
+/// Set on the placeholder that `get` / `get_mut` return for an id that names
+/// no live widget (destroyed, or another object type). Treated as
+/// not-visible by `is_tree_visible`.
 pub const FLAG_DESTROYED: u16 = 1 << 10;
 
 /// Label text is rendered as multiple lines split by '\n'.
@@ -66,7 +69,7 @@ pub const KIND_LINE: u8 = 15;
 pub const KIND_ELLIPSE: u8 = 16;
 /// Toggle button in an exclusive group: widgets of this kind with the same
 /// `group_id` form one group, and at most one of them is CHECKED (drawn with
-/// `press_color`). See `WidgetTree::select_in_group`.
+/// `press_color`). See `ObjPool::select_in_group`.
 pub const KIND_BUTTON_GROUP: u8 = 17;
 
 // --- Text Alignment ---
@@ -77,10 +80,7 @@ pub const ALIGN_RIGHT: u8 = 2;
 
 // --- WidgetId ---
 
-/// Widget index. NONE = no link.
-///
-/// u16 width gives headroom for dialog widgets (allocated/destroyed at runtime
-/// without colliding with static UI). Internal cap is `MAX_WIDGETS`.
+/// Widget pointer (an `ObjPtr` naming a `T_WIDGET` object). NONE = no link.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WidgetId(pub u16);
 
@@ -100,64 +100,74 @@ impl WidgetId {
     }
 }
 
-/// Maximum live widgets. Beyond this, alloc() returns None.
-/// Was 254 with u8 ids; raised so dialog open/close cycles don't exhaust slots.
-pub const MAX_WIDGETS: usize = 1024;
+// --- Widget object layout ---
+//
+// A widget is one pool object: the `Widget` header (6 words) followed by the
+// optional sections its `sections` mask names, in bit order. A section is
+// added (the object grows) the first time one of its fields gets a non-default
+// value, so a plain container is 6 words and a label 8.
 
-// --- Extension index ---
+/// Section bits (`Widget::sections`) and their sizes in words.
+const SEC_BOX: u8 = 1 << 0;
+const SEC_TEXT: u8 = 1 << 1;
+const SEC_STYLE: u8 = 1 << 2;
+const SEC_EXTRA: u8 = 1 << 3;
+const SEC_PREV: u8 = 1 << 4;
+const SEC_WORDS: [usize; 5] = [2, 2, 2, 2, 4];
 
-const EXT_NONE: u16 = 0xFFFF;
-/// Maximum live extensions. Same scaling rationale as MAX_WIDGETS.
-pub const MAX_EXTENSIONS: usize = 1024;
+/// Header words of every widget object.
+const HDR_WORDS: usize = size_of::<Widget>() / 4;
 
-// --- Widget (base: 20 bytes) ---
-
-/// Base widget node -- tree links, layout, and appearance.
-///
-/// Optional fields (edges, text, callbacks, etc.) live in WidgetExt,
-/// allocated on demand via WidgetTree::ensure_ext(). Widgets that only
-/// need position, size, and color pay 20 bytes instead of 50.
+/// Widget header — tree links, layout, appearance and the common `value`.
+/// Lives in the pool arena; `get` / `get_mut` return references into it.
+#[repr(C)]
 pub struct Widget {
-    // Tree links (6 bytes — u16 ids)
+    // Tree links (6 bytes)
     pub parent: WidgetId,
     pub first_child: WidgetId,
     pub next_sibling: WidgetId,
 
-    // Type (1 byte) + extension index (2 bytes)
     pub kind: u8,
-    ext: u16,
+    /// Present sections (`SEC_*`).
+    sections: u8,
 
-    // State (2 bytes) -- u16 for dual-buffer dirty tracking
+    // State -- u16 for dual-buffer dirty tracking
     pub flags: u16,
 
-    // Position and size (8 bytes)
+    // Position and size
     pub location: Offset,
     pub size: Size,
 
-    // Appearance (4 bytes)
+    // Appearance
     pub background_color: Color,
     pub border_color: Color,
+
+    /// Progress/slider value, input cursor, scroll offset, graph array id.
+    pub value: i16,
 }
 
-impl Widget {
-    fn new() -> Self {
-        Self {
-            parent: WidgetId::NONE,
-            first_child: WidgetId::NONE,
-            next_sibling: WidgetId::NONE,
-            kind: KIND_BASE,
-            ext: EXT_NONE,
-            flags: FLAG_VISIBLE | FLAG_ENABLED,
-            location: Offset { x: 0, y: 0 },
-            size: Size { w: 0, h: 0 },
-            background_color: 0x0000,
-            border_color: 0x0000,
-        }
-    }
+const _: () = assert!(size_of::<Widget>() == 24 && align_of::<Widget>() <= 4);
 
-    pub fn has_ext(&self) -> bool {
-        self.ext != EXT_NONE
-    }
+impl Widget {
+    /// Placeholder for an id that names no live widget.
+    pub const DEAD: Self = Self {
+        parent: WidgetId::NONE,
+        first_child: WidgetId::NONE,
+        next_sibling: WidgetId::NONE,
+        kind: KIND_BASE,
+        sections: 0,
+        flags: FLAG_DESTROYED,
+        location: Offset { x: 0, y: 0 },
+        size: Size { w: 0, h: 0 },
+        background_color: 0,
+        border_color: 0,
+        value: 0,
+    };
+
+    const NEW: Self = Self {
+        flags: FLAG_VISIBLE | FLAG_ENABLED | FLAG_DIRTY_AB,
+        ..Self::DEAD
+    };
 
     pub fn is_visible(&self) -> bool {
         self.flags & FLAG_VISIBLE != 0
@@ -191,45 +201,262 @@ impl Widget {
     }
 }
 
+static DEAD_WIDGET: Widget = Widget::DEAD;
+
+/// A widget section: a fixed-size group of optional fields.
+trait Section: Copy + PartialEq {
+    const BIT: u8;
+    const DEFAULT: Self;
+    fn read(e: &WidgetExt) -> Self;
+    fn write(&self, e: &mut WidgetExt);
+}
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy, PartialEq)]
+struct SecBox {
+    border: Edges,
+    padding: Edges,
+}
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy, PartialEq)]
+struct SecText {
+    text_id: u16,
+    text_color: Color,
+    font_id: u8,
+    text_align: u8,
+    max_length: u8,
+    _pad: u8,
+}
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy, PartialEq)]
+struct SecStyle {
+    border_radius: u16,
+    press_color: Color,
+    gradient_color: Color,
+    gradient_dir: u8,
+    alpha: u8,
+}
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy, PartialEq)]
+struct SecExtra {
+    image_id: u8,
+    group_id: u8,
+    flex: u8,
+    flex_gap: u8,
+    flex_grow: u8,
+    _pad: [u8; 3],
+}
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy, PartialEq)]
+struct SecPrev {
+    a: Rect,
+    b: Rect,
+}
+
+const _: () = assert!(
+    size_of::<SecBox>() == 8
+        && size_of::<SecText>() == 8
+        && size_of::<SecStyle>() == 8
+        && size_of::<SecExtra>() == 8
+        && size_of::<SecPrev>() == 16
+);
+
+impl Section for SecBox {
+    const BIT: u8 = SEC_BOX;
+    const DEFAULT: Self = Self { border: Edges::ZERO, padding: Edges::ZERO };
+    fn read(e: &WidgetExt) -> Self {
+        Self { border: e.border, padding: e.padding }
+    }
+    fn write(&self, e: &mut WidgetExt) {
+        e.border = self.border;
+        e.padding = self.padding;
+    }
+}
+
+impl Section for SecText {
+    const BIT: u8 = SEC_TEXT;
+    const DEFAULT: Self = Self {
+        text_id: 0xFFFF,
+        text_color: 0xFFFF,
+        font_id: 0,
+        text_align: ALIGN_LEFT,
+        max_length: 0,
+        _pad: 0,
+    };
+    fn read(e: &WidgetExt) -> Self {
+        Self {
+            text_id: e.text_id,
+            text_color: e.text_color,
+            font_id: e.font_id,
+            text_align: e.text_align,
+            max_length: e.max_length,
+            _pad: 0,
+        }
+    }
+    fn write(&self, e: &mut WidgetExt) {
+        e.text_id = self.text_id;
+        e.text_color = self.text_color;
+        e.font_id = self.font_id;
+        e.text_align = self.text_align;
+        e.max_length = self.max_length;
+    }
+}
+
+impl Section for SecStyle {
+    const BIT: u8 = SEC_STYLE;
+    const DEFAULT: Self = Self {
+        border_radius: 0,
+        press_color: 0,
+        gradient_color: 0,
+        gradient_dir: 0,
+        alpha: 255,
+    };
+    fn read(e: &WidgetExt) -> Self {
+        Self {
+            border_radius: e.border_radius,
+            press_color: e.press_color,
+            gradient_color: e.gradient_color,
+            gradient_dir: e.gradient_dir,
+            alpha: e.alpha,
+        }
+    }
+    fn write(&self, e: &mut WidgetExt) {
+        e.border_radius = self.border_radius;
+        e.press_color = self.press_color;
+        e.gradient_color = self.gradient_color;
+        e.gradient_dir = self.gradient_dir;
+        e.alpha = self.alpha;
+    }
+}
+
+impl Section for SecExtra {
+    const BIT: u8 = SEC_EXTRA;
+    const DEFAULT: Self = Self {
+        image_id: 0,
+        group_id: 0,
+        flex: 0,
+        flex_gap: 0,
+        flex_grow: 0,
+        _pad: [0; 3],
+    };
+    fn read(e: &WidgetExt) -> Self {
+        Self {
+            image_id: e.image_id,
+            group_id: e.group_id,
+            flex: e.flex,
+            flex_gap: e.flex_gap,
+            flex_grow: e.flex_grow,
+            _pad: [0; 3],
+        }
+    }
+    fn write(&self, e: &mut WidgetExt) {
+        e.image_id = self.image_id;
+        e.group_id = self.group_id;
+        e.flex = self.flex;
+        e.flex_gap = self.flex_gap;
+        e.flex_grow = self.flex_grow;
+    }
+}
+
+impl Section for SecPrev {
+    const BIT: u8 = SEC_PREV;
+    const DEFAULT: Self = Self { a: Rect::new(0, 0, 0, 0), b: Rect::new(0, 0, 0, 0) };
+    fn read(e: &WidgetExt) -> Self {
+        Self { a: e.prev_rect_a, b: e.prev_rect_b }
+    }
+    fn write(&self, e: &mut WidgetExt) {
+        e.prev_rect_a = self.a;
+        e.prev_rect_b = self.b;
+    }
+}
+
+/// Word offset of section `bit` inside a widget payload with mask `mask`.
+fn sec_offset(mask: u8, bit: u8) -> usize {
+    let mut off = HDR_WORDS;
+    for (i, w) in SEC_WORDS.iter().enumerate() {
+        if 1 << i == bit {
+            break;
+        }
+        if mask & (1 << i) != 0 {
+            off += w;
+        }
+    }
+    off
+}
+
+fn sec_words(bit: u8) -> usize {
+    SEC_WORDS[bit.trailing_zeros() as usize]
+}
+
+/// View `T` at the start of `w`.
+#[inline]
+fn cast<T>(w: &[u32]) -> &T {
+    assert!(w.len() * 4 >= size_of::<T>() && align_of::<T>() <= 4);
+    // SAFETY: the slice is word aligned, long enough, and every bit pattern
+    // is valid for the plain-integer header and section types.
+    unsafe { &*(w.as_ptr() as *const T) }
+}
+
+#[inline]
+fn cast_mut<T>(w: &mut [u32]) -> &mut T {
+    assert!(w.len() * 4 >= size_of::<T>() && align_of::<T>() <= 4);
+    // SAFETY: as in `cast`; the borrow is unique.
+    unsafe { &mut *(w.as_mut_ptr() as *mut T) }
+}
+
+/// The words of a section value.
+#[inline]
+fn words<T: Section>(t: &T) -> &[u32] {
+    const { assert!(size_of::<T>() % 4 == 0 && align_of::<T>() == 4) };
+    // SAFETY: sections are padding-free, word-aligned `repr(C)` structs of
+    // integers whose size is a multiple of 4; reading them as words is valid.
+    unsafe { core::slice::from_raw_parts(t as *const T as *const u32, size_of::<T>() / 4) }
+}
+
 // --- WidgetExt ---
 
-/// Extension data for widgets that need edges, text, callbacks, etc.
-/// Allocated on demand -- simple containers skip this entirely.
+/// All optional widget fields, with their defaults. Not stored: it is a value
+/// view assembled from the widget's sections by `ObjPool::ext` and written
+/// back by `ObjPool::update_ext`, which adds only the sections whose fields
+/// differ from the defaults.
+#[derive(Clone, Copy)]
 pub struct WidgetExt {
-    // Button group + flex layout (4 bytes — the former margin edges)
     pub group_id: u8, // KIND_BUTTON_GROUP: exclusive selection group
     pub flex: u8,      // lib/flex.fl container mode (0 = not a flex container)
     pub flex_gap: u8,  // lib/flex.fl gap between children, px
     pub flex_grow: u8, // lib/flex.fl grow factor of a child (0 = fixed size)
 
-    // Box model edges (8 bytes)
+    // Box model edges
     pub border: Edges,
     pub padding: Edges,
 
-    // Label fields (6 bytes)
+    // Label fields
     pub text_color: Color,
     pub font_id: u8,
     pub text_align: u8,
     pub text_id: u16,
 
-    // Appearance extras (4 bytes)
+    // Appearance extras
     pub border_radius: u16,
     pub press_color: Color,
 
-    // Image + max input length (2 bytes)
+    // Image + max input length
     pub image_id: u8,
     pub max_length: u8,
 
-    // Value (2 bytes)
+    /// Mirrors `Widget::value` (kept here so drawing code reads one struct).
     pub value: i16,
 
-    // Gradient (3 bytes)
+    // Gradient
     pub gradient_color: Color, // End color (background_color is start)
     pub gradient_dir: u8,      // 0=none, 1=horizontal (L→R), 2=vertical (T→B)
 
-    // Background opacity, 255 = opaque (1 byte — fills the alignment pad
-    // before prev_rect_a). Only honored on LcdBackend::HAS_ALPHA devices;
-    // others draw the background solid.
+    // Background opacity, 255 = opaque. Only honored on
+    // LcdBackend::HAS_ALPHA devices; others draw the background solid.
     pub alpha: u8,
 
     // Rect at which the widget was last drawn to buffers A and B.
@@ -242,8 +469,7 @@ pub struct WidgetExt {
 }
 
 impl WidgetExt {
-    /// Default extension with all fields at their zero/default values.
-    /// Used as fallback when a widget has no extension allocated.
+    /// All fields at their defaults (what a widget without sections reads).
     pub const DEFAULT: Self = Self {
         group_id: 0,
         flex: 0,
@@ -266,263 +492,299 @@ impl WidgetExt {
         prev_rect_a: Rect::new(0, 0, 0, 0),
         prev_rect_b: Rect::new(0, 0, 0, 0),
     };
-
-    fn new() -> Self {
-        Self::DEFAULT
-    }
 }
 
-// --- WidgetTree ---
+// --- Widget tree (on the object pool) ---
 
-/// Heap-allocated widget tree with on-demand extensions.
-///
-/// Base widgets (18B each) hold tree links + layout.
-/// Extensions (36B each) hold edges, text, callbacks, gradient -- allocated
-/// only when a non-default property is set.
-///
-/// DFS order is cached and rebuilt lazily when the tree structure changes.
-pub struct WidgetTree {
-    widgets: Vec<Widget>,
-    extensions: Vec<WidgetExt>,
-    pub root: WidgetId,
-    dfs_cache: Vec<WidgetId>,
-    dfs_valid: bool,
-    /// FIFO queue of widget slots freed by `destroy_subtree`. `alloc()`
-    /// drains this before growing the Vec, so re-entrant builders (e.g. modal
-    /// dialogs) get back the same slot ids in the same order on each call.
-    widget_free: Vec<WidgetId>,
-    /// Same idea for ext slots, so destroyed widget extensions don't leak.
-    ext_free: Vec<u16>,
-    /// Runtime caps (≤ MAX_WIDGETS / MAX_EXTENSIONS), set from RES_SYSCFG.
-    max_widgets: u16,
-    max_ext: u16,
-}
-
-impl WidgetTree {
-    pub fn new() -> Self {
-        Self {
-            widgets: Vec::new(),
-            extensions: Vec::new(),
-            root: WidgetId::NONE,
-            dfs_cache: Vec::new(),
-            dfs_valid: false,
-            widget_free: Vec::new(),
-            ext_free: Vec::new(),
-            max_widgets: MAX_WIDGETS as u16,
-            max_ext: MAX_EXTENSIONS as u16,
-        }
-    }
-
-    /// Cap live widgets / extensions (0 = compile-time maximum). Values above
-    /// `MAX_WIDGETS` / `MAX_EXTENSIONS` are clamped. Does not shrink an
-    /// existing tree; applied at boot, before the program allocates.
-    pub fn set_limits(&mut self, widgets: usize, exts: usize) {
-        let cap = |v: usize, max: usize| if v == 0 { max } else { v.min(max) } as u16;
-        self.max_widgets = cap(widgets, MAX_WIDGETS);
-        self.max_ext = cap(exts, MAX_EXTENSIONS);
-    }
-
-    /// Current `(widgets, extensions)` caps.
-    pub fn limits(&self) -> (usize, usize) {
-        (self.max_widgets as usize, self.max_ext as usize)
-    }
-
-    /// Pre-allocate capacity for widget_count user widgets and ext_count extensions.
-    /// Called once after image header is parsed, before any alloc() calls run.
-    /// This prevents heap fragmentation from interleaved Vec doublings.
-    pub fn reserve(&mut self, widget_count: usize, ext_count: usize) {
-        let widget_count = widget_count.min(self.max_widgets as usize);
-        let ext_count = ext_count.min(self.max_ext as usize);
-        self.widgets.reserve(widget_count);
-        self.extensions.reserve(ext_count);
-        self.dfs_cache.reserve(widget_count + 1);
-    }
-
-    /// Remove all widgets and reset root. Frees heap memory.
-    pub fn clear(&mut self) {
-        self.widgets.clear();
-        self.extensions.clear();
-        self.dfs_cache.clear();
+impl ObjPool {
+    /// Allocate a new widget (FIFO pointer reuse). Returns None when the pool
+    /// is out of pointers or arena space.
+    pub fn alloc_widget(&mut self) -> Option<WidgetId> {
+        let p = self.alloc_obj(T_WIDGET, HDR_WORDS)?;
+        *cast_mut::<Widget>(self.payload_mut(p, T_WIDGET)?) = Widget::NEW;
         self.dfs_valid = false;
-        self.widget_free.clear();
-        self.ext_free.clear();
-        self.root = WidgetId::NONE;
+        Some(WidgetId(p))
     }
 
-    /// Allocate a new widget. Reuses slots freed via `destroy_subtree` (FIFO)
-    /// before growing the Vec. Returns None if the widget cap is exhausted.
-    pub fn alloc(&mut self) -> Option<WidgetId> {
-        if !self.widget_free.is_empty() {
-            let id = self.widget_free.remove(0);
-            let w = &mut self.widgets[id.index()];
-            *w = Widget::new();
-            w.flags |= FLAG_DIRTY_AB;
-            self.dfs_valid = false;
-            return Some(id);
-        }
-        if self.widgets.len() >= self.max_widgets as usize {
-            return None;
-        }
-        let id = WidgetId(self.widgets.len() as u16);
-        let mut w = Widget::new();
-        w.flags |= FLAG_DIRTY_AB;
-        self.widgets.push(w);
-        self.dfs_valid = false;
-        Some(id)
-    }
-
+    /// Widget header. An id that names no live widget reads as a destroyed,
+    /// invisible placeholder.
     pub fn get(&self, id: WidgetId) -> &Widget {
-        &self.widgets[id.index()]
+        match self.payload(id.0, T_WIDGET) {
+            Some(w) => cast(w),
+            None => &DEAD_WIDGET,
+        }
     }
 
+    /// Mutable widget header. Writes through an id that names no live widget
+    /// go to a scratch placeholder and are lost.
     pub fn get_mut(&mut self, id: WidgetId) -> &mut Widget {
-        &mut self.widgets[id.index()]
+        if self.block(id.0, T_WIDGET).is_some() {
+            return cast_mut(self.payload_mut(id.0, T_WIDGET).unwrap());
+        }
+        self.dead = Widget::DEAD;
+        &mut self.dead
     }
 
-    /// Widget count.
+    /// Pointer high-water mark: an upper bound on the widget count, used as a
+    /// loop guard for tree walks.
     pub fn count(&self) -> usize {
-        self.widgets.len()
+        self.ptr_count()
     }
 
-    /// Extension count (for diagnostics).
-    pub fn ext_count(&self) -> usize {
-        self.extensions.len()
+    /// Live widgets.
+    pub fn widget_count(&self) -> usize {
+        self.live_objects(T_WIDGET)
     }
 
-    /// Diagnostics: `(live widgets, live extensions, widget storage bytes,
-    /// extension storage bytes)`. Destroyed slots waiting for reuse are not
-    /// live; storage counts allocated capacity.
-    pub fn mem_stats(&self) -> (usize, usize, usize, usize) {
-        use core::mem::size_of;
-        (
-            self.widgets.len() - self.widget_free.len(),
-            self.extensions.len() - self.ext_free.len(),
-            self.widgets.capacity() * size_of::<Widget>(),
-            self.extensions.capacity() * size_of::<WidgetExt>(),
-        )
-    }
+    // --- Sections ---
 
-    // --- Extension access ---
+    // The section logic works on word slices so that it exists once, not once
+    // per section type; the typed wrappers only cast.
 
-    /// Get extension for a widget (read-only). Returns None if not allocated.
-    pub fn ext(&self, id: WidgetId) -> Option<&WidgetExt> {
-        let idx = self.widgets[id.index()].ext;
-        if idx == EXT_NONE {
-            None
-        } else {
-            Some(&self.extensions[idx as usize])
-        }
-    }
-
-    /// Get extension for a widget (mutable). Returns None if not allocated.
-    pub fn ext_mut(&mut self, id: WidgetId) -> Option<&mut WidgetExt> {
-        let idx = self.widgets[id.index()].ext;
-        if idx == EXT_NONE {
-            None
-        } else {
-            Some(&mut self.extensions[idx as usize])
-        }
-    }
-
-    /// Get or allocate extension for a widget. Drains the ext free list
-    /// (from destroyed widgets) before growing. Returns None if pool full.
-    pub fn ensure_ext(&mut self, id: WidgetId) -> Option<&mut WidgetExt> {
-        let idx = self.widgets[id.index()].ext;
-        if idx != EXT_NONE {
-            return Some(&mut self.extensions[idx as usize]);
-        }
-        // Reuse a freed slot if available.
-        if let Some(reused) = self.ext_free.pop() {
-            self.extensions[reused as usize] = WidgetExt::new();
-            self.widgets[id.index()].ext = reused;
-            return Some(&mut self.extensions[reused as usize]);
-        }
-        if self.extensions.len() >= self.max_ext as usize {
+    /// Words of section `bit` of `id`, if present.
+    #[inline(never)]
+    fn sec_raw(&self, id: WidgetId, bit: u8) -> Option<&[u32]> {
+        let w = self.payload(id.0, T_WIDGET)?;
+        let mask = cast::<Widget>(w).sections;
+        if mask & bit == 0 {
             return None;
         }
-        let new_idx = self.extensions.len() as u16;
-        self.extensions.push(WidgetExt::new());
-        self.widgets[id.index()].ext = new_idx;
-        Some(&mut self.extensions[new_idx as usize])
+        let off = sec_offset(mask, bit);
+        Some(&w[off..off + sec_words(bit)])
     }
 
-    // --- Convenience accessors (return defaults when no extension) ---
+    #[inline(never)]
+    fn sec_raw_mut(&mut self, id: WidgetId, bit: u8) -> Option<&mut [u32]> {
+        let w = self.payload_mut(id.0, T_WIDGET)?;
+        let mask = cast::<Widget>(w).sections;
+        if mask & bit == 0 {
+            return None;
+        }
+        let off = sec_offset(mask, bit);
+        Some(&mut w[off..off + sec_words(bit)])
+    }
+
+    /// Section `bit` of `id`, added as `default` if missing (the object grows
+    /// and may move). None when `id` is no widget or the pool is full.
+    #[inline(never)]
+    fn ensure_sec_raw(&mut self, id: WidgetId, bit: u8, default: &[u32]) -> Option<&mut [u32]> {
+        let w = self.payload(id.0, T_WIDGET)?;
+        let mask = cast::<Widget>(w).sections;
+        if mask & bit == 0 {
+            let old = w.len();
+            let add = sec_words(bit);
+            if !self.resize_obj(id.0, T_WIDGET, old + add) {
+                return None;
+            }
+            let w = self.payload_mut(id.0, T_WIDGET)?;
+            let off = sec_offset(mask, bit);
+            // Open a gap for the section; later sections move up.
+            w.copy_within(off..old, off + add);
+            w[off..off + add].copy_from_slice(default);
+            cast_mut::<Widget>(w).sections = mask | bit;
+        }
+        self.sec_raw_mut(id, bit)
+    }
+
+    /// Write `s` into section `bit` of `id`: in place if present, else add it
+    /// unless `s` equals `default`. False when the pool is full.
+    #[inline(never)]
+    fn put_sec_raw(&mut self, id: WidgetId, bit: u8, s: &[u32], default: &[u32]) -> bool {
+        if self.sec_raw(id, bit).is_none() && s == default {
+            return true;
+        }
+        match self.ensure_sec_raw(id, bit, default) {
+            Some(cur) => {
+                cur.copy_from_slice(s);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn sec<T: Section>(&self, id: WidgetId) -> Option<&T> {
+        self.sec_raw(id, T::BIT).map(cast)
+    }
+
+    fn sec_mut<T: Section>(&mut self, id: WidgetId) -> Option<&mut T> {
+        self.sec_raw_mut(id, T::BIT).map(cast_mut)
+    }
+
+    fn ensure_sec<T: Section>(&mut self, id: WidgetId) -> Option<&mut T> {
+        self.ensure_sec_raw(id, T::BIT, words(&T::DEFAULT)).map(cast_mut)
+    }
+
+    fn put_sec<T: Section>(&mut self, id: WidgetId, s: T) -> bool {
+        self.put_sec_raw(id, T::BIT, words(&s), words(&T::DEFAULT))
+    }
+
+    /// All optional fields of `id` (defaults for missing sections or ids).
+    pub fn ext(&self, id: WidgetId) -> WidgetExt {
+        let mut e = WidgetExt::DEFAULT;
+        if self.block(id.0, T_WIDGET).is_none() {
+            return e;
+        }
+        e.value = self.get(id).value;
+        if let Some(s) = self.sec::<SecBox>(id) {
+            s.write(&mut e);
+        }
+        if let Some(s) = self.sec::<SecText>(id) {
+            s.write(&mut e);
+        }
+        if let Some(s) = self.sec::<SecStyle>(id) {
+            s.write(&mut e);
+        }
+        if let Some(s) = self.sec::<SecExtra>(id) {
+            s.write(&mut e);
+        }
+        if let Some(s) = self.sec::<SecPrev>(id) {
+            s.write(&mut e);
+        }
+        e
+    }
+
+    /// Store every field of `e` into `id`, adding the sections that now hold
+    /// non-default values. False when `id` is no widget or the pool ran out
+    /// of space (fields that fit are still written).
+    #[inline(never)]
+    pub fn put_ext(&mut self, id: WidgetId, e: &WidgetExt) -> bool {
+        if self.block(id.0, T_WIDGET).is_none() {
+            return false;
+        }
+        self.get_mut(id).value = e.value;
+        let mut ok = self.put_sec(id, SecBox::read(e));
+        ok &= self.put_sec(id, SecText::read(e));
+        ok &= self.put_sec(id, SecStyle::read(e));
+        ok &= self.put_sec(id, SecExtra::read(e));
+        ok &= self.put_sec(id, SecPrev::read(e));
+        ok
+    }
+
+    /// Read-modify-write the optional fields of `id`. False when `id` is no
+    /// widget or a needed section did not fit.
+    pub fn update_ext(&mut self, id: WidgetId, f: impl FnOnce(&mut WidgetExt)) -> bool {
+        let mut e = self.ext(id);
+        f(&mut e);
+        self.put_ext(id, &e)
+    }
+
+    // --- Convenience accessors (defaults when the section is missing) ---
 
     pub fn border(&self, id: WidgetId) -> Edges {
-        self.ext(id).map_or(Edges::ZERO, |e| e.border)
+        self.sec::<SecBox>(id).map_or(Edges::ZERO, |s| s.border)
     }
 
     pub fn padding(&self, id: WidgetId) -> Edges {
-        self.ext(id).map_or(Edges::ZERO, |e| e.padding)
+        self.sec::<SecBox>(id).map_or(Edges::ZERO, |s| s.padding)
     }
 
     pub fn text_color(&self, id: WidgetId) -> Color {
-        self.ext(id).map_or(0xFFFF, |e| e.text_color)
+        self.sec::<SecText>(id).map_or(0xFFFF, |s| s.text_color)
     }
 
     pub fn font_id(&self, id: WidgetId) -> u8 {
-        self.ext(id).map_or(0, |e| e.font_id)
+        self.sec::<SecText>(id).map_or(0, |s| s.font_id)
     }
 
     pub fn text_align(&self, id: WidgetId) -> u8 {
-        self.ext(id).map_or(ALIGN_LEFT, |e| e.text_align)
+        self.sec::<SecText>(id).map_or(ALIGN_LEFT, |s| s.text_align)
     }
 
     pub fn text_id(&self, id: WidgetId) -> u16 {
-        self.ext(id).map_or(0xFFFF, |e| e.text_id)
+        self.sec::<SecText>(id).map_or(0xFFFF, |s| s.text_id)
+    }
+
+    /// Set the widget's text string (no-op when `id` is no widget).
+    pub fn set_text_id(&mut self, id: WidgetId, text: u16) -> bool {
+        match self.sec_mut::<SecText>(id) {
+            Some(s) => {
+                s.text_id = text;
+                true
+            }
+            None => self.update_ext(id, |e| e.text_id = text),
+        }
     }
 
     pub fn border_radius(&self, id: WidgetId) -> u16 {
-        self.ext(id).map_or(0, |e| e.border_radius)
+        self.sec::<SecStyle>(id).map_or(0, |s| s.border_radius)
     }
 
     pub fn press_color(&self, id: WidgetId) -> Color {
-        self.ext(id).map_or(0, |e| e.press_color)
+        self.sec::<SecStyle>(id).map_or(0, |s| s.press_color)
     }
 
     pub fn image_id(&self, id: WidgetId) -> u8 {
-        self.ext(id).map_or(0, |e| e.image_id)
+        self.sec::<SecExtra>(id).map_or(0, |s| s.image_id)
     }
 
     pub fn max_length(&self, id: WidgetId) -> u8 {
-        self.ext(id).map_or(0, |e| e.max_length)
+        self.sec::<SecText>(id).map_or(0, |s| s.max_length)
     }
 
     pub fn value(&self, id: WidgetId) -> i16 {
-        self.ext(id).map_or(0, |e| e.value)
+        self.get(id).value
     }
 
     pub fn gradient_color(&self, id: WidgetId) -> Color {
-        self.ext(id).map_or(0, |e| e.gradient_color)
+        self.sec::<SecStyle>(id).map_or(0, |s| s.gradient_color)
     }
 
     pub fn gradient_dir(&self, id: WidgetId) -> u8 {
-        self.ext(id).map_or(0, |e| e.gradient_dir)
+        self.sec::<SecStyle>(id).map_or(0, |s| s.gradient_dir)
     }
 
     pub fn alpha(&self, id: WidgetId) -> u8 {
-        self.ext(id).map_or(255, |e| e.alpha)
+        self.sec::<SecStyle>(id).map_or(255, |s| s.alpha)
+    }
+
+    /// Selection group of a KIND_BUTTON_GROUP / KIND_RADIO widget.
+    pub fn group_id(&self, id: WidgetId) -> u8 {
+        self.sec::<SecExtra>(id).map_or(0, |s| s.group_id)
+    }
+
+    /// Rect at which `id` was last drawn to buffer `buf` (0=A, 1=B).
+    pub fn prev_rect(&self, id: WidgetId, buf: u8) -> Rect {
+        match self.sec::<SecPrev>(id) {
+            Some(s) if buf == 0 => s.a,
+            Some(s) => s.b,
+            None => Rect::new(0, 0, 0, 0),
+        }
+    }
+
+    /// Store the drawn rect for buffer `buf`. Adds the section on demand; an
+    /// empty rect on a widget without one is not stored.
+    pub fn set_prev_rect(&mut self, id: WidgetId, buf: u8, rect: Rect) {
+        if rect.is_empty() && self.sec::<SecPrev>(id).is_none() {
+            return;
+        }
+        if let Some(s) = self.ensure_sec::<SecPrev>(id) {
+            if buf == 0 {
+                s.a = rect;
+            } else {
+                s.b = rect;
+            }
+        }
     }
 
     // --- Tree operations ---
 
     /// Add child to end of parent's child list (highest z-order).
     pub fn add_child(&mut self, parent: WidgetId, child: WidgetId) {
-        if parent == child {
+        if parent == child || !self.is_live(parent) || !self.is_live(child) {
             return;
         }
-        self.widgets[child.index()].parent = parent;
-        self.widgets[child.index()].next_sibling = WidgetId::NONE;
+        self.get_mut(child).parent = parent;
+        self.get_mut(child).next_sibling = WidgetId::NONE;
 
-        let first = self.widgets[parent.index()].first_child;
+        let first = self.get(parent).first_child;
         if first.is_none() {
-            self.widgets[parent.index()].first_child = child;
+            self.get_mut(parent).first_child = child;
         } else {
-            let max = self.widgets.len();
+            let max = self.count();
             let mut last = first;
             let mut guard = 0usize;
-            while self.widgets[last.index()].next_sibling.is_some() {
-                let next = self.widgets[last.index()].next_sibling;
+            while self.get(last).next_sibling.is_some() {
+                let next = self.get(last).next_sibling;
                 if next == child {
                     return;
                 }
@@ -532,20 +794,20 @@ impl WidgetTree {
                     return;
                 }
             }
-            self.widgets[last.index()].next_sibling = child;
+            self.get_mut(last).next_sibling = child;
         }
         self.dfs_valid = false;
     }
 
     /// Compute widget's absolute border-box rect in screen coordinates.
     /// If an ancestor has FLAG_CLIP_CHILDREN, children are offset by
-    /// that ancestor's scroll_y (stored in ext.value).
+    /// that ancestor's scroll_y (stored in `value`).
     pub fn absolute_rect(&self, id: WidgetId) -> Rect {
-        let w = &self.widgets[id.index()];
+        let w = self.get(id);
         let mut x = w.location.x;
         let mut y = w.location.y;
 
-        let max = self.widgets.len();
+        let max = self.count();
         let mut depth = 0usize;
         let mut pid = w.parent;
         while pid.is_some() {
@@ -553,7 +815,7 @@ impl WidgetTree {
             if depth > max {
                 break;
             }
-            let p = &self.widgets[pid.index()];
+            let p = self.get(pid);
             if p.kind == KIND_DROPDOWN {
                 x += p.location.x;
                 y += p.location.y;
@@ -565,8 +827,7 @@ impl WidgetTree {
             }
             // Scroll offset: shift children by -scroll_y
             if p.flags & FLAG_CLIP_CHILDREN != 0 {
-                let scroll_y = self.value(pid);
-                y -= scroll_y;
+                y -= p.value;
             }
             pid = p.parent;
         }
@@ -607,18 +868,18 @@ impl WidgetTree {
 
     /// Find nearest ancestor with FLAG_CLIP_CHILDREN. Returns NONE if none found.
     pub fn scroll_parent(&self, id: WidgetId) -> WidgetId {
-        let max = self.widgets.len();
+        let max = self.count();
         let mut depth = 0usize;
-        let mut pid = self.widgets[id.index()].parent;
+        let mut pid = self.get(id).parent;
         while pid.is_some() {
-            if self.widgets[pid.index()].flags & FLAG_CLIP_CHILDREN != 0 {
+            if self.get(pid).flags & FLAG_CLIP_CHILDREN != 0 {
                 return pid;
             }
             depth += 1;
             if depth > max {
                 break;
             }
-            pid = self.widgets[pid.index()].parent;
+            pid = self.get(pid).parent;
         }
         WidgetId::NONE
     }
@@ -627,11 +888,11 @@ impl WidgetTree {
     /// Used to clamp scroll range: max_scroll = content_height - viewport_height.
     pub fn content_height(&self, id: WidgetId) -> u16 {
         let mut max_bottom: i16 = 0;
-        let mut child = self.widgets[id.index()].first_child;
-        let guard_max = self.widgets.len();
+        let mut child = self.get(id).first_child;
+        let guard_max = self.count();
         let mut guard = 0usize;
         while child.is_some() {
-            let c = &self.widgets[child.index()];
+            let c = self.get(child);
             let bottom = c.location.y + c.size.h as i16;
             if bottom > max_bottom {
                 max_bottom = bottom;
@@ -647,9 +908,9 @@ impl WidgetTree {
 
     /// Is child a descendant of ancestor?
     pub fn is_descendant(&self, child: WidgetId, ancestor: WidgetId) -> bool {
-        let max = self.widgets.len();
+        let max = self.count();
         let mut depth = 0usize;
-        let mut current = self.widgets[child.index()].parent;
+        let mut current = self.get(child).parent;
         while current.is_some() {
             if current == ancestor {
                 return true;
@@ -658,24 +919,20 @@ impl WidgetTree {
             if depth > max {
                 return false;
             }
-            current = self.widgets[current.index()].parent;
+            current = self.get(current).parent;
         }
         false
     }
 
-    /// Check if this widget and all its ancestors are visible.
-    /// Destroyed widgets (FLAG_DESTROYED) are treated as not visible — folding
-    /// the destroy check here means render/hit-test skip them automatically.
+    /// Check if this widget and all its ancestors are visible. An id that
+    /// names no live widget is not visible.
     pub fn is_tree_visible(&self, id: WidgetId) -> bool {
-        let max = self.widgets.len();
+        let max = self.count();
         let mut depth = 0usize;
         let mut current = id;
         while current.is_some() {
-            let w = &self.widgets[current.index()];
-            if w.flags & FLAG_DESTROYED != 0 {
-                return false;
-            }
-            if !w.is_visible() {
+            let w = self.get(current);
+            if w.flags & FLAG_DESTROYED != 0 || !w.is_visible() {
                 return false;
             }
             depth += 1;
@@ -687,87 +944,62 @@ impl WidgetTree {
         true
     }
 
-    /// Is this widget's slot live (not destroyed)?
+    /// Does `id` name a live widget?
     pub fn is_live(&self, id: WidgetId) -> bool {
-        if id.is_none() || id.index() >= self.widgets.len() {
-            return false;
-        }
-        self.widgets[id.index()].flags & FLAG_DESTROYED == 0
+        self.block(id.0, T_WIDGET).is_some()
     }
 
-    /// Destroy a widget and all its descendants. Unlinks from parent, marks
-    /// FLAG_DESTROYED, frees the WidgetExt slot, and pushes the slot id onto
-    /// the reuse queue. Caller is responsible for marking dirty (this fn just
-    /// invalidates the DFS cache).
+    /// Destroy a widget and all its descendants: unlink it from its parent and
+    /// free the objects (their pointers go back on the reuse queue). Caller
+    /// is responsible for marking dirty.
     ///
     /// String fields on the destroyed widgets become unreferenced; the next
-    /// `StringPool::smart_clear` will reclaim them.
+    /// string sweep (`strClear()`) frees them.
     pub fn destroy_subtree(&mut self, root: WidgetId) {
         if !self.is_live(root) {
             return;
         }
         // Unlink root from its parent's child list.
-        let parent = self.widgets[root.index()].parent;
+        let parent = self.get(root).parent;
         if parent.is_some() {
-            let next = self.widgets[root.index()].next_sibling;
-            let first = self.widgets[parent.index()].first_child;
+            let next = self.get(root).next_sibling;
+            let first = self.get(parent).first_child;
             if first == root {
-                self.widgets[parent.index()].first_child = next;
+                self.get_mut(parent).first_child = next;
             } else {
                 let mut sib = first;
-                let max = self.widgets.len();
+                let max = self.count();
                 let mut guard = 0usize;
-                while sib.is_some() && self.widgets[sib.index()].next_sibling != root {
-                    sib = self.widgets[sib.index()].next_sibling;
+                while sib.is_some() && self.get(sib).next_sibling != root {
+                    sib = self.get(sib).next_sibling;
                     guard += 1;
                     if guard > max {
                         break;
                     }
                 }
-                if sib.is_some() && self.widgets[sib.index()].next_sibling == root {
-                    self.widgets[sib.index()].next_sibling = next;
+                if sib.is_some() && self.get(sib).next_sibling == root {
+                    self.get_mut(sib).next_sibling = next;
                 }
             }
         }
-        // DFS-mark the whole subtree destroyed and free their ext slots.
+        // Free the whole subtree.
         let mut stack: Vec<WidgetId> = Vec::new();
         stack.push(root);
         while let Some(id) = stack.pop() {
-            // Queue children before mutating.
-            let mut c = self.widgets[id.index()].first_child;
-            let max = self.widgets.len();
+            let mut c = self.get(id).first_child;
+            let max = self.count();
             let mut guard = 0usize;
             while c.is_some() {
                 stack.push(c);
-                c = self.widgets[c.index()].next_sibling;
+                c = self.get(c).next_sibling;
                 guard += 1;
                 if guard > max {
                     break;
                 }
             }
-            let w = &mut self.widgets[id.index()];
-            // Free ext slot.
-            if w.ext != EXT_NONE {
-                let ext_idx = w.ext;
-                w.ext = EXT_NONE;
-                self.ext_free.push(ext_idx);
-            }
-            // Clear tree links so stale traversal cannot reach live widgets.
-            w.first_child = WidgetId::NONE;
-            w.next_sibling = WidgetId::NONE;
-            w.parent = WidgetId::NONE;
-            // Mark destroyed and clear visibility/clickable so any cached
-            // pointer treats it as inert.
-            w.flags = (w.flags & !(FLAG_VISIBLE | FLAG_CLICKABLE)) | FLAG_DESTROYED;
-            self.widget_free.push(id);
+            self.free_obj(id.0, T_WIDGET);
         }
         self.dfs_valid = false;
-    }
-
-    /// Selection group of a KIND_BUTTON_GROUP / KIND_RADIO widget (0 without
-    /// an extension).
-    pub fn group_id(&self, id: WidgetId) -> u8 {
-        self.ext(id).map_or(0, |e| e.group_id)
     }
 
     /// Check `id` (a KIND_BUTTON_GROUP or KIND_RADIO widget) and uncheck every
@@ -778,44 +1010,42 @@ impl WidgetTree {
     /// radio behaviour). Button groups and radios never share a group.
     /// Changed widgets are marked dirty; re-selecting keeps `id` checked.
     pub fn select_in_group(&mut self, id: WidgetId) {
-        let kind = self.widgets[id.index()].kind;
-        let parent = self.widgets[id.index()].parent;
+        let kind = self.get(id).kind;
+        let parent = self.get(id).parent;
         let group = self.group_id(id);
         let siblings_only = kind == KIND_RADIO && group == 0;
-        for i in 0..self.widgets.len() {
-            let other = WidgetId(i as u16);
-            let w = &self.widgets[i];
-            if other == id
-                || w.kind != kind
-                || w.flags & (FLAG_CHECKED | FLAG_DESTROYED) != FLAG_CHECKED
+        for p in 0..self.count() as u16 {
+            let other = WidgetId(p);
+            if other == id || !self.is_live(other) {
+                continue;
+            }
+            let w = self.get(other);
+            if w.kind != kind
+                || w.flags & FLAG_CHECKED == 0
                 || (siblings_only && w.parent != parent)
                 || self.group_id(other) != group
             {
                 continue;
             }
-            self.widgets[i].flags &= !FLAG_CHECKED;
+            self.get_mut(other).flags &= !FLAG_CHECKED;
             self.mark_dirty(other);
         }
-        if self.widgets[id.index()].flags & FLAG_CHECKED == 0 {
-            self.widgets[id.index()].flags |= FLAG_CHECKED;
+        if self.get(id).flags & FLAG_CHECKED == 0 {
+            self.get_mut(id).flags |= FLAG_CHECKED;
             self.mark_dirty(id);
         }
     }
 
     /// Mark widget and all descendants as dirty in both buffers.
     pub fn mark_dirty(&mut self, id: WidgetId) {
-        if id.is_none() || id.index() >= self.widgets.len() {
+        if !self.is_live(id) {
             return;
         }
-        let w = &mut self.widgets[id.index()];
-        if w.flags & FLAG_DESTROYED != 0 {
-            return;
-        }
-        w.flags |= FLAG_DIRTY_AB;
-        let mut child = self.widgets[id.index()].first_child;
+        self.get_mut(id).flags |= FLAG_DIRTY_AB;
+        let mut child = self.get(id).first_child;
         while child.is_some() {
             self.mark_dirty(child);
-            child = self.widgets[child.index()].next_sibling;
+            child = self.get(child).next_sibling;
         }
     }
 
@@ -826,7 +1056,7 @@ impl WidgetTree {
         }
 
         self.dfs_cache.clear();
-        let max = self.widgets.len();
+        let max = self.count();
 
         if self.root.is_none() {
             self.dfs_valid = true;
@@ -842,12 +1072,12 @@ impl WidgetTree {
             }
             self.dfs_cache.push(id);
 
-            let mut child = self.widgets[id.index()].first_child;
+            let mut child = self.get(id).first_child;
             let start = stack.len();
             let mut child_count = 0usize;
             while child.is_some() {
                 stack.push(child);
-                child = self.widgets[child.index()].next_sibling;
+                child = self.get(child).next_sibling;
                 child_count += 1;
                 if child_count > max {
                     break;
@@ -891,38 +1121,70 @@ impl WidgetTree {
 }
 
 #[cfg(test)]
-mod limit_tests {
+mod tests {
     use super::*;
 
-    #[test]
-    fn set_limits_caps_alloc_and_ext() {
-        let mut tree = WidgetTree::new();
-        tree.set_limits(2, 1);
-        assert_eq!(tree.limits(), (2, 1));
-        let a = tree.alloc().unwrap();
-        let b = tree.alloc().unwrap();
-        assert!(tree.alloc().is_none());
-        assert!(tree.ensure_ext(a).is_some());
-        assert!(tree.ensure_ext(b).is_none());
+    fn group_widget(tree: &mut ObjPool, kind: u8, group: u8) -> WidgetId {
+        let id = tree.alloc_widget().unwrap();
+        tree.get_mut(id).kind = kind;
+        assert!(tree.update_ext(id, |e| e.group_id = group));
+        id
+    }
 
-        // 0 = compile-time maximum; oversized values clamp to it.
-        tree.set_limits(0, 5000);
-        assert_eq!(tree.limits(), (MAX_WIDGETS, MAX_EXTENSIONS));
+    #[test]
+    fn sections_grow_on_demand_and_keep_fields() {
+        let mut tree = ObjPool::new();
+        let w = tree.alloc_widget().unwrap();
+        let other = tree.alloc_widget().unwrap();
+        let plain = tree.bytes_of(T_WIDGET) / 2;
+        assert_eq!(plain, 4 + 24, "header only");
+
+        // Sections out of bit order: STYLE first, then BOX (inserted before it).
+        assert!(tree.update_ext(w, |e| e.border_radius = 7));
+        assert!(tree.update_ext(w, |e| e.padding = Edges::uniform(3)));
+        tree.set_text_id(w, 42);
+        tree.get_mut(w).value = -5;
+        let e = tree.ext(w);
+        assert_eq!(e.border_radius, 7);
+        assert!(e.padding == Edges::uniform(3));
+        assert_eq!(e.text_id, 42);
+        assert_eq!(e.value, -5);
+        assert_eq!(e.alpha, 255, "untouched fields keep defaults");
+        assert_eq!(tree.bytes_of(T_WIDGET), plain + 28 + 3 * 8);
+
+        // Writing defaults adds nothing.
+        assert!(tree.update_ext(other, |e| e.alpha = 255));
+        assert_eq!(tree.ext(other).text_id, 0xFFFF);
+
+        // Moving / compacting keeps everything.
+        tree.compact();
+        assert!(tree.ext(w).padding == Edges::uniform(3));
+        assert_eq!(tree.text_id(w), 42);
+    }
+
+    #[test]
+    fn stale_ids_read_as_dead_widgets() {
+        let mut tree = ObjPool::new();
+        let root = tree.alloc_widget().unwrap();
+        let child = tree.alloc_widget().unwrap();
+        tree.add_child(root, child);
+        tree.destroy_subtree(child);
+        assert!(!tree.is_live(child));
+        assert!(!tree.is_tree_visible(child));
+        assert!(tree.get(root).first_child.is_none());
+        tree.get_mut(child).location.x = 9; // lost, no panic
+        assert_eq!(tree.get(child).location.x, 0);
+        // FIFO reuse hands the pointer back.
+        assert_eq!(tree.alloc_widget().map(|w| w.0), Some(child.0));
     }
 
     #[test]
     fn select_in_group_keeps_one_checked_per_group() {
-        let mut tree = WidgetTree::new();
-        let mk = |tree: &mut WidgetTree, group: u8| {
-            let id = tree.alloc().unwrap();
-            tree.get_mut(id).kind = KIND_BUTTON_GROUP;
-            tree.ensure_ext(id).unwrap().group_id = group;
-            id
-        };
-        let a = mk(&mut tree, 1);
-        let b = mk(&mut tree, 1);
-        let other = mk(&mut tree, 2);
-        let checked = |tree: &WidgetTree, id: WidgetId| tree.get(id).flags & FLAG_CHECKED != 0;
+        let mut tree = ObjPool::new();
+        let a = group_widget(&mut tree, KIND_BUTTON_GROUP, 1);
+        let b = group_widget(&mut tree, KIND_BUTTON_GROUP, 1);
+        let other = group_widget(&mut tree, KIND_BUTTON_GROUP, 2);
+        let checked = |tree: &ObjPool, id: WidgetId| tree.get(id).flags & FLAG_CHECKED != 0;
 
         tree.select_in_group(other);
         tree.select_in_group(a);
@@ -938,17 +1200,15 @@ mod limit_tests {
 
     #[test]
     fn radio_group_zero_is_siblings_nonzero_is_tree_wide() {
-        let mut tree = WidgetTree::new();
-        let p1 = tree.alloc().unwrap();
-        let p2 = tree.alloc().unwrap();
-        let radio = |tree: &mut WidgetTree, parent: WidgetId, group: u8| {
-            let id = tree.alloc().unwrap();
-            tree.get_mut(id).kind = KIND_RADIO;
-            tree.ensure_ext(id).unwrap().group_id = group;
+        let mut tree = ObjPool::new();
+        let p1 = tree.alloc_widget().unwrap();
+        let p2 = tree.alloc_widget().unwrap();
+        let radio = |tree: &mut ObjPool, parent: WidgetId, group: u8| {
+            let id = group_widget(tree, KIND_RADIO, group);
             tree.add_child(parent, id);
             id
         };
-        let checked = |tree: &WidgetTree, id: WidgetId| tree.get(id).flags & FLAG_CHECKED != 0;
+        let checked = |tree: &ObjPool, id: WidgetId| tree.get(id).flags & FLAG_CHECKED != 0;
 
         // group 0: per parent, as before.
         let a1 = radio(&mut tree, p1, 0);
@@ -968,9 +1228,7 @@ mod limit_tests {
         assert!(checked(&tree, a2) && checked(&tree, b1));
 
         // A button group with the same id is a separate group.
-        let btn = tree.alloc().unwrap();
-        tree.get_mut(btn).kind = KIND_BUTTON_GROUP;
-        tree.ensure_ext(btn).unwrap().group_id = 5;
+        let btn = group_widget(&mut tree, KIND_BUTTON_GROUP, 5);
         tree.select_in_group(btn);
         assert!(checked(&tree, btn) && checked(&tree, g2));
     }

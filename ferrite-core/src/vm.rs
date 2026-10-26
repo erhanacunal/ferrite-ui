@@ -17,12 +17,12 @@ use crate::proto::{
 };
 use crate::render;
 use crate::strpool;
-use crate::strpool::StringPool;
+use crate::pool::ObjPool;
 use crate::types::{Edges, Offset, Size};
 use crate::widget::{
     FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_HAS_ON_CLICK,
     FLAG_HAS_ON_PAINT, FLAG_HAS_ON_TAP, FLAG_MULTI_LINE, FLAG_VISIBLE, KIND_BUTTON_GROUP, KIND_RADIO,
-    WidgetExt, WidgetId,
+    WidgetId,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -445,9 +445,9 @@ pub mod fault {
     pub const CALL_OVERFLOW: u8 = 5;
     /// RET with an empty call stack outside a callback.
     pub const RET_EMPTY: u8 = 6;
-    /// Widget pool exhausted (W_ALLOC / W_ALLTAR).
+    /// Object pool full: a widget could not be allocated (W_ALLOC / W_ALLTAR).
     pub const WIDGET_ALLOC: u8 = 7;
-    /// String pool full.
+    /// Object pool full: a string could not be allocated.
     pub const STR_ALLOC: u8 = 8;
     /// Unknown array id (never allocated or already freed).
     pub const BAD_ARRAY: u8 = 9;
@@ -466,6 +466,8 @@ pub mod fault {
     /// EEPROM address range outside the chip, no EEPROM on the board, or an
     /// I2C bus error.
     pub const EEPROM: u8 = 16;
+    /// Object pool full: an array could not be allocated.
+    pub const ARR_ALLOC: u8 = 17;
 
     /// Short human-readable name for the error screen.
     pub fn name(code: u8) -> &'static [u8] {
@@ -476,8 +478,8 @@ pub mod fault {
             STACK_UNDERFLOW => b"stack underflow",
             CALL_OVERFLOW => b"call stack overflow",
             RET_EMPTY => b"ret without call",
-            WIDGET_ALLOC => b"widget pool full",
-            STR_ALLOC => b"string pool full",
+            WIDGET_ALLOC => b"pool full: widget",
+            STR_ALLOC => b"pool full: string",
             BAD_ARRAY => b"invalid array",
             ARRAY_INDEX => b"array index range",
             BAD_FILE => b"invalid file handle",
@@ -486,6 +488,7 @@ pub mod fault {
             GPIO => b"invalid gpio pin/mode",
             PAGE => b"bad widget page",
             EEPROM => b"eeprom error",
+            ARR_ALLOC => b"pool full: array",
             _ => b"unknown fault",
         }
     }
@@ -519,12 +522,6 @@ struct VmVar {
 }
 /// Default call stack depth (overridable via RES_SYSCFG `call_stack`).
 const CALL_STACK_SIZE: usize = 16;
-
-/// Internal heap-allocated VM array.
-struct VmArray {
-    id: u16,
-    data: Vec<i32>,
-}
 
 /// Call stack frame: return address + saved frame state.
 #[derive(Clone, Copy)]
@@ -679,8 +676,6 @@ pub struct Vm {
     fault_pc: CodeAddr,
     /// Start address of the instruction currently executing.
     op_pc: CodeAddr,
-    arrays: Vec<VmArray>,
-    next_arr_id: u16,
     pub wait_until: u32,
     // Code source — owned by VM
     code: VmCode,
@@ -726,7 +721,7 @@ pub struct Vm {
     anims: Vec<Anim>,
     anim_slots: u8,
     // Device-specific syscall handler. Called by OP_SYSCALL; returns None → VM Error.
-    pub syscall_fn: Option<fn(id: u8, args: &[i32], strpool: &StringPool) -> Option<i32>>,
+    pub syscall_fn: Option<fn(id: u8, args: &[i32], strpool: &ObjPool) -> Option<i32>>,
     // True while `run_paint` executes on_paint: render() is then a no-op (the
     // frame being painted is presented by run_paint's caller).
     in_paint: bool,
@@ -769,8 +764,6 @@ impl Vm {
             fault: fault::NONE,
             fault_pc: 0,
             op_pc: 0,
-            arrays: Vec::new(),
-            next_arr_id: 0,
             wait_until: 0,
             code: VmCode::None,
             functions: Vec::new(),
@@ -889,11 +882,18 @@ impl Vm {
     /// Load a VM image from RAM bytes. Parses the image header and keeps
     /// opcodes in a Vec<u8>. Returns false if the header is invalid.
     pub fn load_ram(&mut self, image: &[u8]) -> bool {
-        if let Some((funcs, opcode_start, gc, rm, hint, wide, portrait)) = parse_image_header(image) {
+        self.load_ram_owned(image.to_vec())
+    }
+
+    /// Like `load_ram`, but takes the image buffer and strips the header in
+    /// place, so loading needs no second copy of the program.
+    pub fn load_ram_owned(&mut self, mut image: Vec<u8>) -> bool {
+        if let Some((funcs, opcode_start, gc, rm, hint, wide, portrait)) = parse_image_header(&image) {
             if !code_addressable(wide, image.len() - opcode_start) {
                 return false;
             }
-            let opcodes = image[opcode_start..].to_vec();
+            image.drain(..opcode_start);
+            let opcodes = image;
             self.wide_addr = wide;
             self.code = VmCode::Ram(opcodes);
             self.functions = funcs;
@@ -1134,7 +1134,7 @@ impl Vm {
         let mut ids = [0i32; render::PAINT_MAX];
         let mut n = 0;
         for &id in paint.ids() {
-            if ctx.tree.is_tree_visible(id) {
+            if ctx.objs.is_tree_visible(id) {
                 ids[n] = id.0 as i32;
                 n += 1;
             }
@@ -1142,9 +1142,11 @@ impl Vm {
         if n == 0 {
             return;
         }
-        let arr_id = self.alloc_array_from_i32s(&ids[..n]);
+        let Some(arr_id) = ctx.objs.arr_from(&ids[..n]) else {
+            return;
+        };
         self.in_paint = true;
-        self.call_now(offset, &[arr_id], ctx);
+        self.call_now(offset, &[arr_id as i32], ctx);
         self.in_paint = false;
     }
 
@@ -1219,7 +1221,7 @@ impl Vm {
             WidgetId::NONE
         };
 
-        if !ctx.tree.is_live(overlay) {
+        if !ctx.objs.is_live(overlay) {
             // Builder returned a bogus id — pop modal, emulate Cancel.
             self.modal_stack.pop();
             self.push(DLG_CANCEL);
@@ -1232,10 +1234,10 @@ impl Vm {
         // omitted, so this path always has a real func_id.
         // Mark the overlay as having a click handler so main.rs dispatches it.
         // The actual func_id lives in ModalFrame.overlay_click_fn, not in ext.
-        ctx.tree.get_mut(overlay).flags |= FLAG_CLICKABLE | FLAG_HAS_ON_CLICK;
+        ctx.objs.get_mut(overlay).flags |= FLAG_CLICKABLE | FLAG_HAS_ON_CLICK;
         // Repaint the whole screen on next frame so the overlay's full-screen
         // backdrop covers everything underneath in both buffers.
-        ctx.tree.mark_dirty(WidgetId(0));
+        ctx.objs.mark_dirty(WidgetId(0));
 
         let top = self.modal_stack.last_mut().unwrap();
         top.overlay_id = overlay;
@@ -1273,10 +1275,10 @@ impl Vm {
         };
         self.modal_stack.pop();
 
-        if ctx.tree.is_live(overlay) {
-            ctx.tree.destroy_subtree(overlay);
+        if ctx.objs.is_live(overlay) {
+            ctx.objs.destroy_subtree(overlay);
             // Repaint background under the now-gone overlay in both buffers.
-            ctx.tree.mark_dirty(WidgetId(0));
+            ctx.objs.mark_dirty(WidgetId(0));
         }
 
         // The code that called showModal — a callback or the main program —
@@ -1434,8 +1436,6 @@ impl Vm {
         self.state = VmState::Ready;
         self.fault = fault::NONE;
         self.vars.clear();
-        self.arrays.clear();
-        self.next_arr_id = 0;
         self.wait_until = 0;
         self.code = VmCode::None;
         self.functions.clear();
@@ -1464,29 +1464,6 @@ impl Vm {
 
     pub fn has_code(&self) -> bool {
         self.code.len() > 0
-    }
-
-    pub fn alloc_array_from(&mut self, data: &[u8]) -> Option<i32> {
-        if data.is_empty() {
-            return None;
-        }
-        let id = self.next_arr_id;
-        let arr_data: Vec<i32> = data.iter().map(|&b| b as i32).collect();
-        self.arrays.push(VmArray { id, data: arr_data });
-        self.next_arr_id = self.next_arr_id.wrapping_add(1);
-        Some(id as i32)
-    }
-
-    /// Allocate a VM array from a native i32 slice. Used by the firmware to
-    /// pass batched widget-id lists to generated dispatcher callbacks (e.g. OnPaint).
-    pub fn alloc_array_from_i32s(&mut self, values: &[i32]) -> i32 {
-        let id = self.next_arr_id;
-        self.arrays.push(VmArray {
-            id,
-            data: values.to_vec(),
-        });
-        self.next_arr_id = self.next_arr_id.wrapping_add(1);
-        id as i32
     }
 
     pub fn run<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
@@ -1691,7 +1668,7 @@ impl Vm {
             }
             OP_W_DIRTY => {
                 if self.target.is_some() {
-                    ctx.tree.mark_dirty(self.target);
+                    ctx.objs.mark_dirty(self.target);
                 }
             }
             OP_W_RENDER => match self.render_mode {
@@ -1703,7 +1680,7 @@ impl Vm {
                         ctx.lcd.begin_frame();
                         // Reborrow self as immutable while ctx stays mut —
                         // render reads array data via Vm::array_slice.
-                        let paint = render::render_buffered_content(ctx, &*self);
+                        let paint = render::render_buffered_content(ctx);
                         self.run_paint(ctx, &paint);
                         ctx.lcd.end_frame();
                     }
@@ -1711,7 +1688,7 @@ impl Vm {
                 RenderMode::Dirty => {
                     let mut paint = render::PaintList::new();
                     render::collect_dirty_paint(ctx, &mut paint);
-                    render::render_dirty(ctx, &*self);
+                    render::render_dirty(ctx);
                     self.run_paint(ctx, &paint);
                 }
                 RenderMode::EPaper => {
@@ -1720,25 +1697,25 @@ impl Vm {
                     // framebuffer panels; e-paper backends override the hook.
                     ctx.lcd.pre_full_redraw();
                     // Full redraw — guarantees all rows are tainted for flush.
-                    render::render_all(ctx, &*self);
+                    render::render_all(ctx);
                     ctx.lcd.flush_dirty();
                 }
             },
             OP_ARR_LOAD => {
                 let (arr_id, idx) = self.pop2();
-                self.arr_load(arr_id, idx);
+                self.arr_load(ctx, arr_id, idx);
             }
             OP_ARR_STORE => {
                 let (idx, val) = self.pop2();
                 let arr_id = self.pop();
-                self.arr_store(arr_id, idx, val);
+                self.arr_store(ctx, arr_id, idx, val);
             }
             OP_ARR_LEN => {
                 let arr_id = self.pop();
-                self.arr_len(arr_id);
+                self.arr_len(ctx, arr_id);
             }
             OP_W_ALLOC => {
-                if let Some(id) = ctx.tree.alloc() {
+                if let Some(id) = ctx.objs.alloc_widget() {
                     self.push(id.0 as i32);
                 } else {
                     self.fail(fault::WIDGET_ALLOC);
@@ -1754,7 +1731,9 @@ impl Vm {
             }
             OP_ARR_FREE => {
                 let arr_id = self.pop();
-                self.arr_free(arr_id);
+                if arr_id >= 0 {
+                    ctx.objs.arr_free(arr_id as u16);
+                }
             }
 
             // --- Specialized short forms ---
@@ -1944,24 +1923,27 @@ impl Vm {
                 }
             }
             OP_ARR_ALLOC => {
-                let size = self.read_u8() as u16;
-                self.arr_alloc(size);
+                let size = self.read_u8() as usize;
+                match ctx.objs.arr_alloc(size) {
+                    Some(id) => self.push(id as i32),
+                    None => self.fail(fault::ARR_ALLOC),
+                }
             }
             OP_ARR_INIT => {
                 let count = self.read_u8() as usize;
                 let start = self.pc as usize;
                 let byte_len = count * 4;
                 if start + byte_len <= self.code.len() {
-                    let mut values: Vec<i32> = Vec::with_capacity(count);
-                    let mut tmp = [0u8; 4];
-                    for i in 0..count {
-                        self.code.read_bytes(start + i * 4, &mut tmp);
-                        values.push(i32::from_le_bytes(tmp));
-                    }
                     self.pc = (start + byte_len) as CodeAddr;
-                    let id = self.next_arr_id;
-                    self.arrays.push(VmArray { id, data: values });
-                    self.next_arr_id = self.next_arr_id.wrapping_add(1);
+                    let Some(id) = ctx.objs.arr_alloc(count) else {
+                        return self.fail(fault::ARR_ALLOC);
+                    };
+                    let values = ctx.objs.arr_mut(id).unwrap();
+                    let mut tmp = [0u8; 4];
+                    for (i, v) in values.iter_mut().enumerate() {
+                        self.code.read_bytes(start + i * 4, &mut tmp);
+                        *v = i32::from_le_bytes(tmp);
+                    }
                     self.push(id as i32);
                 } else {
                     self.fail(fault::CODE_OOB);
@@ -2090,7 +2072,7 @@ impl Vm {
                     let n = len.min(buf.len());
                     self.code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as CodeAddr;
-                    match ctx.strpool.intern(&buf[..n]) {
+                    match ctx.objs.str_intern(&buf[..n]) {
                         Some(id) => self.push(id as i32),
                         None => self.fail(fault::STR_ALLOC),
                     }
@@ -2100,14 +2082,14 @@ impl Vm {
             }
             OP_ITOS => {
                 let val = self.pop();
-                match strpool::itos(&mut ctx.strpool, val) {
+                match strpool::itos(&mut ctx.objs, val) {
                     Some(id) => self.push(id as i32),
                     None => self.fail(fault::STR_ALLOC),
                 }
             }
             OP_FTOS => {
                 let bits = self.pop() as u32;
-                match strpool::ftos(&mut ctx.strpool, bits) {
+                match strpool::ftos(&mut ctx.objs, bits) {
                     Some(id) => self.push(id as i32),
                     None => self.fail(fault::STR_ALLOC),
                 }
@@ -2115,43 +2097,43 @@ impl Vm {
             OP_CONCAT => {
                 let (a, b) = self.pop2();
                 let (a, b) = (a as u16, b as u16);
-                match ctx.strpool.concat(a, b) {
+                match ctx.objs.str_concat(a, b) {
                     Some(id) => self.push(id as i32),
                     None => self.fail(fault::STR_ALLOC),
                 }
             }
             OP_PARSE_INT => {
                 let id = self.pop() as u16;
-                self.push(strpool::parse_int(&ctx.strpool, id));
+                self.push(strpool::parse_int(&ctx.objs, id));
             }
             OP_PARSE_FLOAT => {
                 let id = self.pop() as u16;
-                self.push(strpool::parse_float(&ctx.strpool, id) as i32);
+                self.push(strpool::parse_float(&ctx.objs, id) as i32);
             }
             OP_STR_LEN => {
                 let id = self.pop() as u16;
-                self.push(ctx.strpool.len(id) as i32);
+                self.push(ctx.objs.str_len(id) as i32);
             }
             OP_STR_BYTE => {
                 let (id, idx) = self.pop2();
-                let bytes = ctx.strpool.get(id as u16);
+                let bytes = ctx.objs.str_get(id as u16);
                 let b = usize::try_from(idx).ok().and_then(|i| bytes.get(i));
                 self.push(b.map_or(-1, |&b| b as i32));
             }
             OP_STR_CMP => {
                 let (a, b) = self.pop2();
                 let (a, b) = (a as u16, b as u16);
-                self.push(ctx.strpool.compare(a, b));
+                self.push(ctx.objs.str_compare(a, b));
             }
             OP_SET_TEXT => {
                 let str_id = self.pop() as u16;
                 if self.target.is_some() {
-                    if let Some(ext) = ctx.tree.ensure_ext(self.target) {
+                    ctx.objs.update_ext(self.target, |ext| {
                         ext.text_id = str_id;
-                    }
+                    });
                     // Text change repaints on the next render() — same as the
                     // W_SET text path.
-                    ctx.tree.mark_dirty(self.target);
+                    ctx.objs.mark_dirty(self.target);
                 }
             }
             OP_DRAW_STR => {
@@ -2160,16 +2142,16 @@ impl Vm {
                 let (fg, bg) = unpack_pair(colors);
                 let font_id = font_id as u8;
                 let (x, y) = unpack_pair(self.pop());
-                let data = ctx.strpool.get(str_id);
+                let data = ctx.objs.str_get(str_id);
                 if let Some(font) = ctx.fonts.resolve(font_id) {
                     let bg_opt = if bg == 0 { None } else { Some(bg) };
                     font.draw_str(&ctx.lcd, &ctx.flash, data, x as i16, y as i16, fg, bg_opt);
                 }
             }
-            OP_STR_CLEAR => ctx.strpool.smart_clear(&mut ctx.tree),
+            OP_STR_CLEAR => ctx.objs.str_sweep(),
             OP_STR_FREE => {
                 let str_id = self.pop() as u16;
-                ctx.strpool.free(str_id);
+                ctx.objs.str_free(str_id);
             }
             OP_ROUNDED_RECT => {
                 let (r, color) = self.pop2();
@@ -2207,21 +2189,21 @@ impl Vm {
             }
             OP_SEND_USART => {
                 let arr_id = self.pop() as u16;
-                if let Some(arr) = self.arrays.iter().find(|a| a.id == arr_id) {
-                    for &val in &arr.data {
+                if let Some(arr) = ctx.objs.arr(arr_id) {
+                    for &val in arr {
                         ctx.usart.write_byte(val as u8);
                     }
                 }
             }
             OP_SEND_USART_STR => {
                 let str_id = self.pop() as u16;
-                let bytes = ctx.strpool.get(str_id);
+                let bytes = ctx.objs.str_get(str_id);
                 ctx.usart.write(bytes);
             }
             OP_RTC_READ => {
                 // Read RTC → allocate array [sec, min, hour, day, weekday, month, year]
                 let dt = ctx.rtc.read_time();
-                let data = alloc::vec![
+                let data = [
                     dt.second as i32,
                     dt.minute as i32,
                     dt.hour as i32,
@@ -2230,26 +2212,25 @@ impl Vm {
                     dt.month as i32,
                     dt.year as i32,
                 ];
-                let id = self.next_arr_id;
-                self.arrays.push(VmArray { id, data });
-                self.next_arr_id = self.next_arr_id.wrapping_add(1);
-                self.push(id as i32);
+                match ctx.objs.arr_from(&data) {
+                    Some(id) => self.push(id as i32),
+                    None => self.fail(fault::ARR_ALLOC),
+                }
             }
             OP_RTC_WRITE => {
                 // Pop arr_id, read [sec, min, hour, day, weekday, month, year], set RTC
                 let arr_id = self.pop();
-                match self.find_array(arr_id) {
-                    Some(pos) => {
-                        let arr = &self.arrays[pos];
-                        if arr.data.len() >= 7 {
+                match Self::find_array(ctx, arr_id) {
+                    Some(arr) => {
+                        if arr.len() >= 7 {
                             let dt = crate::rtc::DateTime {
-                                second: arr.data[0] as u8,
-                                minute: arr.data[1] as u8,
-                                hour: arr.data[2] as u8,
-                                day: arr.data[3] as u8,
-                                weekday: arr.data[4] as u8,
-                                month: arr.data[5] as u8,
-                                year: arr.data[6] as u8,
+                                second: arr[0] as u8,
+                                minute: arr[1] as u8,
+                                hour: arr[2] as u8,
+                                day: arr[3] as u8,
+                                weekday: arr[4] as u8,
+                                month: arr[5] as u8,
+                                year: arr[6] as u8,
                             };
                             ctx.rtc.set_time(&dt);
                         } else {
@@ -2333,7 +2314,7 @@ impl Vm {
             #[cfg(feature = "audio")]
             OP_SOUND_PLAY => {
                 let (str_id, looping) = self.pop2();
-                let name = ctx.strpool.get(str_id as u16);
+                let name = ctx.objs.str_get(str_id as u16);
                 let ok = match ctx.fs.as_ref() {
                     Some(fs) => ctx.audio.play(fs, &ctx.flash, name, looping != 0),
                     None => false,
@@ -2375,7 +2356,7 @@ impl Vm {
             // --- File ops (flash filesystem, read-only) ---
             OP_FILE_OPEN => {
                 let str_id = self.pop() as u16;
-                let name = ctx.strpool.get(str_id);
+                let name = ctx.objs.str_get(str_id);
                 let result = self.file_open(ctx, name);
                 self.push(result);
             }
@@ -2431,28 +2412,30 @@ impl Vm {
             }
             OP_ARR_TO_STR => {
                 let (arr_id, len) = self.pop2();
-                match self.find_array(arr_id) {
-                    Some(pos) => {
-                        let data = &self.arrays[pos].data;
+                let mut buf = [0u8; 256];
+                let take = match Self::find_array(ctx, arr_id) {
+                    Some(data) => {
                         let take = if len < 0 {
                             data.len()
                         } else {
                             (len as usize).min(data.len())
                         };
-                        let mut buf = [0u8; 256];
-                        if take > buf.len() {
-                            self.fail(fault::BAD_OPERAND);
-                        } else {
+                        if take <= buf.len() {
                             for i in 0..take {
                                 buf[i] = data[i] as u8;
                             }
-                            match ctx.strpool.alloc(&buf[..take]) {
-                                Some(id) => self.push(id as i32),
-                                None => self.fail(fault::STR_ALLOC),
-                            }
                         }
+                        take
                     }
-                    None => self.fail(fault::BAD_ARRAY),
+                    None => return self.fail(fault::BAD_ARRAY),
+                };
+                if take > buf.len() {
+                    self.fail(fault::BAD_OPERAND);
+                } else {
+                    match ctx.objs.str_alloc(&buf[..take]) {
+                        Some(id) => self.push(id as i32),
+                        None => self.fail(fault::STR_ALLOC),
+                    }
                 }
             }
 
@@ -2466,12 +2449,12 @@ impl Vm {
                 let fmt_id = self.pop() as u16;
                 let mut fmt_buf = [0u8; 128];
                 let fmt_len = {
-                    let fmt = ctx.strpool.get(fmt_id);
+                    let fmt = ctx.objs.str_get(fmt_id);
                     let n = fmt.len().min(128);
                     fmt_buf[..n].copy_from_slice(&fmt[..n]);
                     n
                 };
-                match strpool::sprintf(&mut ctx.strpool, &fmt_buf[..fmt_len], &args[..actual]) {
+                match strpool::sprintf(&mut ctx.objs, &fmt_buf[..fmt_len], &args[..actual]) {
                     Some(id) => self.push(id as i32),
                     None => self.fail(fault::STR_ALLOC),
                 }
@@ -2486,7 +2469,7 @@ impl Vm {
                     args[i] = self.pop();
                 }
                 match self.syscall_fn {
-                    Some(f) => match f(syscall_id, &args[..actual], &ctx.strpool) {
+                    Some(f) => match f(syscall_id, &args[..actual], &ctx.objs) {
                         Some(v) => self.push(v),
                         None => self.fail(fault::SYSCALL),
                     },
@@ -2660,7 +2643,7 @@ impl Vm {
     #[inline(never)]
     fn w_alltar<P: Platform>(&mut self, ctx: &mut Ctx<P>, raw: u8) {
         let slot = self.resolve_slot(raw);
-        if let Some(id) = ctx.tree.alloc() {
+        if let Some(id) = ctx.objs.alloc_widget() {
             self.var_set(slot, id.0 as i32);
             self.target = id;
         } else {
@@ -2671,7 +2654,7 @@ impl Vm {
     #[inline(never)]
     fn w_parent<P: Platform>(&mut self, ctx: &mut Ctx<P>, parent: u16) {
         if self.target.is_some() {
-            ctx.tree.add_child(WidgetId(parent), self.target);
+            ctx.objs.add_child(WidgetId(parent), self.target);
         }
     }
 
@@ -2698,7 +2681,7 @@ impl Vm {
         // A property write that changes appearance schedules a redraw, so
         // `render()` repaints without an explicit `dirty(widget)` call.
         if prop_is_visual(prop_id) {
-            ctx.tree.mark_dirty(self.target);
+            ctx.objs.mark_dirty(self.target);
         }
     }
 
@@ -2708,7 +2691,7 @@ impl Vm {
         if self.target.is_some() {
             self.set_compound_prop(prop_id, data, ctx);
             if prop_is_visual(prop_id) {
-                ctx.tree.mark_dirty(self.target);
+                ctx.objs.mark_dirty(self.target);
             }
         }
     }
@@ -2818,18 +2801,18 @@ impl Vm {
             // the rest of its group. Radios in group 0 keep the plain flag.
             if flag == FLAG_CHECKED
                 && val != 0
-                && match ctx.tree.get(target).kind {
+                && match ctx.objs.get(target).kind {
                     KIND_BUTTON_GROUP => true,
-                    KIND_RADIO => ctx.tree.group_id(target) != 0,
+                    KIND_RADIO => ctx.objs.group_id(target) != 0,
                     _ => false,
                 }
             {
-                ctx.tree.select_in_group(target);
+                ctx.objs.select_in_group(target);
                 return;
             }
-            set_flag(&mut ctx.tree.get_mut(target).flags, flag, val != 0);
+            set_flag(&mut ctx.objs.get_mut(target).flags, flag, val != 0);
             if flag & (FLAG_VISIBLE | FLAG_ENABLED) != 0 {
-                ctx.tree.mark_dirty(target);
+                ctx.objs.mark_dirty(target);
             }
             return;
         }
@@ -2839,50 +2822,50 @@ impl Vm {
         let mut prop_set = false;
         match prop_id {
             PROP_LOC_X => {
-                ctx.tree.get_mut(target).location.x = val as i16;
+                ctx.objs.get_mut(target).location.x = val as i16;
                 dirty = true;
                 prop_set = true;
                 
             }
             PROP_LOC_Y => {
-                ctx.tree.get_mut(target).location.y = val as i16;
+                ctx.objs.get_mut(target).location.y = val as i16;
                 dirty = true;   
                 prop_set = true;
             }
             PROP_SIZE_W => {
-                ctx.tree.get_mut(target).size.w = val as u16;
+                ctx.objs.get_mut(target).size.w = val as u16;
                 dirty = true;
                 prop_set = true;
             }
             PROP_SIZE_H => {
-                ctx.tree.get_mut(target).size.h = val as u16;
+                ctx.objs.get_mut(target).size.h = val as u16;
                 dirty = true;
                 prop_set = true;
             }
             PROP_BG_COLOR => {
-                ctx.tree.get_mut(target).background_color = val as u16;
+                ctx.objs.get_mut(target).background_color = val as u16;
                 prop_set = true;
             }
             PROP_BORDER_COLOR => {
-                ctx.tree.get_mut(target).border_color = val as u16;
+                ctx.objs.get_mut(target).border_color = val as u16;
                 prop_set = true;
             }
             PROP_KIND => {
-                ctx.tree.get_mut(target).kind = val as u8;
+                ctx.objs.get_mut(target).kind = val as u8;
                 prop_set = true;
             }
             _ => {}
         }
 
         if dirty {
-            ctx.tree.mark_dirty(target);
+            ctx.objs.mark_dirty(target);
         }
         if prop_set {
             return;
         }
 
         // Extension fields (allocate on demand)
-        if let Some(ext) = ctx.tree.ensure_ext(target) {
+        ctx.objs.update_ext(target, |ext| {
             match prop_id {
                 PROP_BORDER_T => ext.border.top = val as u8,
                 PROP_BORDER_R => ext.border.right = val as u8,
@@ -2916,7 +2899,7 @@ impl Vm {
                 PROP_GRAPH_FLAGS => ext.image_id = val as u8,
                 _ => {}
             }
-        }
+        });
     }
 
     fn get_scalar_prop<P: Platform>(&self, ctx: &Ctx<P>, prop_id: u8) -> i32 {
@@ -2928,9 +2911,9 @@ impl Vm {
     /// so the animation engine can sample any widget without disturbing the
     /// VM's current `self.target`.
     fn get_scalar_prop_on<P: Platform>(ctx: &Ctx<P>, target: WidgetId, prop_id: u8) -> i32 {
-        let w = ctx.tree.get(target);
+        let w = ctx.objs.get(target);
         // One extension lookup for all ext props; no extension reads as the defaults.
-        let e = ctx.tree.ext(target).unwrap_or(&WidgetExt::DEFAULT);
+        let e = &ctx.objs.ext(target);
         let link = |id: WidgetId| if id.is_none() { -1 } else { id.0 as i32 };
         match prop_id {
             // Base fields
@@ -3127,7 +3110,7 @@ impl Vm {
             if val != Self::get_scalar_prop_on(ctx, a.target, a.prop_id) {
                 Self::set_scalar_prop_on(ctx, a.target, a.prop_id, val);
                 if prop_is_visual(a.prop_id) {
-                    ctx.tree.mark_dirty(a.target);
+                    ctx.objs.mark_dirty(a.target);
                 }
             }
             if done {
@@ -3163,10 +3146,10 @@ impl Vm {
             if self.target.is_some() {
                 // `set(text, "…")` literal: interned like OP_STR_LIT, so a
                 // handler that runs it repeatedly reuses one slot.
-                if let Some(str_id) = ctx.strpool.intern(data) {
-                    if let Some(ext) = ctx.tree.ensure_ext(self.target) {
+                if let Some(str_id) = ctx.objs.str_intern(data) {
+                    ctx.objs.update_ext(self.target, |ext| {
                         ext.text_id = str_id;
-                    }
+                    });
                 } else {
                     self.fail(fault::STR_ALLOC);
                 }
@@ -3179,28 +3162,28 @@ impl Vm {
         // Base fields
         match prop_id {
             PROP_LOCATION if count >= 2 => {
-                let w = ctx.tree.get_mut(self.target);
+                let w = ctx.objs.get_mut(self.target);
                 w.location = Offset {
                     x: vals[0] as i16,
                     y: vals[1] as i16,
                 };
-                ctx.tree.mark_dirty(self.target);
+                ctx.objs.mark_dirty(self.target);
                 return;
             }
             PROP_SIZE if count >= 2 => {
-                let w = ctx.tree.get_mut(self.target);
+                let w = ctx.objs.get_mut(self.target);
                 w.size = Size {
                     w: vals[0] as u16,
                     h: vals[1] as u16,
                 };
-                ctx.tree.mark_dirty(self.target);
+                ctx.objs.mark_dirty(self.target);
                 return;
             }
             _ => {}
         }
 
         // Extension fields
-        if let Some(ext) = ctx.tree.ensure_ext(self.target) {
+        ctx.objs.update_ext(self.target, |ext| {
             match prop_id {
                 PROP_BORDER_EDGES if count >= 4 => {
                     ext.border =
@@ -3212,7 +3195,7 @@ impl Vm {
                 }
                 _ => {}
             }
-        }
+        });
     }
 
     // --- Array operations ---
@@ -3229,10 +3212,10 @@ impl Vm {
         arr_id: i32,
         count: i32,
     ) {
-        let Some(pos) = self.find_array(arr_id) else {
+        let Some(len) = Self::find_array(ctx, arr_id).map(|a| a.len()) else {
             return self.fail(fault::BAD_ARRAY);
         };
-        if count < 0 || count as usize > self.arrays[pos].data.len() {
+        if count < 0 || count as usize > len {
             return self.fail(fault::BAD_OPERAND);
         }
         let count = count as usize;
@@ -3244,7 +3227,7 @@ impl Vm {
         while done < count {
             let n = (count - done).min(buf.len());
             let at = addr + done as i32;
-            let data = &mut self.arrays[pos].data[done..done + n];
+            let data = &mut ctx.objs.arr_mut(arr_id as u16).unwrap()[done..done + n];
             let ok = if write {
                 for (b, &v) in buf.iter_mut().zip(data.iter()) {
                     *b = v as u8;
@@ -3264,73 +3247,40 @@ impl Vm {
         }
     }
 
-    fn find_array(&self, arr_id: i32) -> Option<usize> {
+    /// Elements of the array a VM value names (None: no array).
+    fn find_array<P: Platform>(ctx: &Ctx<P>, arr_id: i32) -> Option<&[i32]> {
         if arr_id < 0 {
             return None;
         }
-        let id = arr_id as u16;
-        self.arrays.iter().position(|a| a.id == id)
+        ctx.objs.arr(arr_id as u16)
     }
 
-    fn arr_free(&mut self, arr_id: i32) {
-        if let Some(pos) = self.find_array(arr_id) {
-            // swap_remove is O(1) — array order doesn't matter since lookup is by id.
-            self.arrays.swap_remove(pos);
-        }
-    }
-
-    fn arr_alloc(&mut self, size: u16) {
-        let id = self.next_arr_id;
-        let data = alloc::vec![0i32; size as usize];
-        self.arrays.push(VmArray { id, data });
-        self.next_arr_id = self.next_arr_id.wrapping_add(1);
-        self.push(id as i32);
-    }
-
-    fn arr_load(&mut self, arr_id: i32, idx: i32) {
-        match self.find_array(arr_id) {
-            Some(pos) => {
-                let arr = &self.arrays[pos];
-                if idx < 0 || idx as usize >= arr.data.len() {
-                    self.fail(fault::ARRAY_INDEX);
-                    return;
-                }
-                let val = arr.data[idx as usize];
-                self.push(val);
-            }
+    fn arr_load<P: Platform>(&mut self, ctx: &Ctx<P>, arr_id: i32, idx: i32) {
+        match Self::find_array(ctx, arr_id) {
+            Some(arr) => match arr.get(idx as usize) {
+                Some(&v) if idx >= 0 => self.push(v),
+                _ => self.fail(fault::ARRAY_INDEX),
+            },
             None => self.fail(fault::BAD_ARRAY),
         }
     }
 
-    fn arr_store(&mut self, arr_id: i32, idx: i32, val: i32) {
-        match self.find_array(arr_id) {
-            Some(pos) => {
-                let arr = &mut self.arrays[pos];
-                if idx < 0 || idx as usize >= arr.data.len() {
-                    self.fail(fault::ARRAY_INDEX);
-                    return;
-                }
-                arr.data[idx as usize] = val;
-            }
+    fn arr_store<P: Platform>(&mut self, ctx: &mut Ctx<P>, arr_id: i32, idx: i32, val: i32) {
+        let arr = if arr_id < 0 { None } else { ctx.objs.arr_mut(arr_id as u16) };
+        match arr {
+            Some(arr) => match arr.get_mut(idx as usize) {
+                Some(v) if idx >= 0 => *v = val,
+                _ => self.fail(fault::ARRAY_INDEX),
+            },
             None => self.fail(fault::BAD_ARRAY),
         }
     }
 
-    fn arr_len(&mut self, arr_id: i32) {
-        match self.find_array(arr_id) {
-            Some(pos) => self.push(self.arrays[pos].data.len() as i32),
+    fn arr_len<P: Platform>(&mut self, ctx: &Ctx<P>, arr_id: i32) {
+        match Self::find_array(ctx, arr_id) {
+            Some(arr) => self.push(arr.len() as i32),
             None => self.fail(fault::BAD_ARRAY),
         }
-    }
-
-    /// Borrow a VM array's data by id. Used by the renderer (e.g. graph
-    /// widget) to read sample buffers without copying. Returns None when the
-    /// id does not name a live array.
-    pub fn array_slice(&self, arr_id: u16) -> Option<&[i32]> {
-        self.arrays
-            .iter()
-            .find(|a| a.id == arr_id)
-            .map(|a| a.data.as_slice())
     }
 
     // --- File ops ---
@@ -3594,8 +3544,7 @@ mod anim_tests {
     use crate::usart::UsartImpl;
     use crate::font::FontList;
     use crate::image::ImageList;
-    use crate::strpool::StringPool;
-    use crate::widget::WidgetTree;
+    use crate::pool::ObjPool;
     #[cfg(feature = "audio")]
     use crate::audio::AudioImpl;
     use crate::gpio::GpioImpl;
@@ -3604,10 +3553,9 @@ mod anim_tests {
         Ctx {
             lcd: LcdImpl::with_backend(MockLcd),
             flash: FlashImpl::with_backend(MockFlash),
-            tree: WidgetTree::new(),
             fonts: FontList::new(),
             images: ImageList::new(),
-            strpool: StringPool::new(),
+            objs: ObjPool::new(),
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),
@@ -3625,7 +3573,7 @@ mod anim_tests {
 
     // Allocate one widget and return its id.
     fn one_widget(ctx: &mut Ctx<MockPlatform>) -> WidgetId {
-        ctx.tree.alloc().expect("alloc")
+        ctx.objs.alloc_widget().expect("alloc")
     }
 
     #[test]
@@ -3641,12 +3589,12 @@ mod anim_tests {
         vm.set_compound_prop(PROP_TEXT, b"Text Input Demo", &mut ctx);
         vm.target = input;
         vm.set_compound_prop(PROP_TEXT, b"erhan", &mut ctx);
-        ctx.strpool.smart_clear(&mut ctx.tree);
+        ctx.objs.str_sweep();
 
         let id = Vm::get_scalar_prop_on(&ctx, input, PROP_TEXT);
-        assert_eq!(ctx.strpool.get(id as u16), b"erhan");
+        assert_eq!(ctx.objs.str_get(id as u16), b"erhan");
         let none = Vm::get_scalar_prop_on(&ctx, empty, PROP_TEXT);
-        assert_eq!(ctx.strpool.get(none as u16), b"", "no text reads as empty");
+        assert_eq!(ctx.objs.str_get(none as u16), b"", "no text reads as empty");
     }
 
     #[test]
@@ -3657,8 +3605,8 @@ mod anim_tests {
         let root = one_widget(&mut ctx);
         let a = one_widget(&mut ctx);
         let b = one_widget(&mut ctx);
-        ctx.tree.add_child(root, a);
-        ctx.tree.add_child(root, b);
+        ctx.objs.add_child(root, a);
+        ctx.objs.add_child(root, b);
 
         let get = |ctx: &Ctx<MockPlatform>, id, prop| Vm::get_scalar_prop_on(ctx, id, prop);
         assert_eq!(get(&ctx, root, PROP_FIRST_CHILD), a.0 as i32);
@@ -3972,7 +3920,7 @@ mod anim_tests {
         assert_eq!(vm.cb_frames.len(), 1);
 
         vm.try_resume_modal(&mut ctx);
-        assert!(!ctx.tree.is_live(overlay));
+        assert!(!ctx.objs.is_live(overlay));
         vm.tick(&mut ctx, 1);
         assert_eq!(vm.var_get(0), 42, "A sees the dialog result");
         assert!(vm.cb_frames.is_empty());
@@ -4078,15 +4026,14 @@ mod anim_tests {
         let mut vm = cb_vm(&code);
         vm.tick(&mut ctx, 100);
         assert!(vm.state == VmState::Halted, "fault {}", vm.fault());
-        let pos = vm.find_array(vm.var_get(3)).unwrap();
         let want: Vec<i32> = (100..120).collect();
-        assert_eq!(vm.arrays[pos].data, want);
+        assert_eq!(ctx.objs.arr(vm.var_get(3) as u16), Some(&want[..]));
     }
 
     #[test]
     fn str_byte_reads_bytes_and_minus_one_past_the_end() {
         let mut ctx = mock_ctx();
-        let id = ctx.strpool.alloc(b"Hi").unwrap() as i8;
+        let id = ctx.objs.str_alloc(b"Hi").unwrap() as i8;
         // g0 = strByte(s, 1); g1 = strByte(s, 2); g2 = strByte(s, -1)
         let code = [
             OP_PUSH_I8, id as u8, OP_PUSH_1, OP_STR_BYTE, OP_STORE, 0,
@@ -4244,7 +4191,7 @@ mod anim_tests {
     #[test]
     fn page_ops_build_widgets_like_bytecode() {
         let mut ctx = mock_ctx();
-        ctx.tree.root = ctx.tree.alloc().unwrap();
+        ctx.objs.root = ctx.objs.alloc_widget().unwrap();
         let mut vm = cb_vm(&[OP_HALT]);
         vm.frame_base = 4; // locals after the 4 globals
         #[rustfmt::skip]
@@ -4264,12 +4211,12 @@ mod anim_tests {
         let (a, b) = (WidgetId(1), WidgetId(2));
         assert_eq!(vm.var_get(0), 1);
         assert_eq!(vm.var_get(4), 2);
-        let w = ctx.tree.get(a);
-        assert!(w.parent == ctx.tree.root);
+        let w = ctx.objs.get(a);
+        assert!(w.parent == ctx.objs.root);
         assert_eq!((w.size.w, w.size.h), (800, 50));
         assert_eq!(w.background_color, 0x0841);
-        assert!(ctx.tree.get(b).parent == a);
-        assert_eq!(ctx.strpool.get(ctx.tree.text_id(b)), b"Hi");
+        assert!(ctx.objs.get(b).parent == a);
+        assert_eq!(ctx.objs.str_get(ctx.objs.text_id(b)), b"Hi");
         assert!(vm.target == b);
     }
 
@@ -4283,7 +4230,7 @@ mod anim_tests {
         ];
         for ops in cases {
             let mut ctx = mock_ctx();
-            ctx.tree.root = ctx.tree.alloc().unwrap();
+            ctx.objs.root = ctx.objs.alloc_widget().unwrap();
             let mut vm = cb_vm(&[OP_HALT]);
             vm.run_page_ops(&mut ctx, ops);
             assert_eq!(vm.fault(), fault::PAGE, "{ops:?}");
@@ -4298,12 +4245,12 @@ mod anim_tests {
         code.extend_from_slice(text);
         code.push(OP_HALT);
         let mut ctx = mock_ctx();
-        ctx.tree.root = ctx.tree.alloc().unwrap();
-        let w = ctx.tree.alloc().unwrap();
+        ctx.objs.root = ctx.objs.alloc_widget().unwrap();
+        let w = ctx.objs.alloc_widget().unwrap();
         let mut vm = cb_vm(&code);
         vm.tick(&mut ctx, 8);
         assert_eq!(vm.fault(), fault::NONE);
-        assert_eq!(ctx.strpool.get(ctx.tree.text_id(w)), text);
+        assert_eq!(ctx.objs.str_get(ctx.objs.text_id(w)), text);
     }
 
     #[test]

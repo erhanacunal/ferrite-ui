@@ -1,472 +1,213 @@
-/// String pool for VM string operations.
-///
-/// The buffer, the string metadata and the `smart_clear` scratch table are
-/// heap slices allocated once — at construction with the default capacity,
-/// then again by [`StringPool::configure`] when the image's `RES_SYSCFG`
-/// requests a different size. Strings never allocate individually, so the
-/// pool causes no fragmentation at runtime.
-/// Compacting smart_clear preserves widget text while reclaiming temporaries.
-///
-/// The default capacity is selected at compile time (2 KB buffer / 64 strings)
-/// and suits small RAM targets; BSPs with plenty of RAM enable the
-/// `strpool_large` feature for a 1 MB buffer / 256 strings. The string-metadata word width (`Off`)
-/// follows the capacity: `u16` (4-byte `StrMeta`) on the small profile, `u32`
-/// (8-byte `StrMeta`, strings/buffer past 64 KB) on the large profile.
-///
-/// RAM cost (heap): pool bytes + slots × (size_of::<StrMeta>() + 2).
-extern crate alloc;
+//! VM strings, stored as `T_STRING` objects in the object pool.
+//!
+//! A string object's payload is one word — byte length (bits 0-29) plus the
+//! interned flag (bit 31) — followed by the bytes. A string id is the object's
+//! pointer, so it stays valid until the string is freed: by `str_free`, or by
+//! the sweep at `strClear()` (`str_sweep`), which frees every string no live
+//! widget shows. Edits (`str_insert_byte` / `str_delete_byte`) resize the
+//! object in place and keep the id.
+//!
+//! The formatting / parsing helpers below work on any `ObjPool`.
 
-use alloc::boxed::Box;
+use crate::pool::{ObjPool, T_STRING};
+use crate::widget::WidgetId;
 
-use crate::syscfg::try_alloc_slice;
-use crate::widget::{WidgetId, WidgetTree};
-
-#[cfg(not(feature = "strpool_large"))]
-const DEFAULT_POOL_SIZE: usize = 2048;
-#[cfg(not(feature = "strpool_large"))]
-const DEFAULT_MAX_STRINGS: usize = 64;
-/// Offset/length word for the small profile — buffer ≤ 64 KB.
-#[cfg(not(feature = "strpool_large"))]
-type Off = u16;
-
-#[cfg(feature = "strpool_large")]
-const DEFAULT_POOL_SIZE: usize = 1024 * 1024;
-#[cfg(feature = "strpool_large")]
-const DEFAULT_MAX_STRINGS: usize = 256;
-/// Offset/length word for the large profile — buffer past 64 KB.
-#[cfg(feature = "strpool_large")]
-type Off = u32;
-
-const STR_NONE: u16 = 0xFFFF;
+pub const STR_NONE: u16 = 0xFFFF;
 const FMT_BUF_SIZE: usize = 32;
+const INTERNED: u32 = 1 << 31;
+/// `str_sweep` mark bit (lengths never reach it: an object holds < 256 KB).
+const KEEP: u32 = 1 << 30;
+const LEN_MASK: u32 = KEEP - 1;
 
-/// Largest pool buffer the metadata word can address.
-const MAX_POOL_SIZE: usize = Off::MAX as usize;
-/// Largest slot count: ids are `u16` and `STR_NONE` is reserved.
-const MAX_SLOTS: usize = STR_NONE as usize;
-
-#[derive(Clone, Copy)]
-struct StrMeta {
-    offset: Off,
-    len: Off,
-}
-
-impl StrMeta {
-    const fn empty() -> Self {
-        Self { offset: 0, len: 0 }
-    }
-}
-
-pub struct StringPool {
-    buf: Box<[u8]>,
-    meta: Box<[StrMeta]>,
-    /// smart_clear scratch: keep marker + old→new id remap, one per slot.
-    remap: Box<[u16]>,
-    /// One bit per slot: set for literals from `intern`. Those may be shared
-    /// by several users, so they are never freed or edited in place. `u16`
-    /// words so the allocation shares `remap`'s `try_alloc_slice::<u16>`.
-    interned: Box<[u16]>,
-    count: u16,
-    next: Off,
-}
-
-impl StringPool {
-    /// Pool with the compile-time default capacity.
-    pub fn new() -> Self {
-        let mut pool = Self::empty();
-        // Boot-time allocation on an empty heap; failing here is fatal anyway.
-        assert!(pool.alloc_storage(DEFAULT_POOL_SIZE, DEFAULT_MAX_STRINGS));
-        pool
+impl ObjPool {
+    /// Allocate a string. Returns its id, or None when the pool is full.
+    pub fn str_alloc(&mut self, data: &[u8]) -> Option<u16> {
+        self.str_new(data, false)
     }
 
-    fn empty() -> Self {
-        Self {
-            buf: Box::new([]),
-            meta: Box::new([]),
-            remap: Box::new([]),
-            interned: Box::new([]),
-            count: 0,
-            next: 0,
+    fn str_new(&mut self, data: &[u8], interned: bool) -> Option<u16> {
+        let p = self.alloc_obj(T_STRING, 1 + data.len().div_ceil(4))?;
+        self.str_bytes_mut(p)[..data.len()].copy_from_slice(data);
+        self.payload_mut(p, T_STRING)?[0] = data.len() as u32 | if interned { INTERNED } else { 0 };
+        Some(p)
+    }
+
+    /// Writable byte area of string `p` (its whole payload capacity).
+    fn str_bytes_mut(&mut self, p: u16) -> &mut [u8] {
+        match self.payload_mut(p, T_STRING) {
+            // SAFETY: the words after the length word are plain storage;
+            // viewing them as bytes is always valid.
+            Some(w) => unsafe {
+                core::slice::from_raw_parts_mut(w[1..].as_mut_ptr() as *mut u8, (w.len() - 1) * 4)
+            },
+            None => &mut [],
         }
     }
 
-    /// Resize the pool to `bytes` / `strings` (0 = compile-time default),
-    /// clamped to what the metadata width can address. Clears all strings.
-    /// Returns false if the heap cannot hold the requested size; the pool then
-    /// falls back to the default capacity (or stays empty if even that fails).
-    pub fn configure(&mut self, bytes: usize, strings: usize) -> bool {
-        let bytes = if bytes == 0 { DEFAULT_POOL_SIZE } else { bytes.min(MAX_POOL_SIZE) };
-        let strings = if strings == 0 { DEFAULT_MAX_STRINGS } else { strings.min(MAX_SLOTS) };
-        self.clear();
-        if bytes == self.buf.len() && strings == self.meta.len() {
-            return true;
-        }
-        // Release the old storage first so the allocator can reuse it.
-        *self = Self::empty();
-        if self.alloc_storage(bytes, strings) {
-            return true;
-        }
-        self.alloc_storage(DEFAULT_POOL_SIZE, DEFAULT_MAX_STRINGS);
-        false
-    }
-
-    fn alloc_storage(&mut self, bytes: usize, strings: usize) -> bool {
-        let (Some(buf), Some(meta), Some(remap), Some(interned)) = (
-            try_alloc_slice(bytes, 0u8),
-            try_alloc_slice(strings, StrMeta::empty()),
-            try_alloc_slice(strings, STR_NONE),
-            try_alloc_slice(strings.div_ceil(16), 0u16),
-        ) else {
-            return false;
-        };
-        self.buf = buf;
-        self.meta = meta;
-        self.remap = remap;
-        self.interned = interned;
-        true
-    }
-
-    #[inline(never)]
-    fn is_interned(&self, id: u16) -> bool {
-        self.interned[id as usize / 16] & (1 << (id % 16)) != 0
-    }
-
-    #[inline(never)]
-    fn set_interned(&mut self, id: u16, on: bool) {
-        let word = &mut self.interned[id as usize / 16];
-        let bit = 1 << (id % 16);
-        if on {
-            *word |= bit;
-        } else {
-            *word &= !bit;
-        }
-    }
-
-    /// Pool buffer size in bytes.
-    pub fn capacity_bytes(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// Maximum number of live strings.
-    pub fn capacity_strings(&self) -> usize {
-        self.meta.len()
-    }
-
-    /// Pool bytes in use (bump pointer — what `alloc` checks against).
-    pub fn used_bytes(&self) -> usize {
-        self.next as usize
-    }
-
-    /// String slots in use.
-    pub fn used_strings(&self) -> usize {
-        self.count as usize
-    }
-
-    /// Heap bytes held by the pool (buffer + per-string tables).
-    pub fn heap_bytes(&self) -> usize {
-        use core::mem::size_of;
-        self.buf.len()
-            + self.meta.len() * size_of::<StrMeta>()
-            + self.remap.len() * size_of::<u16>()
-            + self.interned.len() * size_of::<u16>()
-    }
-
-    /// Allocate a string from a byte slice. Returns string ID (u16) or None if full.
-    pub fn alloc(&mut self, data: &[u8]) -> Option<u16> {
-        let len = data.len();
-        if self.count as usize >= self.meta.len() || self.next as usize + len > self.buf.len() {
-            return None;
-        }
-        let buf = &mut self.buf;
-        let id = self.count;
-        let offset = self.next;
-        buf[offset as usize..offset as usize + len].copy_from_slice(data);
-        self.meta[id as usize] = StrMeta {
-            offset,
-            len: len as Off,
-        };
-        self.next += len as Off;
-        self.count += 1;
-        self.set_interned(id, false);
-        Some(id as u16)
+    fn str_interned(&self, id: u16) -> bool {
+        self.payload(id, T_STRING).is_some_and(|w| w[0] & INTERNED != 0)
     }
 
     /// Allocate a string literal, or return the id of an identical literal
     /// that is still live. Without this every run of a `set(text, "…")` line
-    /// took a new slot, and a handler without `strClear()` filled the pool.
-    /// The result may be shared: `free` ignores it and `insert_byte` /
-    /// `delete_byte` edit a private copy. `smart_clear` reclaims it as usual.
-    pub fn intern(&mut self, data: &[u8]) -> Option<u16> {
-        for id in 0..self.count {
-            if self.is_interned(id) && self.get(id) == data {
-                return Some(id);
-            }
-        }
-        let id = self.alloc(data)?;
-        self.set_interned(id, true);
-        Some(id)
+    /// took a new string, and a handler without `strClear()` filled the pool.
+    /// The result may be shared: `str_free` ignores it and the byte edits
+    /// work on a private copy.
+    pub fn str_intern(&mut self, data: &[u8]) -> Option<u16> {
+        let found = self.ptrs_of(T_STRING).find(|&p| self.str_interned(p) && self.str_get(p) == data);
+        found.or_else(|| self.str_new(data, true))
     }
 
     /// Id that can be edited in place: `id` itself, or a fresh private copy
     /// when `id` is an interned (possibly shared) literal.
-    fn unshare(&mut self, id: u16) -> Option<u16> {
-        if self.is_interned(id) {
-            // concat with "nothing" = copy into a fresh, non-interned slot.
-            self.concat(id, STR_NONE)
+    fn str_unshare(&mut self, id: u16) -> Option<u16> {
+        if self.str_interned(id) {
+            // concat with "nothing" = copy into a fresh, non-interned string.
+            self.str_concat(id, STR_NONE)
         } else {
             Some(id)
         }
     }
 
-    /// Mark a string as freed (zero-length). Reclaimed on next smart_clear().
-    /// Interned literals may be shared, so they are left alone.
-    pub fn free(&mut self, id: u16) {
-        if (id as usize) < self.count as usize && !self.is_interned(id) {
-            self.meta[id as usize].len = 0;
+    /// Free a string. Interned literals may be shared, so they are left alone.
+    pub fn str_free(&mut self, id: u16) {
+        if !self.str_interned(id) {
+            self.free_obj(id, T_STRING);
         }
     }
 
-    /// Get string bytes by ID.
-    pub fn get(&self, id: u16) -> &[u8] {
-        if id as usize >= self.count as usize {
-            return &[];
+    /// String bytes by id (empty when `id` names no string).
+    pub fn str_get(&self, id: u16) -> &[u8] {
+        match self.payload(id, T_STRING) {
+            Some(w) => {
+                let len = (w[0] & LEN_MASK) as usize;
+                // SAFETY: see `str_bytes_mut`; len ≤ (payload words - 1) × 4.
+                unsafe { core::slice::from_raw_parts(w[1..].as_ptr() as *const u8, len) }
+            }
+            None => &[],
         }
-        let m = &self.meta[id as usize];
-        let buf = &self.buf;
-        &buf[m.offset as usize..m.offset as usize + m.len as usize]
     }
 
-    /// Get string length by ID. Returns `u32` so it covers both metadata
-    /// profiles (the large pool allows strings past 64 KB).
-    pub fn len(&self, id: u16) -> u32 {
-        if id as usize >= self.count as usize {
-            return 0;
-        }
-        self.meta[id as usize].len as u32
+    /// String length by id (0 when `id` names no string).
+    pub fn str_len(&self, id: u16) -> u32 {
+        self.str_get(id).len() as u32
     }
 
     /// Compare two strings lexicographically. Returns -1, 0, or 1.
-    pub fn compare(&self, a: u16, b: u16) -> i32 {
-        let a_data = self.get(a);
-        let b_data = self.get(b);
-        match a_data.cmp(b_data) {
+    pub fn str_compare(&self, a: u16, b: u16) -> i32 {
+        match self.str_get(a).cmp(self.str_get(b)) {
             core::cmp::Ordering::Less => -1,
             core::cmp::Ordering::Equal => 0,
             core::cmp::Ordering::Greater => 1,
         }
     }
 
-    /// Concatenate two strings. Returns new string ID or None if full.
-    /// An id that names no string (e.g. `0xFFFF` from `get(text)` on an
-    /// emptied input) counts as an empty string, as in `get` / `len`.
-    pub fn concat(&mut self, a: u16, b: u16) -> Option<u16> {
-        let meta = |id: u16| match self.meta.get(id as usize) {
-            Some(&m) if (id as usize) < self.count as usize => m,
-            _ => StrMeta::empty(),
-        };
-        let a_meta = meta(a);
-        let b_meta = meta(b);
-        let total = a_meta.len as usize + b_meta.len as usize;
-        if self.count as usize >= self.meta.len() || self.next as usize + total > self.buf.len() {
-            return None;
+    /// Concatenate two strings into a new one. An id that names no string
+    /// (e.g. `0xFFFF` from `get(text)` on an emptied input) counts as empty.
+    pub fn str_concat(&mut self, a: u16, b: u16) -> Option<u16> {
+        let (la, lb) = (self.str_get(a).len(), self.str_get(b).len());
+        let p = self.alloc_obj(T_STRING, 1 + (la + lb).div_ceil(4))?;
+        // Copy through a small buffer: the sources live in the same arena.
+        let mut buf = [0u8; 64];
+        let mut at = 0;
+        for (src, len) in [(a, la), (b, lb)] {
+            let mut done = 0;
+            while done < len {
+                let n = (len - done).min(buf.len());
+                buf[..n].copy_from_slice(&self.str_get(src)[done..done + n]);
+                self.str_bytes_mut(p)[at..at + n].copy_from_slice(&buf[..n]);
+                done += n;
+                at += n;
+            }
         }
-        let buf = &mut self.buf;
-        let id = self.count;
-        let offset = self.next as usize;
-        // Copy a (byte-by-byte — src and dst in the same buffer)
-        let a_start = a_meta.offset as usize;
-        let a_len = a_meta.len as usize;
-        for i in 0..a_len {
-            buf[offset + i] = buf[a_start + i];
-        }
-        // Copy b
-        let b_start = b_meta.offset as usize;
-        let b_len = b_meta.len as usize;
-        for i in 0..b_len {
-            buf[offset + a_len + i] = buf[b_start + i];
-        }
-        self.meta[id as usize] = StrMeta {
-            offset: self.next,
-            len: total as Off,
-        };
-        self.next += total as Off;
-        self.count += 1;
-        self.set_interned(id, false);
-        Some(id as u16)
+        self.payload_mut(p, T_STRING)?[0] = (la + lb) as u32;
+        Some(p)
     }
 
-    /// Reset the entire pool. All string IDs become invalid.
-    pub fn clear(&mut self) {
-        self.count = 0;
-        self.next = 0;
+    /// Resize string `id` to `len` bytes, keeping the prefix.
+    fn str_resize(&mut self, id: u16, len: usize) -> bool {
+        if !self.resize_obj(id, T_STRING, 1 + len.div_ceil(4)) {
+            return false;
+        }
+        let w = self.payload_mut(id, T_STRING).unwrap();
+        w[0] = (w[0] & INTERNED) | len as u32;
+        true
     }
 
-    /// Insert a byte at `pos` in string `id`. Copies to end of pool.
-    /// Old space becomes a gap, reclaimed by smart_clear().
-    /// Returns the id now holding the text — a new one when `id` was a shared
-    /// literal, so the caller must store it — or None if nothing changed.
-    pub fn insert_byte(&mut self, id: u16, pos: usize, byte: u8, max_len: u8) -> Option<u16> {
-        if id as usize >= self.count as usize {
-            return None;
+    /// Free every string.
+    pub fn str_clear(&mut self) {
+        for p in 0..self.ptr_count() as u16 {
+            self.free_obj(p, T_STRING);
         }
+    }
+
+    /// Insert a byte at `pos` in string `id`. Returns the id now holding the
+    /// text — a new one when `id` was a shared literal, so the caller must
+    /// store it — or None if nothing changed.
+    pub fn str_insert_byte(&mut self, id: u16, pos: usize, byte: u8, max_len: u8) -> Option<u16> {
+        self.payload(id, T_STRING)?;
+        let old_len = self.str_get(id).len();
         // Enforce max_length (0 = no limit)
-        if max_len > 0 && self.meta[id as usize].len as usize >= max_len as usize {
+        if max_len > 0 && old_len >= max_len as usize {
             return None;
         }
-        let id = self.unshare(id)?;
-        let m = self.meta[id as usize];
-        let old_len = m.len as usize;
+        let id = self.str_unshare(id)?;
+        if !self.str_resize(id, old_len + 1) {
+            return None;
+        }
         let pos = pos.min(old_len);
-        let new_len = old_len + 1;
-        if self.next as usize + new_len > self.buf.len() {
-            return None;
-        }
-        let buf = &mut self.buf;
-        let src = m.offset as usize;
-        let dst = self.next as usize;
-        // Copy bytes before pos
-        for i in 0..pos {
-            buf[dst + i] = buf[src + i];
-        }
-        // Insert new byte
-        buf[dst + pos] = byte;
-        // Copy bytes after pos
-        for i in pos..old_len {
-            buf[dst + 1 + i] = buf[src + i];
-        }
-        self.meta[id as usize] = StrMeta {
-            offset: self.next,
-            len: new_len as Off,
-        };
-        self.next += new_len as Off;
+        let bytes = self.str_bytes_mut(id);
+        bytes.copy_within(pos..old_len, pos + 1);
+        bytes[pos] = byte;
         Some(id)
     }
 
-    /// Delete byte at `pos` in string `id`. Copies to end of pool.
-    /// Old space becomes a gap, reclaimed by smart_clear().
-    /// Returns the id now holding the text (see `insert_byte`).
-    pub fn delete_byte(&mut self, id: u16, pos: usize) -> Option<u16> {
-        if id as usize >= self.count as usize {
+    /// Delete the byte at `pos` in string `id`. Returns the id now holding
+    /// the text (see `str_insert_byte`).
+    pub fn str_delete_byte(&mut self, id: u16, pos: usize) -> Option<u16> {
+        let old_len = self.str_get(id).len();
+        if pos >= old_len {
             return None;
         }
-        if pos >= self.meta[id as usize].len as usize {
-            return None;
-        }
-        let id = self.unshare(id)?;
-        let m = self.meta[id as usize];
-        let old_len = m.len as usize;
-        let new_len = old_len - 1;
-        if new_len == 0 {
-            self.meta[id as usize].len = 0;
-            return Some(id);
-        }
-        if self.next as usize + new_len > self.buf.len() {
-            return None;
-        }
-        let buf = &mut self.buf;
-        let src = m.offset as usize;
-        let dst = self.next as usize;
-        // Copy bytes before pos
-        for i in 0..pos {
-            buf[dst + i] = buf[src + i];
-        }
-        // Copy bytes after pos (skip deleted byte)
-        for i in (pos + 1)..old_len {
-            buf[dst + i - 1] = buf[src + i];
-        }
-        self.meta[id as usize] = StrMeta {
-            offset: self.next,
-            len: new_len as Off,
-        };
-        self.next += new_len as Off;
+        let id = self.str_unshare(id)?;
+        self.str_bytes_mut(id).copy_within(pos + 1..old_len, pos);
+        self.str_resize(id, old_len - 1);
         Some(id)
     }
 
-    /// Smart clear: keep strings referenced by widget text_id fields,
-    /// compact survivors to the front, remap widget references.
-    /// Zero heap allocations — uses the preallocated `remap` scratch table.
-    pub fn smart_clear(&mut self, tree: &mut WidgetTree) {
-        if self.count == 0 {
-            return;
-        }
-
-        let wcount = tree.count();
-
-        // Phase 1: Build keep set from widget text_ids. Skip destroyed
-        // widgets — their text references are about to be reclaimed.
-        // `remap[id] == KEEP` marks a survivor; everything else is STR_NONE.
-        const KEEP: u16 = 0;
-        let old_count = self.count as usize;
-        let remap = &mut self.remap;
-        remap[..old_count].fill(STR_NONE);
-        let mut any_kept = false;
-        for i in 0..wcount {
-            let wid = WidgetId(i as u16);
-            if !tree.is_live(wid) {
+    /// `strClear()`: free every string that no live widget shows. Widget text
+    /// that became empty is dropped too (the widget then has no text).
+    pub fn str_sweep(&mut self) {
+        // Pass 1: mark the strings live widgets show.
+        for p in 0..self.ptr_count() as u16 {
+            let w = WidgetId(p);
+            if !self.is_live(w) {
                 continue;
             }
-            let text_id = tree.text_id(wid);
-            if text_id != STR_NONE && (text_id as usize) < old_count {
-                remap[text_id as usize] = KEEP;
-                any_kept = true;
-            }
-        }
-
-        // If nothing to keep, just clear
-        if !any_kept {
-            self.count = 0;
-            self.next = 0;
-            return;
-        }
-
-        // Phase 2: Compact survivors to front with new sequential IDs.
-        // A survivor's remap entry is overwritten with its new id; dropped
-        // strings (and empty survivors) go back to STR_NONE.
-        let mut new_id: u16 = 0;
-        let mut write_pos: Off = 0;
-
-        for old_id in 0..old_count {
-            if self.remap[old_id] != KEEP {
-                continue;
-            }
-            let m = self.meta[old_id];
-            if m.len == 0 {
-                self.remap[old_id] = STR_NONE;
-                continue;
-            }
-            let src = m.offset as usize;
-            // Move bytes forward (src >= dst always since we compact left)
-            self.buf.copy_within(src..src + m.len as usize, write_pos as usize);
-            self.meta[new_id as usize] = StrMeta {
-                offset: write_pos,
-                len: m.len,
-            };
-            // Carry the interned bit. Ids only move down and are visited in
-            // order, so `new_id`'s old bit was already consumed.
-            let interned = self.is_interned(old_id as u16);
-            self.set_interned(new_id, interned);
-            self.remap[old_id] = new_id;
-            write_pos += m.len;
-            new_id += 1;
-        }
-
-        self.count = new_id;
-        self.next = write_pos;
-
-        // Phase 3: Remap widget text_id references (live widgets only).
-        for i in 0..wcount {
-            let wid = WidgetId(i as u16);
-            if !tree.is_live(wid) {
-                continue;
-            }
-            let text_id = tree.text_id(wid);
-            if text_id != STR_NONE && (text_id as usize) < old_count {
-                let new = self.remap[text_id as usize];
-                if let Some(ext) = tree.ext_mut(wid) {
-                    ext.text_id = new;
+            let t = self.text_id(w);
+            if self.str_len(t) == 0 {
+                if t != STR_NONE {
+                    self.set_text_id(w, STR_NONE);
                 }
+                continue;
+            }
+            if let Some(s) = self.payload_mut(t, T_STRING) {
+                s[0] |= KEEP;
             }
         }
+        // Pass 2: free the unmarked strings, unmark the kept ones.
+        for p in 0..self.ptr_count() as u16 {
+            match self.payload_mut(p, T_STRING) {
+                Some(w) if w[0] & KEEP != 0 => w[0] &= !KEEP,
+                Some(_) => self.free_obj(p, T_STRING),
+                None => {}
+            }
+        }
+    }
+
+    /// Live strings.
+    pub fn str_count(&self) -> usize {
+        self.live_objects(T_STRING)
     }
 }
 
@@ -527,10 +268,10 @@ pub fn format_i32(val: i32, buf: &mut [u8]) -> usize {
 }
 
 /// Convert i32 to string in the pool. Returns string ID.
-pub fn itos(pool: &mut StringPool, val: i32) -> Option<u16> {
+pub fn itos(pool: &mut ObjPool, val: i32) -> Option<u16> {
     let mut tmp = [0u8; FMT_BUF_SIZE];
     let len = format_i32(val, &mut tmp);
-    pool.alloc(&tmp[..len])
+    pool.str_alloc(&tmp[..len])
 }
 
 // === Formatting: f32 to string ===
@@ -595,18 +336,18 @@ pub fn format_f32(val: f32, buf: &mut [u8]) -> usize {
 }
 
 /// Convert f32 to string in the pool. Returns string ID.
-pub fn ftos(pool: &mut StringPool, bits: u32) -> Option<u16> {
+pub fn ftos(pool: &mut ObjPool, bits: u32) -> Option<u16> {
     let val = f32::from_bits(bits);
     let mut tmp = [0u8; FMT_BUF_SIZE];
     let len = format_f32(val, &mut tmp);
-    pool.alloc(&tmp[..len])
+    pool.str_alloc(&tmp[..len])
 }
 
 // === Parsing: string to number ===
 
 /// Parse a string (by ID) as i32. Returns 0 on failure.
-pub fn parse_int(pool: &StringPool, id: u16) -> i32 {
-    let data = pool.get(id);
+pub fn parse_int(pool: &ObjPool, id: u16) -> i32 {
+    let data = pool.str_get(id);
     if data.is_empty() {
         return 0;
     }
@@ -780,7 +521,7 @@ fn pad_write(digits: &[u8], width: u8, zero_pad: bool, out: &mut [u8]) -> usize 
 /// Format a string using printf-style specifiers.
 /// Supported: `%[0][width]d/i/u/x/X`, `%[.N]f`, `%s`, `%%`
 /// `%s` args are str_ids resolved from pool. Output is capped at 128 bytes.
-pub fn sprintf(pool: &mut StringPool, fmt: &[u8], args: &[i32]) -> Option<u16> {
+pub fn sprintf(pool: &mut ObjPool, fmt: &[u8], args: &[i32]) -> Option<u16> {
     const OUT_SIZE: usize = 128;
     let mut out = [0u8; OUT_SIZE];
     let mut out_pos = 0;
@@ -874,7 +615,7 @@ pub fn sprintf(pool: &mut StringPool, fmt: &[u8], args: &[i32]) -> Option<u16> {
                     let str_id = args[arg_idx] as u16;
                     let mut tmp = [0u8; 64];
                     let copy_n = {
-                        let s = pool.get(str_id);
+                        let s = pool.str_get(str_id);
                         let n = s.len().min(OUT_SIZE - out_pos).min(tmp.len());
                         tmp[..n].copy_from_slice(&s[..n]);
                         n
@@ -894,12 +635,12 @@ pub fn sprintf(pool: &mut StringPool, fmt: &[u8], args: &[i32]) -> Option<u16> {
         }
     }
 
-    pool.alloc(&out[..out_pos])
+    pool.str_alloc(&out[..out_pos])
 }
 
 /// Parse a string (by ID) as f32. Returns f32 bits. Returns 0.0 bits on failure.
-pub fn parse_float(pool: &StringPool, id: u16) -> u32 {
-    let data = pool.get(id);
+pub fn parse_float(pool: &ObjPool, id: u16) -> u32 {
+    let data = pool.str_get(id);
     if data.is_empty() {
         return 0.0f32.to_bits();
     }
@@ -943,122 +684,120 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configure_sets_capacity_and_limits_alloc() {
-        let mut pool = StringPool::new();
-        assert_eq!(pool.capacity_bytes(), DEFAULT_POOL_SIZE);
-        assert_eq!(pool.capacity_strings(), DEFAULT_MAX_STRINGS);
-
-        assert!(pool.configure(8, 2));
-        assert_eq!((pool.capacity_bytes(), pool.capacity_strings()), (8, 2));
-        assert!(pool.alloc(b"abcd").is_some());
-        assert!(pool.alloc(b"efghi").is_none(), "exceeds 8-byte buffer");
-        assert!(pool.alloc(b"efgh").is_some());
-        assert!(pool.alloc(b"").is_none(), "only 2 slots");
-
-        // 0 = back to the defaults.
-        assert!(pool.configure(0, 0));
-        assert_eq!(pool.capacity_bytes(), DEFAULT_POOL_SIZE);
-        assert_eq!(pool.capacity_strings(), DEFAULT_MAX_STRINGS);
+    fn strings_keep_ids_across_edits_and_compaction() {
+        let mut pool = ObjPool::new();
+        let a = pool.str_alloc(b"abc").unwrap();
+        let gap = pool.str_alloc(b"0123456789").unwrap();
+        let b = pool.str_alloc(b"xyz").unwrap();
+        pool.str_free(gap);
+        assert_eq!(pool.str_insert_byte(a, 3, b'd', 0), Some(a));
+        assert_eq!(pool.str_insert_byte(a, 0, b'>', 0), Some(a));
+        assert_eq!(pool.str_get(a), b">abcd");
+        pool.compact();
+        assert_eq!(pool.str_get(a), b">abcd");
+        assert_eq!(pool.str_get(b), b"xyz");
+        assert_eq!(pool.str_delete_byte(a, 0), Some(a));
+        assert_eq!(pool.str_get(a), b"abcd");
+        assert_eq!(pool.str_insert_byte(a, 9, b'!', 4), None, "max_length");
+        assert_eq!(pool.str_get(gap), b"", "freed id reads empty");
     }
 
     #[test]
-    fn smart_clear_keeps_and_remaps_widget_text() {
-        let mut pool = StringPool::new();
-        assert!(pool.configure(64, 4));
-        let mut tree = WidgetTree::new();
-        let w = tree.alloc().unwrap();
+    fn sweep_keeps_widget_text() {
+        let mut pool = ObjPool::new();
+        let w = pool.alloc_widget().unwrap();
+        let tmp = pool.str_alloc(b"temp").unwrap();
+        let kept = pool.str_alloc(b"label").unwrap();
+        pool.set_text_id(w, kept);
 
-        let tmp = pool.alloc(b"temp").unwrap();
-        let kept = pool.alloc(b"label").unwrap();
-        assert_eq!((tmp, kept), (0, 1));
-        tree.ensure_ext(w).unwrap().text_id = kept;
-
-        pool.smart_clear(&mut tree);
-        let new_id = tree.text_id(w);
-        assert_eq!(new_id, 0, "survivor compacted to the front");
-        assert_eq!(pool.get(new_id), b"label");
-        // Freed capacity is reusable up to the configured slot count.
-        assert!(pool.alloc(b"a").is_some());
-        assert!(pool.alloc(b"b").is_some());
-        assert!(pool.alloc(b"c").is_some());
-        assert!(pool.alloc(b"d").is_none());
+        pool.str_sweep();
+        assert_eq!(pool.text_id(w), kept, "ids never change");
+        assert_eq!(pool.str_get(kept), b"label");
+        assert_eq!(pool.str_get(tmp), b"");
+        assert_eq!(pool.str_count(), 1);
     }
 
     #[test]
     fn concat_with_an_emptied_input() {
         // text_input: backspacing the last char, then strClear() in on_change,
         // leaves the input with no text (0xFFFF); concat(s, get(text)) must
-        // not fail with "string pool full".
-        let mut pool = StringPool::new();
-        let mut tree = WidgetTree::new();
-        let input = tree.alloc().unwrap();
-        let t = pool.alloc(b"a").unwrap();
-        tree.ensure_ext(input).unwrap().text_id = t;
-        assert_eq!(pool.delete_byte(t, 0), Some(t));
-        pool.smart_clear(&mut tree);
-        assert_eq!(tree.text_id(input), STR_NONE);
+        // not fail with "pool full: string".
+        let mut pool = ObjPool::new();
+        let input = pool.alloc_widget().unwrap();
+        let t = pool.str_alloc(b"a").unwrap();
+        pool.set_text_id(input, t);
+        assert_eq!(pool.str_delete_byte(t, 0), Some(t));
+        pool.str_sweep();
+        assert_eq!(pool.text_id(input), STR_NONE);
 
-        let s = pool.alloc(b"Name: ").unwrap();
-        let out = pool.concat(s, tree.text_id(input)).expect("concat with no text");
-        assert_eq!(pool.get(out), b"Name: ");
-        let both = pool.concat(STR_NONE, STR_NONE).unwrap();
-        assert_eq!(pool.get(both), b"");
+        let s = pool.str_alloc(b"Name: ").unwrap();
+        let out = pool.str_concat(s, pool.text_id(input)).expect("concat with no text");
+        assert_eq!(pool.str_get(out), b"Name: ");
+        let both = pool.str_concat(STR_NONE, STR_NONE).unwrap();
+        assert_eq!(pool.str_get(both), b"");
     }
 
     #[test]
     fn intern_reuses_identical_literals() {
-        let mut pool = StringPool::new();
-        assert!(pool.configure(64, 4));
-        let a = pool.intern(b"Tapped: 0").unwrap();
-        let b = pool.intern(b"Reset").unwrap();
+        let mut pool = ObjPool::new();
+        let a = pool.str_intern(b"Tapped: 0").unwrap();
+        let b = pool.str_intern(b"Reset").unwrap();
         // widget_demo on_reset: the same literals on every tap, no strClear().
         for _ in 0..20 {
-            assert_eq!(pool.intern(b"Tapped: 0"), Some(a));
-            assert_eq!(pool.intern(b"Reset"), Some(b));
+            assert_eq!(pool.str_intern(b"Tapped: 0"), Some(a));
+            assert_eq!(pool.str_intern(b"Reset"), Some(b));
         }
         // A computed string with the same bytes is not shared.
-        let c = pool.alloc(b"Reset").unwrap();
+        let c = pool.str_alloc(b"Reset").unwrap();
         assert_ne!(c, b);
-        assert_eq!(pool.intern(b"Reset"), Some(b));
+        assert_eq!(pool.str_intern(b"Reset"), Some(b));
     }
 
     #[test]
     fn interned_literal_is_not_freed_or_edited_in_place() {
-        let mut pool = StringPool::new();
-        let lit = pool.intern(b"ab").unwrap();
-        pool.free(lit);
-        assert_eq!(pool.get(lit), b"ab", "free ignores shared literals");
+        let mut pool = ObjPool::new();
+        let lit = pool.str_intern(b"ab").unwrap();
+        pool.str_free(lit);
+        assert_eq!(pool.str_get(lit), b"ab", "free ignores shared literals");
 
         // Typing into an input that shows the literal edits a copy.
-        let edited = pool.insert_byte(lit, 2, b'c', 0).unwrap();
+        let edited = pool.str_insert_byte(lit, 2, b'c', 0).unwrap();
         assert_ne!(edited, lit);
-        assert_eq!(pool.get(edited), b"abc");
-        assert_eq!(pool.get(lit), b"ab", "other users keep the literal");
+        assert_eq!(pool.str_get(edited), b"abc");
+        assert_eq!(pool.str_get(lit), b"ab", "other users keep the literal");
         // The copy is private: later edits stay in place.
-        assert_eq!(pool.delete_byte(edited, 0), Some(edited));
-        assert_eq!(pool.get(edited), b"bc");
+        assert_eq!(pool.str_delete_byte(edited, 0), Some(edited));
+        assert_eq!(pool.str_get(edited), b"bc");
 
-        let gone = pool.delete_byte(lit, 0).unwrap();
+        let gone = pool.str_delete_byte(lit, 0).unwrap();
         assert_ne!(gone, lit);
-        assert_eq!(pool.get(lit), b"ab");
+        assert_eq!(pool.str_get(lit), b"ab");
     }
 
     #[test]
-    fn smart_clear_keeps_interned_flag() {
-        let mut pool = StringPool::new();
-        let mut tree = WidgetTree::new();
-        let w = tree.alloc().unwrap();
-        let _tmp = pool.alloc(b"tmp").unwrap();
-        let lit = pool.intern(b"label").unwrap();
-        tree.ensure_ext(w).unwrap().text_id = lit;
+    fn sweep_keeps_interned_flag() {
+        let mut pool = ObjPool::new();
+        let w = pool.alloc_widget().unwrap();
+        let _tmp = pool.str_alloc(b"tmp").unwrap();
+        let lit = pool.str_intern(b"label").unwrap();
+        pool.set_text_id(w, lit);
 
-        pool.smart_clear(&mut tree);
-        let moved = tree.text_id(w);
-        assert_eq!(moved, 0);
-        assert_eq!(pool.intern(b"label"), Some(moved), "still found after compaction");
-        // The slot it vacated is a plain string again.
-        let plain = pool.alloc(b"x").unwrap();
-        pool.free(plain);
-        assert_eq!(pool.get(plain), b"");
+        pool.str_sweep();
+        assert_eq!(pool.str_intern(b"label"), Some(lit), "still found after the sweep");
+        pool.compact();
+        assert_eq!(pool.str_intern(b"label"), Some(lit), "and after compaction");
+    }
+
+    #[test]
+    fn long_strings_and_formatting() {
+        let mut pool = ObjPool::new();
+        let long = [b'x'; 300];
+        let id = pool.str_alloc(&long).unwrap();
+        assert_eq!(pool.str_len(id), 300);
+        let both = pool.str_concat(id, id).unwrap();
+        assert_eq!(pool.str_len(both), 600);
+        assert!(pool.str_get(both).iter().all(|&b| b == b'x'));
+        let n = itos(&mut pool, -1234).unwrap();
+        assert_eq!(parse_int(&pool, n), -1234);
     }
 }

@@ -9,6 +9,6 @@ name = "ferrite-ui"
 path = "src/main.rs"
 
 [dependencies]
-ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "strpool_large", "wide_code", "audio", "jpeg", "sdboot"] }
+ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "pool_large", "wide_code", "audio", "jpeg", "sdboot"] }
 # HAL: default features off to drop its UART panic handler (this BSP has its own).
 n32903_rs = { path = "../../vendor/n32903_rs", default-features = false, features = ["heap"] }

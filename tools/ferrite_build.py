@@ -39,8 +39,7 @@ JSON format:
       {"name": "beep", "source": "assets/beep.wav"}
     ],
     "memory": {
-      "strpool_bytes": 4096, "max_strings": 96, "uart_rx_bytes": 512,
-      "max_widgets": 200, "max_ext": 150,
+      "arena_bytes": 16384, "max_objects": 400, "uart_rx_bytes": 512,
       "eval_stack": 32, "call_stack": 12, "cb_queue": 16, "anim_slots": 8
     }
   }
@@ -203,14 +202,12 @@ def convert_sound(source_path: str) -> bytes:
         raise ValueError(f"{source_path}: {8 * width}-bit samples not supported")
     return SOUND_MAGIC + bytes([SOUND_VERSION, channels]) + struct.pack("<I", rate) + pcm
 SYSCFG_MAGIC = 0x4353  # "SC" LE
-SYSCFG_VERSION = 1
+SYSCFG_VERSION = 2
 # key -> (struct offset, struct format, max value)
 SYSCFG_FIELDS = {
-    "strpool_bytes": (4, "<I", 0xFFFFFFFF),
-    "max_strings": (8, "<H", 0xFFFE),
+    "arena_bytes": (4, "<I", 0xFFFFFFFF),
+    "max_objects": (8, "<H", 0x3FFF),
     "uart_rx_bytes": (10, "<H", 32 * 1024),
-    "max_widgets": (12, "<H", 1024),
-    "max_ext": (14, "<H", 1024),
     "eval_stack": (16, "<B", 255),
     "call_stack": (17, "<B", 255),
     "cb_queue": (18, "<B", 255),

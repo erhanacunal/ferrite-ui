@@ -3,7 +3,6 @@
     "screen_height": 480,
     "include_dirs": ["../../../lib"],
     "render_mode": "buffered",
-    "memory": {"max_strings": 96},
     "widget_page": true,
     "images": [
         {"name": "bulb", "image_id": 1, "source": "assets/bulb.png"},

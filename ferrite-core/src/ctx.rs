@@ -20,16 +20,14 @@ use crate::usart::UsartImpl;
 use crate::font::FontList;
 use crate::fs::Fs;
 use crate::image::ImageList;
-use crate::strpool::StringPool;
-use crate::widget::WidgetTree;
+use crate::pool::ObjPool;
 
 pub struct Ctx<P: Platform> {
     pub lcd: LcdImpl<P::LcdB>,
     pub flash: FlashImpl<P::FlashB>,
-    pub tree: WidgetTree,
     pub fonts: FontList,
     pub images: ImageList,
-    pub strpool: StringPool,
+    pub objs: ObjPool,
     pub fs: Option<Fs>,
     pub backlight: BacklightImpl<P::BacklightB>,
     pub rtc: RtcImpl<P::RtcB>,

@@ -320,6 +320,7 @@ fn setup() {
 // Compiler wraps this body in while(true){ ... yield; } — never use return.
 
 fn loop() {
+    critical();
     if (game_state != 0) {
         delay(80);
     } else {
@@ -380,4 +381,5 @@ fn loop() {
         render();
         delay(16);
     }
+    yield_op();
 }

@@ -104,7 +104,7 @@ impl Rect {
 }
 
 /// Edge values for border, margin, padding (pixels)
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Edges {
     pub top: u8,
     pub right: u8,

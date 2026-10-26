@@ -362,7 +362,7 @@ Exact firmware size changes as features are added; inspect the current build art
 | Resource storage | 32 MB SPI NOR | 2 MB NAND region, shadowed in SDRAM | SPI NOR after the firmware |
 | USART RX ring | 128 B | 4 KB | 4 KB |
 
-Common: clip region pool 32 rects (256 B). Heap-allocated: Ctx (WidgetTree + extensions, FontList, ImageList, StringPool), VM (stack-based locals, arrays, callback queue), fonts.
+Common: clip region pool 32 rects (256 B). Heap-allocated: Ctx (object pool for widgets, strings and arrays; FontList, ImageList), VM (stack-based locals, callback queue), fonts.
 
 ## Project Structure
 
@@ -376,14 +376,15 @@ ferrite-ui/
 │       ├── platform.rs  Platform trait (backend types, flash layout, caps)
 │       ├── ctx.rs       Shared application context (Ctx<P>)
 │       ├── vm.rs        Bytecode VM (stack frames, callbacks, arrays, f32, math, animation)
-│       ├── widget.rs    Widget + WidgetExt split, tree, box model
+│       ├── pool.rs      Object pool: one compacting arena for widgets, strings, arrays
+│       ├── widget.rs    Widgets (header + optional sections), tree, box model
 │       ├── render.rs    Painter's algorithm, dirty redraw, clip
 │       ├── clip.rs      Clip region (rect subtract algorithm)
 │       ├── font.rs      Sparse UTF-8 bitmap font renderer (+ embedded_font.rs)
 │       ├── image.rs     Ferrite Image (FI) decoder
 │       ├── fs.rs        Flash filesystem (TOC, named resources)
 │       ├── config.rs    Persistent config sector (touch calibration, ...)
-│       ├── strpool.rs   Heap string pool (itos/ftos/concat/sprintf/GC)
+│       ├── strpool.rs   Strings on the object pool (itos/ftos/concat/sprintf/sweep)
 │       ├── protocol.rs  USART protobuf protocol (+ proto.rs primitives)
 │       ├── keyboard.rs  On-screen keyboard for input widgets
 │       └── {lcd,flash,touch,usart,backlight,rtc,systick,sdcard,audio}.rs
@@ -428,7 +429,7 @@ ferrite-ui/
 - **Math builtins via libm** -- sin/cos/sqrt/abs/atan2/floor/ceil compiled to single opcodes, no interpreter overhead
 - **sprintf zero-heap** -- format output written to a 128B stack buffer, then interned into the string pool as one allocation
 - **Debug symbols sidecar** -- compiler writes `.dbg` alongside bytecode; disassembler and designer use it for human-readable names
-- **Shared context** -- Ctx struct bundles LCD, Flash, WidgetTree, FontList, ImageList, StringPool, Fs
+- **Shared context** -- Ctx struct bundles LCD, Flash, ObjPool, FontList, ImageList, Fs
 
 ## License
 

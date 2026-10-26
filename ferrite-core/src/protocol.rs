@@ -536,16 +536,17 @@ pub mod mem_pool {
     pub const HEAP: u8 = 1;
     /// used / (used + free) CPU stack bytes; extra = peak (0 = not measured).
     pub const CPU_STACK: u8 = 2;
-    /// String pool bytes used / `strpool_bytes`; extra = pool heap bytes.
-    pub const STR_BYTES: u8 = 3;
-    /// Live string slots / `max_strings`.
-    pub const STR_SLOTS: u8 = 4;
+    /// Object pool arena bytes below the bump pointer / `arena_bytes`;
+    /// extra = bytes in freed blocks that compaction would reclaim.
+    pub const OBJ_ARENA: u8 = 3;
+    /// Live objects (all types) / `max_objects`; extra = pool heap bytes.
+    pub const OBJ_PTRS: u8 = 4;
     /// UART RX bytes waiting / ring size (0 / 0 = backend doesn't report).
     pub const UART_RX: u8 = 5;
-    /// Live widgets / `max_widgets`; extra = widget storage bytes.
+    /// Live widgets / `max_objects`; extra = their arena bytes.
     pub const WIDGETS: u8 = 6;
-    /// Live widget extensions / `max_ext`; extra = extension storage bytes.
-    pub const WIDGET_EXT: u8 = 7;
+    /// Live strings / `max_objects`; extra = their arena bytes.
+    pub const STRINGS: u8 = 7;
     /// Eval stack depth / `eval_stack`; extra = heap bytes.
     pub const EVAL_STACK: u8 = 8;
     /// Call stack depth / `call_stack`; extra = heap bytes.
@@ -554,6 +555,8 @@ pub mod mem_pool {
     pub const CB_QUEUE: u8 = 10;
     /// Active tweens / animation slot cap; extra = heap bytes.
     pub const ANIMS: u8 = 11;
+    /// Live arrays / `max_objects`; extra = their arena bytes.
+    pub const ARRAYS: u8 = 12;
 }
 
 /// One MemDetail row: pool `id` (`mem_pool`), `used` and `capacity` in the
@@ -646,7 +649,7 @@ mod memdetail_tests {
         let usart = UsartImpl::with_backend(Rec(RefCell::new(Vec::new())));
         send_memdetail(&usart, &[
             MemEntry { id: mem_pool::HEAP, used: 100, capacity: 200, extra: 50 },
-            MemEntry { id: mem_pool::STR_SLOTS, used: 3, capacity: 47, extra: 0 },
+            MemEntry { id: mem_pool::OBJ_PTRS, used: 3, capacity: 47, extra: 0 },
         ]);
         let want: &[u8] = &[
             0x32, 28, 1, 2, //

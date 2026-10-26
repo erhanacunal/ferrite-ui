@@ -17,20 +17,21 @@
 //!   keyboard module.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use crate::lcd::LcdBackend;
 use crate::platform::Platform;
 use crate::touch::{TouchEventKind, TouchImpl};
 
 use crate::ctx::Ctx;
-use crate::strpool::StringPool;
+use crate::pool::{ObjPool, T_ARRAY, T_FREE, T_STRING, T_WIDGET};
 use crate::syscfg::SysCfg;
 use crate::types::{COLOR_RED, Size};
 use crate::vm::{CodeAddr, FunctionKind, RenderMode, Vm, VmState};
 use crate::{font, fs, heap, keyboard, protocol, render, widget};
 
 use crate::protocol::{Protocol, RxEvent};
-use crate::widget::{WidgetExt, WidgetId};
+use crate::widget::WidgetId;
 
 // === Error codes ===
 
@@ -106,7 +107,7 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
     fn reset() -> !;
 
     /// VM syscall dispatcher, wired into `Vm::syscall_fn`.
-    fn syscall(id: u8, args: &[i32], strpool: &StringPool) -> Option<i32> {
+    fn syscall(id: u8, args: &[i32], strpool: &ObjPool) -> Option<i32> {
         let _ = (id, args, strpool);
         None
     }
@@ -233,18 +234,6 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
         }
     }
 
-    // --- Root widget (always widget 0) ---
-    let root = ctx.tree.alloc().unwrap();
-    {
-        let w = ctx.tree.get_mut(root);
-        w.size = Size {
-            w: P::LcdB::WIDTH,
-            h: P::LcdB::HEIGHT,
-        };
-        w.background_color = P::BG_COLOR;
-    }
-    ctx.tree.root = root;
-
     // --- VM ---
     let mut vm = Box::new(Vm::new());
     vm.syscall_fn = Some(P::syscall);
@@ -254,6 +243,10 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
     if error_code == 0 {
         error_code = apply_syscfg(&mut ctx, &mut vm);
     }
+
+    // --- Root widget (always widget 0; after the pool is sized, which drops
+    // every object) ---
+    alloc_root(&mut ctx);
 
     // --- Load main program ---
     if error_code == 0 {
@@ -346,8 +339,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                     vm.reset();
                     #[cfg(feature = "audio")]
                     ctx.audio.stop();
-                    ctx.tree.clear();
-                    ctx.strpool.clear();
+                    ctx.objs.clear();
                     ctx.images.clear();
                     error_code = 0;
                     protocol.alloc_sector_buf();
@@ -377,8 +369,10 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                             vm.find_by_kind(FunctionKind::OnUserMessage).map(|e| e.offset as CodeAddr)
                         {
                             let msg = protocol.user_message();
-                            if let Some(arr_id) = vm.alloc_array_from(msg) {
-                                vm.enqueue_callback(offset, &[arr_id]);
+                            if !msg.is_empty() {
+                                if let Some(arr_id) = ctx.objs.arr_from_bytes(msg) {
+                                    vm.enqueue_callback(offset, &[arr_id as i32]);
+                                }
                             }
                         }
                     }
@@ -442,8 +436,8 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
 //  Startup helpers
 // ============================================================================
 
-/// Apply the image's RES_SYSCFG: resize the USART RX ring, string pool and
-/// VM stacks, and set the widget / animation caps. No entry → all defaults.
+/// Apply the image's RES_SYSCFG: resize the USART RX ring, the object pool
+/// and the VM stacks, and set the animation cap. No entry → all defaults.
 /// Runs once at boot (filesystem writes reboot), before the program loads.
 #[inline(never)]
 fn apply_syscfg<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
@@ -457,10 +451,8 @@ fn apply_syscfg<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     };
     let mut ok = ctx.usart.set_rx_capacity(cfg.uart_rx_bytes as usize);
     ok &= ctx
-        .strpool
-        .configure(cfg.strpool_bytes as usize, cfg.max_strings as usize);
-    ctx.tree
-        .set_limits(cfg.max_widgets as usize, cfg.max_ext as usize);
+        .objs
+        .configure(cfg.arena_bytes as usize, cfg.max_objects as usize);
     ok &= vm.configure(
         cfg.eval_stack as usize,
         cfg.call_stack as usize,
@@ -490,8 +482,12 @@ fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     let mut err = 0;
     // A RAM image over the platform limit runs from flash rather than being
     // truncated (which would cut off the functions at the end of the image).
-    let flash_exec =
-        entry.flags & fs::RES_FLAG_FLASH_EXEC != 0 || entry.size as usize > P::MAX_CODE_SIZE;
+    let size = entry.size as usize;
+    let mut img = Vec::new();
+    // Too big for the RAM limit, or the heap can't hold it: also run from flash.
+    let flash_exec = entry.flags & fs::RES_FLAG_FLASH_EXEC != 0
+        || size > P::MAX_CODE_SIZE
+        || img.try_reserve_exact(size).is_err();
     if flash_exec {
         // The VM keeps its own (cloned) flash handle for cache refills; the
         // backend is a stateless MMIO driver so the clone shares no state.
@@ -499,11 +495,11 @@ fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
             err = ERR_PROGRAM_ERROR;
         }
     } else {
-        let mut img = alloc::vec![0u8; entry.size as usize];
+        img.resize(size, 0);
         if let Some(fs) = ctx.fs.as_ref() {
             fs.read_resource(&ctx.flash, &entry, 0, &mut img);
         }
-        if !vm.load_ram(&img) {
+        if !vm.load_ram_owned(img) {
             err = ERR_PROGRAM_ERROR;
         }
     }
@@ -516,12 +512,11 @@ fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
         vm.set_page(page.offset, page.size);
     }
     apply_orientation(ctx, vm);
-    reserve_tree(ctx, vm);
     err
 }
 
 /// Per-pool memory usage for the `MemDetail` USART command.
-fn mem_detail<P: PlatformRuntime>(ctx: &Ctx<P>, vm: &Vm) -> [protocol::MemEntry; 11] {
+fn mem_detail<P: PlatformRuntime>(ctx: &Ctx<P>, vm: &Vm) -> [protocol::MemEntry; 12] {
     use protocol::{MemEntry, mem_pool};
     let e = |id: u8, used: usize, capacity: usize, extra: usize| MemEntry {
         id,
@@ -533,17 +528,18 @@ fn mem_detail<P: PlatformRuntime>(ctx: &Ctx<P>, vm: &Vm) -> [protocol::MemEntry;
     let total = P::heap_total();
     let (stack_used, stack_free) = P::stack_info();
     let (rx_waiting, rx_size) = ctx.usart.rx_stats();
-    let (widgets, exts, widget_bytes, ext_bytes) = ctx.tree.mem_stats();
-    let (max_widgets, max_ext) = ctx.tree.limits();
+    let objs = &ctx.objs;
+    let max_objs = objs.capacity_objects();
     let [eval, call, cbq, anims] = vm.mem_stats::<P>();
     [
         e(mem_pool::HEAP, total.saturating_sub(free), total, largest),
         e(mem_pool::CPU_STACK, stack_used as usize, (stack_used + stack_free) as usize, P::stack_peak() as usize),
-        e(mem_pool::STR_BYTES, ctx.strpool.used_bytes(), ctx.strpool.capacity_bytes(), ctx.strpool.heap_bytes()),
-        e(mem_pool::STR_SLOTS, ctx.strpool.used_strings(), ctx.strpool.capacity_strings(), 0),
+        e(mem_pool::OBJ_ARENA, objs.used_bytes(), objs.capacity_bytes(), objs.garbage_bytes()),
+        e(mem_pool::OBJ_PTRS, objs.live_objects(T_FREE), max_objs, objs.heap_bytes()),
         e(mem_pool::UART_RX, rx_waiting, rx_size, rx_size),
-        e(mem_pool::WIDGETS, widgets, max_widgets, widget_bytes),
-        e(mem_pool::WIDGET_EXT, exts, max_ext, ext_bytes),
+        e(mem_pool::WIDGETS, objs.live_objects(T_WIDGET), max_objs, objs.bytes_of(T_WIDGET)),
+        e(mem_pool::STRINGS, objs.live_objects(T_STRING), max_objs, objs.bytes_of(T_STRING)),
+        e(mem_pool::ARRAYS, objs.live_objects(T_ARRAY), max_objs, objs.bytes_of(T_ARRAY)),
         e(mem_pool::EVAL_STACK, eval.0, eval.1, eval.2),
         e(mem_pool::CALL_STACK, call.0, call.1, call.2),
         e(mem_pool::CB_QUEUE, cbq.0, cbq.1, cbq.2),
@@ -559,26 +555,8 @@ fn apply_orientation<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) {
         w: ctx.lcd.width(),
         h: ctx.lcd.height(),
     };
-    let root = ctx.tree.root;
-    ctx.tree.get_mut(root).size = size;
-}
-
-/// Pre-allocate tree capacity (one allocation per Vec): the RES_SYSCFG caps
-/// when set, else the v4 header counts, else a fallback.
-fn reserve_tree<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) {
-    let (max_w, max_e) = ctx.tree.limits();
-    if max_w < widget::MAX_WIDGETS || max_e < widget::MAX_EXTENSIONS {
-        ctx.tree.reserve(max_w, max_e);
-        return;
-    }
-    // A v4 header carries the program's exact alloc() counts (0 = none — a
-    // program that only draws must not hold widget storage it never uses);
-    // older images have none, so guess.
-    let (wc, ec) = match vm.tree_hint {
-        Some((w, e)) => (w as usize, e as usize),
-        None => (96, 96),
-    };
-    ctx.tree.reserve(wc, ec);
+    let root = ctx.objs.root;
+    ctx.objs.get_mut(root).size = size;
 }
 
 #[inline(never)]
@@ -601,6 +579,20 @@ fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     0
 }
 
+/// Allocate the full-screen root widget into the (empty) object pool.
+fn alloc_root<P: PlatformRuntime>(ctx: &mut Ctx<P>) {
+    let Some(root) = ctx.objs.alloc_widget() else {
+        return;
+    };
+    let w = ctx.objs.get_mut(root);
+    w.size = Size {
+        w: P::LcdB::WIDTH,
+        h: P::LcdB::HEIGHT,
+    };
+    w.background_color = P::BG_COLOR;
+    ctx.objs.root = root;
+}
+
 /// Runtime program reload (USART `ProgramReady`). Returns the new error code.
 #[inline(never)]
 fn reload_program<P: PlatformRuntime>(
@@ -609,31 +601,20 @@ fn reload_program<P: PlatformRuntime>(
     input: &mut P::Input,
     protocol: &Protocol,
 ) -> u8 {
-    ctx.tree.clear();
-    ctx.strpool.clear();
+    ctx.objs.clear();
     vm.reset();
     #[cfg(feature = "audio")]
     ctx.audio.stop();
     input.reset(ctx);
     ctx.cursor_visible = false;
 
-    let root = ctx.tree.alloc().unwrap();
-    {
-        let w = ctx.tree.get_mut(root);
-        w.size = Size {
-            w: P::LcdB::WIDTH,
-            h: P::LcdB::HEIGHT,
-        };
-        w.background_color = P::BG_COLOR;
-    }
-    ctx.tree.root = root;
+    alloc_root(ctx);
 
     let prog = protocol.program_code();
     if !vm.load_ram(prog) {
         vm.load_raw(prog);
     }
     apply_orientation(ctx, vm);
-    reserve_tree(ctx, vm);
 
     if vm.has_code() {
         start_program(ctx, vm)
@@ -662,7 +643,7 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, input: &mut P
         RenderMode::Buffered => {
             if render::buffered_has_dirty(ctx) {
                 ctx.lcd.begin_frame();
-                let paint = render::render_buffered_content(ctx, vm);
+                let paint = render::render_buffered_content(ctx);
                 // on_paint into this back buffer, before the overlay + swap.
                 vm.run_paint(ctx, &paint);
                 input.draw_overlay(ctx, true);
@@ -675,7 +656,7 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, input: &mut P
         RenderMode::Dirty => {
             let mut paint = render::PaintList::new();
             render::collect_dirty_paint(ctx, &mut paint);
-            render::render_dirty(ctx, vm);
+            render::render_dirty(ctx);
             vm.run_paint(ctx, &paint);
             input.draw_overlay(ctx, false);
             ctx.lcd.flush_dirty();
@@ -869,8 +850,8 @@ pub fn dropdown_parent<P: Platform>(ctx: &Ctx<P>, id: WidgetId) -> WidgetId {
     if id.is_none() {
         return WidgetId::NONE;
     }
-    let parent = ctx.tree.get(id).parent;
-    if parent.is_some() && ctx.tree.get(parent).kind == widget::KIND_DROPDOWN {
+    let parent = ctx.objs.get(id).parent;
+    if parent.is_some() && ctx.objs.get(parent).kind == widget::KIND_DROPDOWN {
         parent
     } else {
         WidgetId::NONE
@@ -883,14 +864,14 @@ pub fn dropdown_child_index<P: Platform>(
     option: WidgetId,
 ) -> i16 {
     let mut idx: i16 = 0;
-    let mut child = ctx.tree.get(dropdown).first_child;
-    let max = ctx.tree.count();
+    let mut child = ctx.objs.get(dropdown).first_child;
+    let max = ctx.objs.count();
     let mut guard = 0usize;
     while child.is_some() {
         if child == option {
             return idx;
         }
-        child = ctx.tree.get(child).next_sibling;
+        child = ctx.objs.get(child).next_sibling;
         idx += 1;
         guard += 1;
         if guard > max {
@@ -905,32 +886,32 @@ pub fn set_dropdown_options_visible<P: Platform>(
     dropdown: WidgetId,
     visible: bool,
 ) {
-    let mut child = ctx.tree.get(dropdown).first_child;
-    let max = ctx.tree.count();
+    let mut child = ctx.objs.get(dropdown).first_child;
+    let max = ctx.objs.count();
     let mut guard = 0usize;
     while child.is_some() {
         if visible {
-            ctx.tree.get_mut(child).flags |= widget::FLAG_VISIBLE;
+            ctx.objs.get_mut(child).flags |= widget::FLAG_VISIBLE;
         } else {
-            ctx.tree.get_mut(child).flags &= !widget::FLAG_VISIBLE;
+            ctx.objs.get_mut(child).flags &= !widget::FLAG_VISIBLE;
         }
-        ctx.tree.mark_dirty(child);
-        child = ctx.tree.get(child).next_sibling;
+        ctx.objs.mark_dirty(child);
+        child = ctx.objs.get(child).next_sibling;
         guard += 1;
         if guard > max {
             break;
         }
     }
-    ctx.tree.mark_dirty(dropdown);
+    ctx.objs.mark_dirty(dropdown);
 }
 
 pub fn toggle_dropdown<P: Platform>(ctx: &mut Ctx<P>, dropdown: WidgetId) {
-    let expanded = ctx.tree.get(dropdown).flags & widget::FLAG_CHECKED != 0;
+    let expanded = ctx.objs.get(dropdown).flags & widget::FLAG_CHECKED != 0;
     if expanded {
-        ctx.tree.get_mut(dropdown).flags &= !widget::FLAG_CHECKED;
+        ctx.objs.get_mut(dropdown).flags &= !widget::FLAG_CHECKED;
         set_dropdown_options_visible(ctx, dropdown, false);
     } else {
-        ctx.tree.get_mut(dropdown).flags |= widget::FLAG_CHECKED;
+        ctx.objs.get_mut(dropdown).flags |= widget::FLAG_CHECKED;
         set_dropdown_options_visible(ctx, dropdown, true);
     }
 }
@@ -940,13 +921,13 @@ pub fn select_dropdown_option<P: Platform>(
     dropdown: WidgetId,
     option: WidgetId,
 ) {
-    let text_id = ctx.tree.text_id(option);
+    let text_id = ctx.objs.text_id(option);
     let selected = dropdown_child_index(ctx, dropdown, option);
-    if let Some(ext) = ctx.tree.ensure_ext(dropdown) {
+    ctx.objs.update_ext(dropdown, |ext| {
         ext.text_id = text_id;
         ext.value = selected;
-    }
-    ctx.tree.get_mut(dropdown).flags &= !widget::FLAG_CHECKED;
+    });
+    ctx.objs.get_mut(dropdown).flags &= !widget::FLAG_CHECKED;
     set_dropdown_options_visible(ctx, dropdown, false);
 }
 
@@ -955,8 +936,8 @@ pub fn scrollbar_set_position<P: Platform>(
     scroll_id: WidgetId,
     touch_y: u16,
 ) {
-    let cr = ctx.tree.content_rect(scroll_id);
-    let ch = ctx.tree.content_height(scroll_id) as i32;
+    let cr = ctx.objs.content_rect(scroll_id);
+    let ch = ctx.objs.content_height(scroll_id) as i32;
     let vh = cr.h as i32;
     if ch <= vh {
         return;
@@ -972,10 +953,10 @@ pub fn scrollbar_set_position<P: Platform>(
     let ratio = ((ty - track_top).clamp(0, track_h) * 1000) / track_h;
     let new_scroll = ((ratio * max_scroll) / 1000).clamp(0, max_scroll) as i16;
 
-    if let Some(ext) = ctx.tree.ensure_ext(scroll_id) {
+    ctx.objs.update_ext(scroll_id, |ext| {
         ext.value = new_scroll;
-    }
-    ctx.tree.mark_dirty(scroll_id);
+    });
+    ctx.objs.mark_dirty(scroll_id);
 }
 
 // ============================================================================
@@ -1000,23 +981,23 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
         (event.x, event.y) = ctx.lcd.touch_to_logical(event.x, event.y);
         match event.kind {
             TouchEventKind::Press => {
-                let hit = crate::touch::hit_test(&mut ctx.tree, event.x, event.y);
+                let hit = crate::touch::hit_test(&mut ctx.objs, event.x, event.y);
                 if hit.is_some() {
-                    ctx.tree.get_mut(hit).flags |= widget::FLAG_PRESSED;
-                    ctx.tree.mark_dirty(hit);
+                    ctx.objs.get_mut(hit).flags |= widget::FLAG_PRESSED;
+                    ctx.objs.mark_dirty(hit);
                 }
             }
             TouchEventKind::Release => {
-                let hit = crate::touch::hit_test(&mut ctx.tree, event.x, event.y);
+                let hit = crate::touch::hit_test(&mut ctx.objs, event.x, event.y);
                 if hit.is_none() {
                     return;
                 }
-                ctx.tree.get_mut(hit).flags &= !widget::FLAG_PRESSED;
-                ctx.tree.mark_dirty(hit);
+                ctx.objs.get_mut(hit).flags &= !widget::FLAG_PRESSED;
+                ctx.objs.mark_dirty(hit);
                 if !vm.has_code() {
                     return;
                 }
-                if ctx.tree.get(hit).flags & widget::FLAG_HAS_ON_CLICK != 0 {
+                if ctx.objs.get(hit).flags & widget::FLAG_HAS_ON_CLICK != 0 {
                     if let Some(click_fn) = vm.modal_overlay_click_fn(hit) {
                         if let Some(off) = vm.find_func(click_fn).map(|e| e.offset as CodeAddr) {
                             vm.enqueue_callback(off, &[hit.0 as i32]);
@@ -1027,8 +1008,8 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
                         vm.enqueue_callback(off, &[hit.0 as i32]);
                     }
                 }
-                if ctx.tree.get(hit).flags & widget::FLAG_HAS_ON_TAP != 0
-                    && ctx.tree.get(hit).kind != widget::KIND_INPUT
+                if ctx.objs.get(hit).flags & widget::FLAG_HAS_ON_TAP != 0
+                    && ctx.objs.get(hit).kind != widget::KIND_INPUT
                 {
                     if let Some(off) = vm.find_by_kind(FunctionKind::OnTap).map(|e| e.offset as CodeAddr) {
                         let packed = ((event.x as u32) << 16 | event.y as u32) as i32;
@@ -1092,7 +1073,7 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
             let now = ctx.systick.millis();
             if self.kb.update_blink(now) {
                 ctx.cursor_visible = self.kb.cursor_visible;
-                ctx.tree.mark_dirty(self.kb.focused);
+                ctx.objs.mark_dirty(self.kb.focused);
             }
         }
     }
@@ -1129,10 +1110,10 @@ impl FullInput {
             return;
         }
 
-        let hit = crate::touch::hit_test(&mut ctx.tree, x, y);
+        let hit = crate::touch::hit_test(&mut ctx.objs, x, y);
 
         // Dismiss keyboard when tapping outside an input.
-        if self.kb.visible && (!hit.is_some() || ctx.tree.get(hit).kind != widget::KIND_INPUT) {
+        if self.kb.visible && (!hit.is_some() || ctx.objs.get(hit).kind != widget::KIND_INPUT) {
             self.dismiss_keyboard(ctx);
         }
 
@@ -1146,18 +1127,18 @@ impl FullInput {
 
         // Scrollbar hit-test.
         let scroll_target = if hit.is_some() {
-            let w = ctx.tree.get(hit);
+            let w = ctx.objs.get(hit);
             if w.flags & widget::FLAG_CLIP_CHILDREN != 0 {
                 hit
             } else {
-                ctx.tree.scroll_parent(hit)
+                ctx.objs.scroll_parent(hit)
             }
         } else {
             WidgetId::NONE
         };
         if scroll_target.is_some() {
-            let cr = ctx.tree.content_rect(scroll_target);
-            let ch = ctx.tree.content_height(scroll_target);
+            let cr = ctx.objs.content_rect(scroll_target);
+            let ch = ctx.objs.content_height(scroll_target);
             if ch > cr.h
                 && (x as i16) >= cr.x + cr.w as i16 - 10
                 && (x as i16) < cr.right()
@@ -1171,24 +1152,24 @@ impl FullInput {
         }
 
         if hit.is_some() {
-            ctx.tree.get_mut(hit).flags |= widget::FLAG_PRESSED;
+            ctx.objs.get_mut(hit).flags |= widget::FLAG_PRESSED;
 
-            if ctx.tree.get(hit).kind == widget::KIND_INPUT {
+            if ctx.objs.get(hit).kind == widget::KIND_INPUT {
                 self.focus_input(ctx, hit);
                 self.position_cursor(ctx, hit, x);
             }
 
-            if ctx.tree.get(hit).kind == widget::KIND_SLIDER {
-                let abs = ctx.tree.absolute_rect(hit);
+            if ctx.objs.get(hit).kind == widget::KIND_SLIDER {
+                let abs = ctx.objs.absolute_rect(hit);
                 let new_val = touch_to_slider_value(&abs, x);
-                if let Some(ext) = ctx.tree.ensure_ext(hit) {
+                ctx.objs.update_ext(hit, |ext| {
                     ext.value = new_val;
-                }
+                });
                 // The click dispatcher takes exactly one argument, the widget
                 // id (a second one would be popped *as* the id); the new value
                 // is already stored, and the dispatcher passes it on to
                 // handlers declared as `fn h(wid, val)`.
-                if vm.has_code() && ctx.tree.get(hit).flags & widget::FLAG_HAS_ON_CLICK != 0 {
+                if vm.has_code() && ctx.objs.get(hit).flags & widget::FLAG_HAS_ON_CLICK != 0 {
                     if let Some(off) = vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as CodeAddr)
                     {
                         vm.enqueue_callback(off, &[hit.0 as i32]);
@@ -1196,9 +1177,9 @@ impl FullInput {
                 }
             }
 
-            ctx.tree.mark_dirty(hit);
+            ctx.objs.mark_dirty(hit);
             if vm.render_mode != RenderMode::Buffered {
-                render::render_dirty(ctx, vm);
+                render::render_dirty(ctx);
             }
         }
 
@@ -1221,26 +1202,26 @@ impl FullInput {
         if self.scroll_active && self.scroll_id.is_some() {
             scrollbar_set_position(ctx, self.scroll_id, y);
             if vm.render_mode != RenderMode::Buffered {
-                render::render_dirty(ctx, vm);
+                render::render_dirty(ctx);
             }
         }
 
         // Slider drag (the pressed slider).
-        ctx.tree.ensure_dfs();
-        for i in 0..ctx.tree.dfs_len() {
-            let id = ctx.tree.dfs_at(i);
-            let w = ctx.tree.get(id);
+        ctx.objs.ensure_dfs();
+        for i in 0..ctx.objs.dfs_len() {
+            let id = ctx.objs.dfs_at(i);
+            let w = ctx.objs.get(id);
             if w.flags & widget::FLAG_PRESSED != 0 && w.kind == widget::KIND_SLIDER {
-                let abs = ctx.tree.absolute_rect(id);
+                let abs = ctx.objs.absolute_rect(id);
                 let new_val = touch_to_slider_value(&abs, x);
-                if let Some(ext) = ctx.tree.ensure_ext(id) {
+                ctx.objs.update_ext(id, |ext| {
                     ext.value = new_val;
-                }
-                ctx.tree.mark_dirty(id);
+                });
+                ctx.objs.mark_dirty(id);
                 if vm.render_mode != RenderMode::Buffered {
-                    render::render_dirty(ctx, vm);
+                    render::render_dirty(ctx);
                 }
-                if vm.has_code() && ctx.tree.get(id).flags & widget::FLAG_HAS_ON_CLICK != 0 {
+                if vm.has_code() && ctx.objs.get(id).flags & widget::FLAG_HAS_ON_CLICK != 0 {
                     if let Some(off) =
                         vm.find_by_kind(FunctionKind::OnClick).map(|e| e.offset as CodeAddr)
                     {
@@ -1260,11 +1241,11 @@ impl FullInput {
             let dx = x as i32 - self.gesture_start_x as i32;
             let dy = y as i32 - self.gesture_start_y as i32;
             if dx * dx + dy * dy <= LONG_PRESS_MAX_MOVE_SQ {
-                ctx.tree.ensure_dfs();
+                ctx.objs.ensure_dfs();
                 let mut pressed_id = WidgetId::NONE;
-                for i in 0..ctx.tree.dfs_len() {
-                    let id = ctx.tree.dfs_at(i);
-                    if ctx.tree.get(id).flags & widget::FLAG_PRESSED != 0 {
+                for i in 0..ctx.objs.dfs_len() {
+                    let id = ctx.objs.dfs_at(i);
+                    if ctx.objs.get(id).flags & widget::FLAG_PRESSED != 0 {
                         pressed_id = id;
                     }
                 }
@@ -1316,13 +1297,13 @@ impl FullInput {
         let mut clicked_id = WidgetId::NONE;
         let mut swipe_widget_id = WidgetId::NONE;
 
-        ctx.tree.ensure_dfs();
-        for i in 0..ctx.tree.dfs_len() {
-            let id = ctx.tree.dfs_at(i);
-            if ctx.tree.get(id).flags & widget::FLAG_PRESSED != 0 {
-                ctx.tree.get_mut(id).flags &= !widget::FLAG_PRESSED;
+        ctx.objs.ensure_dfs();
+        for i in 0..ctx.objs.dfs_len() {
+            let id = ctx.objs.dfs_at(i);
+            if ctx.objs.get(id).flags & widget::FLAG_PRESSED != 0 {
+                ctx.objs.get_mut(id).flags &= !widget::FLAG_PRESSED;
                 if !was_scrolling && !is_swipe {
-                    let abs = ctx.tree.absolute_rect(id);
+                    let abs = ctx.objs.absolute_rect(id);
                     if abs.contains(x, y) {
                         clicked_id = id;
                     }
@@ -1330,7 +1311,7 @@ impl FullInput {
                 if is_swipe {
                     swipe_widget_id = id;
                 }
-                ctx.tree.mark_dirty(id);
+                ctx.objs.mark_dirty(id);
             }
         }
 
@@ -1339,33 +1320,33 @@ impl FullInput {
         if dropdown.is_some() {
             select_dropdown_option(ctx, dropdown, clicked_id);
             clicked_id = dropdown;
-        } else if clicked_id.is_some() && ctx.tree.get(clicked_id).kind == widget::KIND_DROPDOWN {
+        } else if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_DROPDOWN {
             toggle_dropdown(ctx, clicked_id);
             clicked_id = WidgetId::NONE;
         }
 
         // Checkbox toggle.
-        if clicked_id.is_some() && ctx.tree.get(clicked_id).kind == widget::KIND_CHECKBOX {
-            ctx.tree.get_mut(clicked_id).flags ^= widget::FLAG_CHECKED;
-            ctx.tree.mark_dirty(clicked_id);
+        if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_CHECKBOX {
+            ctx.objs.get_mut(clicked_id).flags ^= widget::FLAG_CHECKED;
+            ctx.objs.mark_dirty(clicked_id);
         }
 
         // Radio / button group: select this one, deselect the rest of its
         // group (radio group_id 0 = sibling radios).
         if clicked_id.is_some()
-            && matches!(ctx.tree.get(clicked_id).kind, widget::KIND_RADIO | widget::KIND_BUTTON_GROUP)
+            && matches!(ctx.objs.get(clicked_id).kind, widget::KIND_RADIO | widget::KIND_BUTTON_GROUP)
         {
-            ctx.tree.select_in_group(clicked_id);
+            ctx.objs.select_in_group(clicked_id);
         }
 
         // Input: reposition cursor on tap.
-        if clicked_id.is_some() && ctx.tree.get(clicked_id).kind == widget::KIND_INPUT {
+        if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_INPUT {
             self.position_cursor(ctx, clicked_id, x);
-            ctx.tree.mark_dirty(clicked_id);
+            ctx.objs.mark_dirty(clicked_id);
         }
 
         if vm.render_mode != RenderMode::Buffered {
-            render::render_dirty(ctx, vm);
+            render::render_dirty(ctx);
         }
 
         // OnSwipe — mutually exclusive with on_click.
@@ -1390,7 +1371,7 @@ impl FullInput {
         // on_click (modal overlay func id first, else the global dispatcher).
         if clicked_id.is_some()
             && vm.has_code()
-            && ctx.tree.get(clicked_id).flags & widget::FLAG_HAS_ON_CLICK != 0
+            && ctx.objs.get(clicked_id).flags & widget::FLAG_HAS_ON_CLICK != 0
         {
             if let Some(click_fn) = vm.modal_overlay_click_fn(clicked_id) {
                 if let Some(off) = vm.find_func(click_fn).map(|e| e.offset as CodeAddr) {
@@ -1405,8 +1386,8 @@ impl FullInput {
         // on_tap (skip KIND_INPUT).
         if clicked_id.is_some()
             && vm.has_code()
-            && ctx.tree.get(clicked_id).kind != widget::KIND_INPUT
-            && ctx.tree.get(clicked_id).flags & widget::FLAG_HAS_ON_TAP != 0
+            && ctx.objs.get(clicked_id).kind != widget::KIND_INPUT
+            && ctx.objs.get(clicked_id).flags & widget::FLAG_HAS_ON_TAP != 0
         {
             if let Some(off) = vm.find_by_kind(FunctionKind::OnTap).map(|e| e.offset as CodeAddr) {
                 let packed = ((x as u32) << 16 | y as u32) as i32;
@@ -1428,12 +1409,12 @@ impl FullInput {
 
     fn focus_input<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, id: WidgetId) {
         if self.kb.focused.is_some() && self.kb.focused != id {
-            ctx.tree.get_mut(self.kb.focused).flags &= !widget::FLAG_FOCUSED;
-            ctx.tree.mark_dirty(self.kb.focused);
+            ctx.objs.get_mut(self.kb.focused).flags &= !widget::FLAG_FOCUSED;
+            ctx.objs.mark_dirty(self.kb.focused);
         }
         self.kb.focused = id;
-        ctx.tree.get_mut(id).flags |= widget::FLAG_FOCUSED;
-        ctx.tree.mark_dirty(id);
+        ctx.objs.get_mut(id).flags |= widget::FLAG_FOCUSED;
+        ctx.objs.mark_dirty(id);
         self.kb.set_screen(ctx.lcd.width(), ctx.lcd.height());
         self.kb.visible = true;
         self.kb.dirty = true;
@@ -1444,25 +1425,25 @@ impl FullInput {
 
     fn dismiss_keyboard<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>) {
         if self.kb.focused.is_some() {
-            ctx.tree.get_mut(self.kb.focused).flags &= !widget::FLAG_FOCUSED;
-            ctx.tree.mark_dirty(self.kb.focused);
+            ctx.objs.get_mut(self.kb.focused).flags &= !widget::FLAG_FOCUSED;
+            ctx.objs.mark_dirty(self.kb.focused);
         }
         self.kb.focused = WidgetId::NONE;
         self.kb.visible = false;
         ctx.cursor_visible = false;
 
-        ctx.tree.ensure_dfs();
-        for i in 0..ctx.tree.dfs_len() {
-            let id = ctx.tree.dfs_at(i);
-            let abs = ctx.tree.absolute_rect(id);
+        ctx.objs.ensure_dfs();
+        for i in 0..ctx.objs.dfs_len() {
+            let id = ctx.objs.dfs_at(i);
+            let abs = ctx.objs.absolute_rect(id);
             if abs.y + abs.h as i16 > self.kb.top() as i16 {
-                ctx.tree.mark_dirty(id);
+                ctx.objs.mark_dirty(id);
             }
         }
     }
 
     fn position_cursor<P: PlatformRuntime>(&self, ctx: &mut Ctx<P>, id: WidgetId, touch_x: u16) {
-        let ext = ctx.tree.ext(id).unwrap_or(&WidgetExt::DEFAULT);
+        let ext = &ctx.objs.ext(id);
         let text_id = ext.text_id;
         let font_id = ext.font_id;
 
@@ -1471,14 +1452,14 @@ impl FullInput {
             None => return,
         };
 
-        let abs = ctx.tree.absolute_rect(id);
-        let b = ctx.tree.border(id);
-        let p = ctx.tree.padding(id);
+        let abs = ctx.objs.absolute_rect(id);
+        let b = ctx.objs.border(id);
+        let p = ctx.objs.padding(id);
         let cx = abs.x + b.left as i16 + p.left as i16;
 
         let mut cursor_pos: i16 = 0;
         if text_id != 0xFFFF {
-            let text = ctx.strpool.get(text_id);
+            let text = ctx.objs.str_get(text_id);
             let tx = touch_x as i16;
             let mut acc = cx;
             let mut byte_pos = 0;
@@ -1501,9 +1482,9 @@ impl FullInput {
             }
         }
 
-        if let Some(ext) = ctx.tree.ensure_ext(id) {
+        ctx.objs.update_ext(id, |ext| {
             ext.value = cursor_pos;
-        }
+        });
     }
 
     fn handle_key_action<P: PlatformRuntime>(
@@ -1518,27 +1499,27 @@ impl FullInput {
         }
         match action {
             keyboard::KeyAction::Char(ch) => {
-                let text_id = ctx.tree.text_id(id);
-                let max_len = ctx.tree.max_length(id);
-                let cursor = ctx.tree.value(id).max(0) as usize;
+                let text_id = ctx.objs.text_id(id);
+                let max_len = ctx.objs.max_length(id);
+                let cursor = ctx.objs.value(id).max(0) as usize;
                 if text_id != 0xFFFF {
                     // A shared literal is edited as a private copy: store its id.
-                    if let Some(new_id) = ctx.strpool.insert_byte(text_id, cursor, ch, max_len) {
-                        if let Some(ext) = ctx.tree.ensure_ext(id) {
+                    if let Some(new_id) = ctx.objs.str_insert_byte(text_id, cursor, ch, max_len) {
+                        ctx.objs.update_ext(id, |ext| {
                             ext.text_id = new_id;
                             ext.value = (cursor + 1) as i16;
-                        }
-                        ctx.tree.mark_dirty(id);
+                        });
+                        ctx.objs.mark_dirty(id);
                         self.fire_on_change(ctx, vm, id);
                     }
                 } else {
                     let data = [ch];
-                    if let Some(new_id) = ctx.strpool.alloc(&data) {
-                        if let Some(ext) = ctx.tree.ensure_ext(id) {
+                    if let Some(new_id) = ctx.objs.str_alloc(&data) {
+                        ctx.objs.update_ext(id, |ext| {
                             ext.text_id = new_id;
                             ext.value = 1;
-                        }
-                        ctx.tree.mark_dirty(id);
+                        });
+                        ctx.objs.mark_dirty(id);
                         self.fire_on_change(ctx, vm, id);
                     }
                 }
@@ -1547,15 +1528,15 @@ impl FullInput {
                 ctx.cursor_visible = true;
             }
             keyboard::KeyAction::Backspace => {
-                let text_id = ctx.tree.text_id(id);
-                let cursor = ctx.tree.value(id).max(0) as usize;
+                let text_id = ctx.objs.text_id(id);
+                let cursor = ctx.objs.value(id).max(0) as usize;
                 if text_id != 0xFFFF && cursor > 0 {
-                    if let Some(new_id) = ctx.strpool.delete_byte(text_id, cursor - 1) {
-                        if let Some(ext) = ctx.tree.ensure_ext(id) {
+                    if let Some(new_id) = ctx.objs.str_delete_byte(text_id, cursor - 1) {
+                        ctx.objs.update_ext(id, |ext| {
                             ext.text_id = new_id;
                             ext.value = (cursor - 1) as i16;
-                        }
-                        ctx.tree.mark_dirty(id);
+                        });
+                        ctx.objs.mark_dirty(id);
                         self.fire_on_change(ctx, vm, id);
                     }
                 }
@@ -1576,7 +1557,7 @@ impl FullInput {
     }
 
     fn fire_on_change<P: PlatformRuntime>(&self, ctx: &Ctx<P>, vm: &mut Vm, id: WidgetId) {
-        if !vm.has_code() || ctx.tree.get(id).flags & widget::FLAG_HAS_ON_TAP == 0 {
+        if !vm.has_code() || ctx.objs.get(id).flags & widget::FLAG_HAS_ON_TAP == 0 {
             return;
         }
         if let Some(off) = vm.find_by_kind(FunctionKind::OnTap).map(|e| e.offset as CodeAddr) {
@@ -1628,16 +1609,14 @@ mod mem_detail_tests {
     use crate::rtc::RtcImpl;
     use crate::systick::SystickImpl;
     use crate::usart::UsartImpl;
-    use crate::widget::WidgetTree;
 
     fn ctx() -> Ctx<MockPlatform> {
         Ctx {
             lcd: LcdImpl::with_backend(MockLcd),
             flash: FlashImpl::with_backend(MockFlash),
-            tree: WidgetTree::new(),
             fonts: FontList::new(),
             images: ImageList::new(),
-            strpool: StringPool::new(),
+            objs: ObjPool::new(),
             fs: None,
             backlight: BacklightImpl::with_backend(MockBacklight),
             rtc: RtcImpl::with_backend(MockRtc),
@@ -1654,51 +1633,32 @@ mod mem_detail_tests {
     }
 
     #[test]
-    fn reserve_tree_trusts_a_v4_count_of_zero() {
-        // fpga probe: no alloc() sites. A v4 header says so exactly — the
-        // old 96 + 96 fallback held ~6.6 KB of a 17 KB GD32 heap for nothing.
-        let mut c = ctx();
-        let mut vm = Vm::new();
-        vm.tree_hint = Some((0, 0));
-        reserve_tree(&mut c, &vm);
-        let (_, _, wbytes, ebytes) = c.tree.mem_stats();
-        assert_eq!((wbytes, ebytes), (0, 0));
-
-        // Older images carry no counts: keep the fallback.
-        let mut c = ctx();
-        vm.tree_hint = None;
-        reserve_tree(&mut c, &vm);
-        let (_, _, wbytes, ebytes) = c.tree.mem_stats();
-        assert!(wbytes >= 96 * core::mem::size_of::<widget::Widget>());
-        assert!(ebytes >= 96 * core::mem::size_of::<widget::WidgetExt>());
-    }
-
-    #[test]
     fn mem_detail_reports_pool_usage_and_capacity() {
         let mut ctx = ctx();
         let mut vm = Vm::new();
-        assert!(ctx.strpool.configure(256, 10));
+        assert!(ctx.objs.configure(1024, 50));
         assert!(vm.configure(20, 6, 5, 3));
-        ctx.tree.set_limits(50, 40);
-        ctx.strpool.alloc(b"hello").unwrap();
-        ctx.strpool.alloc(b"world!").unwrap();
+        let a = ctx.objs.str_alloc(b"hello").unwrap(); // 1 + 1 + 2 words
+        ctx.objs.str_alloc(b"world!").unwrap(); // 1 + 1 + 2 words
         for _ in 0..4 {
-            ctx.tree.alloc().unwrap();
+            ctx.objs.alloc_widget().unwrap(); // 1 + 6 words each
         }
+        ctx.objs.arr_alloc(3).unwrap(); // 1 + 3 words
+        ctx.objs.str_free(a);
 
         let rows = mem_detail(&ctx, &vm);
         let row = |id: u8| {
             let e = rows.iter().find(|e| e.id == id).expect("pool row");
             (e.used, e.capacity, e.extra)
         };
-        assert_eq!(rows.len(), 11);
-        let (used, cap, heap) = row(mem_pool::STR_BYTES);
-        assert_eq!((used, cap), (11, 256));
-        assert!(heap >= 256);
-        assert_eq!(row(mem_pool::STR_SLOTS), (2, 10, 0));
-        let (live, max, _) = row(mem_pool::WIDGETS);
-        assert_eq!((live, max), (4, 50));
-        assert_eq!(row(mem_pool::WIDGET_EXT).1, 40);
+        assert_eq!(rows.len(), 12);
+        assert_eq!(row(mem_pool::OBJ_ARENA), (4 * (8 + 28 + 4), 1024, 16));
+        let (live, max, heap) = row(mem_pool::OBJ_PTRS);
+        assert_eq!((live, max), (6, 50));
+        assert!(heap >= 1024 + 100);
+        assert_eq!(row(mem_pool::WIDGETS), (4, 50, 4 * 28));
+        assert_eq!(row(mem_pool::STRINGS), (1, 50, 16));
+        assert_eq!(row(mem_pool::ARRAYS), (1, 50, 16));
         assert_eq!(row(mem_pool::EVAL_STACK), (0, 20, 80));
         assert_eq!((row(mem_pool::CALL_STACK).0, row(mem_pool::CALL_STACK).1), (0, 6));
         assert_eq!((row(mem_pool::CB_QUEUE).0, row(mem_pool::CB_QUEUE).1), (0, 5));

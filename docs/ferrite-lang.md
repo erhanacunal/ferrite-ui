@@ -856,7 +856,7 @@ render();
 
 ### arrFree(arr)
 
-Free a heap-allocated array. Required in loops to prevent memory exhaustion.
+Free an array (arrays live in the object pool). Required in loops to prevent memory exhaustion; a full pool faults with `pool full: array`.
 
 ```c
 var time = rtcRead();  // allocates a 7-element array each call
@@ -1158,7 +1158,7 @@ All angles are in **radians**. Multiply by `3.14159 / 180.0` to convert from deg
 
 ## String Operations
 
-Runtime string pool for dynamic text. Strings are immutable, referenced by ID.
+Strings for dynamic text live in the object pool (shared with widgets and arrays), referenced by ID. An ID stays valid until the string is freed (`strFree`, or `strClear`, which frees every string no widget shows).
 
 ```c
 var s = str("Hello");          // create from literal

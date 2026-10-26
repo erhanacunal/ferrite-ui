@@ -8,7 +8,8 @@
   "programs": [
     {
       "name": "main",
-      "source": "standalone.fl"
+      "source": "standalone.fl",
+      "exec_mode": "flash"
     }
   ]
 }

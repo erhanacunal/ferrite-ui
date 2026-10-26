@@ -10,7 +10,7 @@ use ferrite_core::ctx::Ctx;
 use ferrite_core::protocol::{self, RxEvent};
 use ferrite_core::render;
 use ferrite_core::runtime::{FullInput, PlatformRuntime};
-use ferrite_core::strpool::StringPool;
+use ferrite_core::pool::ObjPool;
 use ferrite_core::types::{COLOR_BLACK, COLOR_WHITE};
 use ferrite_core::vm::Vm;
 
@@ -73,7 +73,7 @@ impl PlatformRuntime for TdoY13Platform {
         }
     }
 
-    fn syscall(id: u8, args: &[i32], _strpool: &StringPool) -> Option<i32> {
+    fn syscall(id: u8, args: &[i32], _strpool: &ObjPool) -> Option<i32> {
         match id {
             SYS_REBOOT => {
                 let _ = args;
@@ -158,7 +158,7 @@ impl PlatformRuntime for TdoY13Platform {
     fn on_extra_rx(
         ev: RxEvent,
         ctx: &mut Ctx<Self>,
-        vm: &mut Vm,
+        _vm: &mut Vm,
         touch: &mut TouchImpl<Self::TouchB>,
     ) -> bool {
         match ev {
@@ -177,7 +177,7 @@ impl PlatformRuntime for TdoY13Platform {
                 let mut cfg = ConfigStore::mount_or_format(&ctx.flash, Self::CONFIG_BASE);
                 cfg.write(&ctx.flash, config::KEY_TOUCH_CAL, &cal.to_bytes());
                 protocol::send_touch_cal(&ctx.usart, &cal);
-                render::render_all(ctx, vm);
+                render::render_all(ctx);
                 true
             }
             _ => false,

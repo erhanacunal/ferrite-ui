@@ -155,11 +155,9 @@ from ferrite_build import SYSCFG_FIELDS
 
 # Designer labels for the "memory" (system config) keys, in display order.
 MEMORY_LABELS = {
-    "strpool_bytes": "String pool (bytes)",
-    "max_strings": "Max strings",
+    "arena_bytes": "Object arena (bytes)",
+    "max_objects": "Max objects",
     "uart_rx_bytes": "UART RX buffer (bytes)",
-    "max_widgets": "Max widgets",
-    "max_ext": "Max widget extensions",
     "eval_stack": "Eval stack depth",
     "call_stack": "Call stack depth",
     "cb_queue": "Callback queue",

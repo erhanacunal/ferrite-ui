@@ -63,14 +63,14 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 
 ### Widget System
 - **HTML-like nesting** — widgets inside widgets, tree structure
-- **Heap-allocated Vec** — widgets grow on demand, max 254 (WidgetId is u8)
+- **Stored in the object pool** (`ctx.objs`, see Object Pool) — a widget is one `T_WIDGET` object, `WidgetId` = its pointer
 - **Tree structure:** left-child right-sibling (parent + first_child + next_sibling)
-- **WidgetId:** `u16` index, `0xFFFF` = NONE sentinel (max 1024 widgets)
-- **Split struct: Widget (18B base) + WidgetExt (32B on-demand)**
-  - **Widget (base):** tree links, flags, kind, location, size, background_color, border_color, ext index
-  - **WidgetExt:** group_id (+ 3 reserved bytes, the former margin), border/padding edges, text fields, press_color, border_radius, image_id, callbacks, value
-  - Extensions allocated lazily via `ensure_ext()` — pure containers stay at 18B
-  - Accessed via `WidgetTree` accessor methods: `tree.border(id)`, `tree.press_color(id)`, etc.
+- **WidgetId:** `u16` object pointer, `0xFFFF` = NONE sentinel
+- **Variable-size object: 24 B header + optional 8/16 B sections**
+  - **Header (`Widget`):** tree links, kind, section mask, flags, location, size, background_color, border_color, value
+  - **Sections** (stored in bit order, added only when a field gets a non-default value): `SEC_BOX` border/padding, `SEC_TEXT` text id/color/font/align/max_length, `SEC_STYLE` border_radius/press/gradient/alpha, `SEC_EXTRA` image_id/group_id/flex fields, `SEC_PREV` (16 B) last-drawn rects. Adding one grows the object (it may move; the id doesn't change).
+  - `WidgetExt` is a by-value view of all optional fields: `objs.ext(id)` gathers, `objs.update_ext(id, |e| …)` / `put_ext` scatter. Single fields: `objs.border(id)`, `objs.press_color(id)`, etc.
+  - Stale/destroyed ids: `get` returns a static destroyed placeholder, `get_mut` a scratch one (writes are lost)
 - **Box model (CSS border-box style):**
   - `border` → border line (included in size)
   - `padding` → inner spacing (included in size)
@@ -79,12 +79,12 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Flags:** `VISIBLE` (0x01), `ENABLED` (0x02), `CLICKABLE` (0x04), `DIRTY` (0x08), `PRESSED` (0x10), `CHECKED` (0x20)
 - **Widget types:** `KIND_BASE` (0, container), `KIND_LABEL` (1, text), `KIND_BUTTON` (2, clickable container), `KIND_PROGRESS` (3, progress bar), `KIND_SLIDER` (4, slider), `KIND_CHECKBOX` (5, checkbox), `KIND_RADIO` (6, radio button), `KIND_INPUT` (7, text input), `KIND_GAUGE` (8, gauge), `KIND_DROPDOWN` (9, dropdown), `KIND_GRAPH` (10, spline graph), `KIND_IMAGE` (11, image)
 - **Shape widgets:** `KIND_RECTANGLE` (12), `KIND_CIRCLE` (13), `KIND_POLYGON` (14), `KIND_LINE` (15), `KIND_ELLIPSE` (16) — fill = `bg_color`, stroke = `border_color`, stroke/line thickness = border width. Polygon points come from `text` as `"x,y x,y …"` (relative to the widget's top-left); Line draws the widget-box diagonal; Circle/Ellipse fill the widget box (ellipse uses the full w×h). Kind numbers are duplicated in `widget.rs` and `tools/ferrite_designer.py` — keep in sync. `lib/shapes.fl` provides named `KIND_*` constants.
-- **Button Group:** `KIND_BUTTON_GROUP` (17) — exclusive toggle button. Widgets of this kind with the same `group_id` (`PROP_GROUP_ID` 0x32, `WidgetExt.group_id`, tree-wide) form one group; only one is CHECKED. A tap or `set(checked, 1)` → `WidgetTree::select_in_group`. Re-tapping the selected one keeps it selected. Selected = drawn with `press_color` (`render::shows_press`). Set `group_id` before `checked`. Kind number is in `widget.rs`, `tools/ferrite_designer.py`, `lib/core.fl`.
+- **Button Group:** `KIND_BUTTON_GROUP` (17) — exclusive toggle button. Widgets of this kind with the same `group_id` (`PROP_GROUP_ID` 0x32, `WidgetExt.group_id`, tree-wide) form one group; only one is CHECKED. A tap or `set(checked, 1)` → `ObjPool::select_in_group`. Re-tapping the selected one keeps it selected. Selected = drawn with `press_color` (`render::shows_press`). Set `group_id` before `checked`. Kind number is in `widget.rs`, `tools/ferrite_designer.py`, `lib/core.fl`.
 - **Radio groups:** `KIND_RADIO` uses the same `group_id` via `select_in_group`, with one difference: `group_id` 0 (the default) = sibling radios with group 0 (the original behaviour), ≠ 0 = tree-wide like Button Group. `set(checked, 1)` enforces the group only for ≠ 0. Radio and Button Group groups are separate even with equal ids. The designer mirrors this in `DesignerModel.enforce_exclusive_group`.
-- **Margin removed:** prop ids 0x10–0x13 / 0x42 are reserved, and its 4 `WidgetExt` bytes became `group_id` + `flex`/`flex_gap`/`flex_grow`.
+- **Margin removed:** prop ids 0x10–0x13 / 0x42 are reserved.
 - **Tree links readable:** `get(parent/first_child/next_sibling)` (`PROP_PARENT`/`FIRST_CHILD`/`NEXT_SIBLING` 0x0B–0x0D) return a widget id or -1. Read-only: the compiler rejects `set` and dot assignment (`_READ_ONLY_PROPS` in `ferrite_lang.py`).
 - **Flex layout (`lib/flex.fl`):** layout lives in the library, not the firmware. `PROP_FLEX` 0x33 (container: bits 0-1 direction 1=row/2=column, 2-4 justify start/center/end/space-between/stretch, 5-6 cross align start/center/end/stretch), `PROP_FLEX_GAP` 0x34, `PROP_FLEX_GROW` 0x35 (child) are only stored in `WidgetExt`. `flexLayout(box)` walks the children and sets their loc/size, then recurses into flex children. Growing children ignore their own main size (CSS `flex: 1`), so re-running is idempotent. Bit layout is duplicated in `lib/flex.fl` and docs — keep in sync. Example: `examples/nextion/flex_demo`.
-- **Label:** text_color, font_id, text_align (LEFT/CENTER/RIGHT), text (from StringPool)
+- **Label:** text_color, font_id, text_align (LEFT/CENTER/RIGHT), text (a string object id)
 - **Button:** press_color (background when pressed), accepts child widgets
 - **Color:** RGB565 (`background_color`, `border_color`, `text_color`, `press_color`)
 - **Painter's algorithm** — z-order: DFS pre-order (lower index = behind)
@@ -103,7 +103,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - `render_all()` — full screen, DFS pre-order, no clipping (initial draw)
   - `render_dirty()` — iterative (not recursive), uses DFS cache, clipped (partial update)
   - `render_buffered()` — double-buffered full redraw: begin_frame + render_all + end_frame (flicker-free, only fires when dirty)
-  - **DFS cache:** `WidgetTree.dfs_cache` — not recomputed unless tree changes (alloc/add_child/clear invalidate it)
+  - **DFS cache:** `ObjPool.dfs_cache` — not recomputed unless tree changes (alloc/add_child/clear invalidate it)
 - **Render mode** (per-program, stored in image header v3):
   - `dirty` (default): partial update, direct front buffer writes
   - `buffered`: double-buffered full redraw every dirty frame, no tearing
@@ -137,7 +137,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **37 opcodes:** stack ops (PUSH/POP/DUP/SWAP), arithmetic (ADD/SUB/MUL/DIV/MOD/NEG), comparison (EQ/NE/LT/LE/GT/GE), logic (AND/OR/NOT), control (JMP/JZ/JNZ/CALL/RET/YIELD/HALT), widget (W_TARGET/W_SET/W_GET/W_DIRTY/W_RENDER/W_ALLOC/W_PARENT), flash (F_READ/F_WRITE)
 - **Opcode 0–15:** 1-byte tag (frequent), **16+:** 2-byte tag (rare)
 - **W_ALLTAR opcode (0x1C):** combined alloc + store + target (saves 5 bytes per widget)
-- **Vm struct:** eval stack (32-deep), vars (sparse Vec, max 256), call stack (16-deep)
+- **Vm struct:** eval stack (32-deep), vars (sparse Vec, max 256), call stack (16-deep). Arrays are `T_ARRAY` objects in `ctx.objs` (array id = pointer); pool full → fault 17 (`ARR_ALLOC`)
 - **Property R/W:** scalar (W_SET wt=0, single value from stack) and compound (W_SET wt=2, LEN payload with multiple zigzag varints)
 - **Builder:** builds bytecode in RAM, forward jump patching, writes to `&mut [u8]` buffer
 - **Execution:** `vm.run(&code[..len], &mut tree, &mut lcd, &flash)` — F_READ/F_WRITE operate via flash
@@ -157,6 +157,15 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - flags bit 3: portrait — `"portrait": true` in project.json (see Portrait mode)
   - Backward compatible: v1/v2 images parsed with 5-byte header, v3 with 7-byte header
 - **Code addresses (`vm::CodeAddr`):** `u16` by default; `u32` with the ferrite-core `wide_code` feature (enabled by tdo_y13, n32903, sim). Widens pc, call frames, callback queue, snapshots. A narrow build (nextion, epaper) rejects wide images and >64 KB code at load → Code 6. VM error USART payload carries a u32 PC (6 bytes) once PC > 0xFFFF.
+
+### Object Pool (`pool.rs`)
+- **One allocator for widgets, strings and VM arrays:** `ObjPool` = word arena (`Box<[u32]>`) + pointer table (`Box<[Off]>`, `Off` = u16 word offset, u32 with the `pool_large` feature). An object id (`ObjPtr`, u16) indexes the table; the table gives the block's arena offset, so ids stay valid while blocks move.
+- **Block:** u32 header = owning pointer (bits 0–13) | type (14–15: `T_FREE`/`T_WIDGET`/`T_STRING`/`T_ARRAY`) | payload words (16–31), then the payload. Max 0x3FFF objects, 0xFFFF payload words each.
+- **Allocation:** bump at `top`. Freeing a block marks it `T_FREE` (garbage) or lowers `top` if it is the last one. When a request doesn't fit, `compact()` slides live blocks down and rewrites their table entries via the header pointer. `resize_obj` grows in place if the block is last, else moves it.
+- **Pointers:** freed pointers are reused FIFO (free list threaded through the table, top-bit tag), so a stale id isn't handed out again right away. Typed access (`payload(p, ty)`) returns None for a free or wrong-type pointer.
+- **Lifetimes are manual:** `destroy` frees a widget subtree, `strFree`/`strClear` (sweep: frees every string no live widget shows), `arrFree`. No tracing GC.
+- **Strings:** payload word 0 = length (bits 0–29) | `KEEP` sweep mark (bit 30) | interned (bit 31), then the bytes. Interned literals are shared: `str_free` ignores them, byte edits copy first.
+- **Sizing:** syscfg `arena_bytes` / `max_objects` (0 = default: 8 KB / 320, `pool_large` 2 MB / 8192). `pool_large` is enabled by n32903 and tdo_y13.
 
 ### External Flash (W25Q256, 32MB)
 - **Pin assignment:** PA4=CS, PA5=CLK, PA6=MISO, PA7=MOSI (bit-bang SPI)
@@ -183,16 +192,16 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 
 ### System Config (RES_SYSCFG)
 - **Purpose:** Per-image sizing of the runtime pools, applied once at boot right after `Fs::mount` (FS writes reboot, so pools never resize under a running program). No heap-size field — the heap is linker-sized (`__sheap`..`_heap_end`, `_stack_size` in `memory.x`), and every configurable pool is allocated from it.
-- **Embedding:** `project.json` → `"memory": {"strpool_bytes", "max_strings", "uart_rx_bytes", "max_widgets", "max_ext", "eval_stack", "call_stack", "cb_queue", "anim_slots"}` → 32-byte entry named `"sys"`. Omitted key / 0 = firmware default; no `"memory"` block = no entry = all defaults.
-- **Record (LE):** magic `"SC"` u16, version u8 (=1), rsvd u8, strpool_bytes u32, max_strings u16, uart_rx_bytes u16, max_widgets u16, max_ext u16, eval_stack u8, call_stack u8, cb_queue u8, anim_slots u8, 12 B reserved. Layout duplicated in `syscfg.rs` and `tools/ferrite_build.py` (`SYSCFG_FIELDS`) — keep in sync.
-- **Apply (`runtime::apply_syscfg`):** `usart.set_rx_capacity` (`UsartBackend` hook; nextion: heap ring, power of two 16 B–32 KB; other BSPs ignore it), `strpool.configure`, `tree.set_limits` (+ `reserve_tree` preallocates to the caps), `vm.configure` (eval/call ≤ 255, queue ≥ 2; snapshots save only the live stack prefix).
+- **Embedding:** `project.json` → `"memory": {"arena_bytes", "max_objects", "uart_rx_bytes", "eval_stack", "call_stack", "cb_queue", "anim_slots"}` → 32-byte entry named `"sys"`. Omitted key / 0 = firmware default; no `"memory"` block = no entry = all defaults.
+- **Record (LE):** magic `"SC"` u16, version u8 (=2; v1 records are rejected → Code 8), rsvd u8, arena_bytes u32, max_objects u16, uart_rx_bytes u16, 4 B reserved, eval_stack u8, call_stack u8, cb_queue u8, anim_slots u8, 12 B reserved. Layout duplicated in `syscfg.rs` and `tools/ferrite_build.py` (`SYSCFG_FIELDS`) — keep in sync.
+- **Apply (`runtime::apply_syscfg`):** `usart.set_rx_capacity` (`UsartBackend` hook; nextion: heap ring, power of two 16 B–32 KB; other BSPs ignore it), `objs.configure(arena_bytes, max_objects)`, `vm.configure` (eval/call ≤ 255, queue ≥ 2; snapshots save only the live stack prefix).
 - **Designer:** Resources panel → "Memory (system config)" group, one spin box per key (0 shown as "default"). Stored as `"memory"` in the `.fui`; exported to project.json only for non-zero keys. Field list comes from `ferrite_build.SYSCFG_FIELDS` (labels: `MEMORY_LABELS` in `ferrite_designer.py`).
 - **Errors:** malformed entry → Code 8 (invalid system config); a pool the heap can't hold → Code 7 (insufficient memory).
 
 ### Memory Report (MemDetail)
-- `ferrite_cli.py -p COMx memdetail` → per-pool table: heap (used/total, largest free block), CPU stack (+ peak), string pool bytes + slots, UART RX ring (waiting/size), widgets + extensions (live/cap, storage bytes), eval/call stack, callback queue, animations (each with the heap bytes it holds).
+- `ferrite_cli.py -p COMx memdetail` → per-pool table: heap (used/total, largest free block), CPU stack (+ peak), object arena (used/size, reclaimable garbage), object pointers (live/max, heap bytes of arena + table + DFS cache), UART RX ring (waiting/size), widgets / strings / arrays (live/max objects, bytes in the arena), eval/call stack, callback queue, animations (each with the heap bytes it holds).
 - Protocol: host field 11 varint (`0x58`) → device field 6 payload (`0x32`): version u8 (=1) + count u8 + count × [id u8, used u32, capacity u32, extra u32] LE. Pool ids `protocol::mem_pool` = `MEM_POOLS` in `ferrite_cli.py` (keep in sync). capacity 0 = board doesn't report that pool (CLI prints n/a).
-- Gathered in `runtime::mem_detail` from `heap_stats`/`heap_total`/`stack_info` (PlatformRuntime), `UsartBackend::rx_stats` (nextion only), `StringPool::used_bytes/used_strings/heap_bytes`, `WidgetTree::mem_stats`, `Vm::mem_stats`. VM stack depths are the current values (≈0 between iterations), not high-water marks. `meminfo` is unchanged.
+- Gathered in `runtime::mem_detail` from `heap_stats`/`heap_total`/`stack_info` (PlatformRuntime), `UsartBackend::rx_stats` (nextion only), `ObjPool::used_bytes/garbage_bytes/live_objects/bytes_of/heap_bytes`, `Vm::mem_stats`. VM stack depths are the current values (≈0 between iterations), not high-water marks. `meminfo` is unchanged.
 
 ### User Files (RES_FILE)
 - **Purpose:** Arbitrary user data accessible from ferrite programs — config, level data, raw tables.
@@ -347,7 +356,8 @@ ferrite-ui/                  (workspace root — virtual manifest + shared relea
 │       │                      (FullInput / BasicInput), error screen
 │       ├── ctx.rs           — Ctx<P> (all hardware-backed fields use P's backends)
 │       ├── vm.rs            — bytecode interpreter   ├── render.rs — painter's algorithm
-│       ├── widget.rs        — Widget/WidgetTree      ├── clip.rs   — ClipRegion
+│       ├── pool.rs          — ObjPool (object pool)  ├── clip.rs   — ClipRegion
+│       ├── widget.rs        — widgets on the pool
 │       ├── font.rs/embedded_font.rs — sparse UTF-8 font + ROM font
 │       ├── fs.rs/image.rs/strpool.rs/keyboard.rs/config.rs/proto.rs/protocol.rs/heap.rs
 │       ├── fat.rs/sdboot.rs — FAT reader + shared SD boot actions
@@ -368,13 +378,13 @@ ferrite-ui/                  (workspace root — virtual manifest + shared relea
 
 ## Memory Usage
 
-- Widget base: N × 18 bytes (tree links, layout, colors)
-- Widget ext: M × 32 bytes (edges, text, callbacks — only for widgets that need them)
+- Object pool: arena (default 8 KB, `pool_large` 2 MB) + one table entry per object pointer (default 320 × 2 B, `pool_large` 8192 × 4 B) + DFS cache, all allocated at boot
+- Widget: 4 B block header + 24 B + 8 B per used section (a label with text ≈ 36 B, a styled button ≈ 52 B)
+- String: 4 B block header + 4 B length + bytes rounded up to 4; array: 4 B header + 4 B per element
 - Clip region: 32 × 8 bytes = 256 bytes
-- VM: ~150 bytes (stack + vars + call stack + array pool)
+- VM: ~150 bytes (stack + vars + call stack)
 - Fs header: 12 bytes
 - Font (per font): ~900 bytes (128 glyphs × 7B + meta)
-- Example: 25 widgets, 22 with ext = 462B + 716B = 1.2KB (was 1.2KB at 48B/widget)
 
 ## Current Status
 
@@ -400,7 +410,8 @@ ferrite-ui/                  (workspace root — virtual manifest + shared relea
 - [x] USART protobuf protocol (ping/pong, execute, restart, fs write, meminfo, stackinfo)
 - [x] Startup sequence (backlight → display → recovery check → font → fs → vm)
 - [x] Error protocol (display + USART, 9 error codes; 9 = flash image corrupted)
-- [x] RES_SYSCFG — per-image pool sizes (UART RX, strpool, VM stacks, anim/widget caps), heap-allocated at boot
+- [x] RES_SYSCFG — per-image pool sizes (UART RX, object arena/pointers, VM stacks, anim slots), heap-allocated at boot
+- [x] Object pool — widgets, strings and arrays in one compacting arena with stable u16 pointers
 - [x] Touch event → VM callback (on_click, on_tap, on_paint, on_touch_down/up/move)
 - [x] Touch gestures (swipe left/right/up/down, long press — global callbacks OnSwipe=10, OnLongPress=11)
 - [x] Iterative render (flat DFS instead of recursive, DFS cache)

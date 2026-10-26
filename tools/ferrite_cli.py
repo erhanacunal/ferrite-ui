@@ -55,15 +55,16 @@ TAG_MEMDETAIL_RESP = (6 << 3) | 2  # 0x32, payload (version + count + 13-byte en
 MEM_POOLS = {
     1: ("heap", "B", "largest free"),
     2: ("cpu stack", "B", "peak"),
-    3: ("string pool", "B", "heap"),
-    4: ("strings", "", None),
+    3: ("object arena", "B", "reclaimable"),
+    4: ("object ptrs", "", "heap"),
     5: ("uart rx", "B", "heap"),
-    6: ("widgets", "", "heap"),
-    7: ("widget ext", "", "heap"),
+    6: ("widgets", "", "in arena"),
+    7: ("strings", "", "in arena"),
     8: ("eval stack", "", "heap"),
     9: ("call stack", "", "heap"),
     10: ("callback queue", "", "heap"),
     11: ("animations", "", "heap"),
+    12: ("arrays", "", "in arena"),
 }
 
 BAUD_RATE = 115200
@@ -89,8 +90,8 @@ VM_FAULT_NAMES = {
     4: "stack underflow",
     5: "call stack overflow",
     6: "ret without call",
-    7: "widget pool full",
-    8: "string pool full",
+    7: "pool full: widget",
+    8: "pool full: string",
     9: "invalid array",
     10: "array index out of range",
     11: "invalid file handle",
@@ -99,6 +100,7 @@ VM_FAULT_NAMES = {
     14: "invalid gpio pin/mode",
     15: "bad widget page",
     16: "eeprom error",
+    17: "pool full: array",
 }
 
 
@@ -373,6 +375,8 @@ def format_memdetail(entries) -> list[str]:
         if extra_kind == "heap":
             pool_heap += extra
             extra_txt = f"{_fmt_amount(extra, 'B')} heap"
+        elif extra_kind in ("reclaimable", "in arena"):
+            extra_txt = f"{_fmt_amount(extra, 'B')} {extra_kind}"
         elif extra_kind == "largest free":
             extra_txt = f"largest free block {_fmt_amount(extra, 'B')}"
         elif extra_kind == "peak":

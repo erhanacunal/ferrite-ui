@@ -8,7 +8,7 @@ use ferrite_core::touch::{CalParams, TouchImpl};
 use ferrite_core::ctx::Ctx;
 use ferrite_core::protocol::RxEvent;
 use ferrite_core::runtime::{ERR_EMPTY_RUN, FullInput, PlatformRuntime};
-use ferrite_core::strpool::StringPool;
+use ferrite_core::pool::ObjPool;
 use ferrite_core::types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
 use ferrite_core::vm::Vm;
 use ferrite_core::{config, protocol, render};
@@ -53,7 +53,7 @@ impl PlatformRuntime for NextionPlatform {
         cortex_m::peripheral::SCB::sys_reset();
     }
 
-    fn syscall(id: u8, args: &[i32], _strpool: &StringPool) -> Option<i32> {
+    fn syscall(id: u8, args: &[i32], _strpool: &ObjPool) -> Option<i32> {
         match id {
             SYS_GPIOB_MODE => {
                 if args.len() != 1 {
@@ -150,7 +150,7 @@ impl PlatformRuntime for NextionPlatform {
     fn on_extra_rx(
         ev: RxEvent,
         ctx: &mut Ctx<Self>,
-        vm: &mut Vm,
+        _vm: &mut Vm,
         touch: &mut TouchImpl<Self::TouchB>,
     ) -> bool {
         match ev {
@@ -159,7 +159,7 @@ impl PlatformRuntime for NextionPlatform {
                 let mut cfg = config::ConfigStore::mount_or_format(&ctx.flash, Self::CONFIG_BASE);
                 cfg.write(&ctx.flash, config::KEY_TOUCH_CAL, &cal.to_bytes());
                 protocol::send_touch_cal(&ctx.usart, &cal);
-                render::render_all(ctx, vm);
+                render::render_all(ctx);
                 true
             }
             _ => false,

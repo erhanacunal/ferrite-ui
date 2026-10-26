@@ -989,7 +989,7 @@ NO_VALUE_BUILTINS = {
 # Builtins whose return value is an array ID (so the variable must be in array_vars)
 _ARRAY_RETURNING_BUILTINS = {'rtcRead'}
 
-# Tree links: get() only. Writing them would bypass WidgetTree's linking.
+# Tree links: get() only. Writing them would bypass the firmware's tree linking.
 _READ_ONLY_PROPS = {Prop.PARENT, Prop.FIRST_CHILD, Prop.NEXT_SIBLING}
 
 
@@ -3414,7 +3414,7 @@ class CodeGen:
                 raise CompileError("set(text) takes 1 value", node.line)
             arg = value_args[0]
             if isinstance(arg, StrLit):
-                # String literal → W_SET PROP_TEXT LEN (allocates in StringPool)
+                # String literal → W_SET PROP_TEXT LEN (allocates a string object)
                 self.asm.w_set_text(arg.value)
             else:
                 # Expression (str_id) → BUILTIN SET_TEXT
