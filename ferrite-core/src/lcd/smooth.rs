@@ -556,7 +556,17 @@ impl<B: LcdBackend> LcdImpl<B> {
         let float = B::HAS_ALPHA;
         let sector = arc.and_then(|(s, e)| Sector::new(s, e));
         let reach = ring.reach();
-        for y in (cy2 - reach).div_euclid(2)..=(cy2 + reach + 1).div_euclid(2) {
+        // Rows (and, for arcs, columns) outside the scissor draw nothing:
+        // skip their coverage math (a gauge redraws through small scissors).
+        let mut y0 = (cy2 - reach).div_euclid(2);
+        let mut y1 = (cy2 + reach + 1).div_euclid(2);
+        let mut xs = i32::MIN..=i32::MAX;
+        if let Some(sc) = self.scissor() {
+            y0 = y0.max(sc.y as i32);
+            y1 = y1.min(sc.bottom() as i32 - 1);
+            xs = sc.x as i32..=sc.right() as i32 - 1;
+        }
+        for y in y0..=y1 {
             let dy2 = 2 * y - cy2;
             let Some(row) = ring.row(dy2, float) else { continue };
             // Left-most pixel with |dx2| <= outer.
@@ -582,7 +592,7 @@ impl<B: LcdBackend> LcdImpl<B> {
                 ),
                 Some(sec) => {
                     // Not mirror-symmetric: evaluate every ring pixel.
-                    for px in x0..=cx2 - x0 {
+                    for px in x0.max(*xs.start())..=(cx2 - x0).min(*xs.end()) {
                         let dx2 = 2 * px - cx2;
                         if dx2.abs() <= row.hole {
                             continue;

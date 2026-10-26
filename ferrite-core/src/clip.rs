@@ -51,6 +51,25 @@ impl ClipRegion {
         self.count = new_count;
     }
 
+    /// Restrict the region to the union of `keep`, which must not overlap
+    /// (so the result doesn't either). If the pieces don't fit the rect pool,
+    /// the region is left as it was (overdraw, never underdraw).
+    pub fn restrict(&mut self, keep: &[Rect]) {
+        let mut out = Self::new();
+        for r in self.iter() {
+            for k in keep {
+                if let Some(i) = r.intersection(k) {
+                    if out.count == MAX_CLIP_RECTS {
+                        return;
+                    }
+                    out.rects[out.count] = i;
+                    out.count += 1;
+                }
+            }
+        }
+        *self = out;
+    }
+
     /// Subtract an occluder rect from the region.
     ///
     /// Each subtraction can produce up to 4 new rects (top, bottom, left, right strips).
@@ -162,5 +181,38 @@ impl ClipRegion {
             count += 1;
         }
         count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area(r: &ClipRegion) -> u32 {
+        r.iter().iter().map(|r| r.w as u32 * r.h as u32).sum()
+    }
+
+    #[test]
+    fn restrict_keeps_disjoint_union() {
+        let mut clip = ClipRegion::from_rect(Rect::new(0, 0, 100, 100));
+        clip.subtract(&Rect::new(40, 40, 20, 20));
+        // Two keep rects, one crossing the hole, one past the right edge.
+        clip.restrict(&[Rect::new(30, 30, 40, 20), Rect::new(70, 40, 60, 10)]);
+        // 40×20 minus the hole's share (40..60 × 40..50 = 200), plus 30×10.
+        assert_eq!(area(&clip), 800 - 200 + 300);
+        let rects = clip.iter();
+        for (i, a) in rects.iter().enumerate() {
+            for b in &rects[i + 1..] {
+                assert!(!a.intersects(b), "overlapping pieces");
+            }
+            assert!(!a.intersects(&Rect::new(40, 40, 20, 20)), "piece inside the hole");
+        }
+    }
+
+    #[test]
+    fn restrict_to_nothing_empties() {
+        let mut clip = ClipRegion::from_rect(Rect::new(0, 0, 10, 10));
+        clip.restrict(&[]);
+        assert!(clip.is_empty());
     }
 }

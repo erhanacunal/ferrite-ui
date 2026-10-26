@@ -113,6 +113,11 @@ pub struct ObjPool {
     /// Scratch widget returned by `get_mut` for an id that names no widget,
     /// so a stale id behaves like a destroyed widget instead of panicking.
     pub(crate) dead: Widget,
+    /// Bumped whenever something outside the widget renderer may have drawn
+    /// over widgets (VM drawing builtins, erased areas). A widget redrawn
+    /// incrementally (gauge) trusts its on-screen pixels only if they were
+    /// drawn in the current epoch.
+    pub(crate) draw_epoch: u32,
 }
 
 impl ObjPool {
@@ -138,6 +143,7 @@ impl ObjPool {
             dfs_cache: Vec::new(),
             dfs_valid: false,
             dead: Widget::DEAD,
+            draw_epoch: 0,
         }
     }
 

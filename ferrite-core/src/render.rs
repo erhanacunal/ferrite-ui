@@ -7,7 +7,7 @@ use crate::lcd::{LcdBackend, LcdImpl, Underlay};
 use crate::platform::Platform;
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
-    FLAG_HAS_ON_PAINT, FLAG_PAINTED, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
+    FLAG_DIRTY_AB, FLAG_HAS_ON_PAINT, FLAG_PAINTED, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
     KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_PROGRESS,
     KIND_BUTTON_GROUP, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId,
 };
@@ -93,6 +93,8 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
     let mut paint = PaintList::new();
     let buf = ctx.lcd.back_buf();
     ctx.objs.ensure_dfs();
+    // The two buffers hold different frames: no incremental redraws.
+    ctx.objs.screen_touched();
     // Whole-screen clip for the unclipped Pass-2 draws (built once).
     let full = ClipRegion::from_rect(screen_rect(&ctx.lcd));
 
@@ -204,6 +206,9 @@ fn set_buf_prev_rect(tree: &mut ObjPool, id: WidgetId, buf: u8, rect: Rect) {
 /// Reads the DFS order from the tree cache — ensure_dfs must have been called
 /// before entering the enclosing render loop.
 fn redraw_behind<P: Platform>(ctx: &mut Ctx<P>, target_idx: usize, stale: Rect) {
+    // Ancestors repainted here may cover widgets in front that are not
+    // redrawn: their pixels are no longer what they last drew.
+    ctx.objs.screen_touched();
     let mut clip = ClipRegion::from_rect(stale);
     clip.clip_to_bounds(&screen_rect(&ctx.lcd));
     if clip.is_empty() {
@@ -233,6 +238,8 @@ fn redraw_behind_region<P: Platform>(
             continue;
         }
         draw_widget(ctx, uid, &u_abs, clip);
+        // Partly redrawn (possibly with a newer value than recorded).
+        ctx.objs.forget_drawn(uid);
     }
 }
 
@@ -278,6 +285,7 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>) {
             {
                 draw_widget(ctx, id, &abs, &full);
                 ctx.objs.get_mut(id).flags |= FLAG_RENDERED;
+                record_drawn(ctx, id, &abs);
             } else {
                 // Outside or partially visible — skip entire subtree
                 let mut end = i + 1;
@@ -290,6 +298,7 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>) {
         } else {
             draw_widget(ctx, id, &abs, &full);
             ctx.objs.get_mut(id).flags |= FLAG_RENDERED;
+            record_drawn(ctx, id, &abs);
         }
         i += 1;
     }
@@ -340,6 +349,8 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
                 let abs = ctx.objs.absolute_rect(id);
                 if !abs.is_empty() {
                     erase_widget_area(&ctx.objs, &ctx.lcd, id, abs);
+                    // The erase may cover visible widgets that stay as they are.
+                    ctx.objs.screen_touched();
                 }
                 ctx.objs.get_mut(id).flags &= !FLAG_RENDERED;
             }
@@ -436,6 +447,16 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
                 clip.subtract(&occluders[oi]);
             }
 
+            // A gauge whose own value changed (it is the dirty root, so no
+            // ancestor repainted over it) redraws only the boxes the change
+            // touches: the same drawing, clipped smaller.
+            let gauge = ctx.objs.get(sid).kind == KIND_GAUGE;
+            if gauge && si == di {
+                if let Some((rects, n)) = gauge_changed_rects::<P>(&ctx.objs, sid, &sabs) {
+                    clip.restrict(&rects[..n]);
+                }
+            }
+
             if !clip.is_empty() {
                 // Translucent widgets and transparent labels must not blend
                 // over their own previous output — restore what is behind
@@ -451,6 +472,10 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
                 }
                 draw_widget(ctx, sid, &sabs, &clip);
                 ctx.objs.get_mut(sid).flags |= FLAG_RENDERED | FLAG_PAINTED;
+            }
+            if gauge {
+                // All of its visible part now shows the current value.
+                record_drawn(ctx, sid, &sabs);
             }
         }
         di = sub_end;
@@ -468,6 +493,16 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     }
 
     clear_all_dirty(ctx);
+}
+
+/// After a complete drawing of widget `id` at `abs`: remember what an
+/// incrementally redrawn kind (gauge) now shows.
+fn record_drawn<P: Platform>(ctx: &mut Ctx<P>, id: WidgetId, abs: &Rect) {
+    if ctx.objs.get(id).kind == KIND_GAUGE {
+        let key = gauge_key::<P>(&ctx.objs, id, abs);
+        let value = ctx.objs.get(id).value;
+        ctx.objs.set_drawn(id, key, value);
+    }
 }
 
 /// Clear the per-pass `FLAG_PAINTED` marks.
@@ -846,10 +881,16 @@ fn draw_widget<P: Platform>(
         draw_dropdown(ctx, widget, abs, ext);
     }
 
-    // Gauge arc
+    // Gauge arc. Like the shapes below, its primitives take no clip: confine
+    // them to the clip region via the scissor.
     if widget.kind == KIND_GAUGE {
-        let inner = inner_rect(abs, &ext.border);
-        draw_gauge(&ctx.lcd, widget, &inner, ext);
+        if let Some(g) = GaugeGeom::new(&inner_rect(abs, &ext.border)) {
+            for cr in clip.iter() {
+                ctx.lcd.set_scissor(Some(*cr));
+                draw_gauge(&ctx.lcd, widget, &g, ext);
+            }
+            ctx.lcd.set_scissor(None);
+        }
     }
 
     // Spline graph (clip region already applied via screen-clipped fill calls
@@ -1387,38 +1428,142 @@ fn draw_dropdown<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &W
     }
 }
 
-/// Draw gauge arc/dial inside the inner rect.
-///
-/// 270° arc from 135° (bottom-left) to 45° (bottom-right), clockwise through top.
-/// - border_color: track arc color
+/// Gauge layout inside the widget's inner rect: a 270° arc from 135°
+/// (bottom-left) to 45° (bottom-right), clockwise through the top, tick marks
+/// in a band just outside it, the needle inside it. Everything stays inside
+/// the rect, anti-aliased fringes included.
+#[derive(Clone, Copy)]
+struct GaugeGeom {
+    cx: i16,
+    cy: i16,
+    outer_r: i16,
+    inner_r: i16,
+    needle_r: i16,
+    tick_r0: i16,
+    tick_r1: i16,
+}
+
+const GAUGE_ARC_START: i16 = 135;
+const GAUGE_ARC_END: i16 = 45;
+const GAUGE_ARC_SWEEP: i32 = 270;
+/// Needle half-widths (Q8 px) at the hub and at the tip.
+const GAUGE_NEEDLE_BASE_Q8: i32 = 3 * 256 + 128;
+const GAUGE_NEEDLE_TIP_Q8: i32 = 256;
+
+impl GaugeGeom {
+    fn new(inner: &Rect) -> Option<Self> {
+        if inner.is_empty() {
+            return None;
+        }
+        let r = (inner.w.min(inner.h) / 2) as i16 - 1;
+        // 2 px wide ticks with round caps: keep the cap off the edge.
+        let tick_r1 = r - 2;
+        let tick_r0 = tick_r1 - 4;
+        let outer_r = tick_r0 - 2;
+        if outer_r < 8 {
+            return None;
+        }
+        // Arc thickness: ~8% of radius, min 3px
+        let inner_r = outer_r - (outer_r / 12).max(3);
+        Some(Self {
+            cx: inner.x + inner.w as i16 / 2,
+            cy: inner.y + inner.h as i16 / 2,
+            outer_r,
+            inner_r,
+            // A gap between the needle tip and the arc.
+            needle_r: inner_r - 6,
+            tick_r0,
+            tick_r1,
+        })
+    }
+
+    /// Angle (unwrapped, 135..=405) of a 0..100 value.
+    fn angle(value: i32) -> i32 {
+        GAUGE_ARC_START as i32 + value.clamp(0, 100) * GAUGE_ARC_SWEEP / 100
+    }
+
+    fn point(&self, angle: i32, radius: i16) -> (i16, i16) {
+        let (sin_v, cos_v) = lcd::sin_cos_deg((angle % 360) as i16);
+        (
+            self.cx + ((radius as i32 * cos_v as i32) >> 8) as i16,
+            self.cy + ((radius as i32 * sin_v as i32) >> 8) as i16,
+        )
+    }
+
+    /// Box around the needle (and hub) at `value`.
+    fn needle_box(&self, value: i32) -> Rect {
+        let (nx, ny) = self.point(Self::angle(value), self.needle_r);
+        // Hub/base radius + anti-aliasing (and the 1 px offset lines of the
+        // aliased needle).
+        const M: i16 = 6;
+        let (x0, x1) = (self.cx.min(nx) - M, self.cx.max(nx) + M);
+        let (y0, y1) = (self.cy.min(ny) - M, self.cy.max(ny) + M);
+        Rect::new(x0, y0, (x1 - x0 + 1) as u16, (y1 - y0 + 1) as u16)
+    }
+
+    /// Box around the arc between two values (either order), wide enough for
+    /// the value end's anti-aliased edge.
+    fn arc_box(&self, a: i32, b: i32) -> Rect {
+        let lo = Self::angle(a.min(b)) - 3;
+        let hi = Self::angle(a.max(b)) + 3;
+        let (mut x0, mut y0, mut x1, mut y1) = (i16::MAX, i16::MAX, i16::MIN, i16::MIN);
+        let mut ang = lo;
+        loop {
+            for r in [self.inner_r - 1, self.outer_r + 1] {
+                let (x, y) = self.point(ang, r);
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+            if ang == hi {
+                break;
+            }
+            // Sampling every 10° leaves under 1 px of sagitta at these radii.
+            ang = (ang + 10).min(hi);
+        }
+        const M: i16 = 2;
+        Rect::new(x0 - M, y0 - M, (x1 - x0 + 2 * M + 1) as u16, (y1 - y0 + 2 * M + 1) as u16)
+    }
+
+    /// Non-overlapping boxes holding every pixel that differs between the
+    /// drawings at `old` and `new`: both needles (with the hub) and the arc
+    /// in between. Returns the boxes and how many are used.
+    fn change_boxes(&self, old: i32, new: i32) -> ([Rect; 2], usize) {
+        // Both needle boxes contain the hub, so one box around both wastes little.
+        let (a, b) = (self.needle_box(old), self.needle_box(new));
+        let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
+        let needles = Rect::new(
+            x0,
+            y0,
+            (a.right().max(b.right()) - x0) as u16,
+            (a.bottom().max(b.bottom()) - y0) as u16,
+        );
+        let arc = self.arc_box(old, new);
+        if !needles.intersects(&arc) {
+            return ([needles, arc], 2);
+        }
+        // Overlapping boxes would draw (and on readback backends blend) twice.
+        let (x0, y0) = (needles.x.min(arc.x), needles.y.min(arc.y));
+        let both = Rect::new(
+            x0,
+            y0,
+            (needles.right().max(arc.right()) - x0) as u16,
+            (needles.bottom().max(arc.bottom()) - y0) as u16,
+        );
+        ([both, both], 1)
+    }
+}
+
+/// Draw gauge arc/dial inside the inner rect (see `GaugeGeom`).
+/// - border_color: track arc and tick color
 /// - press_color: filled arc color (value portion)
 /// - text_color: needle color
 /// - value: 0-100 gauge position
-fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, inner: &Rect, ext: &WidgetExt) {
-    if inner.is_empty() {
-        return;
-    }
-
-    // Gauge geometry
-    let cx = inner.x + inner.w as i16 / 2;
-    let cy = inner.y + inner.h as i16 / 2;
-    let r = (inner.w.min(inner.h) / 2).saturating_sub(2) as i16;
-    if r < 8 {
-        return;
-    }
-
-    // Arc angles: 135° (start) → 45° (end), 270° sweep
-    const ARC_START: i16 = 135;
-    const ARC_END: i16 = 45;
-    const ARC_SWEEP: i32 = 270;
-
+fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, g: &GaugeGeom, ext: &WidgetExt) {
+    let (cx, cy) = (g.cx, g.cy);
     let val = ext.value.clamp(0, 100) as i32;
-    let value_angle = (ARC_START as i32 + val * ARC_SWEEP / 100) % 360;
-
-    // Arc thickness: ~8% of radius, min 3px
-    let thickness = (r / 12).max(3) as i16;
-    let outer_r = r;
-    let inner_r = r - thickness;
+    let value_angle = GaugeGeom::angle(val);
 
     // Draw track arc (full 270°)
     let track_color = if widget.border_color != 0 {
@@ -1426,20 +1571,28 @@ fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, inner: &Rect, ex
     } else {
         0x3186 // default dark gray
     };
-    lcd.fill_arc(cx, cy, outer_r, inner_r, ARC_START, ARC_END, track_color);
+    lcd.fill_arc(cx, cy, g.outer_r, g.inner_r, GAUGE_ARC_START, GAUGE_ARC_END, track_color);
 
     // Draw value arc (filled portion)
     if val > 0 && ext.press_color != 0 {
         let end = if val >= 100 {
-            ARC_END
+            GAUGE_ARC_END
         } else {
-            value_angle as i16
+            (value_angle % 360) as i16
         };
         // Without readback the value arc's leading end mixes with the track.
         let base = lcd.underlay();
         lcd.update_underlay(|u| Underlay { sweep: track_color, ..u });
-        lcd.fill_arc(cx, cy, outer_r, inner_r, ARC_START, end, ext.press_color);
+        lcd.fill_arc(cx, cy, g.outer_r, g.inner_r, GAUGE_ARC_START, end, ext.press_color);
         lcd.set_underlay(base);
+    }
+
+    // Tick marks at 0%, 25%, 50%, 75%, 100%, outside the arc
+    for i in 0..=4 {
+        let angle = GAUGE_ARC_START as i32 + i * GAUGE_ARC_SWEEP / 4;
+        let (tx0, ty0) = g.point(angle, g.tick_r0);
+        let (tx1, ty1) = g.point(angle, g.tick_r1);
+        lcd.draw_line_thick(tx0, ty0, tx1, ty1, track_color, 2);
     }
 
     // Draw needle
@@ -1448,16 +1601,13 @@ fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, inner: &Rect, ex
     } else {
         0xFFFF // white default
     };
-    let needle_r = inner_r - 4;
-    if needle_r > 4 {
-        let (sin_v, cos_v) = lcd::sin_cos_deg(value_angle as i16);
-        let nx = cx + ((needle_r as i32 * cos_v as i32) >> 8) as i16;
-        let ny = cy + ((needle_r as i32 * sin_v as i32) >> 8) as i16;
+    if g.needle_r > 4 {
+        let (nx, ny) = g.point(value_angle, g.needle_r);
         if lcd.smooth() {
             // One anti-aliased tapered stroke whose round base is the hub
             // (separate strokes would double-blend or, without readback,
             // overwrite each other's soft edges).
-            lcd.draw_wedge(cx, cy, nx, ny, 3 * 256 + 128, 256, needle_color);
+            lcd.draw_wedge(cx, cy, nx, ny, GAUGE_NEEDLE_BASE_Q8, GAUGE_NEEDLE_TIP_Q8, needle_color);
         } else {
             lcd.draw_line(cx, cy, nx, ny, needle_color);
             // Draw thicker needle (2 extra lines offset by 1px)
@@ -1467,21 +1617,56 @@ fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, inner: &Rect, ex
     }
 
     // Center dot (part of the wedge when smooth)
-    if !lcd.smooth() || needle_r <= 4 {
+    if !lcd.smooth() || g.needle_r <= 4 {
         lcd.fill_circle(cx, cy, 3, needle_color);
     }
+}
 
-    // Draw tick marks at 0%, 25%, 50%, 75%, 100%
-    let tick_color = track_color;
-    for i in 0..=4u32 {
-        let tick_angle = (ARC_START as i32 + i as i32 * ARC_SWEEP / 4) % 360;
-        let (sin_v, cos_v) = lcd::sin_cos_deg(tick_angle as i16);
-        let tx0 = cx + (((outer_r + 2) as i32 * cos_v as i32) >> 8) as i16;
-        let ty0 = cy + (((outer_r + 2) as i32 * sin_v as i32) >> 8) as i16;
-        let tx1 = cx + (((outer_r + 6) as i32 * cos_v as i32) >> 8) as i16;
-        let ty1 = cy + (((outer_r + 6) as i32 * sin_v as i32) >> 8) as i16;
-        lcd.draw_line(tx0, ty0, tx1, ty1, tick_color);
+/// Key of everything that shapes a gauge's pixels except its value, for
+/// `ObjPool::drawn_value`. Never 0.
+fn gauge_key<P: Platform>(objs: &ObjPool, id: WidgetId, abs: &Rect) -> u32 {
+    let w = objs.get(id);
+    let e = objs.ext(id);
+    let pair = |a: u16, b: u16| a as u32 | (b as u32) << 16;
+    let edges = |x: Edges| u32::from_le_bytes([x.top, x.right, x.bottom, x.left]);
+    let words = [
+        pair(abs.x as u16, abs.y as u16),
+        pair(abs.w, abs.h),
+        pair(w.kind as u16, w.flags & !(FLAG_DIRTY_AB | FLAG_RENDERED | FLAG_PAINTED)),
+        pair(w.background_color, w.border_color),
+        pair(effective_bg(objs, w, &e), backdrop(objs, w, P::DEFAULT_BG_COLOR)),
+        pair(e.text_color, e.press_color),
+        pair(e.gradient_color, e.border_radius),
+        u32::from_le_bytes([e.gradient_dir, e.alpha, e.image_id, 0]),
+        edges(e.border),
+        edges(e.padding),
+    ];
+    // FNV-1a over the words.
+    let mut h: u32 = 0x811C_9DC5;
+    for v in words {
+        for b in v.to_le_bytes() {
+            h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+        }
     }
+    h | 1
+}
+
+/// The part of gauge `id` a value change touches, if its pixels still show
+/// its last full drawing (else None: redraw it whole). No rects when the
+/// value is unchanged.
+fn gauge_changed_rects<P: Platform>(objs: &ObjPool, id: WidgetId, abs: &Rect) -> Option<([Rect; 2], usize)> {
+    let w = objs.get(id);
+    if w.flags & FLAG_RENDERED == 0 {
+        return None;
+    }
+    let old = objs.drawn_value(id, gauge_key::<P>(objs, id, abs))?.clamp(0, 100) as i32;
+    let new = w.value.clamp(0, 100) as i32;
+    let none = [Rect::new(0, 0, 0, 0); 2];
+    if old == new {
+        return Some((none, 0));
+    }
+    let g = GaugeGeom::new(&inner_rect(abs, &objs.border(id)))?;
+    Some(g.change_boxes(old, new))
 }
 
 // --- Spline graph ---
@@ -2055,6 +2240,124 @@ mod tests {
         tree.get_mut(label).kind = KIND_LABEL;
         tree.add_child(button, label);
         (button, label)
+    }
+
+    /// 128×128 frame buffer; `ALPHA` = readback backend (blends), else
+    /// write-only with underlays (Nextion).
+    struct Fb<const ALPHA: bool> {
+        px: core::cell::RefCell<alloc::vec::Vec<u16>>,
+    }
+    const FB: usize = 128;
+    impl<const ALPHA: bool> LcdBackend for Fb<ALPHA> {
+        const WIDTH: u16 = FB as u16;
+        const HEIGHT: u16 = FB as u16;
+        const HAS_ALPHA: bool = ALPHA;
+        const AA_UNDERLAY: bool = !ALPHA;
+        fn begin_frame(&mut self) {}
+        fn end_frame(&mut self) {}
+        fn back_buf(&self) -> u8 {
+            0
+        }
+        fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, c: u16) {
+            self.blend_rect(x, y, w, h, c, 255);
+        }
+        fn blend_rect(&self, x: u16, y: u16, w: u16, h: u16, c: u16, a: u8) {
+            let mut px = self.px.borrow_mut();
+            for yy in y as usize..(y as usize + h as usize).min(FB) {
+                for xx in x as usize..(x as usize + w as usize).min(FB) {
+                    let p = &mut px[yy * FB + xx];
+                    *p = lcd::lerp_rgb565(*p, c, a as u16, 255);
+                }
+            }
+        }
+        fn blend_pixel(&self, x: u16, y: u16, c: u16, a: u8) {
+            self.blend_rect(x, y, 1, 1, c, a);
+        }
+        fn begin_pixels(&self, _: u16, _: u16, _: u16, _: u16) {}
+        fn write_pixel(&self, _: u16) {}
+        fn send_command(&self, _: u16) {}
+        fn send_data(&self, _: u16) {}
+    }
+
+    const GAUGE_BG: u16 = 0x18E3;
+    const GAUGE_BOX: Rect = Rect::new(4, 4, 120, 120);
+
+    /// The gauge part of `draw_widget` (background + `draw_gauge`), clipped
+    /// to `rects`.
+    fn paint_gauge<const ALPHA: bool>(lcd: &LcdImpl<Fb<ALPHA>>, value: i16, rects: &[Rect]) {
+        let mut w = Widget::DEAD;
+        w.kind = KIND_GAUGE;
+        w.border_color = 0x3186;
+        let mut e = WidgetExt::DEFAULT;
+        e.value = value;
+        e.press_color = 0x05FF;
+        e.text_color = 0xF800;
+        let g = GaugeGeom::new(&GAUGE_BOX).unwrap();
+        if lcd.wants_underlay() {
+            lcd.set_underlay(Some(Underlay::solid(GAUGE_BG)));
+        }
+        for r in rects {
+            lcd.set_scissor(Some(*r));
+            lcd.fill_rect(GAUGE_BOX.x as u16, GAUGE_BOX.y as u16, GAUGE_BOX.w, GAUGE_BOX.h, GAUGE_BG);
+            draw_gauge(lcd, &w, &g, &e);
+        }
+        lcd.set_scissor(None);
+        lcd.set_underlay(None);
+    }
+
+    fn fresh<const ALPHA: bool>() -> LcdImpl<Fb<ALPHA>> {
+        LcdImpl::with_backend(Fb { px: core::cell::RefCell::new(alloc::vec![0; FB * FB]) })
+    }
+
+    /// Redrawing only `change_boxes` turns the drawing at `old` into exactly
+    /// the drawing at `new`.
+    fn gauge_update_matches_full_draw<const ALPHA: bool>() {
+        let g = GaugeGeom::new(&GAUGE_BOX).unwrap();
+        let values = [0, 1, 7, 25, 33, 50, 51, 66, 75, 99, 100];
+        for &old in &values {
+            for &new in &values {
+                let inc = fresh::<ALPHA>();
+                paint_gauge(&inc, old, &[GAUGE_BOX]);
+                let mut clip = ClipRegion::from_rect(GAUGE_BOX);
+                let (boxes, n) = g.change_boxes(old as i32, new as i32);
+                clip.restrict(&boxes[..n]);
+                paint_gauge(&inc, new, clip.iter());
+
+                let full = fresh::<ALPHA>();
+                paint_gauge(&full, new, &[GAUGE_BOX]);
+                let (a, b) = (inc.backend().px.borrow(), full.backend().px.borrow());
+                for i in 0..FB * FB {
+                    assert!(a[i] == b[i], "alpha={ALPHA} {old}->{new}: pixel ({}, {})", i % FB, i / FB);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gauge_update_matches_full_draw_write_only() {
+        gauge_update_matches_full_draw::<false>();
+    }
+
+    #[test]
+    fn gauge_update_matches_full_draw_readback() {
+        gauge_update_matches_full_draw::<true>();
+    }
+
+    #[test]
+    fn gauge_stays_inside_its_box() {
+        for value in [0, 50, 100] {
+            let lcd = fresh::<true>();
+            paint_gauge(&lcd, value, &[Rect::new(0, 0, FB as u16, FB as u16)]);
+            let px = lcd.backend().px.borrow();
+            for y in 0..FB {
+                for x in 0..FB {
+                    let inside = GAUGE_BOX.contains(x as u16, y as u16);
+                    if !inside {
+                        assert!(px[y * FB + x] == 0, "value {value}: drawn outside at ({x}, {y})");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

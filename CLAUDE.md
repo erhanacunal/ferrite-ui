@@ -68,7 +68,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **WidgetId:** `u16` object pointer, `0xFFFF` = NONE sentinel
 - **Variable-size object: 24 B header + optional 8/16 B sections**
   - **Header (`Widget`):** tree links, kind, section mask, flags, location, size, background_color, border_color, value
-  - **Sections** (stored in bit order, added only when a field gets a non-default value): `SEC_BOX` border/padding, `SEC_TEXT` text id/color/font/align/max_length, `SEC_STYLE` border_radius/press/gradient/alpha, `SEC_EXTRA` image_id/group_id/flex fields, `SEC_PREV` (16 B) last-drawn rects. Adding one grows the object (it may move; the id doesn't change).
+  - **Sections** (stored in bit order, added only when a field gets a non-default value): `SEC_BOX` border/padding, `SEC_TEXT` text id/color/font/align/max_length, `SEC_STYLE` border_radius/press/gradient/alpha, `SEC_EXTRA` image_id/group_id/flex fields, `SEC_PREV` (16 B) last-drawn rects, `SEC_DRAWN` (12 B, renderer-private, gauges only) what an incrementally redrawn widget last drew. Adding one grows the object (it may move; the id doesn't change).
   - `WidgetExt` is a by-value view of all optional fields: `objs.ext(id)` gathers, `objs.update_ext(id, |e| …)` / `put_ext` scatter. Single fields: `objs.border(id)`, `objs.press_color(id)`, etc.
   - Stale/destroyed ids: `get` returns a static destroyed placeholder, `get_mut` a scratch one (writes are lost)
 - **Box model (CSS border-box style):**
@@ -99,6 +99,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   4. Subtracts occluder rects from ClipRegion
   5. Widget is drawn over remaining visible rects
   6. Child widgets are drawn recursively with the same occluder list
+- **Incremental gauge redraw (dirty mode):** a gauge that is itself the dirty root (no ancestor repainted over it) and whose pixels still show its last full drawing redraws only the boxes its value change touches (`GaugeGeom::change_boxes`: both needles + hub, the arc span in between): the same `draw_widget` call with the clip `restrict`ed to those boxes, so the result is pixel-identical to a full redraw (tests: `gauge_update_matches_full_draw_*`). "Still shows" = `SEC_DRAWN` holds the same appearance key (`gauge_key`: rect, colours, border, flags, backdrop…) and the current `ObjPool::draw_epoch`. The epoch is bumped by anything that may draw over widgets outside the renderer: VM drawing builtins (`fillRect`, `line`, `drawText`, `beginFrame`, `fpgaCmd`…), the pass-1 erase, `redraw_behind`, keyboard dismiss, every buffered frame; partial redraws (`redraw_behind_region`) forget the widget's record. Gauges draw through the scissor (they used to ignore the clip region) and keep ticks inside their box.
 - **Three render functions:**
   - `render_all()` — full screen, DFS pre-order, no clipping (initial draw)
   - `render_dirty()` — iterative (not recursive), uses DFS cache, clipped (partial update)
@@ -379,7 +380,7 @@ ferrite-ui/                  (workspace root — virtual manifest + shared relea
 ## Memory Usage
 
 - Object pool: arena (default 8 KB, `pool_large` 2 MB) + one table entry per object pointer (default 320 × 2 B, `pool_large` 8192 × 4 B) + DFS cache, all allocated at boot
-- Widget: 4 B block header + 24 B + 8 B per used section (a label with text ≈ 36 B, a styled button ≈ 52 B)
+- Widget: 4 B block header + 24 B + 8 B per used section (a label with text ≈ 36 B, a styled button ≈ 52 B; a gauge adds 12 B `SEC_DRAWN` once drawn)
 - String: 4 B block header + 4 B length + bytes rounded up to 4; array: 4 B header + 4 B per element
 - Clip region: 32 × 8 bytes = 256 bytes
 - VM: ~150 bytes (stack + vars + call stack)

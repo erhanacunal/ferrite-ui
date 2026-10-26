@@ -1430,6 +1430,8 @@ impl FullInput {
         self.kb.visible = false;
         ctx.cursor_visible = false;
 
+        // The widgets under the keyboard redraw in full, not incrementally.
+        ctx.objs.screen_touched();
         ctx.objs.ensure_dfs();
         for i in 0..ctx.objs.dfs_len() {
             let id = ctx.objs.dfs_at(i);

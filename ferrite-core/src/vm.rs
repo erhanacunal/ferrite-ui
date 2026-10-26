@@ -1988,6 +1988,7 @@ impl Vm {
 
             // --- Builtins (args on stack) ---
             OP_FILL_RECT => {
+                ctx.objs.screen_touched();
                 let (wh, color) = self.pop2();
                 let (w, h) = unpack_pair(wh);
                 let (x, y) = unpack_pair(self.pop());
@@ -1995,6 +1996,7 @@ impl Vm {
                 ctx.lcd.fill_rect(x, y, w, h, color);
             }
             OP_RECT => {
+                ctx.objs.screen_touched();
                 let (wh, color) = self.pop2();
                 let (w, h) = unpack_pair(wh);
                 let (x, y) = unpack_pair(self.pop());
@@ -2002,6 +2004,7 @@ impl Vm {
                 ctx.lcd.draw_rect(x, y, w, h, color);
             }
             OP_LINE => {
+                ctx.objs.screen_touched();
                 let (xy1, color) = self.pop2();
                 let (x1, y1) = unpack_pair(xy1);
                 let color = color as u16;
@@ -2010,18 +2013,21 @@ impl Vm {
                     .draw_line(x0 as i16, y0 as i16, x1 as i16, y1 as i16, color);
             }
             OP_CIRCLE => {
+                ctx.objs.screen_touched();
                 let (radius, color) = self.pop2();
                 let (radius, color) = (radius as i16, color as u16);
                 let (cx, cy) = unpack_pair(self.pop());
                 ctx.lcd.draw_circle(cx as i16, cy as i16, radius, color);
             }
             OP_FILL_CIRCLE => {
+                ctx.objs.screen_touched();
                 let (radius, color) = self.pop2();
                 let (radius, color) = (radius as i16, color as u16);
                 let (cx, cy) = unpack_pair(self.pop());
                 ctx.lcd.fill_circle(cx as i16, cy as i16, radius, color);
             }
             OP_DRAW_IMAGE => {
+                ctx.objs.screen_touched();
                 let (xy, image_id) = self.pop2();
                 let (x, y) = unpack_pair(xy);
                 let image_id = image_id as u8;
@@ -2030,6 +2036,7 @@ impl Vm {
                 }
             }
             OP_DRAW_TEXT_LIT => {
+                ctx.objs.screen_touched();
                 // Inline text: u8 len + text bytes, stack: [colors, font_id, loc]
                 let len = self.read_u8() as usize;
                 let start = self.pc as usize;
@@ -2138,6 +2145,7 @@ impl Vm {
                 }
             }
             OP_DRAW_STR => {
+                ctx.objs.screen_touched();
                 let str_id = self.pop() as u16;
                 let (font_id, colors) = self.pop2();
                 let (fg, bg) = unpack_pair(colors);
@@ -2155,6 +2163,7 @@ impl Vm {
                 ctx.objs.str_free(str_id);
             }
             OP_ROUNDED_RECT => {
+                ctx.objs.screen_touched();
                 let (r, color) = self.pop2();
                 let (r, color) = (r as u16, color as u16);
                 let (w, h) = unpack_pair(self.pop());
@@ -2162,6 +2171,7 @@ impl Vm {
                 ctx.lcd.draw_rounded_rect(x, y, w, h, r, color);
             }
             OP_FILL_ROUNDED_RECT => {
+                ctx.objs.screen_touched();
                 let (r, color) = self.pop2();
                 let (r, color) = (r as u16, color as u16);
                 let (w, h) = unpack_pair(self.pop());
@@ -2169,6 +2179,7 @@ impl Vm {
                 ctx.lcd.fill_rounded_rect(x, y, w, h, r, color);
             }
             OP_ARC => {
+                ctx.objs.screen_touched();
                 let (end, color) = self.pop2();
                 let (end, color) = (end as i16, color as u16);
                 let start = self.pop() as i16;
@@ -2178,12 +2189,14 @@ impl Vm {
                     .draw_arc(cx as i16, cy as i16, radius, start, end, color);
             }
             OP_BEGIN_FRAME => {
+                ctx.objs.screen_touched();
                 // Buffered and EPaper modes manage their own frame lifecycle
                 if self.render_mode == RenderMode::Dirty {
                     ctx.lcd.begin_frame();
                 }
             }
             OP_END_FRAME => {
+                ctx.objs.screen_touched();
                 if self.render_mode == RenderMode::Dirty {
                     ctx.lcd.end_frame();
                 }
@@ -2246,6 +2259,7 @@ impl Vm {
                 self.push(ctx.systick.millis() as i32);
             }
             OP_FPGA_CMD => {
+                ctx.objs.screen_touched();
                 // fpgaCmd(cmd, data) — raw FPGA command + data
                 let (cmd, data) = self.pop2();
                 let (cmd, data) = (cmd as u16, data as u16);
@@ -2253,6 +2267,7 @@ impl Vm {
                 ctx.lcd.send_data(data);
             }
             OP_FPGA_DAT => {
+                ctx.objs.screen_touched();
                 // fpgaData(data) — raw FPGA data (after a cmd)
                 let data = self.pop() as u16;
                 ctx.lcd.send_data(data);

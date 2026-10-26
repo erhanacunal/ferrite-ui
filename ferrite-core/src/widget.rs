@@ -113,7 +113,8 @@ const SEC_TEXT: u8 = 1 << 1;
 const SEC_STYLE: u8 = 1 << 2;
 const SEC_EXTRA: u8 = 1 << 3;
 const SEC_PREV: u8 = 1 << 4;
-const SEC_WORDS: [usize; 5] = [2, 2, 2, 2, 4];
+const SEC_DRAWN: u8 = 1 << 5;
+const SEC_WORDS: [usize; 6] = [2, 2, 2, 2, 4, 3];
 
 /// Header words of every widget object.
 const HDR_WORDS: usize = size_of::<Widget>() / 4;
@@ -257,7 +258,20 @@ struct SecPrev {
     b: Rect,
 }
 
+/// What an incrementally redrawn widget (gauge) last put on screen: a key
+/// of everything that shapes its pixels except the value, the value, and the
+/// draw epoch. Renderer-private, not part of `WidgetExt`.
+#[repr(C, align(4))]
+#[derive(Clone, Copy, PartialEq)]
+struct SecDrawn {
+    key: u32,
+    epoch: u32,
+    value: i16,
+    _pad: u16,
+}
+
 const _: () = assert!(
+    size_of::<SecDrawn>() == 12 &&
     size_of::<SecBox>() == 8
         && size_of::<SecText>() == 8
         && size_of::<SecStyle>() == 8
@@ -360,6 +374,15 @@ impl Section for SecExtra {
         e.flex_gap = self.flex_gap;
         e.flex_grow = self.flex_grow;
     }
+}
+
+impl Section for SecDrawn {
+    const BIT: u8 = SEC_DRAWN;
+    const DEFAULT: Self = Self { key: 0, epoch: 0, value: 0, _pad: 0 };
+    fn read(_: &WidgetExt) -> Self {
+        Self::DEFAULT
+    }
+    fn write(&self, _: &mut WidgetExt) {}
 }
 
 impl Section for SecPrev {
@@ -764,6 +787,35 @@ impl ObjPool {
                 s.b = rect;
             }
         }
+    }
+
+    /// The value `id` was last fully drawn with, if its pixels are still that
+    /// drawing: same appearance `key` (never 0) and drawn in the current
+    /// epoch. None means redraw it whole.
+    pub(crate) fn drawn_value(&self, id: WidgetId, key: u32) -> Option<i16> {
+        let s = self.sec::<SecDrawn>(id)?;
+        (s.key == key && s.epoch == self.draw_epoch).then_some(s.value)
+    }
+
+    /// Record that `id` is now fully drawn with appearance `key` and `value`.
+    pub(crate) fn set_drawn(&mut self, id: WidgetId, key: u32, value: i16) {
+        let epoch = self.draw_epoch;
+        if let Some(s) = self.ensure_sec::<SecDrawn>(id) {
+            *s = SecDrawn { key, epoch, value, _pad: 0 };
+        }
+    }
+
+    /// Forget what `id` last drew (its pixels were partly redrawn).
+    pub(crate) fn forget_drawn(&mut self, id: WidgetId) {
+        if let Some(s) = self.sec_mut::<SecDrawn>(id) {
+            s.key = 0;
+        }
+    }
+
+    /// Something drew over the screen outside the widget renderer: no
+    /// incrementally drawn widget may trust its pixels any more.
+    pub fn screen_touched(&mut self) {
+        self.draw_epoch = self.draw_epoch.wrapping_add(1);
     }
 
     // --- Tree operations ---
