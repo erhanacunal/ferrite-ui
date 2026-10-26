@@ -321,6 +321,9 @@ Scalar properties are used by `W_SET` and `W_GET`.
 | `0x07` | `CLICKABLE` | flag |
 | `0x08` | `BG_COLOR` | RGB565 |
 | `0x09` | `BORDER_COLOR` | RGB565 |
+| `0x0B` | `PARENT` | read-only: parent widget id, `-1` = none |
+| `0x0C` | `FIRST_CHILD` | read-only: first child id, `-1` = none |
+| `0x0D` | `NEXT_SIBLING` | read-only: next sibling id, `-1` = none |
 | `0x0E` | `KIND` | widget kind |
 | `0x0F` | `TEXT_COLOR` | RGB565 |
 | `0x10..0x13` | reserved | former `MARGIN_T/R/B/L` (margin removed) |
@@ -344,6 +347,9 @@ Scalar properties are used by `W_SET` and `W_GET`.
 | `0x2B` | `GRADIENT_COLOR` | RGB565 gradient end color |
 | `0x2C` | `GRADIENT_DIR` | `0=none`, `1=horizontal`, `2=vertical` |
 | `0x32` | `GROUP_ID` | Button Group selection group (u8) |
+| `0x33` | `FLEX` | `lib/flex.fl` container mode (u8): bits 0-1 direction, 2-4 justify, 5-6 align |
+| `0x34` | `FLEX_GAP` | `lib/flex.fl` gap between children, px (u8) |
+| `0x35` | `FLEX_GROW` | `lib/flex.fl` grow factor of a child (u8) |
 
 Compound properties are used by `W_SET_LEN`:
 

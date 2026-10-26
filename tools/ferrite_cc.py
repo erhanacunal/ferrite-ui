@@ -300,6 +300,10 @@ class Prop:
     MULTI_LINE = 0x30     # label: split text by \n, 0=off 1=on
     ALPHA = 0x31           # background opacity 0-255 (alpha-capable devices)
     GROUP_ID = 0x32        # KIND_BUTTON_GROUP: exclusive selection group
+    # Flex layout data, read by lib/flex.fl (the firmware only stores it)
+    FLEX = 0x33            # container: direction | justify | align bits
+    FLEX_GAP = 0x34        # container: px between children
+    FLEX_GROW = 0x35       # child: share of the leftover main-axis space
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -1105,6 +1109,7 @@ PROP_NAMES = {
     0x2B: 'GRADIENT_COLOR', 0x2C: 'GRADIENT_DIR',
     0x2D: 'GRAPH_ARR', 0x2E: 'GRAPH_COUNT', 0x2F: 'GRAPH_FLAGS',
     0x30: 'MULTI_LINE', 0x31: 'ALPHA', 0x32: 'GROUP_ID',
+    0x33: 'FLEX', 0x34: 'FLEX_GAP', 0x35: 'FLEX_GROW',
     0x40: 'LOCATION', 0x41: 'SIZE',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -1387,6 +1392,13 @@ PROP_MAP = {
     'multi_line': (Prop.MULTI_LINE, False),
     'alpha': (Prop.ALPHA, False),
     'group_id': (Prop.GROUP_ID, False),
+    'flex': (Prop.FLEX, False),
+    'flex_gap': (Prop.FLEX_GAP, False),
+    'flex_grow': (Prop.FLEX_GROW, False),
+    # Tree links, read-only (get() only): widget id, or -1 = none
+    'parent': (Prop.PARENT, False),
+    'first_child': (Prop.FIRST_CHILD, False),
+    'next_sibling': (Prop.NEXT_SIBLING, False),
     'text': (Prop.TEXT, True),
     'text_id': (Prop.TEXT, True),  # alias -- same underlying prop
 }

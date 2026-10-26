@@ -360,6 +360,8 @@ fn distance(x1: float, y1: float, x2: float, y2: float) {
 
 Int parameters don't need annotation — `fn foo(x)` and `fn foo(x: int)` are equivalent.
 
+A `: widget` parameter or local can be used with `target()`/`parent()` and dot syntax. Widget ids are ints, so any int fills it: another widget variable, a forwarded widget parameter, or an id read from the tree (`var c: widget = get(first_child);`).
+
 The VM has an 8-deep call stack.
 
 ## Widget System
@@ -730,6 +732,46 @@ var w = btn.width;
 var color = btn.bg_color;
 var val = slider.value;
 ```
+
+### Walking the tree
+
+`parent`, `first_child` and `next_sibling` are read-only properties holding widget ids (`-1` = none). Children come in tree order (the order they were parented):
+
+```c
+target(list);
+var c: widget = get(first_child);
+while (c >= 0) {
+    target(c);
+    set(bg_color, GRAY);
+    c = get(next_sibling);
+}
+```
+
+### Flex Layout (lib/flex.fl)
+
+`lib/flex.fl` places the children of a container in a row or a column, so you don't compute coordinates by hand. The layout data is stored on the widgets (`flex`, `flex_gap`, `flex_grow`); `flexLayout(box)` reads it and sets `loc_x`/`loc_y`/`size_w`/`size_h` of the children.
+
+```c
+#include "flex.fl"
+
+row.flex = FLEX_ROW | JUSTIFY_SPACE_BETWEEN | ITEMS_CENTER;
+row.flex_gap = 8;        // px between children
+search.flex_grow = 1;    // takes the leftover width
+flexLayout(row);
+```
+
+| Property | On | Value |
+| --- | --- | --- |
+| `flex` | container | `FLEX_ROW` or `FLEX_COLUMN`, OR'd with one `JUSTIFY_*` and one `ITEMS_*`. `0` = not a flex container |
+| `flex_gap` | container | gap between children, px (0–255) |
+| `flex_grow` | child | share of the leftover main-axis space (0 = keep own size) |
+
+- **Main axis** (x for a row, y for a column): `JUSTIFY_START`, `JUSTIFY_CENTER`, `JUSTIFY_END`, `JUSTIFY_SPACE_BETWEEN`, `JUSTIFY_STRETCH`. Children with `flex_grow` share the leftover space in proportion to it, and their own main size is ignored (like CSS `flex: 1`). When any child grows there is no leftover space, so `JUSTIFY_*` has no effect. `JUSTIFY_STRETCH` gives every child without its own `flex_grow` a grow of 1, so all children end up the same size.
+- **Cross axis**: `ITEMS_START`, `ITEMS_CENTER`, `ITEMS_END`, `ITEMS_STRETCH` (child fills the container's cross size). These are named `ITEMS_*` because `ALIGN_*` is text alignment.
+- Children are placed inside the content area (size minus border and padding), in tree order. Hidden children take no space. Children that are flex containers themselves are laid out afterwards, with their final size, so call `flexLayout` once on the outermost container.
+- Layout is not automatic. Call `flexLayout` again after changing sizes, visibility or children. Growing and stretched sizes overwrite the child's size, so set it again before switching away from `JUSTIFY_STRETCH` / `ITEMS_STRETCH`.
+
+See `examples/nextion/flex_demo`.
 
 ### dirty() / render()
 

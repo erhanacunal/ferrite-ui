@@ -196,9 +196,11 @@ impl Widget {
 /// Extension data for widgets that need edges, text, callbacks, etc.
 /// Allocated on demand -- simple containers skip this entirely.
 pub struct WidgetExt {
-    // Button group (4 bytes — the former margin edges)
+    // Button group + flex layout (4 bytes — the former margin edges)
     pub group_id: u8, // KIND_BUTTON_GROUP: exclusive selection group
-    pub _reserved: [u8; 3],
+    pub flex: u8,      // lib/flex.fl container mode (0 = not a flex container)
+    pub flex_gap: u8,  // lib/flex.fl gap between children, px
+    pub flex_grow: u8, // lib/flex.fl grow factor of a child (0 = fixed size)
 
     // Box model edges (8 bytes)
     pub border: Edges,
@@ -244,7 +246,9 @@ impl WidgetExt {
     /// Used as fallback when a widget has no extension allocated.
     pub const DEFAULT: Self = Self {
         group_id: 0,
-        _reserved: [0; 3],
+        flex: 0,
+        flex_gap: 0,
+        flex_grow: 0,
         border: Edges::ZERO,
         padding: Edges::ZERO,
         text_color: 0xFFFF,

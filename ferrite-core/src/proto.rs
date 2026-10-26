@@ -62,6 +62,10 @@ pub const PROP_GRAPH_FLAGS: u8 = 0x2F;
 pub const PROP_MULTI_LINE: u8 = 0x30;
 pub const PROP_ALPHA: u8 = 0x31;
 pub const PROP_GROUP_ID: u8 = 0x32; // KIND_BUTTON_GROUP selection group
+// Flex layout data for lib/flex.fl. Stored only; the firmware never lays out.
+pub const PROP_FLEX: u8 = 0x33; // container: direction | justify | align bits
+pub const PROP_FLEX_GAP: u8 = 0x34; // container: px between children
+pub const PROP_FLEX_GROW: u8 = 0x35; // child: share of the leftover main-axis space
 
 // Compound properties (LEN wire type — packed zigzag varints)
 pub const PROP_LOCATION: u8 = 0x40;

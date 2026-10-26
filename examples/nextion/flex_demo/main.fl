@@ -1,0 +1,153 @@
+// main.fl — Flex layout demo (800x480)
+//
+// Builds the screen with lib/flex.fl instead of hand-computed coordinates:
+//   - a header row: title on the left, mode button on the right (space-between)
+//   - a body row: a sidebar column of stretched buttons + a content column
+//     that grows to fill the rest
+//   - the content column holds a row of tiles; tapping "Mode" cycles its
+//     justify mode (start → center → end → space-between → stretch)
+
+#include "core.fl"
+#include "color.fl"
+#include "flex.fl"
+
+var mode_idx = 0;
+var modes[5] = [0, 0, 0, 0, 0];
+
+var root_col;
+var header;
+var title;
+var mode_btn;
+var body;
+var sidebar;
+var content;
+var tiles;
+var tiles_lbl;
+
+fn on_mode(wid) {
+    mode_idx = (mode_idx + 1) % 5;
+    tiles.flex = FLEX_ROW | modes[mode_idx] | ITEMS_CENTER;
+    // JUSTIFY_STRETCH overwrote the tile widths: restore them.
+    var t: widget = tiles.first_child;
+    while (t >= 0) {
+        target(t);
+        set(size_w, 80);
+        t = get(next_sibling);
+    }
+    flexLayout(tiles);
+    target(tiles_lbl);
+    if (mode_idx == 0) { set(text, "JUSTIFY_START"); }
+    if (mode_idx == 1) { set(text, "JUSTIFY_CENTER"); }
+    if (mode_idx == 2) { set(text, "JUSTIFY_END"); }
+    if (mode_idx == 3) { set(text, "JUSTIFY_SPACE_BETWEEN"); }
+    if (mode_idx == 4) { set(text, "JUSTIFY_STRETCH"); }
+}
+
+fn setup() {
+    modes[0] = JUSTIFY_START;
+    modes[1] = JUSTIFY_CENTER;
+    modes[2] = JUSTIFY_END;
+    modes[3] = JUSTIFY_SPACE_BETWEEN;
+    modes[4] = JUSTIFY_STRETCH;
+
+    // Whole screen: a column (header on top, body below).
+    root_col = alloc();
+    parent(0);
+    set(size, 800, 480);
+    set(bg_color, BLACK);
+    set(padding, 8, 8, 8, 8);
+    set(flex, FLEX_COLUMN | ITEMS_STRETCH);
+    set(flex_gap, 8);
+
+    // Header: fixed height, width comes from ITEMS_STRETCH.
+    header = alloc();
+    parent(root_col);
+    set(size, 0, 60);
+    set(bg_color, 0x2945);
+    set(padding, 0, 12, 0, 12);
+    set(flex, FLEX_ROW | JUSTIFY_SPACE_BETWEEN | ITEMS_CENTER);
+
+    title = alloc();
+    parent(header);
+    set(kind, KIND_LABEL);
+    set(size, 300, 30);
+    set(text, "Flex layout");
+    set(text_color, WHITE);
+    set(bg_color, 0x2945);
+
+    mode_btn = alloc();
+    parent(header);
+    set(kind, KIND_LABEL);
+    set(size, 120, 44);
+    set(bg_color, BLUE);
+    set(press_color, NAVY);
+    set(border_radius, 8);
+    set(text, "Mode");
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(clickable, ON);
+    set(on_click, @on_mode);
+
+    // Body: grows to the rest of the screen height.
+    body = alloc();
+    parent(root_col);
+    set(size, 0, 0);
+    set(flex_grow, 1);
+    set(flex, FLEX_ROW | ITEMS_STRETCH);
+    set(flex_gap, 8);
+
+    // Sidebar: fixed width, buttons stretched to its width.
+    sidebar = alloc();
+    parent(body);
+    set(size, 180, 0);
+    set(bg_color, 0x18C3);
+    set(padding, 8, 8, 8, 8);
+    set(flex, FLEX_COLUMN | ITEMS_STRETCH);
+    set(flex_gap, 6);
+    for (var i = 0; i < 4; i++) {
+        var b = alloc();
+        parent(sidebar);
+        set(kind, KIND_BUTTON);
+        set(size, 0, 50);
+        set(bg_color, DARK_GRAY);
+        set(press_color, GRAY);
+        set(border_radius, 6);
+    }
+
+    // Content: takes the remaining width.
+    content = alloc();
+    parent(body);
+    set(size, 0, 0);
+    set(flex_grow, 1);
+    set(bg_color, 0x10A2);
+    set(padding, 12, 12, 12, 12);
+    set(flex, FLEX_COLUMN | ITEMS_STRETCH);
+    set(flex_gap, 12);
+
+    tiles_lbl = alloc();
+    parent(content);
+    set(kind, KIND_LABEL);
+    set(size, 0, 30);
+    set(text, "JUSTIFY_START");
+    set(text_color, YELLOW);
+    set(bg_color, 0x10A2);
+
+    tiles = alloc();
+    parent(content);
+    set(size, 0, 120);
+    set(bg_color, 0x0841);
+    set(flex, FLEX_ROW | JUSTIFY_START | ITEMS_CENTER);
+    set(flex_gap, 10);
+    for (var j = 0; j < 4; j++) {
+        var t = alloc();
+        parent(tiles);
+        set(size, 80, 60 + j * 15);
+        set(bg_color, j % 2 ? ORANGE : GREEN);
+        set(border_radius, 8);
+    }
+
+    flexLayout(root_col);
+}
+
+fn loop() {
+}

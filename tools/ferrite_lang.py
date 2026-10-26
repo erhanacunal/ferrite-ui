@@ -989,6 +989,14 @@ NO_VALUE_BUILTINS = {
 # Builtins whose return value is an array ID (so the variable must be in array_vars)
 _ARRAY_RETURNING_BUILTINS = {'rtcRead'}
 
+# Tree links: get() only. Writing them would bypass WidgetTree's linking.
+_READ_ONLY_PROPS = {Prop.PARENT, Prop.FIRST_CHILD, Prop.NEXT_SIBLING}
+
+
+def _check_writable(prop_id, name, line):
+    if prop_id in _READ_ONLY_PROPS:
+        raise CompileError(f"property '{name}' is read-only", line)
+
 
 # ============================================================
 # Widget page (RES_PAGE)
@@ -1800,6 +1808,11 @@ class CodeGen:
             # Same type → that type
             if tt == et:
                 return tt
+            # An untyped (`any`) branch takes the other branch's type
+            if tt == self.T_ANY:
+                return et
+            if et == self.T_ANY:
+                return tt
             # Mismatched non-numeric types → error
             raise CompileError(
                 f"ternary branches have incompatible types "
@@ -1822,6 +1835,11 @@ class CodeGen:
             return True
         if expected == self.T_FLOAT and actual == self.T_INT:
             return True  # auto-promote
+        # Widget ids are ints at runtime, and widget variables/params are
+        # typed int, so an int fills a widget slot (forwarding a widget param,
+        # `var c: widget = get(first_child)`).
+        if expected == self.T_WIDGET and actual == self.T_INT:
+            return True
         return False
 
     def _check_type_match(self, expected: str, actual: str, msg: str, line: int):
@@ -2019,6 +2037,10 @@ class CodeGen:
             self._gen_expr_stmt(node)
         else:
             raise CompileError(f"unknown statement: {type(node).__name__}")
+        # After a branch or loop the body may or may not have run, so the
+        # target it left behind is unknown at compile time.
+        if isinstance(node, (IfStmt, WhileStmt, ForStmt)):
+            self._current_target = None
 
     def _gen_var_decl(self, node):
         if node.is_const:
@@ -2071,6 +2093,8 @@ class CodeGen:
                     node.line)
                 # widget is stored as int on the stack; string/array keep their type
                 self.var_types[node.name] = declared if declared != 'widget' else self.T_INT
+                if declared == 'widget':
+                    self.widget_ids.setdefault(node.name, -1)  # e.g. = get(first_child)
                 if isinstance(node.init, CallExpr) and node.init.name == 'alloc':
                     self.widget_ids[node.name] = self.next_widget_id
                     self.next_widget_id += 1
@@ -2087,6 +2111,8 @@ class CodeGen:
             else:
                 declared = node.var_type or 'int'
                 self.var_types[node.name] = declared if declared != 'widget' else self.T_INT
+                if declared == 'widget':
+                    self.widget_ids.setdefault(node.name, -1)
                 self.asm.push(0)
         self.asm.store(slot)
 
@@ -2186,6 +2212,9 @@ class CodeGen:
                 self._last_alltar_var = node.name
                 self._current_target = node.name
                 return
+            # The variable now holds another widget id (c = get(next_sibling)).
+            if self._current_target == node.name:
+                self._current_target = None
             self._gen_expr(node.value)
             var_type = self.var_types.get(node.name, self.T_INT)
             val_type = self._infer_type(node.value)
@@ -2541,6 +2570,7 @@ class CodeGen:
         """Compile widget.prop += expr → target, get, expr, op, set."""
         self._emit_target(node.obj, node.line)
         prop_id, is_compound = _resolve_prop(node.prop)
+        _check_writable(prop_id, node.prop, node.line)
         if is_compound:
             raise CompileError(
                 f"compound assignment not supported for compound property '{node.prop}'",
@@ -3375,6 +3405,7 @@ class CodeGen:
 
         prop_name = self._prop_name_from_arg(node.args[0], node.line)
         prop_id, is_compound = _resolve_prop(prop_name)
+        _check_writable(prop_id, prop_name, node.line)
         value_args = node.args[1:]
 
         # Special: set(text, "literal") or set(text, str_id_expr)
@@ -3443,6 +3474,7 @@ class CodeGen:
         self._emit_target(node.obj, node.line)
 
         prop_id, is_compound = _resolve_prop(node.prop)
+        _check_writable(prop_id, node.prop, node.line)
 
         # Special: text property
         if prop_id == Prop.TEXT:

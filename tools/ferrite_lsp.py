@@ -614,6 +614,12 @@ PROP_DOCS = {
     'multi_line': 'Multi-line label text flag',
     'alpha': 'Background opacity (0-255)',
     'group_id': 'Exclusive group (button group, radio): one checked per group_id; radio 0 = siblings',
+    'flex': 'Flex container mode for lib/flex.fl: FLEX_ROW/FLEX_COLUMN | JUSTIFY_* | ALIGN_*',
+    'flex_gap': 'Flex container: gap between children in px (lib/flex.fl)',
+    'flex_grow': 'Flex child: share of the leftover main-axis space, 0 = fixed size (lib/flex.fl)',
+    'parent': 'Parent widget id, read-only (-1 = none)',
+    'first_child': 'First child widget id, read-only (-1 = none)',
+    'next_sibling': 'Next sibling widget id, read-only (-1 = none)',
     'text': 'Text content (compound: LEN-encoded)',
     'text_id': 'Text content (alias for text)',
 }

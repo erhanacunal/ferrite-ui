@@ -1,0 +1,171 @@
+// flex.fl — Flex layout (row / column) for widget containers
+// Usage: #include "flex.fl"
+//
+// The layout data lives on the widgets themselves; the firmware only stores
+// it, and flexLayout() below does the placement:
+//
+//   box.flex      = FLEX_ROW | JUSTIFY_CENTER | ITEMS_STRETCH;  // container mode
+//   box.flex_gap  = 8;                                         // px between children
+//   item.flex_grow = 1;                                        // child takes leftover space
+//   flexLayout(box);
+//
+// flexLayout(box) places the visible children of `box` inside its content
+// area (size minus border and padding), in tree order:
+//   - main axis (x for FLEX_ROW, y for FLEX_COLUMN): children keep their size,
+//     separated by flex_gap. Children with flex_grow share the leftover space
+//     in proportion to it, and their own main size is ignored (like CSS
+//     `flex: 1`), so calling flexLayout again gives the same result. Without
+//     any grower, JUSTIFY_* decides where the children sit. JUSTIFY_STRETCH
+//     gives every child a grow of 1 unless it has its own flex_grow (equal
+//     sizes).
+//   - cross axis: ITEMS_* aligns each child; ITEMS_STRETCH sets its cross
+//     size to the full content size.
+// It sets loc_x/loc_y/size_w/size_h of the children (marking them dirty) and
+// then lays out children that are flex containers themselves. Call it again
+// after changing sizes, visibility or children. Hidden children take no space.
+// Growing / stretched sizes overwrite the child's size: set it again before
+// switching a container away from JUSTIFY_STRETCH or ITEMS_STRETCH.
+//
+// The ITEMS_* names avoid core.fl's ALIGN_* (text alignment).
+
+// Direction (bits 0-1). 0 = not a flex container.
+const FLEX_ROW    = 1;
+const FLEX_COLUMN = 2;
+
+// Main-axis justify (bits 2-4)
+const JUSTIFY_START         = 0;
+const JUSTIFY_CENTER        = 4;
+const JUSTIFY_END           = 8;
+const JUSTIFY_SPACE_BETWEEN = 12;
+const JUSTIFY_STRETCH       = 16;
+
+// Cross-axis align (bits 5-6)
+const ITEMS_START   = 0;
+const ITEMS_CENTER  = 32;
+const ITEMS_END     = 64;
+const ITEMS_STRETCH = 96;
+
+fn flexLayout(box: widget) {
+    target(box);
+    var mode = get(flex);
+    var dir = mode & 3;
+    if (dir == 0) {
+        return;
+    }
+    var justify = mode & 28;
+    var items = mode & 96;
+    var gap = get(flex_gap);
+
+    // Content area size.
+    var cw = get(size_w) - get(border_left) - get(border_right)
+             - get(padding_left) - get(padding_right);
+    var ch = get(size_h) - get(border_top) - get(border_bottom)
+             - get(padding_top) - get(padding_bottom);
+    var main_len = cw;
+    var cross_len = ch;
+    if (dir == FLEX_COLUMN) {
+        main_len = ch;
+        cross_len = cw;
+    }
+
+    // Pass 1: count visible children, sum their main sizes and grow factors.
+    var count = 0;
+    var used = 0;
+    var grow_total = 0;
+    var g;
+    var c: widget = get(first_child);
+    while (c >= 0) {
+        target(c);
+        if (get(visible)) {
+            count++;
+            g = get(flex_grow);
+            if (g == 0 && justify == JUSTIFY_STRETCH) {
+                g = 1;
+            }
+            if (g == 0) {
+                used += dir == FLEX_ROW ? get(size_w) : get(size_h);
+            }
+            grow_total += g;
+        }
+        c = get(next_sibling);
+    }
+    if (count == 0) {
+        return;
+    }
+
+    var free = main_len - used - gap * (count - 1);
+    var pos = 0;
+    var extra_gap = 0;     // JUSTIFY_SPACE_BETWEEN: added to every gap
+    var extra_rem = 0;     // ...plus 1 px for the first extra_rem gaps
+    if (grow_total == 0 && free > 0) {
+        if (justify == JUSTIFY_CENTER) {
+            pos = free / 2;
+        } else if (justify == JUSTIFY_END) {
+            pos = free;
+        } else if (justify == JUSTIFY_SPACE_BETWEEN && count > 1) {
+            extra_gap = free / (count - 1);
+            extra_rem = free % (count - 1);
+        }
+    }
+    var free_left = free > 0 ? free : 0;   // grow space not handed out yet
+    var grow_left = grow_total;
+
+    // Pass 2: place the children.
+    target(box);
+    c = get(first_child);
+    while (c >= 0) {
+        target(c);
+        if (get(visible)) {
+            var size = dir == FLEX_ROW ? get(size_w) : get(size_h);
+            g = get(flex_grow);
+            if (g == 0 && justify == JUSTIFY_STRETCH) {
+                g = 1;
+            }
+            if (g > 0) {
+                // Proportional share; the last grower gets the rounding rest.
+                size = free_left * g / grow_left;
+                free_left -= size;
+                grow_left -= g;
+            }
+
+            var csize = dir == FLEX_ROW ? get(size_h) : get(size_w);
+            var cpos = 0;
+            if (items == ITEMS_CENTER) {
+                cpos = (cross_len - csize) / 2;
+            } else if (items == ITEMS_END) {
+                cpos = cross_len - csize;
+            } else if (items == ITEMS_STRETCH) {
+                csize = cross_len;
+            }
+
+            if (dir == FLEX_ROW) {
+                set(loc_x, pos);
+                set(loc_y, cpos);
+                set(size_w, size);
+                set(size_h, csize);
+            } else {
+                set(loc_x, cpos);
+                set(loc_y, pos);
+                set(size_w, csize);
+                set(size_h, size);
+            }
+
+            pos += size + gap + extra_gap;
+            if (extra_rem > 0) {
+                pos++;
+                extra_rem--;
+            }
+
+            // Nested container: its size is final now.
+            if (get(flex) & 3) {
+                flexLayout(c);
+                target(c);
+            }
+        }
+        c = get(next_sibling);
+    }
+
+    // Children moved: repaint the container so their old spots are cleared.
+    target(box);
+    dirty();
+}

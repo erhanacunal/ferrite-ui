@@ -6,10 +6,11 @@ use crate::platform::Platform;
 use crate::proto::{
     self, PROP_ALPHA, PROP_BG_COLOR, PROP_BORDER_B, PROP_BORDER_COLOR, PROP_BORDER_EDGES,
     PROP_BORDER_L, PROP_BORDER_R, PROP_BORDER_RADIUS, PROP_BORDER_T, PROP_CHECKED, PROP_CLICKABLE,
-    PROP_CLIP_CHILDREN, PROP_CURSOR_POS, PROP_ENABLED, PROP_FONT_ID, PROP_GRADIENT_COLOR,
+    PROP_CLIP_CHILDREN, PROP_CURSOR_POS, PROP_ENABLED, PROP_FIRST_CHILD, PROP_FLEX,
+    PROP_FLEX_GAP, PROP_FLEX_GROW, PROP_FONT_ID, PROP_GRADIENT_COLOR,
     PROP_GRADIENT_DIR, PROP_GRAPH_ARR, PROP_GRAPH_COUNT, PROP_GRAPH_FLAGS, PROP_GROUP_ID,
     PROP_IMAGE_ID, PROP_KIND, PROP_LOC_X, PROP_LOC_Y, PROP_LOCATION, PROP_MAX_LENGTH,
-    PROP_MULTI_LINE, PROP_ON_CHANGE, PROP_ON_CLICK,
+    PROP_MULTI_LINE, PROP_NEXT_SIBLING, PROP_ON_CHANGE, PROP_ON_CLICK, PROP_PARENT,
     PROP_ON_PAINT, PROP_ON_TAP, PROP_PADDING, PROP_PADDING_B, PROP_PADDING_L, PROP_PADDING_R,
     PROP_PADDING_T, PROP_PRESS_COLOR, PROP_SCROLL_Y, PROP_SIZE, PROP_SIZE_H, PROP_SIZE_W,
     PROP_TEXT, PROP_TEXT_ALIGN, PROP_TEXT_COLOR, PROP_VALUE, PROP_VISIBLE,
@@ -2905,6 +2906,9 @@ impl Vm {
                 PROP_GRADIENT_DIR => ext.gradient_dir = val as u8,
                 PROP_ALPHA => ext.alpha = val as u8,
                 PROP_GROUP_ID => ext.group_id = val as u8,
+                PROP_FLEX => ext.flex = val as u8,
+                PROP_FLEX_GAP => ext.flex_gap = val as u8,
+                PROP_FLEX_GROW => ext.flex_grow = val as u8,
                 // KIND_GRAPH props share storage with value/max_length/image_id;
                 // safe because a single widget kind is exclusive.
                 PROP_GRAPH_ARR => ext.value = val as i16,
@@ -2927,6 +2931,7 @@ impl Vm {
         let w = ctx.tree.get(target);
         // One extension lookup for all ext props; no extension reads as the defaults.
         let e = ctx.tree.ext(target).unwrap_or(&WidgetExt::DEFAULT);
+        let link = |id: WidgetId| if id.is_none() { -1 } else { id.0 as i32 };
         match prop_id {
             // Base fields
             PROP_LOC_X => w.location.x as i32,
@@ -2978,6 +2983,10 @@ impl Vm {
             PROP_BG_COLOR => w.background_color as i32,
             PROP_BORDER_COLOR => w.border_color as i32,
             PROP_KIND => w.kind as i32,
+            // Tree links (read-only): -1 = none.
+            PROP_PARENT => link(w.parent),
+            PROP_FIRST_CHILD => link(w.first_child),
+            PROP_NEXT_SIBLING => link(w.next_sibling),
             // Extension fields (return defaults when no extension)
             PROP_BORDER_T => e.border.top as i32,
             PROP_BORDER_R => e.border.right as i32,
@@ -3006,6 +3015,9 @@ impl Vm {
             PROP_GRADIENT_DIR => e.gradient_dir as i32,
             PROP_ALPHA => e.alpha as i32,
             PROP_GROUP_ID => e.group_id as i32,
+            PROP_FLEX => e.flex as i32,
+            PROP_FLEX_GAP => e.flex_gap as i32,
+            PROP_FLEX_GROW => e.flex_grow as i32,
             PROP_GRAPH_ARR => e.value as i32,
             PROP_GRAPH_COUNT => e.max_length as i32,
             PROP_GRAPH_FLAGS => e.image_id as i32,
@@ -3635,6 +3647,35 @@ mod anim_tests {
         assert_eq!(ctx.strpool.get(id as u16), b"erhan");
         let none = Vm::get_scalar_prop_on(&ctx, empty, PROP_TEXT);
         assert_eq!(ctx.strpool.get(none as u16), b"", "no text reads as empty");
+    }
+
+    #[test]
+    fn tree_links_and_flex_props_read_back() {
+        // lib/flex.fl walks children via get(first_child)/get(next_sibling)
+        // and reads its layout data from the flex props.
+        let mut ctx = mock_ctx();
+        let root = one_widget(&mut ctx);
+        let a = one_widget(&mut ctx);
+        let b = one_widget(&mut ctx);
+        ctx.tree.add_child(root, a);
+        ctx.tree.add_child(root, b);
+
+        let get = |ctx: &Ctx<MockPlatform>, id, prop| Vm::get_scalar_prop_on(ctx, id, prop);
+        assert_eq!(get(&ctx, root, PROP_FIRST_CHILD), a.0 as i32);
+        assert_eq!(get(&ctx, a, PROP_NEXT_SIBLING), b.0 as i32);
+        assert_eq!(get(&ctx, b, PROP_NEXT_SIBLING), -1, "none reads as -1");
+        assert_eq!(get(&ctx, b, PROP_FIRST_CHILD), -1);
+        assert_eq!(get(&ctx, b, PROP_PARENT), root.0 as i32);
+        assert_eq!(get(&ctx, root, PROP_PARENT), -1);
+
+        assert_eq!(get(&ctx, root, PROP_FLEX), 0, "no extension reads as 0");
+        Vm::set_scalar_prop_on(&mut ctx, root, PROP_FLEX, 0x62);
+        Vm::set_scalar_prop_on(&mut ctx, root, PROP_FLEX_GAP, 8);
+        Vm::set_scalar_prop_on(&mut ctx, a, PROP_FLEX_GROW, 2);
+        assert_eq!(get(&ctx, root, PROP_FLEX), 0x62);
+        assert_eq!(get(&ctx, root, PROP_FLEX_GAP), 8);
+        assert_eq!(get(&ctx, a, PROP_FLEX_GROW), 2);
+        assert_eq!(get(&ctx, root, PROP_GROUP_ID), 0, "flex bytes don't touch group_id");
     }
 
     #[test]
