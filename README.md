@@ -304,7 +304,7 @@ Flash the firmware with [xfel](https://xfel.xboot.org) (a copy is in [tools/xfel
 
 ```powershell
 cd tools\xfel
-.\xfel.exe spinor write 0 E:\repo\ferrite-ui\target\armv5te-none-eabi\release\ferrite-ui.bin
+.\xfel.exe spinor write 0 ..\..\target\armv5te-none-eabi\release\ferrite-ui.bin
 ```
 
 On Windows, xfel needs the WinUSB driver for the FEL device (`VID_1F3A PID_EFE8`) once: run `tools\xfel\Drivers\zadig-2.9.exe`, select the device, choose WinUSB and click *Install/Reinstall Driver*:
