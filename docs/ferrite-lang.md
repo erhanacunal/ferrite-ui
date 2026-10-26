@@ -1615,7 +1615,7 @@ fn loop() {}
 | Property | Event | Callback args |
 |----------|-------|---------------|
 | `on_click` | Press + release on same widget | `(widget_id)` |
-| `on_paint` | After widget is rendered | `(widget_id)` |
+| `on_paint` | After the frame's widgets are rendered (once per frame, for every dirty widget with `on_paint`) | `(ids)` — an array of those widget ids, freed after the call |
 | `on_tap` | Tap with coordinates | `(widget_id, packed_xy)` |
 
 For `on_tap`, extract coordinates: `x = coords / 65536`, `y = coords & 0xFFFF`.

@@ -1,0 +1,276 @@
+// main.fl — Analog clock for the TDO Y13 round 480x480 display
+//
+// A watch face laid out for a circular screen: bezel and dial are circle
+// widgets, the numerals and the digital readout are labels, the hands are
+// anti-aliased polygon widgets (with drop shadows), and the minute track is
+// drawn in the dial's on_paint. Everything is redrawn once per second in
+// buffered mode, so there is no tearing.
+//
+// Time comes from rtcRead(). The TDO Y13 keeps a software clock that starts
+// at 2000-01-01 00:00:00 on boot; set it with `ferrite_cli.py settime`.
+
+#include "core.fl"
+#include "shapes.fl"
+
+const CX = 240;
+const CY = 240;
+
+// Palette (RGB565)
+const BEZEL      = 0x2124;
+const BEZEL_EDGE = 0x52AA;
+const DIAL       = 0x10C3;
+const SHADOW     = 0x0841;
+const TICK_MIN   = 0x632C;
+const TICK_HOUR  = 0xE73C;
+const NUMERAL    = 0xC638;
+const HAND       = 0xFFFF;
+const ACCENT     = 0xFC60;   // orange: second hand, 12 o'clock marker
+const MUTED      = 0x8410;
+const WINDOW     = 0x0861;
+
+const FONT_NUM   = 1;
+const FONT_DIGI  = 2;
+const FONT_SMALL = 3;
+
+// sin(0..90°) × 1000
+var SIN[91] = [0, 17, 35, 52, 70, 87, 105, 122, 139, 156, 174, 191, 208, 225, 242, 259, 276, 292, 309, 326, 342, 358, 375, 391, 407, 423, 438, 454, 469, 485, 500, 515, 530, 545, 559, 574, 588, 602, 616, 629, 643, 656, 669, 682, 695, 707, 719, 731, 743, 755, 766, 777, 788, 799, 809, 819, 829, 839, 848, 857, 866, 875, 883, 891, 899, 906, 914, 921, 927, 934, 940, 946, 951, 956, 961, 966, 970, 974, 978, 982, 985, 988, 990, 993, 995, 996, 998, 999, 999, 1000, 1000];
+
+var bezel;
+var dial;
+var brand;
+var digital;
+var date_lbl;
+var hour_shadow;
+var min_shadow;
+var hour_hand;
+var min_hand;
+var sec_hand;
+var sec_weight;
+var hub;
+var hub_dot;
+
+var last_sec = -1;
+// rtcRead() result: [sec, min, hour, day, weekday, month, year]
+var now;
+
+// --- Trigonometry on clock angles (0° = 12 o'clock, clockwise) ---
+
+fn isin(a) {
+    a = a % 360;
+    if (a < 0) { a += 360; }
+    if (a <= 90) { return SIN[a]; }
+    if (a <= 180) { return SIN[180 - a]; }
+    if (a <= 270) { return -SIN[a - 180]; }
+    return -SIN[360 - a];
+}
+
+fn icos(a) {
+    return isin(a + 90);
+}
+
+// Screen x/y of the point `d` along the hand direction and `w` across it
+// (both in tenths of a pixel), for clock angle `a`, plus an offset.
+fn px(a, d, w, off) {
+    return CX + off + (d * isin(a) + w * icos(a)) / 10000;
+}
+
+fn py(a, d, w, off) {
+    return CY + off + (w * isin(a) - d * icos(a)) / 10000;
+}
+
+// Kite-shaped hand: tip at `len`, widest (`half` each side) at `base`,
+// tail point at `tail` behind the centre. All in tenths of a pixel.
+fn hand_points(a, len, base, half, tail, off) -> string {
+    return sprintf("%d,%d %d,%d %d,%d %d,%d",
+        px(a, len, 0, off), py(a, len, 0, off),
+        px(a, base, half, off), py(a, base, half, off),
+        px(a, -tail, 0, off), py(a, -tail, 0, off),
+        px(a, base, -half, off), py(a, base, -half, off));
+}
+
+fn day_name(d) -> string {
+    if (d == 0) { return str("SUN"); }
+    if (d == 1) { return str("MON"); }
+    if (d == 2) { return str("TUE"); }
+    if (d == 3) { return str("WED"); }
+    if (d == 4) { return str("THU"); }
+    if (d == 5) { return str("FRI"); }
+    return str("SAT");
+}
+
+fn month_name(m) -> string {
+    if (m == 1) { return str("JAN"); }
+    if (m == 2) { return str("FEB"); }
+    if (m == 3) { return str("MAR"); }
+    if (m == 4) { return str("APR"); }
+    if (m == 5) { return str("MAY"); }
+    if (m == 6) { return str("JUN"); }
+    if (m == 7) { return str("JUL"); }
+    if (m == 8) { return str("AUG"); }
+    if (m == 9) { return str("SEP"); }
+    if (m == 10) { return str("OCT"); }
+    if (m == 11) { return str("NOV"); }
+    return str("DEC");
+}
+
+// --- Layout ---
+
+fn circle_at(x, y, d, fill, edge, edge_w) {
+    set(kind, KIND_CIRCLE);
+    set(location, x, y);
+    set(size, d, d);
+    set(bg_color, fill);
+    set(border_color, edge);
+    set(border, edge_w, edge_w, edge_w, edge_w);
+    parent(0);
+}
+
+fn label_at(x, y, w, h, font, color, text) {
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+    set(font_id, font);
+    set(text_color, color);
+    set(text_align, ALIGN_CENTER);
+    set(text, text);
+    parent(0);
+}
+
+// Full-screen polygon widget (points are absolute screen coordinates).
+fn polygon(color) {
+    set(kind, KIND_POLYGON);
+    set(location, 0, 0);
+    set(size, 480, 480);
+    set(bg_color, color);
+    parent(0);
+}
+
+fn numeral(hour, text) {
+    var a = hour * 30;
+    var x = px(a, 1660, 0, 0);
+    var y = py(a, 1660, 0, 0);
+    var w = alloc();
+    target(w);
+    label_at(x - 26, y - 16, 52, 32, FONT_NUM, NUMERAL, text);
+}
+
+fn layout() {
+    bezel = alloc();
+    target(bezel);
+    circle_at(0, 0, 480, BEZEL, BEZEL_EDGE, 2);
+
+    dial = alloc();
+    target(dial);
+    circle_at(16, 16, 448, DIAL, SHADOW, 3);
+    set(on_paint, @paint_track);
+
+    numeral(12, "12"); numeral(1, "1"); numeral(2, "2");
+    numeral(3, "3");   numeral(4, "4"); numeral(5, "5");
+    numeral(6, "6");   numeral(7, "7"); numeral(8, "8");
+    numeral(9, "9");   numeral(10, "10"); numeral(11, "11");
+
+    brand = alloc();
+    target(brand);
+    label_at(180, 140, 120, 22, FONT_SMALL, MUTED, "ferrite");
+
+    digital = alloc();
+    target(digital);
+    label_at(170, 292, 140, 40, FONT_DIGI, HAND, "00:00:00");
+    set(bg_color, WINDOW);
+    set(border_radius, 12);
+
+    date_lbl = alloc();
+    target(date_lbl);
+    label_at(160, 338, 160, 22, FONT_SMALL, MUTED, "");
+
+    // Shadows first, so the hands cover them.
+    hour_shadow = alloc(); target(hour_shadow); polygon(SHADOW);
+    min_shadow = alloc();  target(min_shadow);  polygon(SHADOW);
+    hour_hand = alloc();   target(hour_hand);   polygon(HAND);
+    min_hand = alloc();    target(min_hand);    polygon(HAND);
+    sec_hand = alloc();    target(sec_hand);    polygon(ACCENT);
+
+    sec_weight = alloc();
+    target(sec_weight);
+    circle_at(0, 0, 14, ACCENT, ACCENT, 0);
+
+    hub = alloc();
+    target(hub);
+    circle_at(CX - 10, CY - 10, 20, ACCENT, HAND, 2);
+
+    hub_dot = alloc();
+    target(hub_dot);
+    circle_at(CX - 3, CY - 3, 6, SHADOW, SHADOW, 0);
+}
+
+// Minute track: fine ticks every minute, bold rounded ticks every hour
+// (drawn as a row of overlapping anti-aliased dots), orange at 12.
+fn paint_track(ids) {
+    var i = 0;
+    while (i < 60) {
+        var a = i * 6;
+        if (i % 5 == 0) {
+            var color = TICK_HOUR;
+            var r = 2;
+            if (i == 0) { color = ACCENT; r = 3; }
+            var d = 1920;
+            while (d <= 2130) {
+                fillCircle(px(a, d, 0, 0), py(a, d, 0, 0), r, color);
+                d += 20;
+            }
+        } else {
+            line(px(a, 2040, 0, 0), py(a, 2040, 0, 0), px(a, 2140, 0, 0), py(a, 2140, 0, 0), TICK_MIN);
+        }
+        i++;
+    }
+}
+
+// --- Time ---
+
+fn update() {
+    strClear();
+    var sec = now[0];
+    var min = now[1];
+    var hr = now[2];
+
+    var a_h = (hr % 12) * 30 + min / 2;
+    var a_m = min * 6 + sec / 10;
+    var a_s = sec * 6;
+
+    target(hour_shadow); set(text, hand_points(a_h, 1150, 200, 110, 240, 4));
+    target(min_shadow);  set(text, hand_points(a_m, 1720, 240, 85, 280, 5));
+    target(hour_hand);   set(text, hand_points(a_h, 1150, 200, 110, 240, 0));
+    target(min_hand);    set(text, hand_points(a_m, 1720, 240, 85, 280, 0));
+    target(sec_hand);    set(text, hand_points(a_s, 1900, 0, 20, 480, 0));
+
+    target(sec_weight);
+    set(location, px(a_s, -320, 0, 0) - 7, py(a_s, -320, 0, 0) - 7);
+
+    target(digital);
+    set(text, sprintf("%d%d:%d%d:%d%d", hr / 10, hr % 10, min / 10, min % 10, sec / 10, sec % 10));
+
+    target(date_lbl);
+    set(text, sprintf("%s %d %s", day_name(now[4]), now[3], month_name(now[5])));
+
+    target(0);
+    dirty();
+}
+
+fn setup() {
+    layout();
+    now = rtcRead();
+    update();
+    arrFree(now);
+    render();
+    return 0;
+}
+
+fn loop() {
+    now = rtcRead();
+    if (now[0] != last_sec) {
+        last_sec = now[0];
+        update();
+    }
+    arrFree(now);
+    delay(50);
+}

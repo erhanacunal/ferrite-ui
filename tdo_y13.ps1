@@ -92,7 +92,7 @@ if (-not (Test-Path $MkSunxi)) {
 if ($LASTEXITCODE -ne 0) { Write-Error "mksunxi failed." }
 Write-Host "  Bootable image: $ImgBin" -ForegroundColor Green
 
-scp -i $HOME\.ssh\eniac01  $ImgBin developer@192.168.88.6:/home/developer
+# scp -i $HOME\.ssh\eniac01  $ImgBin developer@192.168.88.6:/home/developer
 
 Write-Host ""
 Write-Host "Done." -ForegroundColor Green

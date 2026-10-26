@@ -4,14 +4,14 @@
 
 use ferrite_core::config::{self, ConfigStore};
 use ferrite_core::platform::Platform;
-use ferrite_core::touch::{CalParams, TouchImpl};
+use ferrite_core::touch::{CalParams, TouchBackend, TouchImpl};
 
 use ferrite_core::ctx::Ctx;
 use ferrite_core::protocol::{self, RxEvent};
 use ferrite_core::render;
-use ferrite_core::runtime::{FullInput, PlatformRuntime};
+use ferrite_core::runtime::{ERR_EMPTY_RUN, FullInput, PlatformRuntime};
 use ferrite_core::pool::ObjPool;
-use ferrite_core::types::{COLOR_BLACK, COLOR_WHITE};
+use ferrite_core::types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
 use ferrite_core::vm::Vm;
 
 const SYS_REBOOT: u8 = 0x01;
@@ -23,7 +23,7 @@ impl Platform for TdoY13Platform {
     type FlashB = crate::flash::HwFlash;
     type TouchB = crate::touch::CstTouch;
     type BacklightB = crate::backlight::PwmBl;
-    type RtcB = crate::rtc::StubRtc;
+    type RtcB = crate::rtc::SoftRtc;
     type UsartB = crate::usart::HwUart;
     type SystickB = crate::systick::F1cSystick;
     // F1C100s has a built-in audio codec — enable ferrite-core's `audio`
@@ -129,6 +129,12 @@ impl PlatformRuntime for TdoY13Platform {
         ctx.systick.delay_ms(500);
         ctx.lcd.fill_rect(0, 0, 480, 480, COLOR_BLACK);
         ctx.backlight.set_brightness(100);
+
+        // Recovery mode: hold the screen centre for 3 seconds at boot (the
+        // round panel has no reachable corners).
+        if recovery_touch(&touch.cal, ctx, 200) && recovery_hold(ctx, &touch.cal) {
+            return ERR_EMPTY_RUN;
+        }
         0
     }
 
@@ -183,4 +189,67 @@ impl PlatformRuntime for TdoY13Platform {
             _ => false,
         }
     }
+}
+
+/// Side of the square at the screen centre that starts recovery mode.
+const RECOVERY_BOX: u16 = 120;
+
+/// True if the panel is held inside the centre box for `hold_ms`.
+fn recovery_touch(cal: &CalParams, ctx: &Ctx<TdoY13Platform>, hold_ms: u32) -> bool {
+    let lo = (480 - RECOVERY_BOX) / 2;
+    let hi = lo + RECOVERY_BOX;
+    let touch = crate::touch::new();
+    let start = ctx.systick.millis();
+    while ctx.systick.millis().wrapping_sub(start) < hold_ms {
+        if !touch.is_active() {
+            return false;
+        }
+        match touch.read_screen(cal) {
+            Some((x, y)) if (lo..hi).contains(&x) && (lo..hi).contains(&y) => {}
+            Some(_) => return false,
+            None => {} // between samples
+        }
+        ctx.systick.delay_ms(10);
+    }
+    true
+}
+
+/// Animate the recovery progress bar; return `true` if held the full 3 seconds.
+fn recovery_hold(ctx: &mut Ctx<TdoY13Platform>, cal: &CalParams) -> bool {
+    // A bar under the centre box, inside the round visible area.
+    const BAR_X: u16 = 140;
+    const BAR_Y: u16 = 320;
+    const BAR_W: u16 = 200;
+    const BAR_H: u16 = 6;
+    let hold_ms: u32 = 3000;
+    let start = ctx.systick.millis();
+    let mut entered = false;
+
+    loop {
+        let elapsed = ctx.systick.millis().wrapping_sub(start);
+        if elapsed >= hold_ms {
+            entered = true;
+            break;
+        }
+        let fill = ((elapsed * BAR_W as u32) / hold_ms) as u16;
+        ctx.lcd.fill_rect(BAR_X, BAR_Y, fill, BAR_H, COLOR_RED);
+        crate::lcd::flush_cache();
+        if !recovery_touch(cal, ctx, 50) {
+            break; // released or moved out
+        }
+    }
+
+    ctx.lcd.fill_rect(0, 0, 480, 480, COLOR_BLACK);
+    if entered {
+        let font = ctx.fonts.embedded();
+        let line = |text: &[u8], y: i16, color: u16| {
+            let x = 240 - font.text_width(text) as i16 / 2;
+            font.draw_str(&ctx.lcd, &ctx.flash, text, x, y, color, Some(COLOR_BLACK));
+        };
+        line(b"RECOVERY MODE", 230, COLOR_RED);
+        line(b"Use writefs to flash", 260, 0x4208);
+        line(b"a new program", 282, 0x4208);
+    }
+    crate::lcd::flush_cache();
+    entered
 }

@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "device": "tdo_y13",
+  "screen": [480, 480],
+  "render_mode": "buffered",
+  "include_dirs": ["../../../lib"],
+  "fonts": [
+    {"name": "numerals", "font_id": 1, "file": "fonts/numerals.font"},
+    {"name": "digital", "font_id": 2, "file": "fonts/digital.font"},
+    {"name": "small", "font_id": 3, "file": "fonts/small.font"}
+  ],
+  "programs": [
+    { "name": "main", "source": "main.fl", "exec_mode": "ram" }
+  ]
+}

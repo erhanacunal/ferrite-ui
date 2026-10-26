@@ -44,6 +44,12 @@ HAL: [n32903_rs](https://github.com/erhanacunal/n32903_rs) (git submodule `vendo
 
 HAL: [f1c100s_rs](https://github.com/erhanacunal/f1c100s_rs) (git submodule `vendor/f1c100s_rs`).
 
+The round panel has no reachable corner, so recovery mode on this board is entered by holding the **centre** of the screen at boot. There is no RTC chip: a software clock starts at 2000-01-01 on every boot, set it with `ferrite_cli.py settime`.
+
+| Board | Clock example ([examples/tdo_y13/clock](examples/tdo_y13/clock/)) |
+|-------|---------------|
+| ![TDO Y13 board](docs/images/tdo_y13.png) | ![TDO Y13 clock example](docs/images/tdo_y13_clock_example.png) |
+
 ### E-paper / ESP32-S3 target
 
 | Component | Part | Details |
@@ -292,6 +298,25 @@ The loader waits 3 s for a key after reset; any byte arriving then (e.g. a `ping
 ```powershell
 # Build -> bootable sunxi image (objcopy + mksunxi)
 .\tdo_y13.ps1
+```
+
+Flash the firmware with [xfel](https://xfel.xboot.org) (a copy is in [tools/xfel/](tools/xfel/)) while the F1C100s is in FEL (USB boot) mode:
+
+```powershell
+cd tools\xfel
+.\xfel.exe spinor write 0 E:\repo\ferrite-ui\target\armv5te-none-eabi\release\ferrite-ui.bin
+```
+
+On Windows, xfel needs the WinUSB driver for the FEL device (`VID_1F3A PID_EFE8`) once: run `tools\xfel\Drivers\zadig-2.9.exe`, select the device, choose WinUSB and click *Install/Reinstall Driver*:
+
+![Zadig WinUSB driver](tools/xfel/Drivers/zadig.png)
+
+Resources go over UART like on the other boards:
+
+```powershell
+python tools\ferrite_build.py examples\tdo_y13\clock\project.json -o fs.bin
+python tools\ferrite_cli.py -p COMx writefs fs.bin
+python tools\ferrite_cli.py -p COMx settime      # software clock from the PC clock
 ```
 
 ### ESP32-S3 (e-paper)

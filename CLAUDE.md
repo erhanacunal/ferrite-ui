@@ -298,7 +298,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - Hosts: `ferrite_cli` `request()` resends once after a 0.6 s resync wait (`writefs` restarts from the header). The designer's device dialog retries ping and the writefs header, and so does its build-and-upload action.
 
 ### Recovery Mode
-- **Hold top-left corner for 3 seconds at boot** → recovery mode
+- **Hold top-left corner for 3 seconds at boot** → recovery mode (nextion, n32903, 50×50 px). tdo_y13 (round panel, no reachable corners): hold the centre 120×120 px; the progress bar runs under it (`bsp/tdo_y13/src/platform.rs` `recovery_touch`/`recovery_hold`)
 - Red progress bar fills to indicate progress, release to cancel
 - In recovery mode: program is not loaded, only USART is active
 - New program can be flashed via `writefs`

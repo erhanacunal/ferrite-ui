@@ -1149,6 +1149,9 @@ impl Vm {
         self.in_paint = true;
         self.call_now(offset, &[arr_id as i32], ctx);
         self.in_paint = false;
+        // The id list lives only for the call (it used to leak one array per
+        // painted frame).
+        ctx.objs.arr_free(arr_id);
     }
 
     // === Modal dialog support ===
