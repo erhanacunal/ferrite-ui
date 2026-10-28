@@ -41,11 +41,12 @@ RUST CODE OUTPUT  (arrays for use as an embedded ROM font):
 
 RANGE SPEC  (-r / --ranges)
   Comma-separated codepoints and/or inclusive ranges.
-  Tokens: decimal (32), hex (0x011E), or char literal ('A').
+  Tokens: decimal (32), hex (0x011E), or char literal ('A', also ',' and '-').
   Maximum codepoint: 0xFFFF (Unicode BMP).
   Examples:
     32-127
     32-127,0xC7,0xD6,0x011E-0x011F
+    '0'-'9',':',' '
     32-127,0xC7,0xD6,0xDC,0xE7,0xF6,0xFC,0x011E-0x011F,0x0130-0x0131,0x015E-0x015F
 
 Requires: freetype-py  (pip install freetype-py)
@@ -75,30 +76,59 @@ CP_COLS = 8
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def parse_ranges(spec):
-    """Parse a range spec into a sorted list of unique codepoints (0..0xFFFF)."""
-    def parse_one(tok):
-        tok = tok.strip()
+    """Parse a range spec into a sorted list of unique codepoints (0..0xFFFF).
+
+    Items are separated by commas; an item is a value or ``lo-hi``. A value
+    is decimal, hex (0x..) or a quoted character, which may itself be a comma
+    or a dash: ``'0'-'9',':',','``.
+    """
+    pos = 0
+
+    def skip_ws():
+        nonlocal pos
+        while pos < len(spec) and spec[pos].isspace():
+            pos += 1
+
+    def value():
+        nonlocal pos
+        skip_ws()
+        if pos < len(spec) and spec[pos] == "'":
+            if pos + 2 >= len(spec) or spec[pos + 2] != "'":
+                raise ValueError("bad character literal at %d in %r" % (pos, spec))
+            code = ord(spec[pos + 1])
+            pos += 3
+            return code
+        start = pos
+        while pos < len(spec) and spec[pos].isalnum():
+            pos += 1
+        tok = spec[start:pos]
         if not tok:
-            raise ValueError("empty token")
-        if len(tok) == 3 and tok[0] == "'" and tok[2] == "'":
-            return ord(tok[1])
+            raise ValueError("expected a value at %d in %r" % (start, spec))
         if tok.lower().startswith("0x"):
             return int(tok, 16)
         return int(tok, 10)
 
     result = set()
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
+    while True:
+        skip_ws()
+        if pos >= len(spec):
+            break
+        if spec[pos] == ",":  # empty item
+            pos += 1
             continue
-        if "-" in part and not (part.startswith("'") and part.endswith("'")):
-            a, _, b = part.partition("-")
-            lo, hi = parse_one(a), parse_one(b)
+        lo = hi = value()
+        skip_ws()
+        if pos < len(spec) and spec[pos] == "-":
+            pos += 1
+            hi = value()
             if hi < lo:
                 lo, hi = hi, lo
-            result.update(range(lo, hi + 1))
-        else:
-            result.add(parse_one(part))
+        result.update(range(lo, hi + 1))
+        skip_ws()
+        if pos < len(spec):
+            if spec[pos] != ",":
+                raise ValueError("expected ',' at %d in %r" % (pos, spec))
+            pos += 1
 
     if not result:
         raise ValueError("no codepoints in range spec %r" % spec)

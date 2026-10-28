@@ -2466,7 +2466,7 @@ class AddFontDialog(QDialog):
         # Codepoint ranges
         self._ranges_edit = QLineEdit()
         self._ranges_edit.setPlaceholderText(
-            "e.g. 32-127,0xC7,0xD6,0x011E-0x011F")
+            "e.g. 32-127,0xC7,0x011E-0x011F,'0'-'9',':'")
         self._ranges_edit.setText(self.DEFAULT_RANGES)
         layout.addRow("Codepoint ranges:", self._ranges_edit)
 
