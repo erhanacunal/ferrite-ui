@@ -141,6 +141,8 @@ var s = str("Hello");
 
 Escape sequences: `\\`, `\"`, `\n`, `\t`.
 
+A literal can be up to 255 bytes (UTF-8); a longer one is a compile error. Build longer strings with `concat()`.
+
 ### RGB565 Colors
 
 The display uses 16-bit RGB565 color format. Common colors:

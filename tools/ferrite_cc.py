@@ -849,6 +849,8 @@ class Asm:
             self._emit(Op.FILL_RECT + method_id)
             return
         text = payload.encode('utf-8') if isinstance(payload, str) else bytes(payload)
+        if len(text) > 255:
+            raise ValueError(f"string literal is {len(text)} bytes, max 255 (u8 length)")
         self._emit_u8(len(text))
         self._emit(text)
 

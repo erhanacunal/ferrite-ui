@@ -102,6 +102,25 @@ impl VmCode {
         }
     }
 
+    /// Run `f` on the `len` code bytes at `pos` (caller checks the range):
+    /// borrowed in place from RAM code, gathered into a heap buffer from
+    /// flash code (`read_bytes` returns at most one cache line per call).
+    fn with_bytes<R>(&mut self, pos: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+        if let VmCode::Ram(data) = self {
+            return f(&data[pos..pos + len]);
+        }
+        let mut buf = alloc::vec![0u8; len];
+        let mut got = 0;
+        while got < len {
+            let n = self.read_bytes(pos + got, &mut buf[got..]);
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        f(&buf[..got])
+    }
+
     #[inline]
     pub fn read_bytes(&mut self, pos: usize, buf: &mut [u8]) -> usize {
         match self {
@@ -2044,9 +2063,6 @@ impl Vm {
                 let len = self.read_u8() as usize;
                 let start = self.pc as usize;
                 if start + len <= self.code.len() {
-                    let mut buf = [0u8; 64];
-                    let n = len.min(buf.len());
-                    self.code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as CodeAddr;
                     let (font_id, colors) = self.pop2();
                     let (fg, bg) = unpack_pair(colors);
@@ -2054,15 +2070,9 @@ impl Vm {
                     let (x, y) = unpack_pair(self.pop());
                     if let Some(font) = ctx.fonts.resolve(font_id) {
                         let bg_opt = if bg == 0 { None } else { Some(bg) };
-                        font.draw_str(
-                            &ctx.lcd,
-                            &ctx.flash,
-                            &buf[..n],
-                            x as i16,
-                            y as i16,
-                            fg,
-                            bg_opt,
-                        );
+                        self.code.with_bytes(start, len, |text| {
+                            font.draw_str(&ctx.lcd, &ctx.flash, text, x as i16, y as i16, fg, bg_opt);
+                        });
                     }
                 } else {
                     self.fail(fault::CODE_OOB);
@@ -2079,11 +2089,8 @@ impl Vm {
                 let len = self.read_u8() as usize;
                 let start = self.pc as usize;
                 if start + len <= self.code.len() {
-                    let mut buf = [0u8; 64];
-                    let n = len.min(buf.len());
-                    self.code.read_bytes(start, &mut buf[..n]);
                     self.pc = (start + len) as CodeAddr;
-                    match ctx.objs.str_intern(&buf[..n]) {
+                    match self.code.with_bytes(start, len, |text| ctx.objs.str_intern(text)) {
                         Some(id) => self.push(id as i32),
                         None => self.fail(fault::STR_ALLOC),
                     }
@@ -4302,6 +4309,47 @@ mod anim_tests {
         fn read_id(&self) -> (u8, u8, u8) {
             (0, 0, 0)
         }
+    }
+
+    /// `OP_STR_LIT` with a `len`-byte literal, then HALT.
+    fn long_literal(len: usize) -> (Vec<u8>, Vec<u8>) {
+        let text: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut code = alloc::vec![OP_STR_LIT, len as u8];
+        code.extend_from_slice(&text);
+        code.push(OP_HALT);
+        (code, text)
+    }
+
+    #[test]
+    fn str_lit_keeps_literals_longer_than_64_bytes() {
+        // Used to be cut to 64 bytes (a 128-byte URL lost its query string).
+        let (code, text) = long_literal(255);
+        let mut ctx = mock_ctx();
+        let mut vm = Vm::new();
+        vm.code = VmCode::Ram(code);
+        vm.run(&mut ctx);
+        assert!(vm.state == VmState::Halted);
+        let id = vm.stack[vm.sp as usize - 1] as u16;
+        assert_eq!(ctx.objs.str_get(id), &text[..]);
+    }
+
+    #[test]
+    fn str_lit_from_flash_spans_cache_refills() {
+        // Literal straddles the end of the first flash cache line.
+        let (lit, text) = long_literal(200);
+        let at = (FLASH_CACHE_SIZE - 100) as u16;
+        let mut code = alloc::vec![0xEE; at as usize];
+        code[..3].copy_from_slice(&[OP_JMP, at as u8, (at >> 8) as u8]);
+        code.extend_from_slice(&lit);
+        let img = image(0, &code);
+        let len = img.len();
+        let mut vm = Vm::new();
+        assert!(vm.load_flash(FlashImpl::with_backend(RomFlash(img)), 0, len));
+        let mut ctx = mock_ctx();
+        vm.run(&mut ctx);
+        assert!(vm.state == VmState::Halted);
+        let id = vm.stack[vm.sp as usize - 1] as u16;
+        assert_eq!(ctx.objs.str_get(id), &text[..]);
     }
 
     #[test]
