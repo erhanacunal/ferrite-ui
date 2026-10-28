@@ -102,12 +102,12 @@ pub struct EpaperPlatform;
 impl Platform for EpaperPlatform {
     type LcdB = crate::lcd::epaper::EpdLcd;
     type FlashB = crate::flash::epaper::EspFlash;
-    type TouchB = crate::touch::epaper::EpdButtons;
+    type TouchB = ferrite_core::touch::NoTouch;
     type BacklightB = crate::backlight::epaper::EpdBacklight;
     type RtcB = crate::rtc::epaper::EpdRtc;
     type UsartB = crate::usart::epaper::EspUart;
     type SystickB = crate::systick::EpdSystick;
-    type GpioB = ferrite_core::gpio::NoGpio;
+    type GpioB = crate::user_gpio::EpdGpio;
     type EepromB = ferrite_core::eeprom::NoEeprom;
     // E-paper is white when idle; anti-aliased text on transparent labels
     // blends against this instead of the raster-board default (black).

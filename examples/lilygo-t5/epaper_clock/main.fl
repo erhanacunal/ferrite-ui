@@ -2,7 +2,7 @@
 //
 // EPD refresh is slow (~5 seconds for 15 waveform frames), so updates are
 // throttled to once per minute.  A full flush is triggered on minute change
-// or when the user presses the refresh button.
+// or when BUTTON_1 (user GPIO pin 0) is pressed.
 //
 // Colors (RGB565 → 4-bit gray, EPD renders grayscale):
 //   0x0000 = black  (gray4 = 0)
@@ -12,6 +12,9 @@
 
 #include "core.fl"
 #include "color.fl"
+#include "gpio.fl"
+
+const BUTTON = 0;     // BUTTON_1, reads 0 while pressed
 
 // ---- Globals ----
 var w_time;      // large HH:MM label
@@ -19,7 +22,7 @@ var w_sec;       // :SS suffix label
 var w_date;      // date label
 
 var last_min = -1;    // previous minute — triggers EPD flush on change
-var needs_flush = 1;  // set by refresh button to force flush
+var needs_flush = 1;  // set by BUTTON_1 to force flush
 
 // Scratch (freed each frame)
 var time_arr;
@@ -32,7 +35,7 @@ var yy;
 
 // ---- Helpers ----
 
-fn pad2(n) {
+fn pad2(n) -> string {
     if (n < 10) {
         return concat(str("0"), itos(n));
     }
@@ -48,12 +51,6 @@ fn read_rtc() {
     mo = time_arr[5];
     yy = time_arr[6];
     arrFree(time_arr);
-}
-
-// ---- Refresh button callback ----
-
-fn on_refresh(wid) {
-    needs_flush = 1;
 }
 
 // ---- Setup ----
@@ -125,32 +122,12 @@ fn setup() {
     // Status text (bottom-left)
     var wst = alloc(); target(wst);
     set(kind, KIND_LABEL);
-    set(location, 20, 7); set(size, 600, 40);
+    set(location, 20, 7); set(size, 920, 40);
     set(bg_color, WHITE);
     set(text_color, BLACK);
     set(text_align, ALIGN_LEFT);
-    set(text, "EPD refreshes once per minute");
+    set(text, "EPD refreshes once per minute - BUTTON_1 refreshes now");
     parent(ftr);
-
-    // Refresh button (bottom-right)
-    var btn = alloc(); target(btn);
-    set(location, 770, 5); set(size, 160, 44);
-    set(bg_color, BLACK);
-    set(press_color, WHITE);
-    set(border, 2, 2, 2, 2);
-    set(border_color, WHITE);
-    set(border_radius, 6);
-    set(clickable, ON);
-    set(on_click, @on_refresh);
-    parent(ftr);
-
-    var btnl = alloc(); target(btnl);
-    set(kind, KIND_LABEL);
-    set(size, 160, 44);
-    set(text_color, 0xFFFF);
-    set(text_align, ALIGN_CENTER);
-    set(text, "Refresh");
-    parent(btn);
 
     return 0;
 }
@@ -190,6 +167,12 @@ fn loop() {
         render();
     }
 
-    // Poll every 10 seconds — EPD flush itself takes ~5 seconds
-    delay(10000);
+    // Read the clock every 10 seconds (EPD flush itself takes ~5 seconds),
+    // checking the button in between.
+    for (var i = 0; i < 50 && !needs_flush; i++) {
+        if (pinRead(BUTTON) == 0) {
+            needs_flush = 1;
+        }
+        delay(200);
+    }
 }

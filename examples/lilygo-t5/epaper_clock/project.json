@@ -3,7 +3,7 @@
   "screen": [960, 540],
   "fonts": [],
   "images": [],
-  "include_dirs": ["../../lib"],
+  "include_dirs": ["../../../lib"],
   "render_mode": "epaper",
   "programs": [
     {

@@ -40,6 +40,7 @@ mod sdcard;
 mod systick;
 mod touch;
 mod usart;
+mod user_gpio;
 
 // --- Device-only modules (binary-local) ---
 mod battery;
@@ -113,6 +114,7 @@ fn init_gpio(peripherals: Peripherals) -> EpaperPins {
         _sd_mosi: Output::new(peripherals.GPIO15, Level::Low, output),
         _sd_miso: Input::new(peripherals.GPIO16, input_pu),
         _sd_cs: Output::new(peripherals.GPIO42, Level::High, output),
+        // User GPIO pin 0 (user_gpio.rs); pull-up on until pinMode.
         _button_1: Input::new(peripherals.GPIO21, input_pu),
     }
 }
@@ -148,7 +150,7 @@ fn main() -> ! {
         rtc: rtc::init(),
         usart: usart::init(),
         systick: systick::Systick::handle(),
-        gpio: ferrite_core::gpio::GpioImpl::none(),
+        gpio: ferrite_core::gpio::GpioImpl::with_backend(user_gpio::EpdGpio),
         eeprom: ferrite_core::eeprom::EepromImpl::none(),
         cursor_visible: false,
     });

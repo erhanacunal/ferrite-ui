@@ -70,6 +70,19 @@ pub trait TouchBackend {
     }
 }
 
+/// Backend for boards without a touch screen: never pressed.
+pub struct NoTouch;
+
+impl TouchBackend for NoTouch {
+    fn is_active(&self) -> bool {
+        false
+    }
+
+    fn read_screen(&self, _cal: &CalParams) -> Option<(u16, u16)> {
+        None
+    }
+}
+
 // === Touch state machine ===
 
 pub const RELEASE_DEBOUNCE: u8 = 5;

@@ -229,7 +229,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 
 ### User GPIO Header
 - **Backend:** `gpio::GpioBackend` (`PIN_COUNT`, `set_mode`, `write`, `read`) → `Platform::GpioB` → `ctx.gpio` (`GpioImpl`, range-checks pin/mode). Boards without a header use `NoGpio` (0 pins).
-- **Pins 0..7, same numbers on every board:** GD32 Nextion PC2–PC9 (`bsp/nextion/src/user_gpio.rs`), N32903 GPD3, GPD2, GPB2–GPB6, GPA0 (`bsp/n32903/src/gpio`). Sim: 8 virtual pins that log to stdout. epaper / tdo_y13: `NoGpio`.
+- **Pins 0..7, same numbers on every board:** GD32 Nextion PC2–PC9 (`bsp/nextion/src/user_gpio.rs`), N32903 GPD3, GPD2, GPB2–GPB6, GPA0 (`bsp/n32903/src/gpio`). Sim: 8 virtual pins that log to stdout. epaper: 1 input-only pin, 0 = BUTTON_1 (GPIO21, `bsp/epaper/src/user_gpio.rs`; pull-up on from boot, `pinMode` switches the IO_MUX pulls, output → fault 14); it has no touch backend (`touch::NoTouch`). tdo_y13: `NoGpio`.
 - **VM builtins:** `pinMode(pin, mode)` (`OP_PIN_MODE` 0xB0), `pinWrite(pin, value)` (0xB1, non-zero = high), `pinRead(pin)` (0xB2 → 0/1). Modes: 0 input, 1 output push-pull, 2 input pull-up, 3 input pull-down (GD32 only). `lib/gpio.fl` has the `GPIO_*` constants and pin table.
 - Pins keep their power-on state until `pinMode`. Writing a non-output pin is ignored (on GD32 the ODR would flip an input's pull). Unknown pin / unsupported mode → VM fault 14 (`GPIO`). No pin-change callback: poll from `loop()`.
 

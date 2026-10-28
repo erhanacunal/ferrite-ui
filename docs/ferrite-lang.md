@@ -889,7 +889,9 @@ var current = brightness(); // read current level
 
 Drive the board's user GPIO header. Pins are numbered `0..7` on every board
 that has one (GD32 Nextion: PC2–PC9; N32903: GPD3, GPD2, GPB2–GPB6, GPA0 —
-see `lib/gpio.fl`), so the same program runs on both.
+see `lib/gpio.fl`), so the same program runs on both. The LilyGo T5 has a
+single input-only pin: pin 0 = BUTTON_1 (GPIO21, reads 0 while pressed; its
+pull-up is on from boot, and `GPIO_OUTPUT` faults).
 
 ```c
 #include "gpio.fl"
@@ -901,7 +903,7 @@ if (pinRead(1) == 0) { /* button pressed (pulls to ground) */ }
 ```
 
 Modes: `GPIO_INPUT` (floating), `GPIO_OUTPUT` (push-pull),
-`GPIO_INPUT_PULLUP`, `GPIO_INPUT_PULLDOWN` (GD32 only). Pins stay floating
+`GPIO_INPUT_PULLUP`, `GPIO_INPUT_PULLDOWN` (GD32 and T5). Pins stay floating
 inputs until `pinMode` is called; `pinWrite` on a pin that isn't an output does
 nothing. A pin number the board doesn't have or an unsupported mode stops the
 program with VM fault 14 (`invalid gpio pin/mode`). There is no pin-change

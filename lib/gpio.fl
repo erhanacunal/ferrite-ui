@@ -17,6 +17,9 @@
 //   6     PC8            GPB6
 //   7     PC9            GPA0
 //
+// LilyGo T5-ePaper-S3: pin 0 only = BUTTON_1 (GPIO21), input-only, pull-up on
+// from boot, reads 0 while pressed.
+//
 // Pins stay floating inputs until pinMode is called. A pin number the board
 // doesn't have, or a mode it can't do (N32903 has no pull-downs), stops the
 // program with VM fault 14.
@@ -24,7 +27,7 @@
 const GPIO_INPUT          = 0;
 const GPIO_OUTPUT         = 1;
 const GPIO_INPUT_PULLUP   = 2;
-const GPIO_INPUT_PULLDOWN = 3; // GD32 only
+const GPIO_INPUT_PULLDOWN = 3; // GD32 and T5
 
 const GPIO_LOW  = 0;
 const GPIO_HIGH = 1;

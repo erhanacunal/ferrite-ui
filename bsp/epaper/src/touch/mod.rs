@@ -1,12 +1,10 @@
 // BSP Touch module (epaper) — re-exports framework traits + free-fn ctor.
-// Hit testing lives in the framework (`ferrite_core::touch::hit_test`).
+// The T5 has no touch screen; BUTTON_1 is user GPIO pin 0 (`user_gpio.rs`).
 
 pub use ferrite_core::touch::*;
 
-pub mod epaper;
-
-pub type Touch = TouchImpl<epaper::EpdButtons>;
+pub type Touch = TouchImpl<NoTouch>;
 
 pub fn init() -> Touch {
-    Touch::with_backend(epaper::EpdButtons::new())
+    Touch::with_backend(NoTouch)
 }
