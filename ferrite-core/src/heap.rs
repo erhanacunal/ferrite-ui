@@ -89,8 +89,9 @@ pub unsafe fn init(start: *mut u8, len: usize) {
 /// Arena size in bytes (0 before `init`, or when another allocator is the
 /// global one).
 pub fn size() -> usize {
+    // esp-alloc: every region (internal SRAM + PSRAM).
     #[cfg(feature = "epaper")]
-    return 0;
+    return esp_alloc::HEAP.stats().size;
 
     #[cfg_attr(feature = "epaper", allow(unreachable_code))]
     unsafe {
@@ -98,7 +99,8 @@ pub fn size() -> usize {
     }
 }
 
-/// Return (total_free_bytes, largest_free_block) for diagnostics.
+/// Return (total_free_bytes, largest_free_block) for diagnostics. esp-alloc
+/// (epaper) does not track its largest block: 0 = unknown.
 pub fn stats() -> (usize, usize) {
     #[cfg(feature = "epaper")]
     return (esp_alloc::HEAP.free(), 0);

@@ -200,7 +200,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Errors:** malformed entry → Code 8 (invalid system config); a pool the heap can't hold → Code 7 (insufficient memory).
 
 ### Memory Report (MemDetail)
-- `ferrite_cli.py -p COMx memdetail` → per-pool table: heap (used/total, largest free block), CPU stack (+ peak), object arena (used/size, reclaimable garbage), object pointers (live/max, heap bytes of arena + table + DFS cache), UART RX ring (waiting/size), widgets / strings / arrays (live/max objects, bytes in the arena), eval/call stack, callback queue, animations (each with the heap bytes it holds).
+- `ferrite_cli.py -p COMx memdetail` → per-pool table: heap (used/total, largest free block), CPU stack (+ peak), object arena (used/size, reclaimable garbage), object pointers (live/max, heap bytes of arena + table + DFS cache), UART RX ring (waiting/size), widgets / strings / arrays (live/max objects, bytes in the arena), eval/call stack, callback queue, animations (each with the heap bytes it holds). epaper's heap row is esp-alloc over all regions (internal + PSRAM), with no largest-block figure.
 - Protocol: host field 11 varint (`0x58`) → device field 6 payload (`0x32`): version u8 (=1) + count u8 + count × [id u8, used u32, capacity u32, extra u32] LE. Pool ids `protocol::mem_pool` = `MEM_POOLS` in `ferrite_cli.py` (keep in sync). capacity 0 = board doesn't report that pool (CLI prints n/a).
 - Gathered in `runtime::mem_detail` from `heap_stats`/`heap_total`/`stack_info` (PlatformRuntime), `UsartBackend::rx_stats` (nextion only), `ObjPool::used_bytes/garbage_bytes/live_objects/bytes_of/heap_bytes`, `Vm::mem_stats`. VM stack depths are the current values (≈0 between iterations), not high-water marks. `meminfo` is unchanged.
 
@@ -279,6 +279,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Memory/flash:** internal heap is now 64 KB `#[ram(reclaimed)]` + 96 KB, because Wi-Fi buffers must be internal. The app grew 200 KB → 1.07 MB, so `partition.csv` has `factory` = 2 MB and the `ferrite` FS partition moved **0x110000 → 0x210000** (`flash/epaper.rs`, `epaper.ps1`). Existing boards need the FS image reflashed at the new offset.
 - `der` is a direct dependency only to enable its `heapless` feature (embedded-tls 0.18 needs `SequenceOf`/`SetOf`, gated since der 0.8.3).
 - **DNS:** `task::resolve` asks the DHCP-offered server (5 s cap), then 1.1.1.1 and 8.8.8.8 with its own UDP A-record query (`dns_query_udp`). Used by NTP and, through the `Resolver` `embedded_nal_async::Dns` impl, by reqwless. `SYS_WIFI_DNS_STR` (0x16) shows the DHCP server.
+- **Serial tools:** the T5 talks over the S3's USB-Serial-JTAG, which resets the chip on esptool-style DTR/RTS changes. `ferrite_cli.open_port` (also used by the designer) keeps both deasserted; pyserial's default open/close rebooted the board.
 - ADC2 (battery) is shared with Wi-Fi: `SYS_BATTERY_VOLTAGE` may return -1 while the radio is on.
 
 ### Touch Gestures

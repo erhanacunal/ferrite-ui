@@ -3648,6 +3648,7 @@ class DeviceChoiceDialog(QDialog):
 try:
     import serial
     import serial.tools.list_ports
+    from ferrite_cli import open_port
     HAS_SERIAL = True
 except ImportError:
     HAS_SERIAL = False
@@ -3772,9 +3773,7 @@ class DeviceDialog(QDialog):
             self._set_status(False)
             return
         try:
-            ser = serial.Serial(port=port, baudrate=115200,
-                                bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                                stopbits=serial.STOPBITS_ONE, timeout=1.0)
+            ser = open_port(port, 1.0)
             self._send_varint_msg(ser, 0x08)
             resp, val = self._read_response(ser)
             ser.close()
@@ -3819,9 +3818,7 @@ class DeviceDialog(QDialog):
             self._log("ERROR: pyserial not installed: pip install pyserial")
             return None
         try:
-            ser = serial.Serial(port=port, baudrate=115200,
-                                bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                                stopbits=serial.STOPBITS_ONE, timeout=timeout)
+            ser = open_port(port, timeout)
             return ser
         except Exception as e:
             self._log(f"ERROR: {e}")
@@ -4702,9 +4699,7 @@ class DesignerWindow(QMainWindow):
             try:
                 import struct as st
                 CHUNK_SIZE = 4096
-                ser = serial.Serial(port=port, baudrate=115200,
-                                    bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                                    stopbits=serial.STOPBITS_ONE, timeout=10.0)
+                ser = open_port(port, 10.0)
                 # Send writefs header
                 header = st.pack("<II", len(data), CHUNK_SIZE)
                 msg = bytearray([0x22])

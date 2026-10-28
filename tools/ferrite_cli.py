@@ -143,15 +143,24 @@ def build_payload_msg(tag: int, payload: bytes) -> bytes:
 
 
 def open_port(port: str, timeout: float = DEFAULT_TIMEOUT) -> serial.Serial:
-    """Open serial port with ferrite-ui settings (115200 8N1)."""
-    return serial.Serial(
-        port=port,
-        baudrate=BAUD_RATE,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_ONE,
-        timeout=timeout,
-    )
+    """Open serial port with ferrite-ui settings (115200 8N1).
+
+    DTR and RTS stay deasserted. pyserial raises both on open by default,
+    and the ESP32-S3 USB-Serial-JTAG (epaper) reads those lines as the
+    esptool reset/boot wiring: opening or closing the port then reset the
+    chip. Boards on a plain UART ignore the lines.
+    """
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = BAUD_RATE
+    ser.bytesize = serial.EIGHTBITS
+    ser.parity = serial.PARITY_NONE
+    ser.stopbits = serial.STOPBITS_ONE
+    ser.timeout = timeout
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    return ser
 
 
 def read_response(ser: serial.Serial) -> tuple[str, int | None]:
@@ -378,7 +387,9 @@ def format_memdetail(entries) -> list[str]:
         elif extra_kind in ("reclaimable", "in arena"):
             extra_txt = f"{_fmt_amount(extra, 'B')} {extra_kind}"
         elif extra_kind == "largest free":
-            extra_txt = f"largest free block {_fmt_amount(extra, 'B')}"
+            # 0 = not tracked (esp-alloc on epaper); a full heap still
+            # shows up as 100% use.
+            extra_txt = f"largest free block {_fmt_amount(extra, 'B')}" if extra else ""
         elif extra_kind == "peak":
             extra_txt = f"peak {_fmt_amount(extra, 'B')}" if extra else ""
         else:
