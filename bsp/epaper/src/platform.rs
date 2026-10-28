@@ -20,7 +20,7 @@ use esp_hal::rtc_cntl::Rtc;
 use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
 use core::time::Duration;
 
-use crate::{battery, lcd, systick};
+use crate::{battery, lcd, net, systick};
 
 // === Ferrite syscall ids (see docs/ferrite-lang.md) ===
 
@@ -32,6 +32,31 @@ const SYS_EPD_POWER_OFF: u8 = 0x03; // () → 0
 const SYS_EPD_POWER_ON: u8 = 0x04; // () → 0
 const SYS_BATTERY_VOLTAGE: u8 = 0x05; // () → battery millivolts (e.g. 3750)
 const SYS_DEEP_SLEEP: u8 = 0x06; // (duration_ms) → does not return; -1 if duration <= 0
+
+// --- Wi-Fi station (0x10–0x1F), see net/mod.rs ---
+const SYS_WIFI_CONNECT: u8 = 0x10; // (ssid, pass) → 0, or -2 bad argument
+const SYS_WIFI_DISCONNECT: u8 = 0x11; // () → 0; radio off
+const SYS_WIFI_STATUS: u8 = 0x12; // () → 0 off, 1 connecting, 2 connected, 3 failed (retrying)
+const SYS_WIFI_RSSI: u8 = 0x13; // () → dBm, 0 if not connected
+const SYS_WIFI_IP: u8 = 0x14; // () → IPv4 big-endian, 0 if not connected
+const SYS_WIFI_IP_STR: u8 = 0x15; // () → string "a.b.c.d"
+const SYS_WIFI_DNS_STR: u8 = 0x16; // () → string, DNS server from DHCP
+
+// --- Network requests (0x30–0x3F) ---
+const SYS_HTTP_GET: u8 = 0x30; // (url) → 0 started, < 0 error
+const SYS_HTTP_STATUS: u8 = 0x31; // () → 0 idle, 1 running, 2 done, < 0 error
+const SYS_HTTP_CODE: u8 = 0x32; // () → HTTP status code
+const SYS_HTTP_LEN: u8 = 0x33; // () → body length
+const SYS_HTTP_BODY: u8 = 0x34; // (start, len) → string
+const SYS_HTTP_BYTE: u8 = 0x35; // (index) → byte, -1 past the end
+const SYS_HTTP_FIND: u8 = 0x36; // (needle, from) → index or -1
+const SYS_HTTP_JSON: u8 = 0x37; // (path) → string ("" if missing)
+const SYS_HTTP_JSON_NUM: u8 = 0x38; // (path, scale) → number × scale, i32::MIN if missing
+const SYS_HTTP_FREE: u8 = 0x39; // () → 0
+const SYS_HTTPS_CA: u8 = 0x3A; // (file name) → 0 / -2; "" = no verification
+const SYS_NTP_SYNC: u8 = 0x3B; // (server, tz_minutes) → 0 started, < 0 error
+const SYS_NTP_STATUS: u8 = 0x3C; // () → 0 idle, 1 running, 2 done, < 0 error
+const SYS_NTP_TIME: u8 = 0x3D; // () → UTC Unix seconds, 0 if never synced
 
 /// RTC controller handle, needed to enter deep sleep. Set once by `init_sleep`.
 static RTC_CNTL: Mutex<RefCell<Option<Rtc<'static>>>> = Mutex::new(RefCell::new(None));
@@ -101,8 +126,8 @@ impl PlatformRuntime for EpaperPlatform {
         unsafe { esp_restart() }
     }
 
-    fn syscall(id: u8, args: &[i32], _strpool: &ObjPool) -> Option<i32> {
-        let _ = args;
+    fn syscall(id: u8, args: &[i32], strpool: &mut ObjPool) -> Option<i32> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(0);
         match id {
             SYS_UPTIME => Some(systick::millis() as i32),
             SYS_REBOOT => unsafe { esp_restart() },
@@ -119,7 +144,30 @@ impl PlatformRuntime for EpaperPlatform {
                 Some(0)
             }
             SYS_BATTERY_VOLTAGE => battery::read_mv().or(Some(-1)),
-            SYS_DEEP_SLEEP => deep_sleep(args.first().copied().unwrap_or(0)),
+            SYS_DEEP_SLEEP => deep_sleep(arg(0)),
+
+            SYS_WIFI_CONNECT => Some(net::wifi_connect(strpool, arg(0), arg(1))),
+            SYS_WIFI_DISCONNECT => Some(net::wifi_disconnect()),
+            SYS_WIFI_STATUS => Some(net::wifi_status()),
+            SYS_WIFI_RSSI => Some(net::wifi_rssi()),
+            SYS_WIFI_IP => Some(net::wifi_ip()),
+            SYS_WIFI_IP_STR => net::wifi_ip_str(strpool),
+            SYS_WIFI_DNS_STR => net::wifi_dns_str(strpool),
+
+            SYS_HTTP_GET => Some(net::http_get(strpool, arg(0))),
+            SYS_HTTP_STATUS => Some(net::http_status()),
+            SYS_HTTP_CODE => Some(net::http_code()),
+            SYS_HTTP_LEN => Some(net::http_len()),
+            SYS_HTTP_BODY => net::http_body(strpool, arg(0), arg(1)),
+            SYS_HTTP_BYTE => Some(net::http_byte(arg(0))),
+            SYS_HTTP_FIND => Some(net::http_find(strpool, arg(0), arg(1))),
+            SYS_HTTP_JSON => net::http_json(strpool, arg(0)),
+            SYS_HTTP_JSON_NUM => Some(net::http_json_num(strpool, arg(0), arg(1))),
+            SYS_HTTP_FREE => Some(net::http_free()),
+            SYS_HTTPS_CA => Some(net::https_ca(strpool, arg(0))),
+            SYS_NTP_SYNC => Some(net::ntp_sync(strpool, arg(0), arg(1))),
+            SYS_NTP_STATUS => Some(net::ntp_status()),
+            SYS_NTP_TIME => Some(net::ntp_time(systick::millis() as u32)),
             _ => None, // unknown id → VM Error
         }
     }
@@ -146,6 +194,14 @@ impl PlatformRuntime for EpaperPlatform {
         if vm.render_mode != RenderMode::EPaper {
             render::render_all(ctx);
             ctx.lcd.flush_dirty();
+        }
+    }
+
+    fn frame_end(ctx: &mut Ctx<Self>) {
+        // A finished SNTP sync (core 1) is written to the RTC here, on the
+        // core that owns the I2C bus.
+        if let Some(dt) = net::take_rtc_update(systick::millis() as u32) {
+            ctx.rtc.set_time(&dt);
         }
     }
 }

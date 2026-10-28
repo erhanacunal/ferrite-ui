@@ -14,7 +14,7 @@
 
 .PARAMETER FlashFs
     After a successful firmware flash, also write .\ferrite_fs.bin to the ferrite
-    partition at 0x110000 (built with tools/ferrite_build.py). Ignored for `build`.
+    partition at 0x210000 (built with tools/ferrite_build.py). Ignored for `build`.
 
 .EXAMPLE
     .\epaper.ps1
@@ -102,9 +102,9 @@ if ($Action -iin @('flash')) {
             Write-Error "-FlashFs was set but ferrite_fs.bin not found. Build one with: python tools/ferrite_build.py <project.json> -o ferrite_fs.bin"
         }
         Write-Host ""
-        Write-Host "[3/3] Writing ferrite_fs.bin to flash 0x110000 (ferrite partition)" -ForegroundColor Cyan
+        Write-Host "[3/3] Writing ferrite_fs.bin to flash 0x210000 (ferrite partition)" -ForegroundColor Cyan
         $wbPort = if ($Port) { @('-p', $Port) } else { @() }
-        espflash write-bin --chip esp32s3 @wbPort "0x110000" $FsBin
+        espflash write-bin --chip esp32s3 @wbPort "0x210000" $FsBin
         if ($LASTEXITCODE -ne 0) {
             Write-Error "write-bin ferrite_fs.bin failed."
         }
@@ -121,9 +121,9 @@ elseif ($Action -iin @('flashfs')) {
         Write-Error "-FlashFs was set but ferrite_fs.bin not found. Build one with: python tools/ferrite_build.py <project.json> -o ferrite_fs.bin"
     }
     Write-Host ""
-    Write-Host "[3/3] Writing ferrite_fs.bin to flash 0x110000 (ferrite partition)" -ForegroundColor Cyan
+    Write-Host "[3/3] Writing ferrite_fs.bin to flash 0x210000 (ferrite partition)" -ForegroundColor Cyan
     $wbPort = if ($Port) { @('-p', $Port) } else { @() }
-    espflash write-bin --chip esp32s3 @wbPort "0x110000" $FsBin
+    espflash write-bin --chip esp32s3 @wbPort "0x210000" $FsBin
     if ($LASTEXITCODE -ne 0) {
         Write-Error "write-bin ferrite_fs.bin failed."
     }

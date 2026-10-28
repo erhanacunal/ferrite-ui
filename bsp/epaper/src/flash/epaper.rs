@@ -3,7 +3,7 @@
 //! The Ferrite filesystem keeps its historical logical address layout with
 //! `FS_BASE = 0x1000`.  This backend maps that logical range into the ESP-IDF
 //! partition named `ferrite`, whose physical offset is defined in
-//! `partition.csv` (`0x110000`). The first byte inside the partition that
+//! `partition.csv` (`0x210000`). The first byte inside the partition that
 //! responds to logical address `FS_BASE` (TOC header `"FERR"`) must align with
 //! how the FS image was flashed:
 //!
@@ -22,7 +22,7 @@ use core::slice;
 use super::FlashBackend;
 
 const LOGICAL_FS_BASE: u32 = 0x1000;
-const FERRITE_PARTITION_BASE: u32 = 0x0011_0000;
+const FERRITE_PARTITION_BASE: u32 = 0x0021_0000;
 const FERRITE_PARTITION_SIZE: u32 = 4 * 1024 * 1024;
 const SECTOR_SIZE: u32 = 4096;
 const WORD_SIZE: usize = 4;

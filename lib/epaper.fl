@@ -16,18 +16,63 @@ const SYS_EPD_POWER_ON      = 0x04; // () → 0
 const SYS_BATTERY_VOLTAGE   = 0x05; // () → battery voltage in millivolts (e.g. 3750 = 3.75 V), or -1 on error
 const SYS_DEEP_SLEEP        = 0x06; // (duration_ms: int) → does not return (chip resets on wake-up); -1 if duration_ms <= 0
 
-// --- WiFi (0x10–0x1F) ---
-const SYS_WIFI_CONNECT    = 0x10; // (ssid: str_id, pass: str_id) → 0=ok, -1=error
-const SYS_WIFI_DISCONNECT = 0x11; // () → 0
-const SYS_WIFI_STATUS     = 0x12; // () → 0=idle, 1=connecting, 2=connected, 3=failed
+// --- WiFi station (0x10–0x1F) ---
+// Credentials come from the program (e.g. a user file); nothing is stored in
+// the firmware. All calls return at once: poll SYS_WIFI_STATUS.
+const SYS_WIFI_CONNECT    = 0x10; // (ssid: str_id, pass: str_id) → 0 = radio on + connecting, -2 = bad ssid/pass
+const SYS_WIFI_DISCONNECT = 0x11; // () → 0; leaves the network and powers the radio down
+const SYS_WIFI_STATUS     = 0x12; // () → WIFI_OFF / WIFI_CONNECTING / WIFI_CONNECTED / WIFI_FAILED
 const SYS_WIFI_RSSI       = 0x13; // () → RSSI in dBm (negative i32), or 0 if not connected
 const SYS_WIFI_IP         = 0x14; // () → IPv4 as u32 big-endian (0 if not connected)
+const SYS_WIFI_IP_STR     = 0x15; // () → string "a.b.c.d" (use syscallStr)
+const SYS_WIFI_DNS_STR    = 0x16; // () → string, DNS server from DHCP ("0.0.0.0" = none)
+
+const WIFI_OFF        = 0;
+const WIFI_CONNECTING = 1; // associating or waiting for DHCP
+const WIFI_CONNECTED  = 2; // has an IP address
+const WIFI_FAILED     = 3; // last attempt failed; retried every 5 s until wifiDisconnect()
 
 // --- Bluetooth (0x20–0x2F) ---
 const SYS_BT_START        = 0x20; // (name: str_id) → 0=ok, -1=error
 const SYS_BT_STOP         = 0x21; // () → 0
 const SYS_BT_STATUS       = 0x22; // () → 0=off, 1=advertising, 2=connected
 const SYS_BT_SEND         = 0x23; // (data: str_id) → bytes_sent, or -1 on error
+
+
+// --- Network requests (0x30–0x3F) ---
+// One HTTP request and one NTP sync can be in flight at a time. Start one,
+// then poll its status from loop() until it is NET_DONE or an error (< 0).
+const SYS_HTTP_GET      = 0x30; // (url: str_id) → 0 started, or NET_ERR_*
+const SYS_HTTP_STATUS   = 0x31; // () → NET_IDLE / NET_RUNNING / NET_DONE, or NET_ERR_*
+const SYS_HTTP_CODE     = 0x32; // () → HTTP status code (200 …), 0 before a response
+const SYS_HTTP_LEN      = 0x33; // () → body length in bytes
+const SYS_HTTP_BODY     = 0x34; // (start, len) → string with that part of the body (syscallStr)
+const SYS_HTTP_BYTE     = 0x35; // (index) → body byte, -1 past the end
+const SYS_HTTP_FIND     = 0x36; // (needle: str_id, from) → byte index in the body, or -1
+const SYS_HTTP_JSON     = 0x37; // (path: str_id) → string value at "a.b.0" in a JSON body, "" if missing (syscallStr)
+const SYS_HTTP_JSON_NUM = 0x38; // (path: str_id, scale) → number × scale (12.34, 10 → 123); NET_NO_NUMBER if missing
+const SYS_HTTP_FREE     = 0x39; // () → 0; drops the body (up to 64 KB of PSRAM)
+const SYS_HTTPS_CA      = 0x3A; // (file: str_id) → 0, or -2 if the user file is missing; "" = no verification
+const SYS_NTP_SYNC      = 0x3B; // (server: str_id, tz_minutes) → 0 started, or NET_ERR_*; sets the RTC on success
+const SYS_NTP_STATUS    = 0x3C; // () → NET_IDLE / NET_RUNNING / NET_DONE, or NET_ERR_*
+const SYS_NTP_TIME      = 0x3D; // () → UTC Unix seconds now, 0 if never synced
+
+const NET_IDLE    = 0;
+const NET_RUNNING = 1;
+const NET_DONE    = 2;
+
+const NET_ERR_BUSY      = -1;  // another request is still running
+const NET_ERR_ARG       = -2;  // bad URL / argument (only http:// and https://)
+const NET_ERR_OFFLINE   = -3;  // Wi-Fi not connected (or lost during the request)
+const NET_ERR_DNS       = -10; // host name did not resolve
+const NET_ERR_NET       = -11; // TCP/UDP connect or transfer failed
+const NET_ERR_TLS       = -12; // TLS handshake / certificate check failed
+const NET_ERR_HTTP      = -13; // malformed HTTP response
+const NET_ERR_TOO_LARGE = -14; // response larger than 64 KB
+const NET_ERR_TIMEOUT   = -15; // no answer in time (HTTP 30 s, NTP 3 × 3 s)
+const NET_ERR_NO_MEM    = -16; // out of PSRAM for the buffers
+
+const NET_NO_NUMBER = -2147483647 - 1; // SYS_HTTP_JSON_NUM: value missing or not a number
 
 
 fn epd_repair_screen() {
@@ -69,4 +114,102 @@ fn battery_percent() {
         return 0;
     }
     return (mv - 3000) / 12;
+}
+
+// --- Wi-Fi helpers ---
+
+// Power the radio up and join a network. Returns 0, or NET_ERR_ARG when the
+// SSID is empty / longer than 32 bytes or the password is 1–7 or more than
+// 64 bytes (an empty password joins an open network).
+fn wifiConnect(ssid: string, pass: string) {
+    return syscall(SYS_WIFI_CONNECT, ssid, pass);
+}
+
+// Leave the network and power the radio down.
+fn wifiDisconnect() {
+    return syscall(SYS_WIFI_DISCONNECT);
+}
+
+fn wifiStatus() {
+    return syscall(SYS_WIFI_STATUS);
+}
+
+fn wifiConnected() {
+    return syscall(SYS_WIFI_STATUS) == WIFI_CONNECTED;
+}
+
+fn wifiRssi() {
+    return syscall(SYS_WIFI_RSSI);
+}
+
+fn wifiIpStr() -> string {
+    return syscallStr(SYS_WIFI_IP_STR);
+}
+
+fn wifiDnsStr() -> string {
+    return syscallStr(SYS_WIFI_DNS_STR);
+}
+
+// --- HTTP(S) helpers ---
+
+// Start a GET request. http:// and https:// (TLS 1.3) are supported.
+fn httpGet(url: string) {
+    return syscall(SYS_HTTP_GET, url);
+}
+
+fn httpStatus() {
+    return syscall(SYS_HTTP_STATUS);
+}
+
+fn httpCode() {
+    return syscall(SYS_HTTP_CODE);
+}
+
+fn httpLen() {
+    return syscall(SYS_HTTP_LEN);
+}
+
+fn httpBody(start, len) -> string {
+    return syscallStr(SYS_HTTP_BODY, start, len);
+}
+
+fn httpFind(needle: string, from) {
+    return syscall(SYS_HTTP_FIND, needle, from);
+}
+
+// Value at a dotted path in a JSON body ("current.weather_code",
+// "daily.time.0"); each key matches the first occurrence inside its parent.
+fn httpJson(path: string) -> string {
+    return syscallStr(SYS_HTTP_JSON, path);
+}
+
+fn httpJsonNum(path: string, scale) {
+    return syscall(SYS_HTTP_JSON_NUM, path, scale);
+}
+
+fn httpFree() {
+    return syscall(SYS_HTTP_FREE);
+}
+
+// Verify https:// servers against the DER CA certificate in user file `file`
+// ("files" in project.json). Without a CA, TLS still encrypts but does not
+// authenticate the server. httpsCa("") turns verification off again.
+fn httpsCa(file: string) {
+    return syscall(SYS_HTTPS_CA, file);
+}
+
+// --- Clock sync ---
+
+// Query an SNTP server (e.g. "pool.ntp.org"); when it answers, the RTC is set
+// to UTC + tz_minutes (e.g. 180 for UTC+3).
+fn ntpSync(server: string, tz_minutes) {
+    return syscall(SYS_NTP_SYNC, server, tz_minutes);
+}
+
+fn ntpStatus() {
+    return syscall(SYS_NTP_STATUS);
+}
+
+fn ntpTime() {
+    return syscall(SYS_NTP_TIME);
 }

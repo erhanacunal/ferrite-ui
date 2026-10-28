@@ -1741,6 +1741,7 @@ class CodeGen:
     # Builtins that return string IDs
     _STRING_RETURNING = {
         'str', 'itos', 'ftos', 'concat', 'strcat', 'sprintf', 'strClear', 'arrToStr',
+        'syscallStr',
     }
     # Builtins that return array IDs
     _ARRAY_RETURNING = {
@@ -3270,17 +3271,19 @@ class CodeGen:
             self.asm.builtin(Builtin.FILE_SEEK)
             return
 
-        if name == 'syscall':
+        if name == 'syscall' or name == 'syscallStr':
             # syscall(id, arg0, arg1, ...) → i32
+            # syscallStr(...) is the same call typed as a string, for
+            # handlers that return a string id.
             # id must be a compile-time integer literal or named const (0-255).
             # Args are passed as i32 stack values; str_ids and arr_ids are valid.
             # Returns None from handler → VM Error state.
             if len(node.args) < 1:
-                raise CompileError("syscall() requires at least 1 argument: id", node.line)
+                raise CompileError(f"{name}() requires at least 1 argument: id", node.line)
             syscall_id = self._resolve_syscall_id(node.args[0], node.line)
             runtime_args = node.args[1:]
             if len(runtime_args) > 16:
-                raise CompileError("syscall() supports at most 16 arguments", node.line)
+                raise CompileError(f"{name}() supports at most 16 arguments", node.line)
             for arg in runtime_args:
                 self._gen_expr(arg)
             self.asm.syscall(syscall_id, len(runtime_args))

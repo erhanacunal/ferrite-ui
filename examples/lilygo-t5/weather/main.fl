@@ -1,0 +1,214 @@
+// weather — Wi-Fi demo for the LilyGo T5-ePaper-S3 (960×540)
+//
+// Joins a Wi-Fi network, sets the RTC from an NTP server, fetches the current
+// weather over HTTPS from open-meteo.com and shows it. Then it turns the radio
+// off and repeats every REFRESH_MS.
+//
+// The SSID and password are not in the firmware or in this source: they are
+// read at run time from the user file "wifi" (wifi.txt, see project.json),
+// line 1 = SSID, line 2 = password. Copy wifi.txt.example to wifi.txt and
+// edit it before building.
+
+#include "core.fl"
+#include "color.fl"
+#include "epaper.fl"
+
+const TZ_MINUTES = 180;               // UTC+3; local time written to the RTC
+const REFRESH_MS = 30 * 60 * 1000;    // fetch again after 30 minutes
+const WIFI_TIMEOUT_MS = 30000;
+
+// States of the update sequence, driven from loop()
+const ST_IDLE    = 0;
+const ST_WIFI    = 1;
+const ST_NTP     = 2;
+const ST_HTTP    = 3;
+
+var w_temp;
+var w_info;
+var w_status;
+
+var state = ST_IDLE;
+var state_ms = 0;
+var next_ms = 0;
+var ntp_rc = 0;     // last ntpStatus(), shown with an HTTP error
+
+// ---- Credentials from the "wifi" user file ----
+
+var cred_ssid;
+var cred_pass;
+
+// Read one line (without CR/LF) from an open file into a string.
+fn readLine(h) -> string {
+    var buf[96];
+    var n = 0;
+    var b = fileRead(h);
+    while (b >= 0 && b != 10) {
+        if (b != 13 && n < 96) {
+            buf[n] = b;
+            n = n + 1;
+        }
+        b = fileRead(h);
+    }
+    var s = arrToStr(buf, n);
+    arrFree(buf);
+    return s;
+}
+
+fn loadCredentials() {
+    var h = fileOpen("wifi");
+    if (h == 0xFF) {
+        return 0;
+    }
+    cred_ssid = readLine(h);
+    cred_pass = readLine(h);
+    fileClose(h);
+    return 1;
+}
+
+// Istanbul; change latitude/longitude for another place.
+fn weatherUrl() -> string {
+    return "https://api.open-meteo.com/v1/forecast?latitude=41.01&longitude=28.98&current=temperature_2m,relative_humidity_2m,wind_speed_10m";
+}
+
+// ---- Display ----
+
+fn showStatus(msg: string) {
+    target(w_status);
+    setText(msg);
+    render();
+}
+
+fn pad2(n) -> string {
+    if (n < 10) {
+        return concat("0", itos(n));
+    }
+    return itos(n);
+}
+
+fn showWeather() {
+    var t10 = httpJsonNum("current.temperature_2m", 10);
+    var hum = httpJsonNum("current.relative_humidity_2m", 1);
+    var wind = httpJsonNum("current.wind_speed_10m", 1);
+    httpFree();
+    if (t10 == NET_NO_NUMBER) {
+        showStatus("Unexpected weather response");
+        return 0;
+    }
+
+    var sign = "";
+    if (t10 < 0) {
+        sign = "-";
+        t10 = 0 - t10;
+    }
+    target(w_temp);
+    setText(sprintf("%s%d.%d C", sign, t10 / 10, t10 % 10));
+    target(w_info);
+    setText(sprintf("Humidity %d %%   Wind %d km/h", hum, wind));
+
+    var tm = rtcRead();
+    showStatus(sprintf("Updated %s:%s  -  IP %s", pad2(tm[2]), pad2(tm[1]), wifiIpStr()));
+    arrFree(tm);
+    return 1;
+}
+
+// ---- Setup ----
+
+fn styleLabel(l: widget, x, y, w, h) {
+    target(l);
+    set(kind, KIND_LABEL);
+    set(location, x, y); set(size, w, h);
+    set(bg_color, WHITE);
+    set(text_color, BLACK);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+}
+
+fn setup() {
+    w_temp = alloc();
+    styleLabel(w_temp, 0, 120, 960, 160);
+    w_info = alloc();
+    styleLabel(w_info, 0, 300, 960, 60);
+    w_status = alloc();
+    styleLabel(w_status, 0, 470, 960, 50);
+    target(w_temp); set(text, "--.- C");
+    target(w_info); set(text, "");
+    target(w_status); set(text, "Starting");
+    render();
+    return 0;
+}
+
+// ---- Update sequence ----
+
+fn enter(st) {
+    state = st;
+    state_ms = millis();
+}
+
+fn finish(msg: string) {
+    wifiDisconnect();
+    if (strlen(msg) > 0) {
+        showStatus(msg);
+    }
+    next_ms = millis() + REFRESH_MS;
+    enter(ST_IDLE);
+}
+
+fn loop() {
+    var now = millis();
+    var rc;
+
+    if (state == ST_IDLE) {
+        if (now - next_ms >= 0) {
+            if (loadCredentials() == 0) {
+                finish("No wifi file - see wifi.txt.example");
+            } else {
+                rc = wifiConnect(cred_ssid, cred_pass);
+                // The firmware keeps its own copy; don't leave the
+                // password lying around in the string pool.
+                strFree(cred_ssid);
+                strFree(cred_pass);
+                if (rc != 0) {
+                    finish("Bad SSID or password in wifi file");
+                } else {
+                    showStatus("Connecting to Wi-Fi");
+                    enter(ST_WIFI);
+                }
+            }
+        }
+    } else if (state == ST_WIFI) {
+        if (wifiConnected()) {
+            ntpSync("pool.ntp.org", TZ_MINUTES);
+            enter(ST_NTP);
+        } else if (now - state_ms > WIFI_TIMEOUT_MS) {
+            finish("Wi-Fi connection failed");
+        }
+    } else if (state == ST_NTP) {
+        rc = ntpStatus();
+        if (rc != NET_RUNNING) {
+            ntp_rc = rc;
+            // A failed time sync is not fatal: the weather still comes.
+            rc = httpGet(weatherUrl());
+            if (rc != 0) {
+                finish(sprintf("HTTP start error %d", rc));
+            } else {
+                enter(ST_HTTP);
+            }
+        }
+    } else if (state == ST_HTTP) {
+        rc = httpStatus();
+        if (rc == NET_DONE) {
+            if (httpCode() == 200) {
+                showWeather();
+                finish("");
+            } else {
+                finish(sprintf("HTTP %d", httpCode()));
+                httpFree();
+            }
+        } else if (rc < 0) {
+            // The DNS server and NTP result help tell a DNS (-10) or
+            // routing problem from a server-side one.
+            finish(sprintf("HTTP error %d  (NTP %d, DNS %s)", rc, ntp_rc, wifiDnsStr()));
+        }
+    }
+    delay(100);
+}

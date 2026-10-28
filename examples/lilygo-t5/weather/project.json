@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "screen": [960, 540],
+  "fonts": [],
+  "images": [],
+  "include_dirs": ["../../../lib"],
+  "render_mode": "epaper",
+  "files": [
+    {"name": "wifi", "source": "wifi.txt"}
+  ],
+  "programs": [
+    {
+      "name": "main",
+      "source": "main.fl"
+    }
+  ]
+}

@@ -73,7 +73,7 @@ impl PlatformRuntime for TdoY13Platform {
         }
     }
 
-    fn syscall(id: u8, args: &[i32], _strpool: &ObjPool) -> Option<i32> {
+    fn syscall(id: u8, args: &[i32], _strpool: &mut ObjPool) -> Option<i32> {
         match id {
             SYS_REBOOT => {
                 let _ = args;

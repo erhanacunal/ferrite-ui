@@ -107,7 +107,7 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
     fn reset() -> !;
 
     /// VM syscall dispatcher, wired into `Vm::syscall_fn`.
-    fn syscall(id: u8, args: &[i32], strpool: &ObjPool) -> Option<i32> {
+    fn syscall(id: u8, args: &[i32], strpool: &mut ObjPool) -> Option<i32> {
         let _ = (id, args, strpool);
         None
     }

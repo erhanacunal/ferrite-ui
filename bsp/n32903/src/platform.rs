@@ -75,7 +75,7 @@ impl PlatformRuntime for N32903Platform {
         }
     }
 
-    fn syscall(_id: u8, _args: &[i32], _strpool: &ObjPool) -> Option<i32> {
+    fn syscall(_id: u8, _args: &[i32], _strpool: &mut ObjPool) -> Option<i32> {
         None
     }
 

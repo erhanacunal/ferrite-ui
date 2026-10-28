@@ -1769,40 +1769,49 @@ var result = syscall(id, arg0, arg1, ...);
 
 The first argument is the syscall **ID** — it must be a compile-time integer literal or a named `const`. Arguments after the ID are runtime values (int, float bits, or str_ids). The call always pushes one `i32` result. If the handler signals an error (by returning `None` internally), the VM enters the **Error** state.
 
+`syscallStr(id, …)` is the same call typed as a `string`, for handlers that return a string id.
+
 ### Using the e-paper device library
 
-Include `lib/epaper.fl` to get the predefined constants:
+Include `lib/epaper.fl` to get the predefined constants and wrappers. Wi-Fi credentials are never part of the firmware: the program supplies them at run time, e.g. from a user file (`"files"` in project.json):
 
 ```c
 #include "epaper.fl"
 
+var state = 0;
+
 fn setup() {
-    var ssid = str("MyNetwork");
-    var pass = str("secret123");
-    var rc = syscall(SYS_WIFI_CONNECT, ssid, pass);
-    strClear();
+    var rc = wifiConnect(str("MyNetwork"), str("secret123"));  // radio on, connecting
     if (rc != 0) {
-        // connection failed
+        // bad SSID / password length
     }
     return 0;
 }
 
 fn loop() {
-    var status = syscall(SYS_WIFI_STATUS);
-    if (status == 2) {
-        // connected — do work
+    if (state == 0 && wifiConnected()) {
+        httpGet(str("https://api.open-meteo.com/v1/forecast?latitude=41&longitude=29&current=temperature_2m"));
+        state = 1;
+    } else if (state == 1 && httpStatus() == NET_DONE) {
+        var t10 = httpJsonNum(str("current.temperature_2m"), 10);   // 12.3 → 123
+        httpFree();
+        wifiDisconnect();                                            // radio off
+        state = 2;
     }
-    delay(1000);
+    delay(100);
 }
 ```
+
+Every network call returns immediately. Start an operation, then poll its status from `loop()`. The radio runs on core 1, and the VM never blocks on it. See `examples/lilygo-t5/weather` for a complete program (credentials file, NTP clock sync, HTTPS weather).
 
 ### Syscall ID ranges (epaper device)
 
 | Range | Category |
 |-------|----------|
 | `0x00–0x0F` | System |
-| `0x10–0x1F` | WiFi |
-| `0x20–0x2F` | Bluetooth |
+| `0x10–0x1F` | Wi-Fi station |
+| `0x20–0x2F` | Bluetooth (reserved, not implemented) |
+| `0x30–0x3F` | Network requests (HTTP(S), SNTP) |
 
 | ID | Name | Arguments | Returns |
 |----|------|-----------|---------|
@@ -1811,17 +1820,33 @@ fn loop() {
 | `0x02` | `SYS_REPAIR_SCREEN` | — | `0` |
 | `0x03` | `SYS_EPD_POWER_OFF` | — | `0` |
 | `0x04` | `SYS_EPD_POWER_ON` | — | `0` |
-| `0x05` | `SYS_BATTERY_VOLTAGE` | — | battery millivolts, or `-1` on error |
+| `0x05` | `SYS_BATTERY_VOLTAGE` | — | battery millivolts, or `-1` on error (ADC2 is shared with Wi-Fi, so readings may fail while the radio is on) |
 | `0x06` | `SYS_DEEP_SLEEP` | `duration_ms: int` | does not return (chip resets on wake-up); `-1` if `duration_ms <= 0` |
-| `0x10` | `SYS_WIFI_CONNECT` | `ssid: str_id, pass: str_id` | `0`=ok, `-1`=error |
-| `0x11` | `SYS_WIFI_DISCONNECT` | — | `0` |
-| `0x12` | `SYS_WIFI_STATUS` | — | `0`=idle, `1`=connecting, `2`=connected, `3`=failed |
+| `0x10` | `SYS_WIFI_CONNECT` | `ssid: str_id, pass: str_id` | `0` = radio on, connecting; `-2` = SSID empty/>32 B or password 1–7/>64 B (empty password = open network). New credentials while connected switch networks. |
+| `0x11` | `SYS_WIFI_DISCONNECT` | — | `0`; leaves the network and powers the radio down |
+| `0x12` | `SYS_WIFI_STATUS` | — | `0` off, `1` connecting (association or DHCP), `2` connected, `3` failed (retried every 5 s until disconnect) |
 | `0x13` | `SYS_WIFI_RSSI` | — | RSSI in dBm, or `0` if not connected |
-| `0x14` | `SYS_WIFI_IP` | — | IPv4 as `u32` big-endian |
-| `0x20` | `SYS_BT_START` | `name: str_id` | `0`=ok, `-1`=error |
-| `0x21` | `SYS_BT_STOP` | — | `0` |
-| `0x22` | `SYS_BT_STATUS` | — | `0`=off, `1`=advertising, `2`=connected |
-| `0x23` | `SYS_BT_SEND` | `data: str_id` | bytes sent, or `-1` on error |
+| `0x14` | `SYS_WIFI_IP` | — | IPv4 as `u32` big-endian, `0` if not connected |
+| `0x15` | `SYS_WIFI_IP_STR` | — | string `"a.b.c.d"` (`syscallStr`) |
+| `0x16` | `SYS_WIFI_DNS_STR` | — | string, DNS server offered by DHCP, `"0.0.0.0"` = none (`syscallStr`) |
+| `0x30` | `SYS_HTTP_GET` | `url: str_id` | `0` started, or `NET_ERR_*`. `http://` and `https://` (TLS 1.3) |
+| `0x31` | `SYS_HTTP_STATUS` | — | `0` idle, `1` running, `2` done, `< 0` = `NET_ERR_*` |
+| `0x32` | `SYS_HTTP_CODE` | — | HTTP status code, `0` before a response |
+| `0x33` | `SYS_HTTP_LEN` | — | body length in bytes |
+| `0x34` | `SYS_HTTP_BODY` | `start, len` | string with that byte range of the body, clamped (`syscallStr`) |
+| `0x35` | `SYS_HTTP_BYTE` | `index` | body byte, `-1` past the end |
+| `0x36` | `SYS_HTTP_FIND` | `needle: str_id, from` | byte index of `needle` at/after `from`, or `-1` |
+| `0x37` | `SYS_HTTP_JSON` | `path: str_id` | string value at a dotted path (`"current.temp"`, `"daily.time.0"`), `""` if missing (`syscallStr`) |
+| `0x38` | `SYS_HTTP_JSON_NUM` | `path: str_id, scale` | number × `scale`, truncated (`12.34`, 10 → `123`); `NET_NO_NUMBER` (`i32::MIN`) if missing |
+| `0x39` | `SYS_HTTP_FREE` | — | `0`; drops the body |
+| `0x3A` | `SYS_HTTPS_CA` | `file: str_id` | `0`, or `-2` if the user file is missing / > 4 KB. Later `https://` requests are verified against this DER CA; `""` = no verification |
+| `0x3B` | `SYS_NTP_SYNC` | `server: str_id, tz_minutes` | `0` started, or `NET_ERR_*`. On success the RTC is set to UTC + `tz_minutes` |
+| `0x3C` | `SYS_NTP_STATUS` | — | `0` idle, `1` running, `2` done, `< 0` = `NET_ERR_*` |
+| `0x3D` | `SYS_NTP_TIME` | — | current UTC Unix seconds, `0` if never synced |
+
+Network error codes (`NET_ERR_*` in `lib/epaper.fl`): `-1` busy (one HTTP request and one NTP sync at a time), `-2` bad argument, `-3` Wi-Fi not connected / lost, `-10` DNS (the DHCP server, then 1.1.1.1 and 8.8.8.8, all failed), `-11` TCP/UDP, `-12` TLS handshake or certificate, `-13` malformed HTTP response, `-14` response > 64 KB, `-15` timeout (HTTP 30 s, NTP 3 × 3 s), `-16` out of PSRAM.
+
+HTTPS notes: TLS 1.3 only, cipher suite AES-128-GCM-SHA256 (servers that only speak TLS 1.2 fail with `-12`). Without `SYS_HTTPS_CA` the connection is encrypted but the server is **not** authenticated. With a CA, the server certificate's signature is checked against it (ECDSA P-256/P-384, Ed25519, RSA); there is no clock, so expiry is not checked.
 
 ### Adding new syscalls
 

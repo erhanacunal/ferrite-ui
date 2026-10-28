@@ -93,7 +93,7 @@ impl PlatformRuntime for SimPlatform {
         std::process::exit(0)
     }
 
-    fn syscall(id: u8, _args: &[i32], _strpool: &ObjPool) -> Option<i32> {
+    fn syscall(id: u8, _args: &[i32], _strpool: &mut ObjPool) -> Option<i32> {
         match id {
             0x00 => Some(systick::millis() as i32), // SYS_UPTIME
             _ => None,

@@ -740,7 +740,7 @@ pub struct Vm {
     anims: Vec<Anim>,
     anim_slots: u8,
     // Device-specific syscall handler. Called by OP_SYSCALL; returns None → VM Error.
-    pub syscall_fn: Option<fn(id: u8, args: &[i32], strpool: &ObjPool) -> Option<i32>>,
+    pub syscall_fn: Option<fn(id: u8, args: &[i32], strpool: &mut ObjPool) -> Option<i32>>,
     // True while `run_paint` executes on_paint: render() is then a no-op (the
     // frame being painted is presented by run_paint's caller).
     in_paint: bool,
@@ -2495,7 +2495,7 @@ impl Vm {
                     args[i] = self.pop();
                 }
                 match self.syscall_fn {
-                    Some(f) => match f(syscall_id, &args[..actual], &ctx.objs) {
+                    Some(f) => match f(syscall_id, &args[..actual], &mut ctx.objs) {
                         Some(v) => self.push(v),
                         None => self.fail(fault::SYSCALL),
                     },

@@ -22,3 +22,20 @@ esp-alloc = { version = "0.10.0", default-features = false }
 esp-storage = { version = "0.9.0", features = ["esp32s3"] }
 nb = "1"
 libm = "0.2"
+# Wi-Fi + network service (src/net): esp-radio's driver and embassy-net are
+# async, so they run as an embassy executor on core 1 (esp-rtos scheduler).
+esp-radio = { version = "0.18.0", features = ["esp32s3", "wifi", "unstable", "esp-alloc"] }
+esp-rtos = { version = "0.3.0", features = ["esp32s3", "esp-radio", "esp-alloc", "embassy"] }
+embassy-executor = "0.10.0"
+embassy-futures = "0.1.2"
+embassy-net = { version = "0.9.0", features = ["dhcpv4", "medium-ethernet", "tcp", "udp", "dns"] }
+embassy-sync = "0.8"
+embassy-time = "0.5.0"
+# HTTP client; `embedded-tls` (TLS 1.3, AES-128-GCM) for https://, `rsa` so
+# RSA-signed server certificates can be verified against a CA.
+embedded-nal-async = "0.9.0"
+reqwless = { version = "0.14.0", default-features = false, features = ["embedded-tls", "alloc", "rsa"] }
+allocator-api2 = { version = "0.3", default-features = false, features = ["alloc"] }
+static_cell = "2.1.0"
+# embedded-tls 0.18 needs der's SequenceOf/SetOf, gated behind `heapless` since der 0.8.3.
+der = { version = "0.8", default-features = false, features = ["heapless"] }

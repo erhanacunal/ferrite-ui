@@ -53,7 +53,7 @@ impl PlatformRuntime for NextionPlatform {
         cortex_m::peripheral::SCB::sys_reset();
     }
 
-    fn syscall(id: u8, args: &[i32], _strpool: &ObjPool) -> Option<i32> {
+    fn syscall(id: u8, args: &[i32], _strpool: &mut ObjPool) -> Option<i32> {
         match id {
             SYS_GPIOB_MODE => {
                 if args.len() != 1 {

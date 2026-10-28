@@ -33,6 +33,7 @@ use ferrite_core::pool::ObjPool;
 mod backlight;
 mod flash;
 mod lcd;
+mod net;
 mod rtc;
 #[cfg(feature = "sdcard")]
 mod sdcard;
@@ -98,6 +99,14 @@ fn init_gpio(peripherals: Peripherals) -> EpaperPins {
     battery::init(peripherals.GPIO14, peripherals.ADC2);
     // RTC_CNTL is only needed for the deep-sleep syscall.
     platform::init_sleep(peripherals.LPWR);
+    // Scheduler + network executor on core 1; the radio stays off until a
+    // program calls SYS_WIFI_CONNECT.
+    net::task::start(
+        peripherals.TIMG0,
+        peripherals.SW_INTERRUPT,
+        peripherals.CPU_CTRL,
+        peripherals.WIFI,
+    );
 
     EpaperPins {
         _sd_sclk: Output::new(peripherals.GPIO11, Level::Low, output),
@@ -115,9 +124,12 @@ fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_80MHz);
     let peripherals = esp_hal::init(config);
 
-    // 64 KB DRAM heap for small allocations; PSRAM (8 MB) is registered inside
-    // init_gpio() before any large allocation is made.
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    // Internal DRAM heaps for small allocations and the Wi-Fi driver (its
+    // buffers must be in internal RAM): 64 KB reclaimed from the second-stage
+    // bootloader + 96 KB. PSRAM (8 MB) is registered inside init_gpio()
+    // before any large allocation is made.
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 96 * 1024);
 
     // Configure GPIO, PSRAM heap, I8080/RMT, SYSTIMER, RTC, battery. Held for
     // the lifetime of the program (main never returns, so never dropped).

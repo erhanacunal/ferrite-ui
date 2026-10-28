@@ -540,6 +540,7 @@ BUILTIN_SIGNATURES = {
     'fileClose':   {'sig': 'fileClose(handle)', 'desc': 'Close a file handle.'},
     'fileSeek':    {'sig': 'fileSeek(handle, pos)', 'desc': 'Seek to byte position in file.'},
     'syscall':     {'sig': 'syscall(id, args...) -> int', 'desc': 'Invoke a system call (up to 16 args).'},
+    'syscallStr':  {'sig': 'syscallStr(id, args...) -> string', 'desc': 'Invoke a system call whose result is a string id (up to 16 args).'},
     'showModal':   {'sig': 'showModal(builderFn, [overlayClickFn]) -> int', 'desc': 'Show a modal dialog. Suspends VM until setDialogResult.'},
     'setDialogResult': {'sig': 'setDialogResult(result)', 'desc': 'Set result value on innermost modal dialog frame.'},
     'animate':     {'sig': 'animate(widget, prop, to, durationMs, easing, [@onEnd])', 'desc': 'Tween a widget property from its current value to `to`. easing = EASE_* | REPEAT_LOOP/REPEAT_YOYO. Optional @onEnd fires when a one-shot tween finishes.'},
