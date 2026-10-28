@@ -163,10 +163,57 @@ def open_port(port: str, timeout: float = DEFAULT_TIMEOUT) -> serial.Serial:
     return ser
 
 
+# Payload lengths a real reply can have. Boot logs and debug prints are
+# text, and text contains the payload tags ('"' 0x22, '*' 0x2A, '2' 0x32,
+# newline 0x0A): a tag whose length doesn't fit is noise, not a reply.
+ERROR_LENGTHS = (1, 4, 6)            # code [+ fault + PC u16 | u32]
+STACKINFO_LENGTHS = (8, 12)          # used + free [+ peak]
+TOUCHCAL_LENGTH = 9
+MEMDETAIL_VERSION = 1
+MEMDETAIL_ENTRY = 13                 # id u8 + used/capacity/extra u32
+
+
+def _memdetail_length_ok(length: int) -> bool:
+    return length >= 2 and (length - 2) % MEMDETAIL_ENTRY == 0 and length <= 2 + 255 * MEMDETAIL_ENTRY
+
+
+def drain_input(ser: serial.Serial, quiet: float = 0.2, limit: float = 3.0):
+    """Drop what the device sent before a request (a boot log after a reset,
+    debug prints), so it isn't read as the reply. Free when nothing is
+    waiting; otherwise reads until the line has been quiet for `quiet` s."""
+    if not ser.in_waiting:
+        return
+    deadline = time.time() + limit
+    last = time.time()
+    while time.time() < deadline:
+        n = ser.in_waiting
+        if n:
+            ser.read(n)
+            last = time.time()
+        elif time.time() - last >= quiet:
+            return
+        else:
+            time.sleep(0.01)
+
+
+def _read_varint(ser: serial.Serial) -> int | None:
+    """One varint, or None on timeout."""
+    raw = bytearray()
+    while True:
+        b = ser.read(1)
+        if not b:
+            return None
+        raw.append(b[0])
+        if b[0] & 0x80 == 0:
+            break
+    return decode_varint(bytes(raw))[0]
+
+
 def read_response(ser: serial.Serial) -> tuple[str, int | None]:
     """Read a single device response. Returns (type, value).
 
-    Skips any non-protocol bytes (e.g. debug prints) until a valid tag is found.
+    Skips any non-protocol bytes (e.g. debug prints) until a valid tag is
+    found; a payload tag with an impossible length is skipped too.
 
     Returns:
         ("pong", None) for pong
@@ -192,76 +239,46 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             return ("pong", None)
 
         if tag == TAG_MEMINFO_RESP:
-            # Varint type — read free heap bytes
-            varint_bytes = bytearray()
-            while True:
-                b = ser.read(1)
-                if not b:
-                    ser.timeout = orig_timeout
-                    return ("timeout", None)
-                varint_bytes.append(b[0])
-                if b[0] & 0x80 == 0:
-                    break
-            free_bytes, _ = decode_varint(bytes(varint_bytes))
+            # Varint type — free heap bytes
+            free_bytes = _read_varint(ser)
             ser.timeout = orig_timeout
+            if free_bytes is None:
+                return ("timeout", None)
             return ("meminfo", free_bytes)
 
-        if tag == TAG_STACKINFO_RESP:
-            # Payload type — read length + used u32 LE + free u32 LE
-            # [+ peak u32 LE: high-water mark, 0 = not measured; older firmware omits it]
-            length_bytes = bytearray()
-            while True:
-                b = ser.read(1)
-                if not b:
-                    ser.timeout = orig_timeout
-                    return ("timeout", None)
-                length_bytes.append(b[0])
-                if b[0] & 0x80 == 0:
-                    break
-            length, _ = decode_varint(bytes(length_bytes))
-            payload = ser.read(length)
-            ser.timeout = orig_timeout
-            if len(payload) < length:
+        if tag in (TAG_STACKINFO_RESP, TAG_MEMDETAIL_RESP, TAG_ERROR, TAG_TOUCHCAL_RESP):
+            length = _read_varint(ser)
+            if length is None:
+                ser.timeout = orig_timeout
                 return ("timeout", None)
-            used = int.from_bytes(payload[0:4], "little")
-            free = int.from_bytes(payload[4:8], "little")
-            peak = int.from_bytes(payload[8:12], "little") if length >= 12 else 0
-            return ("stackinfo", (used, free, peak))
+            if not {
+                TAG_STACKINFO_RESP: length in STACKINFO_LENGTHS,
+                TAG_MEMDETAIL_RESP: _memdetail_length_ok(length),
+                TAG_ERROR: length in ERROR_LENGTHS,
+                TAG_TOUCHCAL_RESP: length == TOUCHCAL_LENGTH,
+            }[tag]:
+                continue  # text that happened to contain a tag byte
+            payload = ser.read(length)
+            if len(payload) < length:
+                ser.timeout = orig_timeout
+                return ("timeout", None)
 
-        if tag == TAG_MEMDETAIL_RESP:
-            length_bytes = bytearray()
-            while True:
-                b = ser.read(1)
-                if not b:
-                    ser.timeout = orig_timeout
-                    return ("timeout", None)
-                length_bytes.append(b[0])
-                if b[0] & 0x80 == 0:
-                    break
-            length, _ = decode_varint(bytes(length_bytes))
-            payload = ser.read(length)
-            ser.timeout = orig_timeout
-            if len(payload) < length:
-                return ("timeout", None)
-            return ("memdetail", parse_memdetail(payload))
+            if tag == TAG_STACKINFO_RESP:
+                # used u32 LE + free u32 LE [+ peak u32 LE: high-water mark,
+                # 0 = not measured; older firmware omits it]
+                ser.timeout = orig_timeout
+                used = int.from_bytes(payload[0:4], "little")
+                free = int.from_bytes(payload[4:8], "little")
+                peak = int.from_bytes(payload[8:12], "little") if length >= 12 else 0
+                return ("stackinfo", (used, free, peak))
 
-        if tag == TAG_ERROR or tag == TAG_TOUCHCAL_RESP:
-            # Read length varint
-            length_bytes = bytearray()
-            while True:
-                b = ser.read(1)
-                if not b:
-                    ser.timeout = orig_timeout
-                    return ("timeout", None)
-                length_bytes.append(b[0])
-                if b[0] & 0x80 == 0:
-                    break
-            length, _ = decode_varint(bytes(length_bytes))
-            # Read payload
-            payload = ser.read(length)
+            if tag == TAG_MEMDETAIL_RESP:
+                if payload[0] != MEMDETAIL_VERSION or 2 + payload[1] * MEMDETAIL_ENTRY != length:
+                    continue
+                ser.timeout = orig_timeout
+                return ("memdetail", parse_memdetail(payload))
+
             ser.timeout = orig_timeout
-            if len(payload) < length:
-                return ("timeout", None)
             if tag == TAG_ERROR:
                 if len(payload) >= 4:
                     fault = payload[1]
@@ -297,6 +314,7 @@ def resync(ser: serial.Serial):
 def request(ser: serial.Serial, msg: bytes) -> tuple[str, int | None]:
     """Send `msg` and read the response. On a timeout, resync and resend once."""
     for attempt in range(2):
+        drain_input(ser)
         ser.write(msg)
         ser.flush()
         resp = read_response(ser)
@@ -452,6 +470,7 @@ def cmd_execute(ser: serial.Serial, path: str) -> bool:
         print(f"program too large: {len(payload)} bytes (max 2048, use writefs for larger)", file=sys.stderr)
         return False
 
+    drain_input(ser)
     ser.write(build_payload_msg(TAG_EXECUTE, payload))
     ser.flush()
     print(f"execute: sent {len(payload)} bytes")
@@ -495,6 +514,7 @@ def _writefs_once(ser: serial.Serial, data: bytes) -> str:
     # 1. Send header: total_size(u32 LE) + chunk_size(u32 LE)
     header = struct.pack("<II", total_size, CHUNK_SIZE)
     
+    drain_input(ser)
     ser.write(build_payload_msg(TAG_WRITEFS, header))
     ser.flush()
 
@@ -621,6 +641,7 @@ def cmd_calibrate(ser: serial.Serial) -> bool:
     """
     print("Starting touch calibration...")
     print("Touch the 3 crosshairs on screen in order (top-left, top-right, bottom-left)")
+    drain_input(ser)
     ser.write(build_varint_msg(TAG_TOUCHCAL))
     ser.flush()
 

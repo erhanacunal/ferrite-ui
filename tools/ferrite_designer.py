@@ -3648,7 +3648,7 @@ class DeviceChoiceDialog(QDialog):
 try:
     import serial
     import serial.tools.list_ports
-    from ferrite_cli import open_port
+    from ferrite_cli import ERROR_LENGTHS, drain_input, open_port
     HAS_SERIAL = True
 except ImportError:
     HAS_SERIAL = False
@@ -3825,6 +3825,7 @@ class DeviceDialog(QDialog):
             return None
 
     def _send_varint_msg(self, ser, tag):
+        drain_input(ser)  # a boot log etc. must not be read as the reply
         ser.write(bytes([tag]))
         ser.flush()
 
@@ -3836,6 +3837,7 @@ class DeviceDialog(QDialog):
             length >>= 7
         out.append(length & 0x7F)
         out.extend(payload)
+        drain_input(ser)
         ser.write(bytes(out))
         ser.flush()
 
@@ -3861,7 +3863,9 @@ class DeviceDialog(QDialog):
                     return ("pong", None)
                 elif tag == 0x0A:  # ERROR
                     lb = ser.read(1)
-                    if lb:
+                    # A newline in debug text is 0x0A too: only a real error
+                    # length makes it a reply.
+                    if lb and lb[0] in ERROR_LENGTHS:
                         length = lb[0]
                         data = ser.read(length)
                         code = data[0] if data else 0
@@ -4709,6 +4713,7 @@ class DesignerWindow(QMainWindow):
                     length >>= 7
                 msg.append(length & 0x7F)
                 msg.extend(header)
+                drain_input(ser)
                 ser.write(bytes(msg))
                 ser.flush()
 
