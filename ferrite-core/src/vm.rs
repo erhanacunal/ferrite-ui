@@ -410,6 +410,10 @@ const OP_EEPROM_WRITE: u8 = 0xB5; // pop value, pop addr → store low byte
 const OP_EEPROM_READ_ARR: u8 = 0xB6; // pop count, pop arr, pop addr → arr[0..count] = bytes
 const OP_EEPROM_WRITE_ARR: u8 = 0xB7; // pop count, pop arr, pop addr → store low bytes of arr[0..count]
 const OP_STR_BYTE: u8 = 0xB8; // pop index, pop str_id → push byte 0..255, or -1 past the end
+// Programs (RES_PROGRAM resources): switching and listing.
+const OP_RUN_PROGRAM: u8 = 0xBD; // pop arg, pop str_id (program name) → push 0 if missing; else exit, switch
+const OP_PROGRAM_ARG: u8 = 0xBE; // push the arg this program was started with (0 at boot)
+const OP_PROGRAM_NAME: u8 = 0xBF; // pop index → push str_id: nth program's name, "" past the end, -1 = own
 // Sound opcodes exist only with the `audio` feature; elsewhere they are
 // bad opcodes.
 #[cfg(feature = "audio")]
@@ -527,6 +531,31 @@ pub enum VmState {
     /// calls `try_resume_modal`.
     AwaitingModal,
     Error,
+    /// `runProgram` succeeded: nothing of this program runs any more (main
+    /// code, callbacks, modals); the runtime loads [`Vm::next_program`].
+    Exit,
+}
+
+/// A program by resource name, and the argument it is started with.
+#[derive(Clone, Copy)]
+pub struct ProgramRef {
+    name: [u8; crate::fs::NAME_LEN],
+    len: u8,
+    pub arg: i32,
+}
+
+impl ProgramRef {
+    /// `name` is cut to the 16 bytes a resource name can hold.
+    pub fn new(name: &[u8], arg: i32) -> Self {
+        let len = name.len().min(crate::fs::NAME_LEN);
+        let mut buf = [0u8; crate::fs::NAME_LEN];
+        buf[..len].copy_from_slice(&name[..len]);
+        Self { name: buf, len: len as u8, arg }
+    }
+
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.len as usize]
+    }
 }
 
 // --- VM ---
@@ -732,6 +761,11 @@ pub struct Vm {
     pub tree_hint: Option<(u8, u8)>,
     // Open file slots — index 0 = handle 1, index 1 = handle 2.
     open_files: [Option<OpenFile>; 2],
+    /// The running program and its start argument; set by the runtime when it
+    /// loads one (kept across `reset`, which the runtime does before).
+    pub program: ProgramRef,
+    /// Set with `VmState::Exit` by `runProgram`; taken by the runtime.
+    pub next_program: Option<ProgramRef>,
     // Open modal dialogs (innermost = last). Empty when no dialog is showing.
     modal_stack: Vec<ModalFrame>,
     // Active property tweens, capped at `anim_slots` (0 = P::ANIM_SLOTS) on
@@ -804,6 +838,8 @@ impl Vm {
             page_len: 0,
             tree_hint: None,
             open_files: [None, None],
+            program: ProgramRef::new(b"main", 0),
+            next_program: None,
             modal_stack: Vec::new(),
             anims: Vec::new(),
             anim_slots: 0,
@@ -1041,7 +1077,7 @@ impl Vm {
             return false;
         }
         match self.state {
-            VmState::Error | VmState::Ready => false,
+            VmState::Error | VmState::Ready | VmState::Exit => false,
             VmState::AwaitingModal => true,
             _ => self.cb_frames.is_empty(),
         }
@@ -1473,6 +1509,7 @@ impl Vm {
         self.render_mode = RenderMode::Dirty;
         self.portrait = false;
         self.open_files = [None, None];
+        self.next_program = None;
         self.modal_stack.clear();
         self.anims.clear();
         self.page_len = 0;
@@ -2334,6 +2371,46 @@ impl Vm {
                 let count = self.pop();
                 let (addr, arr_id) = self.pop2();
                 self.eeprom_array(ctx, op == OP_EEPROM_WRITE_ARR, addr, arr_id, count);
+            }
+
+            // --- Programs ---
+            OP_RUN_PROGRAM => {
+                let (str_id, arg) = self.pop2();
+                let name = ctx.objs.str_get(str_id as u16);
+                let found = name.len() <= crate::fs::NAME_LEN
+                    && ctx.fs.as_ref().is_some_and(|fs| {
+                        fs.find_kind(&ctx.flash, name, crate::fs::RES_PROGRAM).is_some()
+                    });
+                if found {
+                    // Ends everything at once: no instruction of this program
+                    // runs after this one.
+                    self.next_program = Some(ProgramRef::new(name, arg));
+                    self.state = VmState::Exit;
+                } else {
+                    self.push(0);
+                }
+            }
+            OP_PROGRAM_ARG => self.push(self.program.arg),
+            OP_PROGRAM_NAME => {
+                let index = self.pop();
+                let mut buf = [0u8; crate::fs::NAME_LEN];
+                let len = if index < 0 {
+                    let own = self.program.name();
+                    buf[..own.len()].copy_from_slice(own);
+                    own.len()
+                } else {
+                    ctx.fs
+                        .as_ref()
+                        .and_then(|fs| {
+                            let n = index.min(u16::MAX as i32) as u16;
+                            fs.nth_name_by_kind(&ctx.flash, crate::fs::RES_PROGRAM, n, &mut buf)
+                        })
+                        .unwrap_or(0)
+                };
+                match ctx.objs.str_alloc(&buf[..len]) {
+                    Some(id) => self.push(id as i32),
+                    None => self.fail(fault::STR_ALLOC),
+                }
             }
 
             // --- Sound (RES_SOUND resources, streamed by runtime's audio pump) ---
@@ -3974,6 +4051,108 @@ mod anim_tests {
         assert_eq!(vm.cb_frames.len(), 1);
         assert!(vm.state == VmState::Waiting, "A is still waiting");
         assert_eq!(vm.wait_until, 1000);
+    }
+
+    // --- Programs ---
+
+    /// A filesystem at 0x1000 with programs `main` and `settings` and an image.
+    fn ctx_with_programs() -> Ctx<MockPlatform> {
+        const BASE: u32 = 0x1000;
+        let names: [(&[u8], u8); 3] = [
+            (b"main", crate::fs::RES_PROGRAM),
+            (b"pic", crate::fs::RES_IMAGE),
+            (b"settings", crate::fs::RES_PROGRAM),
+        ];
+        let mut img = alloc::vec![0u8; BASE as usize];
+        let mut hdr = [0u8; 16];
+        hdr[0..4].copy_from_slice(b"FERR");
+        hdr[4..6].copy_from_slice(&3u16.to_le_bytes());
+        hdr[10..12].copy_from_slice(&(names.len() as u16).to_le_bytes());
+        img.extend_from_slice(&hdr);
+        for (name, kind) in names {
+            let mut e = [0u8; 32];
+            e[..name.len()].copy_from_slice(name);
+            e[16] = kind;
+            img.extend_from_slice(&e);
+        }
+        crate::mock::set_flash_image(img);
+        let mut ctx = mock_ctx();
+        ctx.fs = crate::fs::Fs::mount(&ctx.flash, BASE).ok();
+        assert!(ctx.fs.is_some());
+        ctx
+    }
+
+    #[test]
+    fn program_name_lists_programs_and_its_own() {
+        // g0 = programName(0); g1 = programName(1); g2 = programName(2);
+        // g3 = programName(-1); then programArg() stays on the stack
+        let code = [
+            OP_PUSH_0, OP_PROGRAM_NAME, OP_STORE, 0,
+            OP_PUSH_1, OP_PROGRAM_NAME, OP_STORE, 1,
+            OP_PUSH_2, OP_PROGRAM_NAME, OP_STORE, 2,
+            OP_PUSH_I8, 0xFF, OP_PROGRAM_NAME, OP_STORE, 3,
+            OP_PROGRAM_ARG,
+            OP_HALT,
+        ];
+        let mut ctx = ctx_with_programs();
+        let mut vm = cb_vm(&code);
+        vm.program = ProgramRef::new(b"settings", 42);
+        vm.tick(&mut ctx, 100);
+        assert!(vm.state == VmState::Halted, "fault {}", vm.fault());
+        let s = |vm: &Vm, slot| ctx.objs.str_get(vm.var_get(slot) as u16).to_vec();
+        assert_eq!(s(&vm, 0), b"main");
+        assert_eq!(s(&vm, 1), b"settings", "only programs count, the image is skipped");
+        assert_eq!(s(&vm, 2), b"", "past the last program");
+        assert_eq!(s(&vm, 3), b"settings", "-1 = the running program");
+        assert_eq!(vm.pop_result(), 42);
+    }
+
+    #[test]
+    fn run_program_exits_at_once_or_returns_0() {
+        let mut ctx = ctx_with_programs();
+        let nope = ctx.objs.str_alloc(b"nope").unwrap() as u8;
+        let settings = ctx.objs.str_alloc(b"settings").unwrap() as u8;
+        // g0 = runProgram("nope", 3); runProgram("settings", 7); g1 = 1 (never runs)
+        let code = [
+            OP_PUSH_I8, nope, OP_PUSH_I8, 3, OP_RUN_PROGRAM, OP_STORE, 0,
+            OP_PUSH_I8, settings, OP_PUSH_I8, 7, OP_RUN_PROGRAM,
+            OP_PUSH_1, OP_STORE, 1,
+            OP_HALT,
+        ];
+        let mut vm = cb_vm(&code);
+        vm.var_set(1, 0);
+        vm.tick(&mut ctx, 100);
+        assert!(vm.state == VmState::Exit, "fault {}", vm.fault());
+        assert_eq!(vm.var_get(0), 0, "a missing program is reported, nothing switches");
+        assert_eq!(vm.var_get(1), 0, "nothing after a successful runProgram runs");
+        let next = vm.next_program.expect("switch requested");
+        assert_eq!(next.name(), b"settings");
+        assert_eq!(next.arg, 7);
+        // Nothing runs any more: no tick, no callbacks.
+        vm.enqueue_callback(0, &[]);
+        assert!(!vm.drain_callbacks(&mut ctx));
+        vm.tick(&mut ctx, 100);
+        assert!(vm.state == VmState::Exit);
+    }
+
+    #[test]
+    fn run_program_inside_a_callback_ends_the_main_program_too() {
+        let mut ctx = ctx_with_programs();
+        let settings = ctx.objs.str_alloc(b"settings").unwrap() as u8;
+        // main @0: loop forever (JMP 0)   callback @3: runProgram("settings", 0); RET
+        let code = [
+            OP_JMP, 0, 0,
+            OP_PUSH_I8, settings, OP_PUSH_0, OP_RUN_PROGRAM, OP_RET,
+        ];
+        let mut vm = cb_vm(&code);
+        vm.tick(&mut ctx, 10);
+        vm.enqueue_callback(3, &[]);
+        assert!(vm.drain_callbacks(&mut ctx));
+        assert!(vm.state == VmState::Exit, "fault {}", vm.fault());
+        vm.tick(&mut ctx, 10);
+        assert!(vm.state == VmState::Exit, "the interrupted main program stays ended");
+        vm.reset();
+        assert!(vm.next_program.is_none() && vm.state == VmState::Ready);
     }
 
     // --- User GPIO ---

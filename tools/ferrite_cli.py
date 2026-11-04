@@ -2,7 +2,7 @@
 """ferrite-cli — Host-side tool for communicating with ferrite-ui devices.
 
 Implements the USART protobuf protocol (see protocol.rs).
-Commands: ping, restart, meminfo, memdetail, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime
+Commands: ping, restart, meminfo, memdetail, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime, monitor
 
 Usage:
     python ferrite_cli.py -p COM3 ping
@@ -12,6 +12,9 @@ Usage:
     python ferrite_cli.py -p COM3 execute program.bin
     python ferrite_cli.py -p COM3 -l execute program.fxe   (execute + listen)
     python ferrite_cli.py -p COM3 writefs flash.bin
+    python ferrite_cli.py -p COM3 -l writefs flash.bin     (writefs, then watch the reboot)
+    python ferrite_cli.py -p COM3 monitor                  (print what the device sends, Ctrl+C ends)
+    python ferrite_cli.py -p COM3 monitor --hex            (raw bytes as hex, protocol replies too)
     python ferrite_cli.py -p COM3 send 0x01 0x02 0x03
     python ferrite_cli.py -p COM3 send "hello world"
     python ferrite_cli.py -p COM3 settime                  (use current system time)
@@ -22,6 +25,7 @@ import argparse
 import struct
 import sys
 import time
+import zlib
 import serial
 
 # --- Protocol constants ---
@@ -48,6 +52,14 @@ TAG_MEMINFO_RESP = (3 << 3) | 0  # 0x18, varint (free heap bytes)
 TAG_TOUCHCAL_RESP = (4 << 3) | 2  # 0x22, payload (calibration result, 9 bytes)
 TAG_STACKINFO_RESP = (5 << 3) | 2  # 0x2A, payload (used + free [+ peak], 8 or 12 bytes)
 TAG_MEMDETAIL_RESP = (6 << 3) | 2  # 0x32, payload (version + count + 13-byte entries)
+TAG_FSCAPS_RESP = (7 << 3) | 2  # 0x3A, payload (1 byte flags): ACK of a CRC writefs header
+
+# WriteFs header flags (u32 after total_size + chunk_size) — FS_FLAG_* in protocol.rs
+FS_FLAG_CRC = 0x01  # chunks carry seq + CRC-32 and are retried
+# Error code for a header/chunk that failed its CRC — ERR_TRANSFER_CRC in protocol.rs
+ERR_TRANSFER_CRC = 10
+# Attempts per chunk in CRC mode before writefs gives up.
+CHUNK_TRIES = 8
 
 # MemDetail pool ids -> (name, unit, meaning of "extra"). Mirrors
 # protocol::mem_pool in ferrite-core/src/protocol.rs — keep in sync.
@@ -80,6 +92,7 @@ ERROR_DESCRIPTIONS = {
     7: "insufficient memory",
     8: "invalid system config",
     9: "flash image corrupted",
+    10: "transfer CRC mismatch (resent automatically by writefs)",
 }
 
 # VM fault codes (error 6 detail) — keep in sync with `vm::fault` in vm.rs
@@ -245,6 +258,17 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             if free_bytes is None:
                 return ("timeout", None)
             return ("meminfo", free_bytes)
+
+        if tag == TAG_FSCAPS_RESP:
+            # Only sent right after a writefs header; one flags byte.
+            length = _read_varint(ser)
+            if length != 1:
+                continue
+            payload = ser.read(1)
+            ser.timeout = orig_timeout
+            if not payload:
+                return ("timeout", None)
+            return ("fscaps", payload[0])
 
         if tag in (TAG_STACKINFO_RESP, TAG_MEMDETAIL_RESP, TAG_ERROR, TAG_TOUCHCAL_RESP):
             length = _read_varint(ser)
@@ -478,79 +502,122 @@ def cmd_execute(ser: serial.Serial, path: str) -> bool:
 
 
 def cmd_writefs(ser: serial.Serial, path: str) -> bool:
-    """Send flash filesystem image in chunks with flow control.
-
-    Protocol:
-      1. Send WriteFs header (total_size u32 LE + chunk_size u32 LE)
-      2. Wait for pong ACK
-      3. For each chunk: send WriteChunk, wait for pong ACK
-      4. Device restarts after final ACK
-
-    A timeout restarts the transfer from the header once, after a resync
-    pause, so a device whose parser was stuck on stray bytes recovers.
-    """
+    """Send a flash filesystem image (see `writefs_data`)."""
     try:
         with open(path, "rb") as f:
             data = f.read()
     except FileNotFoundError:
         print(f"file not found: {path}", file=sys.stderr)
         return False
+    return writefs_data(ser, data)
 
-    result = _writefs_once(ser, data)
+
+def writefs_data(ser: serial.Serial, data: bytes, log=None) -> bool:
+    """Send a flash filesystem image in chunks with flow control.
+
+    Protocol (protocol.rs, "CRC chunks"):
+      1. WriteFs header: total_size u32 + chunk_size u32 + flags u32 (CRC
+         chunks) + CRC-32 of those 12 bytes.
+      2. Firmware with CRC chunks answers FsCaps; older firmware reads only
+         the first 8 bytes and answers a pong: plain chunks then.
+      3. CRC mode: each chunk = seq u32 + CRC-32(seq + data) u32 + data. A
+         chunk answered with error 10, or not answered (bytes lost), is sent
+         again, up to CHUNK_TRIES times; nothing bad reaches the flash.
+      4. After the last ACK the device checks the whole image and restarts.
+
+    `log(text)` gets progress lines (default: print). A plain-mode timeout
+    restarts the transfer from the header once, after a resync pause.
+    """
+    log = log or (lambda text: print(text, flush=True))
+    result = _writefs_once(ser, data, log)
     if result == "timeout":
-        print("retrying writefs from the header...", file=sys.stderr)
+        log("retrying writefs from the header...")
         resync(ser)
-        result = _writefs_once(ser, data)
+        result = _writefs_once(ser, data, log)
     return result == "ok"
 
 
-def _writefs_once(ser: serial.Serial, data: bytes) -> str:
+def _fs_header(total_size: int) -> bytes:
+    head = struct.pack("<III", total_size, CHUNK_SIZE, FS_FLAG_CRC)
+    return head + struct.pack("<I", zlib.crc32(head))
+
+
+def _crc_chunk(seq: int, chunk: bytes) -> bytes:
+    seq_le = struct.pack("<I", seq)
+    return seq_le + struct.pack("<I", zlib.crc32(chunk, zlib.crc32(seq_le))) + chunk
+
+
+def _send_header(ser: serial.Serial, total_size: int, log) -> str:
+    """Send the header until it is taken: "crc", "plain", "timeout" or "error"."""
+    for attempt in range(3):
+        drain_input(ser)
+        ser.write(build_payload_msg(TAG_WRITEFS, _fs_header(total_size)))
+        ser.flush()
+        resp_type, resp_val = read_response(ser)
+        if resp_type == "fscaps":
+            return "crc" if resp_val & FS_FLAG_CRC else "plain"
+        if resp_type == "pong":
+            return "plain"
+        if resp_type == "error" and resp_val == ERR_TRANSFER_CRC:
+            log("header damaged on the line, resending")
+            continue
+        if resp_type == "error":
+            desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
+            log(f"error: code {resp_val} — {desc}")
+            return "error"
+        return "timeout"
+    return "timeout"
+
+
+def _writefs_once(ser: serial.Serial, data: bytes, log) -> str:
     """One writefs transfer: "ok", "timeout" or "error"."""
     total_size = len(data)
     chunk_count = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    log(f"writefs: {total_size} bytes, {chunk_count} chunks ({CHUNK_SIZE}B each)")
 
-    print(f"writefs: {total_size} bytes, {chunk_count} chunks ({CHUNK_SIZE}B each)")
+    mode = _send_header(ser, total_size, log)
+    if mode == "timeout":
+        log("no ACK for header (timeout)")
+    if mode in ("timeout", "error"):
+        return mode
+    crc = mode == "crc"
+    log("CRC chunks with retry" if crc else "device firmware has no CRC chunks: plain transfer")
 
-    # 1. Send header: total_size(u32 LE) + chunk_size(u32 LE)
-    header = struct.pack("<II", total_size, CHUNK_SIZE)
-    
-    drain_input(ser)
-    ser.write(build_payload_msg(TAG_WRITEFS, header))
-    ser.flush()
-
-    # 2. Wait for ACK
-    resp_type, resp_val = read_response(ser)
-    if resp_type != "pong":
-        if resp_type == "error":
-            desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
-            print(f"error: code {resp_val} — {desc}", file=sys.stderr)
-            return "error"
-        print(f"no ACK for header (timeout)", file=sys.stderr)
-        return "timeout"
-
-    # 3. Send chunks
+    retries = 0
     for i in range(chunk_count):
-        offset = i * CHUNK_SIZE
-        chunk = data[offset:offset + CHUNK_SIZE]
-
-        ser.write(build_payload_msg(TAG_WRITECHUNK, chunk))
-        ser.flush()
-
-        # Wait for ACK
-        resp_type, resp_val = read_response(ser)
-        if resp_type == "error":
-            desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
-            print(f"\nerror: code {resp_val} — {desc}", file=sys.stderr)
+        chunk = data[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE]
+        msg = build_payload_msg(TAG_WRITECHUNK, _crc_chunk(i, chunk) if crc else chunk)
+        for attempt in range(CHUNK_TRIES if crc else 1):
+            ser.write(msg)
+            ser.flush()
+            resp_type, resp_val = read_response(ser)
+            if resp_type == "pong":
+                break
+            if crc and resp_type == "error" and resp_val == ERR_TRANSFER_CRC:
+                retries += 1
+                log(f"\n  chunk {i + 1}: CRC mismatch, resending ({attempt + 1}/{CHUNK_TRIES})")
+                continue
+            if resp_type == "error":
+                desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
+                log(f"\nerror: code {resp_val} — {desc}")
+                return "error"
+            if not crc:
+                log(f"\nno ACK for chunk {i + 1} (timeout)")
+                return "timeout"
+            # Bytes lost: the device drops the partial chunk after its
+            # resync timeout, then takes the resend.
+            retries += 1
+            log(f"\n  chunk {i + 1}: no ACK, resending ({attempt + 1}/{CHUNK_TRIES})")
+            resync(ser)
+        else:
+            log(f"\nchunk {i + 1}: gave up after {CHUNK_TRIES} attempts")
             return "error"
-        elif resp_type != "pong":
-            print(f"\nno ACK for chunk {i + 1} (timeout)", file=sys.stderr)
-            return "timeout"
 
-        # Progress
         pct = (i + 1) * 100 // chunk_count
         print(f"\r  [{i + 1}/{chunk_count}] {pct}%", end="", flush=True)
 
-    print(" done (device will restart)")
+    note = f", {retries} chunk(s) resent" if retries else ""
+    log(f" done{note} (device will restart)")
     return "ok"
 
 
@@ -597,39 +664,70 @@ def cmd_send(ser: serial.Serial, data_args: list[str]) -> bool:
     return True
 
 
-def listen_serial(ser: serial.Serial):
-    """Listen for incoming serial data and print it. Ctrl+C to stop."""
-    print("--- Listening (Ctrl+C to stop) ---", flush=True)
-    ser.timeout = 0.1  # short timeout for responsive Ctrl+C
+def listen_serial(ser: serial.Serial, hex_dump: bool = False, timestamps: bool = True):
+    """Print what the device sends until Ctrl+C.
 
+    Text lines are printed as they end; other bytes inline as \\xNN (or every
+    byte as hex with `hex_dump`). Each line gets the time since start. The
+    port is kept across device restarts; if it disappears (USB adapter or
+    USB-serial device re-enumerating) it is reopened when it comes back.
+    """
+    print("--- Monitoring %s (Ctrl+C to stop) ---" % ser.port, flush=True)
+    ser.timeout = 0.1  # short timeout for responsive Ctrl+C
+    t0 = time.time()
     buf = bytearray()
+
+    def stamp():
+        return f"[{time.time() - t0:8.3f}] " if timestamps else ""
+
+    def emit():
+        line = bytes(buf).decode("utf-8", errors="replace").rstrip("\r")
+        print(stamp() + line, flush=True)
+        buf.clear()
+
     try:
         while True:
-            data = ser.read(256)
+            try:
+                data = ser.read(256)
+            except serial.SerialException:
+                if buf:
+                    emit()
+                print(stamp() + "--- port lost, waiting for it ---", flush=True)
+                ser = _reopen(ser)
+                print(stamp() + "--- port back ---", flush=True)
+                continue
             if not data:
                 continue
+            if hex_dump:
+                print(stamp() + " ".join(f"{b:02X}" for b in data), flush=True)
+                continue
             for b in data:
-                if b == 0x0A:  # \n — flush line
-                    try:
-                        line = bytes(buf).decode('utf-8', errors='replace').rstrip('\r')
-                    except Exception:
-                        line = ' '.join(f'{x:02X}' for x in buf)
-                    print(line, flush=True)
-                    buf.clear()
-                elif b >= 0x20 or b == 0x0D or b == 0x09:  # printable, \r, \t
+                if b == 0x0A:
+                    emit()
+                elif b >= 0x20 or b in (0x0D, 0x09):
                     buf.append(b)
                 else:
-                    # Non-printable byte — show hex inline
-                    buf.extend(f'\\x{b:02X}'.encode())
+                    buf.extend(f"\\x{b:02X}".encode())
     except KeyboardInterrupt:
-        # Flush remaining buffer
         if buf:
-            try:
-                line = bytes(buf).decode('utf-8', errors='replace').rstrip('\r')
-            except Exception:
-                line = ' '.join(f'{x:02X}' for x in buf)
-            print(line, flush=True)
+            emit()
         print("\n--- Stopped ---")
+
+
+def _reopen(ser: serial.Serial) -> serial.Serial:
+    """Close `ser` and open the same port again once it exists (Ctrl+C aborts)."""
+    port, timeout = ser.port, ser.timeout
+    try:
+        ser.close()
+    except Exception:
+        pass
+    while True:
+        time.sleep(0.5)
+        try:
+            new = open_port(port, timeout)
+            return new
+        except serial.SerialException:
+            continue
 
 
 def cmd_calibrate(ser: serial.Serial) -> bool:
@@ -721,7 +819,8 @@ def main():
     parser.add_argument("-p", "--port", required=True, help="Serial port (e.g. COM3, /dev/ttyUSB0)")
     parser.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT, help="Response timeout in seconds (default: 2.0)")
     parser.add_argument("-l", "--listen", action="store_true",
-                        help="After command, listen for serial messages (Ctrl+C to stop)")
+                        help="After command, keep printing what the device sends, e.g. the boot "
+                             "log after writefs restarts it (Ctrl+C to stop)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -741,6 +840,10 @@ def main():
 
     sub.add_parser("calibrate", help="Start 3-point touch calibration")
     sub.add_parser("stackinfo", help="Query current stack usage")
+
+    p_mon = sub.add_parser("monitor", help="Print what the device sends (boot log, restarts); Ctrl+C ends")
+    p_mon.add_argument("--hex", action="store_true", help="show every byte as hex")
+    p_mon.add_argument("--no-time", action="store_true", help="no timestamps")
 
     p_settime = sub.add_parser("settime", help="Set device RTC date and time")
     p_settime.add_argument("datetime", nargs="?", default=None,
@@ -776,10 +879,13 @@ def main():
             ok = cmd_stackinfo(ser)
         elif args.command == "settime":
             ok = cmd_settime(ser, args.datetime)
+        elif args.command == "monitor":
+            listen_serial(ser, hex_dump=args.hex, timestamps=not args.no_time)
+            ok = True
         else:
             ok = False
 
-        if args.listen:
+        if args.listen and args.command != "monitor":
             listen_serial(ser)
 
     sys.exit(0 if ok else 1)

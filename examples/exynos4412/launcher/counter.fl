@@ -1,0 +1,85 @@
+// counter.fl — an app of the launcher example.
+//
+// Counts taps, starting from the number the launcher passed (programArg()),
+// and hands the count back to the launcher with runProgram("main", count).
+
+#include "core.fl"
+#include "color.fl"
+
+var count;
+var count_lbl;
+// set(on_click) wires file-scope widget variables.
+var plus_btn;
+var home_btn;
+
+fn button(b: widget, x, y, w, text) {
+    target(b);
+    set(location, x, y);
+    set(size, w, 120);
+    set(bg_color, 0x2945);
+    set(press_color, 0x2C9F);
+    set(border_radius, 16);
+    set(clickable, ON);
+    parent(0);
+    var l = alloc();
+    target(l);
+    set(kind, KIND_LABEL);
+    set(size, w, 120);
+    set(text, text);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(b);
+}
+
+fn show() {
+    target(count_lbl);
+    set(text, sprintf("Count: %d", count));
+    strClear();
+}
+
+fn on_plus(wid) {
+    count = count + 1;
+    show();
+}
+
+fn on_home(wid) {
+    runProgram("main", count);
+}
+
+fn setup() {
+    count = programArg();
+
+    var title = alloc();
+    target(title);
+    set(kind, KIND_LABEL);
+    set(location, 0, 80);
+    set(size, 1280, 60);
+    set(text, sprintf("%s, started with %d", programName(-1), programArg()));
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+
+    count_lbl = alloc();
+    target(count_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 0, 240);
+    set(size, 1280, 60);
+    set(text_color, YELLOW);
+    set(text_align, ALIGN_CENTER);
+    parent(0);
+    show();
+
+    plus_btn = alloc();
+    button(plus_btn, 440, 400, 400, "+1");
+    target(plus_btn);
+    set(on_click, @on_plus);
+
+    home_btn = alloc();
+    button(home_btn, 40, 640, 300, "Home");
+    target(home_btn);
+    set(on_click, @on_home);
+    return 0;
+}
+
+fn loop() {
+}

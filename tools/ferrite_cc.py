@@ -156,6 +156,11 @@ class Op:
     SOUND_VOLUME     = 0xBB  # pop volume 0..100
     SOUND_PLAYING    = 0xBC  # push 1 while a sound plays, else 0
 
+    # Programs (RES_PROGRAM resources)
+    RUN_PROGRAM      = 0xBD  # pop arg, pop name str_id → push 0 if missing; else switch
+    PROGRAM_ARG      = 0xBE  # push the arg this program was started with (0 at boot)
+    PROGRAM_NAME     = 0xBF  # pop index → push str_id (nth program, "" past end, -1 = own)
+
     # Float ops (all no-arg)
     ITOF = 0xC0
     FTOI = 0xC1
@@ -247,6 +252,9 @@ class Builtin:
     SOUND_STOP = 58        # () → void
     SOUND_VOLUME = 59      # (volume 0..100) → void
     SOUND_PLAYING = 60     # () → 1 / 0
+    RUN_PROGRAM = 61       # (name_str_id, arg) → 0 if missing; else this program ends
+    PROGRAM_ARG = 62       # () → arg given by runProgram (0 at boot)
+    PROGRAM_NAME = 63      # (index) → str_id; "" past the end, -1 = this program
 
 
 class Prop:
@@ -1086,6 +1094,7 @@ OP_NAMES = {
     0xB3: 'eepromSize', 0xB4: 'eepromRead', 0xB5: 'eepromWrite',
     0xB6: 'eepromReadArr', 0xB7: 'eepromWriteArr', 0xB8: 'strByte',
     0xB9: 'playSound', 0xBA: 'stopSound', 0xBB: 'setVolume', 0xBC: 'soundPlaying',
+    0xBD: 'runProgram', 0xBE: 'programArg', 0xBF: 'programName',
 
     0xC0: 'itof', 0xC1: 'ftoi', 0xC2: 'fadd', 0xC3: 'fsub',
     0xC4: 'fmul', 0xC5: 'fdiv', 0xC6: 'fneg',
@@ -1126,7 +1135,7 @@ _NO_ARG_OPS = (
      if op not in (0x86, 0x88)} |
     {0xAD, 0xAE, 0xAF} |               # animate, stopAnim, stopAnimProp
     {0xB0, 0xB1, 0xB2} |               # pinMode, pinWrite, pinRead
-    set(range(0xB3, 0xBD)) |           # eepromSize .. strByte, playSound .. soundPlaying
+    set(range(0xB3, 0xC0)) |           # eepromSize .. strByte, playSound .. soundPlaying, runProgram .. programName
     set(range(0xC0, 0xCD))             # 0xC0-0xCC
 )
 

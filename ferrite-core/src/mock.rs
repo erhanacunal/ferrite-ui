@@ -35,9 +35,33 @@ impl LcdBackend for MockLcd {
 
 #[derive(Clone)]
 pub struct MockFlash;
+
+#[cfg(feature = "host")]
+std::thread_local! {
+    /// What `MockFlash` reads, from address 0 (zeros past its end): empty
+    /// unless a test sets an image with [`set_flash_image`].
+    static FLASH_IMAGE: core::cell::RefCell<alloc::vec::Vec<u8>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+}
+
+/// Make `MockFlash` read `image` on this thread (tests with a filesystem).
+#[cfg(feature = "host")]
+pub fn set_flash_image(image: alloc::vec::Vec<u8>) {
+    FLASH_IMAGE.with(|f| *f.borrow_mut() = image);
+}
+
 impl FlashBackend for MockFlash {
-    fn read(&self, _addr: u32, buf: &mut [u8]) {
+    fn read(&self, addr: u32, buf: &mut [u8]) {
         buf.fill(0);
+        #[cfg(feature = "host")]
+        FLASH_IMAGE.with(|f| {
+            let image = f.borrow();
+            let start = (addr as usize).min(image.len());
+            let n = buf.len().min(image.len() - start);
+            buf[..n].copy_from_slice(&image[start..start + n]);
+        });
+        #[cfg(not(feature = "host"))]
+        let _ = addr;
     }
     fn write(&self, _addr: u32, _data: &[u8]) {}
     fn erase_sector(&self, _addr: u32) {}

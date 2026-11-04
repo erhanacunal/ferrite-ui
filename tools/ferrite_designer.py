@@ -3335,6 +3335,7 @@ class FerriteSyntaxHighlighter(QSyntaxHighlighter):
                      "eepromSize", "eepromRead", "eepromWrite",
                      "eepromReadArr", "eepromWriteArr", "strByte",
                      "playSound", "stopSound", "setVolume", "soundPlaying",
+                     "runProgram", "programArg", "programName",
                      "rtcRead", "rtcWrite", "sendUsart",
                      "fpgaCmd", "fpgaData", "beginFrame", "endFrame",
                      "layout"]

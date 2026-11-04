@@ -965,6 +965,42 @@ fn setup() {
 See `examples/nextion/eeprom_demo` for a boot counter that survives power
 cycles.
 
+### Programs: runProgram / programArg / programName
+
+An image can hold several programs (one `"programs"` entry each in
+`project.json`). `main` starts at boot; any program can end itself and start
+another one:
+
+| Builtin | Result | Description |
+|---------|--------|-------------|
+| `runProgram(name [, arg])` | int | End this program and start `name` from scratch. Nothing after a successful call runs, not even the rest of the callback it is in. Returns `0` only when there is no such program (then nothing changes) |
+| `programArg()` | int | The `arg` passed by the program that started this one; `0` for `main` at boot |
+| `programName(i)` | string | Name of program `i` (`0`-based, image order), `""` past the last one. `programName(-1)` is the running program's name |
+
+A switch drops everything the old program had: widgets, strings, arrays,
+callbacks, open dialogs and files, animations, the playing sound, images
+loaded into RAM. The new program runs `setup()` / `loop()` like at boot,
+with its own render mode and orientation (from its image header). What
+survives is the integer `arg`, the EEPROM and the user files, so pass a
+result back with `runProgram("main", result)` and keep bigger state in the
+EEPROM. The system config (`"memory"`) is the image's and applies to every
+program.
+
+```c
+// main.fl: a tile per app
+fn on_tile(wid) {
+    runProgram("counter", programArg());   // ends here if "counter" exists
+}
+
+// counter.fl
+fn on_home(wid) {
+    runProgram("main", count);              // back, with a result
+}
+```
+
+See `examples/exynos4412/launcher` (a launcher listing its apps with
+`programName`, and two apps).
+
 ### Sound: playSound / stopSound / setVolume / soundPlaying
 
 Play WAV files listed under `"sounds"` in `project.json` on boards with an

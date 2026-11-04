@@ -267,6 +267,9 @@ Builtins are single-byte opcodes. Operands are passed on the stack unless noted.
 | `0xBA` | `stopSound` | stop the playing sound |
 | `0xBB` | `setVolume` | pop `percent`; output volume, clamped to `0..100` |
 | `0xBC` | `soundPlaying` | push `1` until the playing sound has been output, else `0` |
+| `0xBD` | `runProgram` | pop `arg`, pop `str_id` (a `RES_PROGRAM` name); push `0` if there is no such program. Otherwise the VM enters `Exit`: nothing of this program runs any more, and the runtime starts that program from scratch with `arg` |
+| `0xBE` | `programArg` | push the `arg` this program was started with (`0` for `main` at boot) |
+| `0xBF` | `programName` | pop `index`; push a string: the name of the `index`th `RES_PROGRAM` (image order), `""` past the last one; `-1` = the running program |
 
 `sprintf` has an inline `u8 argc` byte (number of format arguments after the format string). Stack layout before execution: `[... fmt, arg0, arg1, ..., argN-1]` (fmt pushed first).
 

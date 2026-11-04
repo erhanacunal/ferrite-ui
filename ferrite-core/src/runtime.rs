@@ -27,7 +27,7 @@ use crate::ctx::Ctx;
 use crate::pool::{ObjPool, T_ARRAY, T_FREE, T_STRING, T_WIDGET};
 use crate::syscfg::SysCfg;
 use crate::types::{COLOR_RED, Size};
-use crate::vm::{CodeAddr, FunctionKind, RenderMode, Vm, VmState};
+use crate::vm::{CodeAddr, FunctionKind, ProgramRef, RenderMode, Vm, VmState};
 use crate::{font, fs, heap, keyboard, protocol, render, widget};
 
 use crate::protocol::{Protocol, RxEvent};
@@ -250,7 +250,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
 
     // --- Load main program ---
     if error_code == 0 {
-        error_code = load_main(&mut ctx, &mut vm);
+        error_code = load_program(&mut ctx, &mut vm, ProgramRef::new(b"main", 0));
     }
 
     // --- setup() / on_program_start() / start loop() ---
@@ -261,7 +261,7 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
     // --- First frame / error screen ---
     if error_code != 0 && error_code != ERR_EMPTY_RUN {
         show_error(&mut ctx, error_code, None);
-    } else if error_code == 0 {
+    } else if error_code == 0 && vm.state != VmState::Exit {
         P::initial_render(&mut ctx, &vm);
     }
 
@@ -272,6 +272,11 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
     let mut last_rx_ms = ctx.systick.millis();
 
     loop {
+        // `runProgram` ended the running program: load the next one.
+        if error_code == 0 && vm.state == VmState::Exit {
+            error_code = switch_program(&mut ctx, &mut vm, &mut input);
+        }
+
         // Resume a suspended showModal whose result is now ready.
         if error_code == 0 {
             vm.try_resume_modal(&mut ctx);
@@ -342,9 +347,15 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
                     ctx.images.clear();
                     error_code = 0;
                     protocol.alloc_sector_buf();
-                    protocol::send_pong(&ctx.usart);
+                    if protocol.fs_crc_mode() {
+                        protocol::send_fs_caps(&ctx.usart);
+                    } else {
+                        protocol::send_pong(&ctx.usart);
+                    }
                 }
                 RxEvent::FsChunkDone => protocol::send_pong(&ctx.usart),
+                // Dropped, nothing written: the host resends that header/chunk.
+                RxEvent::FsTransferBad => protocol::send_error(&ctx.usart, protocol::ERR_TRANSFER_CRC),
                 RxEvent::FsWriteComplete => {
                     // Check the image before rebooting into it: on a bad
                     // upload the host gets the error and can resend.
@@ -461,12 +472,16 @@ fn apply_syscfg<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     if ok { 0 } else { ERR_INSUFFICIENT_MEMORY }
 }
 
+/// Load the RES_PROGRAM `program` names (and its widget page) into the reset
+/// VM: `main` at boot, others through `runProgram`.
 #[inline(never)]
-fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
+fn load_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, program: ProgramRef) -> u8 {
+    vm.program = program;
+    let name = program.name();
     let entry = match ctx
         .fs
         .as_ref()
-        .and_then(|fs| fs.find_kind(&ctx.flash, b"main", fs::RES_PROGRAM))
+        .and_then(|fs| fs.find_kind(&ctx.flash, name, fs::RES_PROGRAM))
     {
         Some(e) => e,
         None => {
@@ -506,7 +521,7 @@ fn load_main<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     if let Some(page) = ctx
         .fs
         .as_ref()
-        .and_then(|fs| fs.find_kind(&ctx.flash, b"main", fs::RES_PAGE))
+        .and_then(|fs| fs.find_kind(&ctx.flash, name, fs::RES_PAGE))
     {
         vm.set_page(page.offset, page.size);
     }
@@ -562,6 +577,10 @@ fn apply_orientation<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) {
 fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
     if let Some(offset) = vm.find_by_kind(FunctionKind::Setup).map(|e| e.offset as CodeAddr) {
         vm.call_now(offset, &[], ctx);
+        // setup() called runProgram: the main loop switches.
+        if vm.state == VmState::Exit {
+            return 0;
+        }
         if vm.pop_result() != 0 {
             return ERR_PROGRAM_ERROR;
         }
@@ -571,6 +590,9 @@ fn start_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
         .map(|e| e.offset as CodeAddr)
     {
         vm.call_now(offset, &[], ctx);
+        if vm.state == VmState::Exit {
+            return 0;
+        }
     }
     if let Some(offset) = vm.find_by_kind(FunctionKind::Loop).map(|e| e.offset as CodeAddr) {
         vm.start_main(offset);
@@ -590,6 +612,35 @@ fn alloc_root<P: PlatformRuntime>(ctx: &mut Ctx<P>) {
     };
     w.background_color = P::BG_COLOR;
     ctx.objs.root = root;
+}
+
+/// `runProgram(name, arg)` ended the running program: drop all of its state
+/// (widgets, strings, arrays, images, sound, input focus) and start
+/// `vm.next_program` from scratch, as at boot. Returns the new error code.
+#[inline(never)]
+fn switch_program<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, input: &mut P::Input) -> u8 {
+    let Some(next) = vm.next_program.take() else {
+        return 0;
+    };
+    ctx.objs.clear();
+    ctx.images.clear();
+    vm.reset();
+    #[cfg(feature = "audio")]
+    ctx.audio.stop();
+    input.reset(ctx);
+    ctx.cursor_visible = false;
+    alloc_root(ctx);
+
+    let mut err = load_program(ctx, vm, next);
+    if err == 0 && vm.has_code() {
+        err = start_program(ctx, vm);
+    }
+    if err != 0 {
+        show_error(ctx, err, None);
+    } else if vm.state != VmState::Exit {
+        P::initial_render(ctx, vm);
+    }
+    err
 }
 
 /// Runtime program reload (USART `ProgramReady`). Returns the new error code.

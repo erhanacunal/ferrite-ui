@@ -1734,14 +1734,14 @@ class CodeGen:
         'ftoi', 'feq', 'fne', 'flt', 'fle', 'fgt', 'fge',
         'alloc', 'get', 'parseInt', 'strLen', 'strlen', 'strcmp',
         'millis', 'brightness', 'pinRead', 'eepromSize', 'eepromRead', 'strByte',
-        'playSound', 'soundPlaying',
+        'playSound', 'soundPlaying', 'runProgram', 'programArg',
         'arrFree', 'strFree', 'arrLen',
         'syscall',
     }
     # Builtins that return string IDs
     _STRING_RETURNING = {
         'str', 'itos', 'ftos', 'concat', 'strcat', 'sprintf', 'strClear', 'arrToStr',
-        'syscallStr',
+        'syscallStr', 'programName',
     }
     # Builtins that return array IDs
     _ARRAY_RETURNING = {
@@ -2933,6 +2933,36 @@ class CodeGen:
                 raise CompileError("setVolume() takes 1 argument: percent", node.line)
             self._gen_expr(node.args[0])
             self.asm.builtin(Builtin.SOUND_VOLUME)
+            return
+
+        if name == 'runProgram':
+            # runProgram(name [, arg]) → 0 if there is no such program. Else
+            # this program ends right here (nothing after the call runs) and
+            # the named one starts from scratch; programArg() gives it `arg`.
+            if len(node.args) not in (1, 2):
+                raise CompileError("runProgram() takes 1-2 arguments: name [, arg]", node.line)
+            self._gen_expr(node.args[0])
+            if len(node.args) == 2:
+                self._gen_expr(node.args[1])
+            else:
+                self.asm.push(0)
+            self.asm.builtin(Builtin.RUN_PROGRAM)
+            return
+
+        if name == 'programArg':
+            # programArg() → the arg runProgram passed to this program (0 at boot)
+            if len(node.args) != 0:
+                raise CompileError("programArg() takes no arguments", node.line)
+            self.asm.builtin(Builtin.PROGRAM_ARG)
+            return
+
+        if name == 'programName':
+            # programName(i) → name of program i (image order), "" past the
+            # last one; programName(-1) → this program's name
+            if len(node.args) != 1:
+                raise CompileError("programName() takes 1 argument: index", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.PROGRAM_NAME)
             return
 
         if name == 'strByte':

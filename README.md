@@ -1,6 +1,6 @@
 # ferrite-ui
 
-Bare-metal HMI framework written in Rust. Originally built for the Nextion NX8048K070 display (GD32F103 / Cortex-M3); now also runs on Nextion boards built on the Nuvoton N32903 (ARM926EJ-S), the TDO Y13 round display (Allwinner F1C100s) and e-paper displays on ESP32-S3.
+Bare-metal HMI framework written in Rust. Originally built for the Nextion NX8048K070 display (GD32F103 / Cortex-M3); now also runs on Nextion boards built on the Nuvoton N32903 (ARM926EJ-S), the TDO Y13 round display (Allwinner F1C100s), a 10" Exynos 4412 tablet (Cortex-A9) and e-paper displays on ESP32-S3.
 
 The framework is one device-agnostic library (`ferrite-core`); each board is a thin BSP crate under `bsp/`.
 
@@ -50,6 +50,30 @@ The round panel has no reachable corner, so recovery mode on this board is enter
 |-------|---------------|
 | ![TDO Y13 board](docs/images/tdo_y13.png) | ![TDO Y13 clock example](docs/images/tdo_y13_clock_example.png) |
 
+### Exynos 4412 tablet target
+
+![Exynos 4412 tablet](docs/images/etab4.png)
+
+| Component | Part | Details |
+|-----------|------|---------|
+| CPU | Samsung Exynos 4412 | 4× Cortex-A9, 1.4GHz, MMU + L1/L2 caches (ferrite runs on core 0) |
+| GPU | Mali-400 MP4 | Not used yet |
+| RAM | 1GB | 256MB heap, framebuffers, RAM-backed flash image |
+| Display | LTN101AL03 | 10.1" 1280x800 LVDS, FIMD XRGB8888 framebuffer, alpha blending |
+| Touch | Atmel mXT1664S | Capacitive, I2C (the first finger is the pointer) |
+| Storage | 16GB eMMC | Filesystem image saved as `FERRITE/FLASH.BIN` on the CACHE partition (FAT32) |
+| PMIC / RTC | MAX77686 | Power, RTC |
+| Audio / Wi-Fi | WM8758, BCM4334 | Not used yet |
+| UART | UART2 (115200) | Console, `uart_boot` and the ferrite protocol |
+
+HAL: [exynos-4412-rs](https://github.com/erhanacunal/exynos-4412-rs) (git submodule `vendor/exynos_4412_rs`).
+
+- **Boot:** the boot partition holds the HAL's `uart_boot`. At power-on it waits 3 s for an image over the UART, then boots the saved firmware, `FERRITE/FERRITE.BIN` on CACHE. Hold **volume up** at power-on to stay in `uart_boot`.
+- **Drawing:** frames are drawn into a cached shadow buffer, and the changed area is copied to the scanned framebuffer right after vsync, so redraws show no tearing and no half-drawn frames.
+- **Filesystem:** the 64MB flash image lives in RAM. After a `writefs` (or a config write, 1.5 s after it settles) it is written back to CACHE, so programs and resources survive restarts.
+- **Recovery:** hold the top-left 80×80 px for 3 s at boot. Recovery also starts when CACHE has no filesystem yet.
+- **Power key:** hold to power off; with volume up to restart; with volume down to restart into fastboot.
+
 ### E-paper / ESP32-S3 target
 
 | Component | Part | Details |
@@ -82,6 +106,7 @@ The round panel has no reachable corner, so recovery mode on this board is enter
 - **Scrollable containers** -- FLAG_CLIP_CHILDREN on any widget, scrollbar, virtual rendering (off-screen children skipped)
 - **Custom paint** -- on_paint callback for widget custom drawing
 - **Property animation** -- time-based `animate()` tweening of any scalar property (position, size, RGB565 colors, alpha, …) with easing curves, loop/yoyo repeat, and an optional completion callback
+- **Multiple programs** -- one image holds several programs; `runProgram(name, arg)` ends the running one and starts another from scratch, and `programName(i)` lists them (e.g. for a launcher)
 - **Flash filesystem** -- TOC-based, named resources (fonts, images, programs, pages, files); XIP-embedded on ESP32
 - **Font rendering** -- Adafruit GFX compatible bitmap fonts (flash + embedded)
 - **Image format** -- Ferrite Image (FI): raw/RLE/indexed+RLE, streaming decode
@@ -318,6 +343,32 @@ python tools\ferrite_build.py examples\tdo_y13\clock\project.json -o fs.bin
 python tools\ferrite_cli.py -p COMx writefs fs.bin
 python tools\ferrite_cli.py -p COMx settime      # software clock from the PC clock
 ```
+
+### Exynos 4412 tablet
+
+Clone with submodules. Needs the `armv7a-none-eabihf` target (`rustup target add armv7a-none-eabihf`) and `rust-objcopy` (`cargo install cargo-binutils`, `rustup component add llvm-tools`). The tablet must already run the HAL's `uart_boot` from its boot partition (see the [HAL README](https://github.com/erhanacunal/exynos-4412-rs)).
+
+```powershell
+# Build -> raw image
+cd bsp\exynos4412
+cargo build --release
+cd ..\..
+rust-objcopy -O binary target\armv7a-none-eabihf\release\ferrite-ui target\armv7a-none-eabihf\release\ferrite-ui.bin
+
+# Send it to uart_boot and save it on CACHE as the firmware to boot
+# (--reset restarts a running ferrite first; --wait 30 waits for a manual reset instead)
+python vendor\exynos_4412_rs\tools\uartboot.py --port COMx --reset --save target\armv7a-none-eabihf\release\ferrite-ui.bin
+```
+
+Without `--save` the image runs from RAM only, until the next restart. Resources go over the same UART:
+
+```powershell
+python tools\ferrite_build.py examples\exynos4412\launcher\project.json -o fs.bin
+python tools\ferrite_cli.py -p COMx writefs fs.bin
+python tools\ferrite_cli.py -p COMx monitor      # watch the restart after writefs
+```
+
+[examples/exynos4412/launcher](examples/exynos4412/launcher/) is a launcher with two apps, switched with `runProgram`.
 
 ### ESP32-S3 (e-paper)
 

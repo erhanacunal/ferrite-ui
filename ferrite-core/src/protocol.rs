@@ -8,13 +8,28 @@
 ///   Field 1, Payload = Error (payload: error code byte)
 ///   Field 2, Varint  = Pong (also used as ACK for WriteFs chunks)
 ///   Field 6, Payload = MemDetail (per-pool memory usage, see `send_memdetail`)
+///   Field 7, Payload = FsCaps (1B flags, bit 0 = CRC chunks): ACK of a
+///                      WriteFs header that asked for CRC chunks
 ///
 /// Device receives (RX):
 ///   Field 1, Varint  = Ping
 ///   Field 2, Payload = Execute (payload: program bytecode)
 ///   Field 3, Varint  = Restart
-///   Field 4, Payload = WriteFs header (8B: total_size u32 LE + chunk_size u32 LE)
-///   Field 5, Payload = WriteChunk (chunk data bytes)
+///   Field 4, Payload = WriteFs header (8B: total_size u32 LE + chunk_size u32 LE,
+///                      optionally + flags u32 LE + CRC-32 of the first 12 bytes)
+///   Field 5, Payload = WriteChunk (chunk data bytes; in CRC mode
+///                      seq u32 LE + CRC-32(seq + data) u32 LE + data)
+///
+/// CRC chunks (writefs over a noisy line): a 16-byte header with flags bit 0
+/// set asks for them. Firmware that knows them answers FsCaps instead of a
+/// pong; older firmware reads only the first 8 bytes, answers a pong, and the
+/// host falls back to plain chunks. In CRC mode a chunk is kept in RAM until
+/// its CRC checks out, then written; a bad header or chunk gets error
+/// `ERR_TRANSFER_CRC` (10), nothing is written and the host resends it. `seq`
+/// counts chunks from 0: a resend of the chunk just written (its pong was
+/// lost) is acknowledged again without writing it twice. A chunk cut short
+/// (bytes lost) is dropped by `resync`, and the host resends it after the
+/// resync pause.
 ///   Field 6, Payload = UserMessage (arbitrary user data, max 64 bytes)
 ///   Field 7, Varint  = MemInfo (query free heap memory)
 ///   Field 8, Varint  = TouchCalibrate (start 3-point touch calibration)
@@ -26,6 +41,16 @@ extern crate alloc;
 use crate::flash::{FlashBackend, FlashImpl};
 use crate::usart::{UsartBackend, UsartImpl};
 use alloc::vec::Vec;
+
+use crate::fs::crc32_update;
+
+/// Error code for a WriteFs header or chunk that failed its CRC (resend it).
+pub const ERR_TRANSFER_CRC: u8 = 10;
+
+/// zlib-compatible CRC-32.
+fn crc32(data: &[u8]) -> u32 {
+    !crc32_update(!0, data)
+}
 
 /// Maximum program bytecode size received via USART (2KB)
 pub const MAX_PROGRAM_SIZE: usize = 2048;
@@ -69,10 +94,40 @@ struct FsWriter {
     total_size: u32,
     /// Total bytes received so far
     received: u32,
-    /// Header collection buffer (8 bytes: total_size + chunk_size)
-    header_buf: [u8; 8],
+    /// Header collection buffer (8 bytes: total_size + chunk_size, or 16 with
+    /// flags + header CRC)
+    header_buf: [u8; FS_HEADER_MAX],
     /// Bytes collected into header_buf
     header_pos: u8,
+    /// CRC chunks negotiated by the last header (see the module docs).
+    crc_mode: bool,
+    /// Next chunk sequence number expected (CRC mode).
+    next_seq: u32,
+    /// Chunk in progress (CRC mode): its 8 prefix bytes (seq + CRC), how many
+    /// of them arrived, and where its data starts in `buf` / `received`.
+    chunk_prefix: [u8; 8],
+    chunk_prefix_pos: u8,
+    chunk_start: usize,
+    chunk_rx_start: u32,
+    in_chunk: bool,
+    /// The chunk ran past `MAX_CHUNK` bytes (a corrupted length): it is bad.
+    chunk_overflow: bool,
+}
+
+/// WriteFs header: 8 bytes (plain) or 16 (flags + CRC).
+const FS_HEADER_MAX: usize = 16;
+/// Header flags bit 0: CRC chunks requested.
+pub const FS_FLAG_CRC: u32 = 1;
+/// Largest chunk kept in RAM in CRC mode; longer = corrupted length.
+const MAX_CHUNK: usize = 64 * 1024;
+
+/// What a finished WriteFs header or chunk turned out to be.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ChunkResult {
+    /// Header / chunk taken (or a duplicate of the chunk just written).
+    Ok,
+    /// CRC mismatch, bad length, unexpected seq: nothing written.
+    Bad,
 }
 
 impl FsWriter {
@@ -83,8 +138,16 @@ impl FsWriter {
             buf: Vec::new(),
             total_size: 0,
             received: 0,
-            header_buf: [0; 8],
+            header_buf: [0; FS_HEADER_MAX],
             header_pos: 0,
+            crc_mode: false,
+            next_seq: 0,
+            chunk_prefix: [0; 8],
+            chunk_prefix_pos: 0,
+            chunk_start: 0,
+            chunk_rx_start: 0,
+            in_chunk: false,
+            chunk_overflow: false,
         }
     }
 
@@ -93,25 +156,107 @@ impl FsWriter {
         self.header_pos = 0;
     }
 
-    /// Feed a header byte. Returns true when all 8 bytes are collected.
-    fn feed_header(&mut self, byte: u8) -> bool {
-        if (self.header_pos as usize) < 8 {
+    /// Feed a header byte. Bytes past the 16 known ones are ignored.
+    fn feed_header(&mut self, byte: u8) {
+        if (self.header_pos as usize) < FS_HEADER_MAX {
             self.header_buf[self.header_pos as usize] = byte;
             self.header_pos += 1;
         }
-        self.header_pos >= 8
     }
 
     /// Parse the collected header and prepare for chunk reception.
     /// Buffer allocation is deferred — happens in FsReady handler after
     /// the running program is freed to reclaim heap.
-    fn parse_header(&mut self) {
+    ///
+    /// A 16-byte header with the CRC flag must carry a matching CRC of its
+    /// first 12 bytes, else it is `Bad` and the previous state is kept.
+    fn parse_header(&mut self) -> ChunkResult {
         let b = &self.header_buf;
-        self.total_size =
-            (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24);
+        let word = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let len = self.header_pos as usize;
+        let flags = if len >= 12 { word(8) } else { 0 };
+        let crc_mode = flags & FS_FLAG_CRC != 0;
+        if crc_mode && (len < 16 || crc32(&b[..12]) != word(12)) {
+            return ChunkResult::Bad;
+        }
+        self.total_size = word(0);
+        self.crc_mode = crc_mode;
+        self.next_seq = 0;
+        self.in_chunk = false;
         self.addr = self.fs_base;
         self.received = 0;
         self.buf.clear();
+        ChunkResult::Ok
+    }
+
+    /// A WriteChunk payload begins.
+    fn begin_chunk(&mut self) {
+        self.chunk_prefix_pos = 0;
+        self.chunk_start = self.buf.len();
+        self.chunk_rx_start = self.received;
+        self.chunk_overflow = false;
+        self.in_chunk = true;
+    }
+
+    /// One WriteChunk payload byte.
+    fn chunk_byte<B: FlashBackend>(&mut self, byte: u8, flash: &FlashImpl<B>) {
+        if !self.crc_mode {
+            self.write_byte(byte, flash);
+            return;
+        }
+        if (self.chunk_prefix_pos as usize) < self.chunk_prefix.len() {
+            self.chunk_prefix[self.chunk_prefix_pos as usize] = byte;
+            self.chunk_prefix_pos += 1;
+        } else if self.buf.len() - self.chunk_start < MAX_CHUNK {
+            // Kept in RAM until the CRC is checked: no sector flush here.
+            self.buf.push(byte);
+            self.received += 1;
+        } else {
+            self.chunk_overflow = true;
+        }
+    }
+
+    /// The WriteChunk payload is complete. CRC mode: check it, then write its
+    /// whole sectors (and the tail once the image is complete), or drop it.
+    fn end_chunk<B: FlashBackend>(&mut self, flash: &FlashImpl<B>) -> ChunkResult {
+        if !self.crc_mode {
+            return ChunkResult::Ok;
+        }
+        self.in_chunk = false;
+        let p = &self.chunk_prefix;
+        let seq = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+        let want = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+        let data = &self.buf[self.chunk_start..];
+        let ok = self.chunk_prefix_pos == 8
+            && !self.chunk_overflow
+            && self.received <= self.total_size
+            && !crc32_update(crc32_update(!0, &p[..4]), data) == want;
+        if !ok || seq != self.next_seq {
+            self.rollback_chunk();
+            // The chunk just written, sent again because its pong was lost.
+            let dup = ok && seq.wrapping_add(1) == self.next_seq;
+            return if dup { ChunkResult::Ok } else { ChunkResult::Bad };
+        }
+        self.next_seq += 1;
+        while self.buf.len() >= FS_SECTOR_SIZE {
+            self.flush_sector(flash);
+        }
+        ChunkResult::Ok
+    }
+
+    /// Drop the bytes of the chunk in progress (CRC mode).
+    fn rollback_chunk(&mut self) {
+        self.buf.truncate(self.chunk_start);
+        self.received = self.chunk_rx_start;
+        self.in_chunk = false;
+    }
+
+    /// A chunk cut short by `resync` (bytes lost on the line) is dropped, so
+    /// the host can resend it. Plain mode has no way back.
+    fn abort_chunk(&mut self) {
+        if self.crc_mode && self.in_chunk {
+            self.rollback_chunk();
+        }
     }
 
     /// Pre-allocate sector buffer. Call after freeing program memory.
@@ -139,7 +284,8 @@ impl FsWriter {
             offset += 256;
         }
         self.addr += FS_SECTOR_SIZE as u32;
-        self.buf.clear();
+        // CRC mode can hold more than a sector (a chunk not aligned to one).
+        self.buf.drain(..FS_SECTOR_SIZE);
     }
 
     /// Flush any remaining bytes in the buffer (partial sector at end).
@@ -170,7 +316,7 @@ impl FsWriter {
 
 // --- Events ---
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RxEvent {
     None,
     Ping,
@@ -182,6 +328,9 @@ pub enum RxEvent {
     FsChunkDone,
     /// All chunks received, flash write complete (send pong ACK, then restart)
     FsWriteComplete,
+    /// CRC mode: a header or chunk failed its CRC and was dropped (send
+    /// error `ERR_TRANSFER_CRC`; the host resends it)
+    FsTransferBad,
     /// User message received (arbitrary data for VM callback)
     UserMessage,
     /// Memory info request — respond with free heap bytes
@@ -238,6 +387,35 @@ impl Protocol {
     pub fn resync(&mut self) {
         self.state = RxState::Idle;
         self.program_buf = Vec::new();
+        // CRC mode: a chunk cut short is dropped, the host resends it.
+        self.fs_writer.abort_chunk();
+    }
+
+    /// The last WriteFs header negotiated CRC chunks: ACK it with
+    /// [`send_fs_caps`] instead of a pong.
+    pub fn fs_crc_mode(&self) -> bool {
+        self.fs_writer.crc_mode
+    }
+
+    /// A WriteFs header (field 4) payload is complete.
+    fn fs_header_done(&mut self) -> RxEvent {
+        match self.fs_writer.parse_header() {
+            ChunkResult::Ok => RxEvent::FsReady,
+            ChunkResult::Bad => RxEvent::FsTransferBad,
+        }
+    }
+
+    /// A WriteChunk (field 5) payload is complete.
+    fn fs_chunk_done<B: FlashBackend>(&mut self, flash: &FlashImpl<B>) -> RxEvent {
+        if self.fs_writer.end_chunk(flash) == ChunkResult::Bad {
+            return RxEvent::FsTransferBad;
+        }
+        if self.fs_writer.is_complete() {
+            self.fs_writer.flush(flash);
+            RxEvent::FsWriteComplete
+        } else {
+            RxEvent::FsChunkDone
+        }
     }
 
     /// Hand over the received program (valid after ProgramReady event),
@@ -358,6 +536,9 @@ impl Protocol {
                     self.state = RxState::Idle;
 
                     // For Execute (field 2): allocate buffer or mark skip
+                    if f == 5 {
+                        self.fs_writer.begin_chunk();
+                    }
                     if f == 2 {
                         if len as usize > MAX_PROGRAM_SIZE {
                             self.program_buf = Vec::new(); // capacity=0 → skip mode
@@ -376,16 +557,9 @@ impl Protocol {
                                     RxEvent::ProgramReady
                                 }
                             }
-                            4 => RxEvent::FsReady,
+                            4 => self.fs_header_done(),
                             6 => RxEvent::UserMessage,
-                            5 => {
-                                if self.fs_writer.is_complete() {
-                                    self.fs_writer.flush(flash);
-                                    RxEvent::FsWriteComplete
-                                } else {
-                                    RxEvent::FsChunkDone
-                                }
-                            }
+                            5 => self.fs_chunk_done(flash),
                             _ => RxEvent::None,
                         }
                     } else {
@@ -421,8 +595,9 @@ impl Protocol {
                         self.fs_writer.feed_header(byte);
                     }
                     5 => {
-                        // WriteChunk data → sector buffer
-                        self.fs_writer.write_byte(byte, flash);
+                        // WriteChunk data → sector buffer (CRC mode: held
+                        // until the chunk's CRC is checked)
+                        self.fs_writer.chunk_byte(byte, flash);
                     }
                     6 => {
                         // User message data → buffer
@@ -453,20 +628,10 @@ impl Protocol {
                             }
                         }
                         6 => RxEvent::UserMessage,
-                        4 => {
-                            // Header complete — parse and prepare for chunks
-                            self.fs_writer.parse_header();
-                            RxEvent::FsReady
-                        }
-                        5 => {
-                            // Chunk complete — check if all data received
-                            if self.fs_writer.is_complete() {
-                                self.fs_writer.flush(flash);
-                                RxEvent::FsWriteComplete
-                            } else {
-                                RxEvent::FsChunkDone
-                            }
-                        }
+                        // Header complete — parse and prepare for chunks
+                        4 => self.fs_header_done(),
+                        // Chunk complete — check it, then whether all data arrived
+                        5 => self.fs_chunk_done(flash),
                         10 => RxEvent::SetDateTime,
                         _ => RxEvent::None,
                     }
@@ -500,6 +665,13 @@ pub fn send_vm_error<U: UsartBackend>(usart: &UsartImpl<U>, code: u8, fault: u8,
 }
 
 /// Send pong: Field 2, Varint type — tag byte only
+/// ACK of a WriteFs header that negotiated CRC chunks: field 7 payload, one
+/// flags byte (bit 0 = CRC chunks).
+pub fn send_fs_caps<U: UsartBackend>(usart: &UsartImpl<U>) {
+    // tag = (7 << 3) | 2 = 0x3A, length = 1
+    usart.write(&[0x3A, 0x01, FS_FLAG_CRC as u8]);
+}
+
 pub fn send_pong<U: UsartBackend>(usart: &UsartImpl<U>) {
     // tag = (2 << 3) | 0 = 0x10
     usart.write(&[0x10]);
@@ -678,5 +850,175 @@ mod memdetail_tests {
         p.resync();
         assert!(p.is_idle());
         assert!(matches!(p.feed(0x08, &flash), RxEvent::Ping));
+    }
+}
+
+#[cfg(test)]
+mod writefs_crc_tests {
+    use super::*;
+    use core::cell::RefCell;
+
+    const BASE: u32 = 0x1000;
+
+    /// NOR-like RAM flash starting at 0.
+    struct RamFlash(RefCell<Vec<u8>>);
+    impl FlashBackend for RamFlash {
+        fn read(&self, addr: u32, buf: &mut [u8]) {
+            let m = self.0.borrow();
+            buf.copy_from_slice(&m[addr as usize..addr as usize + buf.len()]);
+        }
+        fn write(&self, addr: u32, data: &[u8]) {
+            let mut m = self.0.borrow_mut();
+            for (d, &b) in m[addr as usize..].iter_mut().zip(data) {
+                *d &= b;
+            }
+        }
+        fn erase_sector(&self, addr: u32) {
+            let a = addr as usize & !4095;
+            self.0.borrow_mut()[a..a + 4096].fill(0xFF);
+        }
+        fn read_id(&self) -> (u8, u8, u8) {
+            (0, 0, 0)
+        }
+    }
+
+    fn flash() -> FlashImpl<RamFlash> {
+        FlashImpl::with_backend(RamFlash(RefCell::new(vec_ff(64 * 1024))))
+    }
+
+    fn vec_ff(n: usize) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.resize(n, 0xFF);
+        v
+    }
+
+    fn msg(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut m = Vec::from([tag]);
+        let mut len = payload.len();
+        while len > 0x7F {
+            m.push((len as u8 & 0x7F) | 0x80);
+            len >>= 7;
+        }
+        m.push(len as u8);
+        m.extend_from_slice(payload);
+        m
+    }
+
+    fn header(total: u32, crc: bool) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&total.to_le_bytes());
+        h.extend_from_slice(&4096u32.to_le_bytes());
+        if crc {
+            h.extend_from_slice(&FS_FLAG_CRC.to_le_bytes());
+            let c = crc32(&h);
+            h.extend_from_slice(&c.to_le_bytes());
+        }
+        msg(0x22, &h)
+    }
+
+    fn chunk(seq: u32, data: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&seq.to_le_bytes());
+        let c = !crc32_update(crc32_update(!0, &seq.to_le_bytes()), data);
+        p.extend_from_slice(&c.to_le_bytes());
+        p.extend_from_slice(data);
+        msg(0x2A, &p)
+    }
+
+    /// Feeds `bytes`; returns the non-`None` events.
+    fn feed(p: &mut Protocol, f: &FlashImpl<RamFlash>, bytes: &[u8]) -> Vec<RxEvent> {
+        bytes.iter().map(|&b| p.feed(b, f)).filter(|e| *e != RxEvent::None).collect()
+    }
+
+    fn image(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    fn stored(f: &FlashImpl<RamFlash>, n: usize) -> Vec<u8> {
+        let mut out = vec_ff(n);
+        f.read(BASE, &mut out);
+        out
+    }
+
+    #[test]
+    fn crc_header_negotiates_and_chunks_land() {
+        let (mut p, f, img) = (Protocol::new(BASE), flash(), image(4096 + 700));
+        assert_eq!(feed(&mut p, &f, &header(img.len() as u32, true)), [RxEvent::FsReady]);
+        assert!(p.fs_crc_mode());
+        assert_eq!(feed(&mut p, &f, &chunk(0, &img[..4096])), [RxEvent::FsChunkDone]);
+        assert_eq!(feed(&mut p, &f, &chunk(1, &img[4096..])), [RxEvent::FsWriteComplete]);
+        assert_eq!(stored(&f, img.len()), img);
+    }
+
+    #[test]
+    fn plain_header_keeps_the_old_protocol() {
+        let (mut p, f, img) = (Protocol::new(BASE), flash(), image(5000));
+        assert_eq!(feed(&mut p, &f, &header(img.len() as u32, false)), [RxEvent::FsReady]);
+        assert!(!p.fs_crc_mode());
+        assert_eq!(feed(&mut p, &f, &msg(0x2A, &img[..4096])), [RxEvent::FsChunkDone]);
+        assert_eq!(feed(&mut p, &f, &msg(0x2A, &img[4096..])), [RxEvent::FsWriteComplete]);
+        assert_eq!(stored(&f, img.len()), img);
+    }
+
+    #[test]
+    fn corrupted_chunk_is_dropped_and_resend_succeeds() {
+        let (mut p, f, img) = (Protocol::new(BASE), flash(), image(4096 + 300));
+        feed(&mut p, &f, &header(img.len() as u32, true));
+        let mut bad = chunk(0, &img[..4096]);
+        bad[100] ^= 0x10; // one bit flipped on the line
+        assert_eq!(feed(&mut p, &f, &bad), [RxEvent::FsTransferBad]);
+        assert_eq!(feed(&mut p, &f, &chunk(0, &img[..4096])), [RxEvent::FsChunkDone]);
+        assert_eq!(feed(&mut p, &f, &chunk(1, &img[4096..])), [RxEvent::FsWriteComplete]);
+        assert_eq!(stored(&f, img.len()), img);
+    }
+
+    #[test]
+    fn resent_chunk_after_lost_pong_is_not_written_twice() {
+        let (mut p, f, img) = (Protocol::new(BASE), flash(), image(4096 * 2 + 10));
+        feed(&mut p, &f, &header(img.len() as u32, true));
+        assert_eq!(feed(&mut p, &f, &chunk(0, &img[..4096])), [RxEvent::FsChunkDone]);
+        // The pong was lost: the host sends chunk 0 again.
+        assert_eq!(feed(&mut p, &f, &chunk(0, &img[..4096])), [RxEvent::FsChunkDone]);
+        assert_eq!(feed(&mut p, &f, &chunk(1, &img[4096..8192])), [RxEvent::FsChunkDone]);
+        assert_eq!(feed(&mut p, &f, &chunk(2, &img[8192..])), [RxEvent::FsWriteComplete]);
+        assert_eq!(stored(&f, img.len()), img);
+    }
+
+    #[test]
+    fn chunk_cut_short_is_dropped_by_resync() {
+        let (mut p, f, img) = (Protocol::new(BASE), flash(), image(3000));
+        feed(&mut p, &f, &header(img.len() as u32, true));
+        let good = chunk(0, &img);
+        // Ten bytes lost: the payload never completes, the parser stalls.
+        let mut short = good.clone();
+        short.drain(500..510);
+        assert_eq!(feed(&mut p, &f, &short), []);
+        p.resync();
+        assert_eq!(feed(&mut p, &f, &good), [RxEvent::FsWriteComplete]);
+        assert_eq!(stored(&f, img.len()), img);
+    }
+
+    #[test]
+    fn corrupted_crc_header_is_rejected() {
+        let (mut p, f) = (Protocol::new(BASE), flash());
+        let mut h = header(5000, true);
+        h[3] ^= 0x01; // total_size damaged
+        assert_eq!(feed(&mut p, &f, &h), [RxEvent::FsTransferBad]);
+        assert_eq!(feed(&mut p, &f, &header(5000, true)), [RxEvent::FsReady]);
+    }
+
+    #[test]
+    fn caps_reply_bytes() {
+        struct Rec(RefCell<Vec<u8>>);
+        impl UsartBackend for Rec {
+            fn write_byte(&self, b: u8) {
+                self.0.borrow_mut().push(b);
+            }
+            fn flush(&self) {}
+        }
+        let u = UsartImpl::with_backend(Rec(RefCell::new(Vec::new())));
+        send_fs_caps(&u);
+        // Decoded by tools/ferrite_cli.py (TAG_FSCAPS_RESP).
+        assert_eq!(&*u.backend().0.borrow(), &[0x3A, 0x01, 0x01]);
     }
 }

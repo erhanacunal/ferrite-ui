@@ -116,6 +116,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **Builder:** builds bytecode in RAM, forward jump patching, writes to `&mut [u8]` buffer
 - **Execution:** `vm.run(&code[..len], &mut tree, &mut lcd, &flash)` — F_READ/F_WRITE operate via flash
 - **Control flow:** if/while/for — via JZ/JNZ/JMP combinations
+- **Program switching:** an image holds any number of `RES_PROGRAM`s (`"programs"` in project.json); `main` starts at boot. `runProgram(name [, arg])` (`OP_RUN_PROGRAM` 0xBD → 0 if missing) sets `vm.next_program` and `VmState::Exit`: nothing of the program runs after it (callbacks, modals, the interrupted main code: `can_take_callback` is false, every run loop stops on a non-`Running` state; `start_program` returns early if setup/on_program_start exited). The main loop then calls `runtime::switch_program`: objs + images cleared, VM reset, sound stopped, input reset, new root, `load_program` (program + its same-named `RES_PAGE`), `start_program`. `programArg()` (0xBE) = the `arg` (`vm.program`, 0 at boot), `programName(i)` (0xBF, `Fs::nth_name_by_kind`) lists programs, `-1` = own name. Only the int arg, EEPROM and files survive a switch; syscfg is per image. Example: `examples/exynos4412/launcher`.
 - **Image header v3:** version(u8=3) + func_count(u16) + global_count(u16) + flags(u16) + func_table
   - flags bit 0: render_mode (0=dirty, 1=buffered)
   - Backward compatible: v1/v2 images parsed with 5-byte header, v3 with 7-byte header
@@ -176,6 +177,8 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - The protocol has no frame markers: a stray byte that looks like a payload tag (noise, an aborted transfer) would leave `Protocol` swallowing every later byte as payload. The main loop calls `protocol.resync()` once the RX ring is drained, the parser is mid-message and no byte has arrived for `protocol::RX_RESYNC_MS` (500 ms). The timestamp is taken after `feed`, so a flash erase it triggers doesn't count as a stall.
 - Nextion: PA10 (USART0 RX) is input pull-up, not floating, so an unplugged line doesn't make noise.
 - Hosts: `ferrite_cli` `request()` resends once after a 0.6 s resync wait (`writefs` restarts from the header). The designer's device dialog retries ping and the writefs header, and so does its build-and-upload action.
+- **CRC chunks (writefs):** a 16-byte WriteFs header (flags bit 0 + header CRC) asks for them; new firmware ACKs with FsCaps (`3A 01 01`), older firmware with a pong (host falls back to plain chunks). Chunk = `seq u32` + `CRC-32(seq + data)` + data, held in RAM until checked; bad header/chunk → error 10 (`ERR_TRANSFER_CRC`), nothing written, host resends (`CHUNK_TRIES` = 8). A resend of the chunk just written (lost pong) is ACKed without writing; `resync` drops a chunk cut short. `protocol.rs` (`FS_FLAG_CRC`, `ERR_TRANSFER_CRC`) and `ferrite_cli.py` (`FS_FLAG_CRC`, `ERR_TRANSFER_CRC`, `TAG_FSCAPS_RESP`) — keep in sync. The designer still uploads with plain chunks.
+- `ferrite_cli.py -p COMx monitor [--hex] [--no-time]` prints what the device sends with timestamps and reopens the port if it disappears; `-l` before a command (e.g. `-l writefs`) does the same after it, to watch the restart.
 
 ### Recovery Mode
 - **Hold top-left corner for 3 seconds at boot** → recovery mode

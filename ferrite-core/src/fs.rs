@@ -36,7 +36,7 @@ const MAGIC: u32 = 0x5252_4546;
 const MAX_RESOURCES: usize = 1000;
 
 /// Resource name max uzunluğu (null-terminator dahil)
-const NAME_LEN: usize = 16;
+pub const NAME_LEN: usize = 16;
 
 /// Tek bir resource table entry boyutu
 const ENTRY_SIZE: usize = 32;
@@ -313,6 +313,32 @@ impl Fs {
             }
         }
 
+        None
+    }
+
+    /// Name of the `n`th resource of `kind` (0-based) into `out`; its length
+    /// (names are NUL-padded to 16 bytes), or `None` past the last one.
+    pub fn nth_name_by_kind<F: FlashBackend>(
+        &self,
+        flash: &FlashImpl<F>,
+        kind: u8,
+        n: u16,
+        out: &mut [u8; NAME_LEN],
+    ) -> Option<usize> {
+        let mut found: u16 = 0;
+        let mut entry_buf = [0u8; ENTRY_SIZE];
+        for i in 0..self.resource_count as u32 {
+            let addr = self.table_offset() + i * ENTRY_SIZE as u32;
+            flash.read(addr, &mut entry_buf);
+            if entry_buf[16] != kind {
+                continue;
+            }
+            if found == n {
+                out.copy_from_slice(&entry_buf[..NAME_LEN]);
+                return Some(out.iter().position(|&b| b == 0).unwrap_or(NAME_LEN));
+            }
+            found += 1;
+        }
         None
     }
 
