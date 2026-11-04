@@ -1,0 +1,13 @@
+{
+  "id": "exynos4412",
+  "name": "Exynos 4412 tablet (1280x800)",
+  "bsp": "bsp/exynos4412",
+  "screen": { "width": 1280, "height": 800 },
+  "flash": { "fs_base": "0x1000" },
+  "color": { "model": "RGB565", "count": 65536, "image_max_colors": 256 },
+  "render_modes": ["dirty", "buffered"],
+  "default_render_mode": "dirty",
+  "widgets": ["base", "label", "button", "progress", "slider", "checkbox", "radio", "input", "gauge", "dropdown", "image"],
+  "caps": { "alpha": true, "audio": false, "video": false, "jpeg": false, "image_alpha": true },
+  "defaults": { "root_bg": "0x0000", "text_color": "0xFFFF" }
+}

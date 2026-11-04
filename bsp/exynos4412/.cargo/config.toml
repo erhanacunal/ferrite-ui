@@ -1,0 +1,8 @@
+# Build from this directory: cargo build --release
+# (the workspace root's config targets the GD32).
+[build]
+target = "armv7a-none-eabihf"
+
+# link.x comes from exynos_4412_rs (its build.rs), memory.x from this crate's build.rs.
+[target.armv7a-none-eabihf]
+rustflags = ["-Clink-arg=-Tlink.x"]

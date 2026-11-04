@@ -1,0 +1,16 @@
+[package]
+name = "bsp-exynos4412"
+version = "0.1.0"
+edition = "2024"
+description = "BSP for the Exynos 4412 tablet — 4 × Cortex-A9 + 1280×800 LVDS panel (LTN101AL03), mXT1664S touch"
+
+[[bin]]
+name = "ferrite-ui"
+path = "src/main.rs"
+
+[dependencies]
+ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "pool_large", "wide_code"] }
+# HAL: its panic handler prints file:line on the UART console and halts. A ferrite
+# panic screen (LCD + USART, like the other BSPs) can replace it later: turn
+# default features off then.
+exynos_4412_rs = { path = "../../vendor/exynos_4412_rs/exynos_4412_rs", features = ["heap", "fat"] }
