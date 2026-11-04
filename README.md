@@ -50,7 +50,7 @@ The round panel has no reachable corner, so recovery mode on this board is enter
 |-------|---------------|
 | ![TDO Y13 board](docs/images/tdo_y13.png) | ![TDO Y13 clock example](docs/images/tdo_y13_clock_example.png) |
 
-### Exynos 4412 tablet target
+### Exynos 4412 tablet target - General Mobile eTab4
 
 ![Exynos 4412 tablet](docs/images/etab4.png)
 
