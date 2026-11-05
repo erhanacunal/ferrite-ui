@@ -9,7 +9,7 @@ name = "ferrite-ui"
 path = "src/main.rs"
 
 [dependencies]
-ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "pool_large", "wide_code"] }
+ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "pool_large", "wide_code", "audio"] }
 # HAL: its panic handler prints file:line on the UART console and halts. A ferrite
 # panic screen (LCD + USART, like the other BSPs) can replace it later: turn
 # default features off then.

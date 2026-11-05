@@ -9,7 +9,8 @@
 //! (FAT32), loaded into RAM at boot and saved after `writefs` (storage.rs).
 //!
 //! Single core: CPU0 runs the ferrite main loop; the other cores stay parked
-//! (network/audio can go there later, as epaper does with Wi-Fi on core 1).
+//! (network can go there later, as epaper does with Wi-Fi on core 1). Audio
+//! is refilled from the `pdma0` interrupt (audio.rs).
 //!
 //! Build (from this directory): `cargo build --release`
 
@@ -24,6 +25,7 @@ use exynos_4412_rs::drivers::gic::Gic;
 use exynos_4412_rs::drivers::i2c::{Bus, I2c};
 use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::drivers::max77686::Max77686;
+use exynos_4412_rs::drivers::pl330::PDMA0_IRQ;
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::exceptions::ExceptionFrame;
 use exynos_4412_rs::{BootArgs, cpu, heap, mmu, println};
@@ -40,6 +42,7 @@ use ferrite_core::systick::SystickImpl;
 use ferrite_core::touch::TouchImpl;
 use ferrite_core::usart::UsartImpl;
 
+mod audio;
 mod backlight;
 mod flash;
 mod lcd;
@@ -61,6 +64,8 @@ extern "C" fn handle_irq(_frame: &mut ExceptionFrame) {
     let Some(irq) = gic.acknowledge() else { return };
     if Some(irq.id()) == usart::UART.irq() {
         usart::rx_isr();
+    } else if irq.id() == PDMA0_IRQ {
+        audio::dma_isr();
     }
     gic.end_of_interrupt(irq);
 }
@@ -86,7 +91,8 @@ fn main(_args: BootArgs) -> ! {
     if let Err(e) = pmic_bus.init(400_000, 100) {
         fail("PMIC bus", e);
     }
-    if let Err(e) = touch::init(Max77686::new(pmic_bus), mct) {
+    let pmic = Max77686::new(pmic_bus);
+    if let Err(e) = touch::init(pmic, mct) {
         // Not fatal: the UI runs without touch (USART still works).
         println!("ferrite: touch ERROR {:?}", e);
     }
@@ -105,6 +111,12 @@ fn main(_args: BootArgs) -> ! {
     if let Some(id) = usart::UART.irq() {
         gic.enable(id);
     }
+    // Codec + I2S + DMA up now (~0.5 s), so the first sound starts at once
+    // and the power-up pop is at boot. Not fatal: the UI runs without sound.
+    let mut audio = audio::new(pmic);
+    if !audio.power_on() {
+        println!("ferrite: audio off");
+    }
     cpu::enable_irq();
     println!("ferrite: up, entering runtime");
 
@@ -121,6 +133,7 @@ fn main(_args: BootArgs) -> ! {
         systick: SystickImpl::init(),
         gpio: ferrite_core::gpio::GpioImpl::none(),
         eeprom: ferrite_core::eeprom::EepromImpl::none(),
+        audio: ferrite_core::audio::AudioImpl::with_backend(audio),
         cursor_visible: false,
     });
     let touch = TouchImpl::with_backend(touch::MxtTouch);

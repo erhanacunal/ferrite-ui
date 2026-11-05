@@ -447,7 +447,8 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
 // ============================================================================
 
 /// Apply the image's RES_SYSCFG: resize the USART RX ring, the object pool
-/// and the VM stacks, and set the animation cap. No entry → all defaults.
+/// and the VM stacks, and set the animation cap. Fields at 0 (or no entry)
+/// → the board's `Platform::DEFAULT_*`, then the built-in defaults.
 /// Runs once at boot (filesystem writes reboot), before the program loads.
 #[inline(never)]
 fn apply_syscfg<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
@@ -455,18 +456,31 @@ fn apply_syscfg<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm) -> u8 {
         return 0;
     };
     let cfg = match SysCfg::load(fs, &ctx.flash) {
-        Ok(Some(cfg)) => cfg,
-        Ok(None) => return 0,
+        Ok(Some(cfg)) => Some(cfg),
+        Ok(None) => None,
         Err(_) => return ERR_BAD_SYSCFG,
     };
+    // A syscfg field of 0 (or no syscfg) falls back to the board default,
+    // and a board default of 0 to the built-in one.
+    let pick = |v: usize, board: usize| if v != 0 { v } else { board };
+    let board_defaults = P::DEFAULT_ARENA_BYTES
+        | P::DEFAULT_MAX_OBJECTS
+        | P::DEFAULT_EVAL_STACK
+        | P::DEFAULT_CALL_STACK
+        | P::DEFAULT_CB_QUEUE
+        != 0;
+    let Some(cfg) = cfg.or_else(|| board_defaults.then(SysCfg::default)) else {
+        return 0;
+    };
     let mut ok = ctx.usart.set_rx_capacity(cfg.uart_rx_bytes as usize);
-    ok &= ctx
-        .objs
-        .configure(cfg.arena_bytes as usize, cfg.max_objects as usize);
+    ok &= ctx.objs.configure(
+        pick(cfg.arena_bytes as usize, P::DEFAULT_ARENA_BYTES),
+        pick(cfg.max_objects as usize, P::DEFAULT_MAX_OBJECTS),
+    );
     ok &= vm.configure(
-        cfg.eval_stack as usize,
-        cfg.call_stack as usize,
-        cfg.cb_queue as usize,
+        pick(cfg.eval_stack as usize, P::DEFAULT_EVAL_STACK),
+        pick(cfg.call_stack as usize, P::DEFAULT_CALL_STACK),
+        pick(cfg.cb_queue as usize, P::DEFAULT_CB_QUEUE),
         cfg.anim_slots as usize,
     );
     if ok { 0 } else { ERR_INSUFFICIENT_MEMORY }

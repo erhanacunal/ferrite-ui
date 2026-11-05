@@ -87,6 +87,23 @@ pub trait Platform {
     /// default suits the small RAM boards (Nextion, epaper); tdo_y13 raises it.
     const ANIM_SLOTS: usize = 8;
 
+    // --- Runtime pool sizes when RES_SYSCFG leaves a field at 0 (or the
+    // image has no syscfg) — 0 here = the ferrite-core built-in default
+    // (`pool::DEFAULT_*`, the VM's `STACK_SIZE` / `CALL_STACK_SIZE` /
+    // `CB_QUEUE_SIZE`). Boards with lots of RAM raise them so programs get
+    // more room without a `"memory"` block. An explicit syscfg value wins.
+
+    /// Object arena bytes (widgets, strings, arrays).
+    const DEFAULT_ARENA_BYTES: usize = 0;
+    /// Object pointers (≤ `pool::MAX_OBJECTS`).
+    const DEFAULT_MAX_OBJECTS: usize = 0;
+    /// VM eval stack depth (≤ 255).
+    const DEFAULT_EVAL_STACK: usize = 0;
+    /// VM call stack depth (≤ 255).
+    const DEFAULT_CALL_STACK: usize = 0;
+    /// VM callback queue length (≤ 255).
+    const DEFAULT_CB_QUEUE: usize = 0;
+
     /// Copy each font's glyph bitmaps into RAM when the font is loaded, so
     /// text rendering does not read the resource flash per glyph. Worth it
     /// where that flash is slow to reach (SPI NOR: a command + address per

@@ -27,16 +27,28 @@ impl Platform for Exynos4412Platform {
     type SystickB = crate::systick::MctSystick;
     type GpioB = ferrite_core::gpio::NoGpio;
     type EepromB = ferrite_core::eeprom::NoEeprom;
+    type AudioB = crate::audio::I2sAudio;
 
     // Default layout (config sector 0, FS from 0x1000) inside the RAM region.
 
-    // CAPS: none yet. WM8758 audio (I2S + PL330 DMA in the HAL) → `audio`
-    // feature + CAP_AUDIO; JPEG → software decoder behind `jpeg` (no HW codec
-    // driver yet). Mirror in tools/devices/exynos4412.json.
+    // WM8758 codec on I2S0 + pdma0 (audio.rs). JPEG → software decoder behind
+    // `jpeg` later (no HW codec driver yet). Mirrored in
+    // tools/devices/exynos4412.json (caps.*).
+    const CAPS: u32 = ferrite_core::platform::CAP_AUDIO;
 
     const ANIM_SLOTS: usize = 64;
-    // Resources are in RAM: reading a glyph is a memcpy, no cache needed.
-    const CACHE_FONT_BITMAPS: bool = false;
+    // Glyph bitmaps in RAM at font load: text drawing then needs no
+    // `FlashBackend` call (bounds check + copy out of the region) per glyph.
+    const CACHE_FONT_BITMAPS: bool = true;
+
+    // 1 GB of DRAM (512 MB heap): pools far past the pool_large defaults
+    // (2 MB / 8192), and the deepest VM stacks the u8 indices allow. A
+    // program's `"memory"` block still overrides each one.
+    const DEFAULT_ARENA_BYTES: usize = 16 << 20;
+    const DEFAULT_MAX_OBJECTS: usize = ferrite_core::pool::MAX_OBJECTS;
+    const DEFAULT_EVAL_STACK: usize = 255;
+    const DEFAULT_CALL_STACK: usize = 255;
+    const DEFAULT_CB_QUEUE: usize = 64;
     // RAM-backed: a CRC of the image takes a few ms.
     const VERIFY_FS_ON_BOOT: bool = true;
 }
@@ -46,25 +58,40 @@ static mut KEYS: Option<PowerKeys> = None;
 /// Temporary: a status line at the bottom of the screen for the writefs
 /// "flash image corrupted" investigation. Remove once resolved.
 const DIAG: bool = true;
-static mut DIAG_LAST: (u32, u32, u32, usize) = (u32::MAX, 0, 0, 0);
+static mut DIAG_LAST: [u32; 7] = [u32::MAX; 7];
 
-/// `rx` bytes received / dropped / UART error bits, and the CRC-32 of what
-/// landed in the RAM flash from FS_BASE to the highest written address
-/// (zlib-compatible: compare with `zlib.crc32(open(img,'rb').read())`).
+/// `rx` bytes received / dropped, UART errors by kind (`ovr` overrun = IRQ
+/// too late, bytes lost; `par` parity; `frm` frame = corrupted on the line /
+/// baud mismatch; `brk` break), and the CRC-32 of what landed in the RAM
+/// flash from FS_BASE to the highest written address (zlib-compatible:
+/// compare with `zlib.crc32(open(img,'rb').read())`).
 fn draw_diag(ctx: &mut Ctx<Exynos4412Platform>) {
     use core::fmt::Write;
-    let (rx, drop, err, end) = unsafe {
-        (crate::usart::RX_TOTAL, crate::usart::RX_DROPPED, crate::usart::RX_ERRORS, crate::flash::WRITE_END)
-    };
-    if unsafe { DIAG_LAST } == (rx, drop, err, end) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use crate::usart::{RX_DROPPED, RX_ERR, RX_TOTAL};
+    let end = unsafe { crate::flash::WRITE_END };
+    let now = [
+        RX_TOTAL.load(Relaxed),
+        RX_DROPPED.load(Relaxed),
+        RX_ERR[0].load(Relaxed),
+        RX_ERR[1].load(Relaxed),
+        RX_ERR[2].load(Relaxed),
+        RX_ERR[3].load(Relaxed),
+        end as u32,
+    ];
+    if unsafe { DIAG_LAST } == now {
         return;
     }
-    unsafe { DIAG_LAST = (rx, drop, err, end) };
+    unsafe { DIAG_LAST = now };
+    let [rx, drop, ovr, par, frm, brk, _] = now;
     let base = Exynos4412Platform::FS_BASE as usize;
     let len = end.saturating_sub(base);
     let crc = crate::flash::crc(base, end);
     let mut text = alloc::string::String::new();
-    let _ = write!(text, "rx={rx} drop={drop} err={err:#x} fs_len={len} crc={crc:08x}");
+    let _ = write!(
+        text,
+        "rx={rx} drop={drop} ovr={ovr} par={par} frm={frm} brk={brk} fs_len={len} crc={crc:08x}"
+    );
     let y = PANEL.height as u16 - 24;
     ctx.lcd.fill_rect(0, y, PANEL.width as u16, 24, COLOR_BLACK);
     let font = ctx.fonts.embedded();
@@ -76,7 +103,8 @@ impl PlatformRuntime for Exynos4412Platform {
     const FG_COLOR: u16 = COLOR_WHITE;
     // Cortex-A9 at 1.4 GHz: long bursts per main-loop pass.
     const VM_STEPS_PER_TICK: u32 = 20_000;
-    const MAX_CODE_SIZE: usize = 1024 * 1024;
+    // Programs up to 16 MB are copied to RAM (larger ones run from the region).
+    const MAX_CODE_SIZE: usize = 16 << 20;
     type Input = FullInput;
 
     fn reset() -> ! {
