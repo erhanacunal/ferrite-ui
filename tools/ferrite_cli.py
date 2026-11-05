@@ -60,6 +60,10 @@ FS_FLAG_CRC = 0x01  # chunks carry seq + CRC-32 and are retried
 ERR_TRANSFER_CRC = 10
 # Attempts per chunk in CRC mode before writefs gives up.
 CHUNK_TRIES = 8
+# Smallest chunk the CRC-mode retry halves down to.
+MIN_CRC_CHUNK = 256
+# Probes asking whether the device took an unanswered chunk.
+PROBE_TRIES = 6
 
 # MemDetail pool ids -> (name, unit, meaning of "extra"). Mirrors
 # protocol::mem_pool in ferrite-core/src/protocol.rs — keep in sync.
@@ -583,40 +587,119 @@ def _writefs_once(ser: serial.Serial, data: bytes, log) -> str:
     crc = mode == "crc"
     log("CRC chunks with retry" if crc else "device firmware has no CRC chunks: plain transfer")
 
-    retries = 0
+    if crc:
+        return _send_crc_chunks(ser, data, log)
+
     for i in range(chunk_count):
         chunk = data[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE]
-        msg = build_payload_msg(TAG_WRITECHUNK, _crc_chunk(i, chunk) if crc else chunk)
-        for attempt in range(CHUNK_TRIES if crc else 1):
-            ser.write(msg)
-            ser.flush()
-            resp_type, resp_val = read_response(ser)
-            if resp_type == "pong":
-                break
-            if crc and resp_type == "error" and resp_val == ERR_TRANSFER_CRC:
-                retries += 1
-                log(f"\n  chunk {i + 1}: CRC mismatch, resending ({attempt + 1}/{CHUNK_TRIES})")
-                continue
-            if resp_type == "error":
-                desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
-                log(f"\nerror: code {resp_val} — {desc}")
-                return "error"
-            if not crc:
-                log(f"\nno ACK for chunk {i + 1} (timeout)")
-                return "timeout"
-            # Bytes lost: the device drops the partial chunk after its
-            # resync timeout, then takes the resend.
-            retries += 1
-            log(f"\n  chunk {i + 1}: no ACK, resending ({attempt + 1}/{CHUNK_TRIES})")
-            resync(ser)
-        else:
-            log(f"\nchunk {i + 1}: gave up after {CHUNK_TRIES} attempts")
+        ser.write(build_payload_msg(TAG_WRITECHUNK, chunk))
+        ser.flush()
+        resp_type, resp_val = read_response(ser)
+        if resp_type == "error":
+            desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
+            log(f"\nerror: code {resp_val} — {desc}")
             return "error"
-
+        if resp_type != "pong":
+            log(f"\nno ACK for chunk {i + 1} (timeout)")
+            return "timeout"
         pct = (i + 1) * 100 // chunk_count
         print(f"\r  [{i + 1}/{chunk_count}] {pct}%", end="", flush=True)
 
-    note = f", {retries} chunk(s) resent" if retries else ""
+    log(" done (device will restart)")
+    return "ok"
+
+
+def _probe_taken(ser: serial.Serial, seq: int):
+    """Whether the device has written chunk `seq`: True / False, None if it
+    doesn't answer. Sends an empty chunk numbered seq - 1: the device ACKs it
+    as a duplicate only while seq - 1 is the last chunk it took (so `seq` is
+    not taken); otherwise it answers error 10. Corruption can turn an ACK
+    into an error but never the reverse, so one ACK settles it and errors
+    must repeat."""
+    probe = build_payload_msg(TAG_WRITECHUNK, _crc_chunk((seq - 1) & 0xFFFFFFFF, b""))
+    errors = 0
+    for _ in range(PROBE_TRIES):
+        ser.write(probe)
+        ser.flush()
+        resp_type, resp_val = read_response(ser)
+        if resp_type == "pong":
+            return False
+        if resp_type == "error" and resp_val == ERR_TRANSFER_CRC:
+            errors += 1
+            if errors >= 3:
+                return True
+        else:
+            resync(ser)
+    return None
+
+
+def _send_crc_chunks(ser: serial.Serial, data: bytes, log) -> str:
+    """CRC-mode chunks. The device accepts any chunk length here, so a chunk
+    that keeps failing is halved (down to MIN_CRC_CHUNK): on a line that
+    corrupts one byte in a few KB, small chunks still get through. After
+    CHUNK_TRIES failures at the smallest size it gives up."""
+    total_size = len(data)
+    size = CHUNK_SIZE
+    seq = 0
+    pos = 0
+    retries = 0
+    fails = 0  # consecutive failures at the current size
+    # This seq went unanswered once: the device may have taken it (lost
+    # pong), so it must be resent with the same bytes until it is ACKed.
+    maybe_taken = False
+    while pos < total_size:
+        chunk = data[pos:pos + size]
+        ser.write(build_payload_msg(TAG_WRITECHUNK, _crc_chunk(seq, chunk)))
+        ser.flush()
+        resp_type, resp_val = read_response(ser)
+        if resp_type == "pong":
+            pos += len(chunk)
+            seq += 1
+            fails = 0
+            maybe_taken = False
+            print(f"\r  {pos}/{total_size} bytes ({pos * 100 // total_size}%), chunk {size} B   ",
+                  end="", flush=True)
+            continue
+        if resp_type == "error" and resp_val != ERR_TRANSFER_CRC:
+            desc = ERROR_DESCRIPTIONS.get(resp_val, "unknown")
+            log(f"\nerror: code {resp_val} — {desc}")
+            return "error"
+        retries += 1
+        fails += 1
+        why = "CRC mismatch" if resp_type == "error" else "no ACK"
+        if resp_type != "error":
+            # Bytes lost: the device drops the partial chunk after its
+            # resync timeout, then takes the resend.
+            resync(ser)
+            maybe_taken = True
+        if maybe_taken and resp_type == "error" and fails >= 2:
+            # Resends keep failing: ask whether the device already has it.
+            taken = _probe_taken(ser, seq)
+            last = pos + len(chunk) >= total_size
+            if taken or (taken is None and last):
+                # It has it (or, last chunk unanswered: it restarted).
+                log(f"\n  seq {seq}: already taken, ACK was lost")
+                pos += len(chunk)
+                seq += 1
+                fails = 0
+                maybe_taken = False
+                continue
+            if taken is False:
+                maybe_taken = False
+        # Shrink only while the device surely hasn't taken this seq: after a
+        # missing ACK it may have written it (lost pong) and then ACKs only
+        # a duplicate of the same bytes — a smaller resend would desync.
+        if resp_type == "error" and not maybe_taken and size > MIN_CRC_CHUNK and fails >= 2:
+            size = max(MIN_CRC_CHUNK, size // 2)
+            fails = 0
+            log(f"\n  seq {seq}: {why}, chunk size -> {size} B")
+            continue
+        if fails >= CHUNK_TRIES:
+            log(f"\nseq {seq} (offset {pos}): gave up after {CHUNK_TRIES} attempts at {size} B")
+            return "error"
+        log(f"\n  seq {seq}: {why}, resending ({fails}/{CHUNK_TRIES})")
+
+    note = f", {retries} resend(s), last chunk size {size} B" if retries else ""
     log(f" done{note} (device will restart)")
     return "ok"
 
