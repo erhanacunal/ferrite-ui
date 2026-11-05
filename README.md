@@ -348,6 +348,16 @@ python tools\ferrite_cli.py -p COMx settime      # software clock from the PC cl
 
 Clone with submodules. Needs the `armv7a-none-eabihf` target (`rustup target add armv7a-none-eabihf`) and `rust-objcopy` (`cargo install cargo-binutils`, `rustup component add llvm-tools`). The tablet must already run the HAL's `uart_boot` from its boot partition (see the [HAL README](https://github.com/erhanacunal/exynos-4412-rs)).
 
+`exynos4412.ps1` does all of it: build, `rust-objcopy` to the raw `.bin` (the ELF alone isn't what boots), and optionally the upload, saved on CACHE as the firmware to boot (`-RamOnly` runs it once):
+
+```powershell
+.\exynos4412.ps1                              # build + raw image
+.\exynos4412.ps1 uart -Port COM8 [-Monitor]   # + send over UART (restarts a running ferrite first)
+.\exynos4412.ps1 http -BoardHost 192.168.88.120 [-Wait 30]   # + send over WiFi
+```
+
+`$env:EXYNOS_PORT` / `$env:EXYNOS_HOST` set the defaults. By hand:
+
 ```powershell
 # Build -> raw image
 cd bsp\exynos4412
