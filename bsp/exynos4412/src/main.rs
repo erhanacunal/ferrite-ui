@@ -78,6 +78,7 @@ fn fail(what: &str, error: impl core::fmt::Debug) -> ! {
 
 fn main(_args: BootArgs) -> ! {
     println!("\nferrite-ui (exynos4412)");
+    usart::report_clock();
     let mct = Mct::new();
     mct.start();
     mmu::enable();

@@ -1,0 +1,12 @@
+{
+    "device": "exynos4412",
+    "screen": [1280, 800],
+    "include_dirs": ["../../../lib"],
+    "render_mode": "buffered",
+    "sounds": [
+        {"name": "tone", "source": "assets/tone.wav"}
+    ],
+    "programs": [
+        {"name": "main", "source": "main.fl", "exec_mode": "ram"}
+    ]
+}

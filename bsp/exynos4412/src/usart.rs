@@ -87,6 +87,31 @@ impl UsartBackend for HwUart {
     }
 }
 
+/// DIAG: the console's real baud rate, from the registers U-Boot left —
+/// UBRDIV/UFRACVAL and SCLK_UART2 (CLK_SRC_PERIL0 / CLK_DIV_PERIL0 bits
+/// 11:8, Exynos 4412 UM 7.9.1) — so a baud mismatch (RX framing errors)
+/// shows in the boot log. Assumes source 6 = SCLK_MPLL_USER_T.
+pub fn report_clock() {
+    use exynos_4412_rs::drivers::cmu::Cmu;
+    use exynos_4412_rs::{println, soc};
+    let reg = |off: usize| unsafe { core::ptr::read_volatile((soc::CMU_BASE + off) as *const u32) };
+    let c = Uart::new(UART).config();
+    let src = (reg(0xC250) >> 8) & 0xF;
+    let div = (reg(0xC550) >> 8) & 0xF;
+    let mpll = Cmu::new().fout_mpll_hz();
+    let sclk = if src == 6 { mpll / (div + 1) } else { 0 };
+    // baud = SCLK / (16 * (UBRDIV + 1 + UFRACVAL / 16)), in mBd.
+    let denom = 16 * (c.ubrdiv as u64 + 1) + (c.ufracval & 0xF) as u64;
+    let mbaud = if denom > 0 { sclk as u64 * 1000 / denom } else { 0 };
+    let err = (mbaud as i64 - 115_200_000) * 10_000 / 115_200_000; // 0.01 %
+    println!(
+        "ferrite: UART2 ulcon {:#x} ucon {:#x} ufcon {:#x} ubrdiv {} ufracval {};          PERIL0 src {} div {}; MPLL {} Hz -> SCLK {} Hz, {}.{:03} Bd ({}{}.{:02} %)",
+        c.ulcon, c.ucon, c.ufcon, c.ubrdiv, c.ufracval, src, div, mpll, sclk,
+        mbaud / 1000, mbaud % 1000,
+        if err < 0 { "-" } else { "+" }, err.abs() / 100, err.abs() % 100
+    );
+}
+
 /// Unmasks the RX interrupt at the UART; the GIC side is in main.rs.
 pub fn init() {
     Uart::new(UART).enable_rx_interrupt();
