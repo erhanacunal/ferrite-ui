@@ -78,22 +78,48 @@ Over a noisy line one flipped bit used to spoil the whole upload (error `9`
 after the last chunk). A host can ask for checked, retried chunks:
 
 1. Header is 16 bytes: `total_size`, `chunk_size`, `flags` (bit 0 = CRC
-   chunks), then the CRC-32 (zlib/IEEE) of those first 12 bytes.
-2. Firmware that supports it replies `FsCaps` (`3A 01 01`) instead of `Pong`.
-   Older firmware reads only the first 8 bytes and replies `Pong`: the host
-   then sends plain chunks. A header whose CRC fails gets error `10`.
+   chunks, bit 1 = sequence ACKs, only with bit 0), then the CRC-32
+   (zlib/IEEE) of those first 12 bytes. A 16-byte header is always checked,
+   whatever its flags say, so a damaged flags word can't turn the transfer
+   into a plain one.
+2. Firmware that supports it replies `FsCaps` with the flags it accepted
+   (`3A 01 01`, or `3A 01 03` with sequence ACKs) instead of `Pong`. Older
+   firmware reads only the first 8 bytes and replies `Pong`: the host then
+   sends plain chunks. A header whose CRC fails gets error `10`.
 3. Each chunk payload is `seq u32 LE` (0, 1, 2…) + `CRC-32(seq bytes + data)
    u32 LE` + data. The device keeps the chunk in RAM until the CRC matches,
    then writes it and replies `Pong`. A bad chunk gets error `10` and nothing
    is written; the host sends the same chunk again.
-4. A chunk resent because its `Pong` was lost (`seq` = the one just written)
-   is acknowledged again without being written twice.
+4. A chunk resent because its `Pong` was lost (`seq` = the one just written,
+   with the same CRC field, so the same bytes) is acknowledged again without
+   being written twice. A resend of that `seq` with other bytes is bad.
 5. A chunk cut short (bytes lost) stalls the parser; after `RX_RESYNC_MS`
    (500 ms) the device drops the partial chunk, and the host resends it after
    its 0.6 s resync wait.
+6. From the header until the image is complete (or the line has been quiet
+   for `TRANSFER_IDLE_MS`, 10 s), only `WriteFs` and `WriteChunk` tags start
+   a message; every other byte is skipped. A damaged chunk tag or length
+   leaves chunk data to be parsed as messages, and image bytes are full of
+   tags such as `Restart` (`0x18`) or `Ping` (`0x08`).
 
-`ferrite_cli.py writefs` uses CRC chunks (up to 8 tries per chunk). The
-designer's upload actions still send the plain 8-byte header.
+**Sequence ACKs (flags bit 1).** Pongs and errors don't say which chunk they
+answer, and one damaged chunk can draw several replies (stray tags in its
+data), so a host can fall one reply behind: it takes a written chunk for a
+failed one or the reverse, and the upload ends short or shifted. With bit 1
+every chunk, written or not, is answered by `FsAck` (below): `next_seq` (the
+chunk the device expects next) and `last_crc` (the CRC field of the last chunk
+written). The host reads it by content: `next_seq` = its seq + 1 with the CRC
+of a version it sent for that seq = written (it moves on by that version's
+length, so halving a failing chunk is always safe); `next_seq` = its seq =
+send again; an older `next_seq` = a stale reply, skipped. The last chunk is
+answered with `FsAck` too, then the device checks the image (error `9` if
+bad) and resets.
+
+`ferrite_cli.py writefs` asks for sequence ACKs and falls back to plain CRC
+chunks (`FsCaps` `01`) or plain chunks (`Pong`). It halves a failing chunk
+down to 256 B and tries that size up to 32 times, 0.2 s apart (8 tries at the
+larger sizes). The designer's upload actions still send the plain 8-byte
+header.
 
 ### UserMessage
 
@@ -110,10 +136,11 @@ complete message arrives, the main loop dispatches the program's
 | `3` | `0x18` | Varint | `MemInfo` response | Free heap bytes as unsigned varint |
 | `4` | `0x22` | Payload | `TouchCalibrate` response | 9-byte calibration record |
 | `5` | `0x2A` | Payload | `StackInfo` response | `used u32 LE` + `free u32 LE` |
-| `7` | `0x3A` | Payload | `FsCaps` | One flags byte (bit 0 = CRC chunks): ACK of a CRC `WriteFs` header |
+| `7` | `0x3A` | Payload | `FsCaps` | One flags byte (bit 0 = CRC chunks, bit 1 = sequence ACKs): ACK of a CRC `WriteFs` header |
+| `8` | `0x42` | Payload | `FsAck` | 12 bytes: `next_seq u32 LE` + `last_crc u32 LE` + CRC-32 of those 8 bytes; the answer to every chunk with sequence ACKs |
 
 `Pong` is used both as the ping response and as the ACK for `WriteFs` header and
-chunk transfer.
+chunk transfer (without sequence ACKs).
 
 ## Payload Layouts
 

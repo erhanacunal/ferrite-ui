@@ -8,9 +8,12 @@
 //! Resources persist in `FERRITE/FLASH.BIN` on the eMMC CACHE partition
 //! (FAT32), loaded into RAM at boot and saved after `writefs` (storage.rs).
 //!
-//! Single core: CPU0 runs the ferrite main loop; the other cores stay parked
-//! (network can go there later, as epaper does with Wi-Fi on core 1). Audio
-//! is refilled from the `pdma0` interrupt (audio.rs).
+//! Embassy, one executor per core (`exynos_4412_rs::embassy`):
+//! - CPU0: [`ui_task`], the ferrite runtime (VM + input + render) one pass at
+//!   a time (`Runtime::step`), yielding between passes;
+//! - CPU1: `usart::rx_task`, UART2 RX on its own core and interrupt, so
+//!   nothing CPU0 does can overrun the 16-byte FIFO.
+//! CPU2/3 stay parked. Audio is refilled from the `pdma0` interrupt (audio.rs).
 //!
 //! Build (from this directory): `cargo build --release`
 
@@ -28,7 +31,7 @@ use exynos_4412_rs::drivers::max77686::Max77686;
 use exynos_4412_rs::drivers::pl330::PDMA0_IRQ;
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::exceptions::ExceptionFrame;
-use exynos_4412_rs::{BootArgs, cpu, heap, mmu, println};
+use exynos_4412_rs::{BootArgs, cpu, embassy, heap, mmu, println, smp};
 
 use ferrite_core::backlight::BacklightImpl;
 use ferrite_core::ctx::Ctx;
@@ -38,6 +41,7 @@ use ferrite_core::image::ImageList;
 use ferrite_core::lcd::LcdImpl;
 use ferrite_core::pool::ObjPool;
 use ferrite_core::rtc::RtcImpl;
+use ferrite_core::runtime::Runtime;
 use ferrite_core::systick::SystickImpl;
 use ferrite_core::touch::TouchImpl;
 use ferrite_core::usart::UsartImpl;
@@ -62,10 +66,14 @@ exynos_4412_rs::global_heap!();
 extern "C" fn handle_irq(_frame: &mut ExceptionFrame) {
     let gic = Gic::new();
     let Some(irq) = gic.acknowledge() else { return };
-    if Some(irq.id()) == usart::UART.irq() {
-        usart::rx_isr();
-    } else if irq.id() == PDMA0_IRQ {
+    // PDMA0 first: the HAL's `on_interrupt` would take it for its async DMA
+    // waits (and disable it).
+    if irq.id() == PDMA0_IRQ {
         audio::dma_isr();
+    } else {
+        // MCT (embassy time), UART2 RX (CPU1), …; the rest, e.g. the wake
+        // SGI a secondary core gets at its start, is ignored.
+        embassy::on_interrupt(irq.id());
     }
     gic.end_of_interrupt(irq);
 }
@@ -108,10 +116,11 @@ fn main(_args: BootArgs) -> ! {
 
     let gic = Gic::new();
     gic.init();
-    usart::init();
-    if let Some(id) = usart::UART.irq() {
-        gic.enable(id);
-    }
+    // MCT comparator 0 → embassy-time, to CPU0.
+    embassy::init();
+    // UART2 RX interrupt to CPU1 (falls back to CPU0 below).
+    let rx = usart::start(1);
+    unsafe { *(&raw mut RX) = Some(rx) };
     // Codec + I2S + DMA up now (~0.5 s), so the first sound starts at once
     // and the power-up pop is at boot. Not fatal: the UI runs without sound.
     let mut audio = audio::new(pmic);
@@ -119,6 +128,16 @@ fn main(_args: BootArgs) -> ! {
         println!("ferrite: audio off");
     }
     cpu::enable_irq();
+    let rx_on_cpu0 = match smp::start_cpu(1, cpu1) {
+        Ok(()) => false,
+        Err(e) => {
+            println!("ferrite: CPU1 ERROR {:?}, UART RX on CPU0", e);
+            if let Some(id) = usart::UART.irq() {
+                gic.set_target(id, 0);
+            }
+            true
+        }
+    };
     println!("ferrite: up, entering runtime");
 
     let ctx = Box::new(Ctx::<Exynos4412Platform> {
@@ -138,5 +157,33 @@ fn main(_args: BootArgs) -> ! {
         cursor_visible: false,
     });
     let touch = TouchImpl::with_backend(touch::MxtTouch);
-    ferrite_core::runtime::run::<Exynos4412Platform>(ctx, touch)
+    embassy::run(move |spawner| {
+        spawner.spawn(ui_task(ctx, touch).unwrap());
+        if rx_on_cpu0 {
+            spawner.spawn(usart::rx_task(rx).unwrap());
+        }
+    })
+}
+
+/// The UART RX handle for CPU1's task, set before CPU1 starts.
+static mut RX: Option<exynos_4412_rs::embassy::uart::UartRx> = None;
+
+/// CPU1: UART2 RX only.
+fn cpu1(_core: usize) -> ! {
+    Gic::new().init_this_cpu();
+    cpu::enable_irq();
+    // SAFETY: written once by CPU0 before it started this core.
+    let rx = unsafe { (*(&raw const RX)).expect("RX set before CPU1 starts") };
+    embassy::run(|spawner| spawner.spawn(usart::rx_task(rx).unwrap()))
+}
+
+/// CPU0: the ferrite runtime, one main-loop pass per poll. Yields between
+/// passes so other CPU0 tasks (if any) get their turn.
+#[embassy_executor::task]
+async fn ui_task(ctx: Box<Ctx<Exynos4412Platform>>, touch: TouchImpl<touch::MxtTouch>) {
+    let mut rt = Runtime::<Exynos4412Platform>::new(ctx, touch);
+    loop {
+        rt.step();
+        embassy_futures::yield_now().await;
+    }
 }

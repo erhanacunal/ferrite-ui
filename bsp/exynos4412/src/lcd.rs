@@ -95,6 +95,34 @@ fn clip(x: u16, y: u16, w: u16, h: u16) -> Option<(usize, usize, usize, usize)> 
     Some((x, y, (w as usize).min(W - x), (h as usize).min(H - y)))
 }
 
+/// VIDCON1 (FIMD + 0x04): VSTATUS, bits 14:13, is 0 during vsync
+/// (samsung_fimd.h `VIDCON1_VSTATUS_*`).
+const VIDCON1: usize = exynos_4412_rs::soc::FIMD_BASE + 0x04;
+/// Polls before giving up (FIMD off): far more than one frame.
+const POLL_LIMIT: u32 = 10_000_000;
+
+/// Waits for the next start of vsync by polling VIDCON1.
+///
+/// Not `Fimd::wait_vsync` (HAL 761e342): it sleeps in `wfi` with IRQs masked
+/// until the FIMD frame interrupt (`exynos_4412_rs::sleep::until`), and under
+/// Embassy it arms no deadline alarm (MCT G0 is embassy-time's), so a missed
+/// frame interrupt never times out. With it the runtime stopped answering
+/// during writefs; with this loop it doesn't.
+fn wait_vsync() -> Result<(), display::Error> {
+    // SAFETY: a read-only register of the FIMD's MMIO block, mapped for good.
+    let in_vsync = || unsafe { (core::ptr::read_volatile(VIDCON1 as *const u32) >> 13) & 0x3 == 0 };
+    for want in [false, true] {
+        let mut polls = 0;
+        while in_vsync() != want {
+            polls += 1;
+            if polls == POLL_LIMIT {
+                return Err(display::Error::NoVsync);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Shows what was drawn since the last flush: copies the dirty box from the
 /// shadow to the scanned buffer, starting at a vsync.
 pub fn flush() {
@@ -104,7 +132,7 @@ pub fn flush() {
     }
     let (x, w) = (d[0], d[2] - d[0]);
     // No vsync (FIMD off): copy anyway.
-    let _ = Fimd::new().wait_vsync();
+    let _ = wait_vsync();
     let (src, dst) = (buf_ptr(SHADOW), buf_ptr(SCREEN));
     for y in d[1]..d[3] {
         let at = y * W + x;

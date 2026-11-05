@@ -212,74 +212,105 @@ pub trait InputHandler<P: PlatformRuntime>: Sized {
 
 /// Run the application forever. The BSP builds every hardware backend, packs
 /// them into `Ctx<P>` and a `TouchImpl`, then hands them here.
-pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::TouchB>) -> ! {
-    // --- Embedded ROM font (always font 0) ---
-    ctx.fonts.add(font::Font::from_embedded(
-        &crate::embedded_font::GLYPHS,
-        &crate::embedded_font::CODEPOINTS,
-        &crate::embedded_font::BITMAP,
-        crate::embedded_font::Y_ADVANCE,
-        crate::embedded_font::BPP,
-    ));
-
-    // --- Platform boot: backlight / recovery / SD flashing / FS preamble ---
-    let mut error_code = P::boot(&mut ctx, &mut touch);
-
-    // --- Mount flash filesystem ---
-    if error_code == 0 {
-        match fs::Fs::mount(&ctx.flash, P::FS_BASE) {
-            Ok(f) if P::VERIFY_FS_ON_BOOT && !f.verify(&ctx.flash) => error_code = ERR_BAD_IMAGE,
-            Ok(f) => ctx.fs = Some(f),
-            Err(_) => error_code = ERR_NO_FILESYSTEM,
-        }
-    }
-
-    // --- VM ---
-    let mut vm = Box::new(Vm::new());
-    vm.syscall_fn = Some(P::syscall);
-    vm.forced_render_mode = P::FORCED_RENDER_MODE;
-
-    // --- Size the runtime pools from the image's RES_SYSCFG (if any) ---
-    if error_code == 0 {
-        error_code = apply_syscfg(&mut ctx, &mut vm);
-    }
-
-    // --- Root widget (always widget 0; after the pool is sized, which drops
-    // every object) ---
-    alloc_root(&mut ctx);
-
-    // --- Load main program ---
-    if error_code == 0 {
-        error_code = load_program(&mut ctx, &mut vm, ProgramRef::new(b"main", 0));
-    }
-
-    // --- setup() / on_program_start() / start loop() ---
-    if error_code == 0 && vm.has_code() {
-        error_code = start_program(&mut ctx, &mut vm);
-    }
-
-    // --- First frame / error screen ---
-    if error_code != 0 && error_code != ERR_EMPTY_RUN {
-        show_error(&mut ctx, error_code, None);
-    } else if error_code == 0 && vm.state != VmState::Exit {
-        P::initial_render(&mut ctx, &vm);
-    }
-
-    // --- Main loop ---
-    let mut input = <P::Input as InputHandler<P>>::new();
-    let mut protocol = Protocol::new(P::FS_BASE);
-    // Time the last USART byte was taken from the RX ring (for resync).
-    let mut last_rx_ms = ctx.systick.millis();
-
+pub fn run<P: PlatformRuntime>(ctx: Box<Ctx<P>>, touch: TouchImpl<P::TouchB>) -> ! {
+    let mut rt = Runtime::<P>::new(ctx, touch);
     loop {
+        rt.step();
+    }
+}
+
+/// The application after its startup sequence, run one main-loop pass at a
+/// time by [`step`](Self::step). [`run`] is `new` + `step` forever; a BSP with
+/// its own scheduler (an async executor) calls `step` from a task instead and
+/// does other work between passes.
+pub struct Runtime<P: PlatformRuntime> {
+    ctx: Box<Ctx<P>>,
+    touch: TouchImpl<P::TouchB>,
+    vm: Box<Vm>,
+    input: P::Input,
+    protocol: Protocol,
+    error_code: u8,
+    /// Time the last USART byte was taken from the RX ring (for resync).
+    last_rx_ms: u32,
+}
+
+impl<P: PlatformRuntime> Runtime<P> {
+    /// Runs the startup sequence: ROM font, `P::boot`, mount, syscfg, root
+    /// widget, `main` + `setup()`, first frame or error screen.
+    pub fn new(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::TouchB>) -> Self {
+        // --- Embedded ROM font (always font 0) ---
+        ctx.fonts.add(font::Font::from_embedded(
+            &crate::embedded_font::GLYPHS,
+            &crate::embedded_font::CODEPOINTS,
+            &crate::embedded_font::BITMAP,
+            crate::embedded_font::Y_ADVANCE,
+            crate::embedded_font::BPP,
+        ));
+
+        // --- Platform boot: backlight / recovery / SD flashing / FS preamble ---
+        let mut error_code = P::boot(&mut ctx, &mut touch);
+
+        // --- Mount flash filesystem ---
+        if error_code == 0 {
+            match fs::Fs::mount(&ctx.flash, P::FS_BASE) {
+                Ok(f) if P::VERIFY_FS_ON_BOOT && !f.verify(&ctx.flash) => error_code = ERR_BAD_IMAGE,
+                Ok(f) => ctx.fs = Some(f),
+                Err(_) => error_code = ERR_NO_FILESYSTEM,
+            }
+        }
+
+        // --- VM ---
+        let mut vm = Box::new(Vm::new());
+        vm.syscall_fn = Some(P::syscall);
+        vm.forced_render_mode = P::FORCED_RENDER_MODE;
+
+        // --- Size the runtime pools from the image's RES_SYSCFG (if any) ---
+        if error_code == 0 {
+            error_code = apply_syscfg(&mut ctx, &mut vm);
+        }
+
+        // --- Root widget (always widget 0; after the pool is sized, which drops
+        // every object) ---
+        alloc_root(&mut ctx);
+
+        // --- Load main program ---
+        if error_code == 0 {
+            error_code = load_program(&mut ctx, &mut vm, ProgramRef::new(b"main", 0));
+        }
+
+        // --- setup() / on_program_start() / start loop() ---
+        if error_code == 0 && vm.has_code() {
+            error_code = start_program(&mut ctx, &mut vm);
+        }
+
+        // --- First frame / error screen ---
+        if error_code != 0 && error_code != ERR_EMPTY_RUN {
+            show_error(&mut ctx, error_code, None);
+        } else if error_code == 0 && vm.state != VmState::Exit {
+            P::initial_render(&mut ctx, &vm);
+        }
+
+        let input = <P::Input as InputHandler<P>>::new();
+        let last_rx_ms = ctx.systick.millis();
+        Self { ctx, touch, vm, input, protocol: Protocol::new(P::FS_BASE), error_code, last_rx_ms }
+    }
+
+    /// The hardware context, between passes.
+    pub fn ctx(&mut self) -> &mut Ctx<P> {
+        &mut self.ctx
+    }
+
+    /// One main-loop pass: VM, USART protocol, input, animations, audio,
+    /// render, callbacks, `P::frame_end`.
+    pub fn step(&mut self) {
         // `runProgram` ended the running program: load the next one.
-        if error_code == 0 && vm.state == VmState::Exit {
-            error_code = switch_program(&mut ctx, &mut vm, &mut input);
+        if self.error_code == 0 && self.vm.state == VmState::Exit {
+            self.error_code = switch_program(&mut self.ctx, &mut self.vm, &mut self.input);
         }
 
         // Resume a suspended showModal whose result is now ready.
-        if error_code == 0 {
-            vm.try_resume_modal(&mut ctx);
+        if self.error_code == 0 {
+            self.vm.try_resume_modal(&mut self.ctx);
         }
 
         // --- VM step ---
@@ -288,120 +319,17 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
         // already spins at CPU speed); faster BSPs and the sim raise
         // VM_STEPS_PER_TICK so animation runs at hardware-like speed instead
         // of one instruction per presented frame.
-        if error_code == 0 {
-            vm.tick(&mut ctx, P::VM_STEPS_PER_TICK);
-            error_code = check_vm_fault(&mut ctx, &vm);
+        if self.error_code == 0 {
+            self.vm.tick(&mut self.ctx, P::VM_STEPS_PER_TICK);
+            self.error_code = check_vm_fault(&mut self.ctx, &self.vm);
         }
 
-        // --- USART protocol (always serviced, even after an error, so a new
-        //     program or filesystem can be flashed to recover) ---
-        while let Some(byte) = ctx.usart.rx_read_byte() {
-            let ev = protocol.feed(byte, &ctx.flash);
-            // After feed: a flash erase it triggered is not idle time.
-            last_rx_ms = ctx.systick.millis();
-            if matches!(ev, RxEvent::None) {
-                continue;
-            }
-            if P::on_extra_rx(ev, &mut ctx, &mut vm, &mut touch) {
-                continue;
-            }
-            match ev {
-                RxEvent::Ping => protocol::send_pong(&ctx.usart),
-                RxEvent::Restart => {
-                    ctx.eeprom.flush();
-                    P::reset()
-                }
-                RxEvent::MemInfo => {
-                    let (free, _largest) = P::heap_stats();
-                    protocol::send_meminfo(&ctx.usart, free as u32);
-                }
-                RxEvent::StackInfo => {
-                    let (used, free) = P::stack_info();
-                    protocol::send_stackinfo(&ctx.usart, used, free, P::stack_peak());
-                }
-                RxEvent::MemDetail => {
-                    let entries = mem_detail(&ctx, &vm);
-                    protocol::send_memdetail(&ctx.usart, &entries);
-                }
-                RxEvent::SetDateTime => {
-                    let dt = protocol.datetime();
-                    ctx.rtc.set_time(&dt);
-                    protocol::send_pong(&ctx.usart);
-                }
-                RxEvent::ProgramReady => {
-                    error_code = reload_program(&mut ctx, &mut vm, &mut input, &mut protocol);
-                    if error_code != 0 {
-                        show_error(&mut ctx, error_code, None);
-                    } else {
-                        P::initial_render(&mut ctx, &vm);
-                    }
-                }
-                RxEvent::ProgramTooLarge => {
-                    protocol::send_error(&ctx.usart, ERR_INSUFFICIENT_MEMORY);
-                }
-                RxEvent::FsReady => {
-                    vm.reset();
-                    #[cfg(feature = "audio")]
-                    ctx.audio.stop();
-                    ctx.objs.clear();
-                    ctx.images.clear();
-                    error_code = 0;
-                    protocol.alloc_sector_buf();
-                    if protocol.fs_crc_mode() {
-                        protocol::send_fs_caps(&ctx.usart);
-                    } else {
-                        protocol::send_pong(&ctx.usart);
-                    }
-                }
-                RxEvent::FsChunkDone => protocol::send_pong(&ctx.usart),
-                // Dropped, nothing written: the host resends that header/chunk.
-                RxEvent::FsTransferBad => protocol::send_error(&ctx.usart, protocol::ERR_TRANSFER_CRC),
-                RxEvent::FsWriteComplete => {
-                    // Check the image before rebooting into it: on a bad
-                    // upload the host gets the error and can resend.
-                    let ok = fs::Fs::mount(&ctx.flash, P::FS_BASE)
-                        .is_ok_and(|f| f.verify(&ctx.flash));
-                    if !ok {
-                        ctx.fs = None;
-                        error_code = ERR_BAD_IMAGE;
-                        protocol::send_error(&ctx.usart, error_code);
-                        show_error(&mut ctx, error_code, None);
-                        continue;
-                    }
-                    protocol::send_pong(&ctx.usart);
-                    ctx.usart.flush();
-                    ctx.eeprom.flush();
-                    P::reset();
-                }
-                RxEvent::UserMessage => {
-                    if vm.has_code() {
-                        if let Some(offset) =
-                            vm.find_by_kind(FunctionKind::OnUserMessage).map(|e| e.offset as CodeAddr)
-                        {
-                            let msg = protocol.user_message();
-                            if !msg.is_empty() {
-                                if let Some(arr_id) = ctx.objs.arr_from_bytes(msg) {
-                                    vm.enqueue_callback(offset, &[arr_id as i32]);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {} // None handled above; extras consumed by on_extra_rx
-            }
-        }
-        // Ring drained. A message stalled mid-frame is dropped, so a stray
-        // byte (RX noise, an aborted host transfer) can't wedge the parser.
-        if !protocol.is_idle()
-            && ctx.systick.millis().wrapping_sub(last_rx_ms) > protocol::RX_RESYNC_MS
-        {
-            protocol.resync();
-        }
+        self.service_usart();
 
         // --- Input ---
-        if error_code == 0 {
-            input.handle(&mut ctx, &mut vm, &mut touch);
-            input.tick(&mut ctx);
+        if self.error_code == 0 {
+            self.input.handle(&mut self.ctx, &mut self.vm, &mut self.touch);
+            self.input.tick(&mut self.ctx);
         }
 
         // --- Advance property animations ---
@@ -409,36 +337,178 @@ pub fn run<P: PlatformRuntime>(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::Tou
         // even while the program is Halted/Waiting. Runs before render so dirtied
         // props paint this frame; any onAnimEnd callbacks enqueued here are picked
         // up by the callback drain below.
-        if error_code == 0 {
-            let now = ctx.systick.millis();
-            vm.tick_animations(&mut ctx, now);
+        if self.error_code == 0 {
+            let now = self.ctx.systick.millis();
+            self.vm.tick_animations(&mut self.ctx, now);
         }
 
         // --- Stream the playing sound (if any) into the audio backend ---
         #[cfg(feature = "audio")]
-        ctx.audio.pump(&ctx.flash);
+        self.ctx.audio.pump(&self.ctx.flash);
 
         // --- Render (on_paint runs inside, for the widgets it drew) ---
-        if error_code == 0 {
-            render_phase(&mut ctx, &mut vm, &mut input);
+        if self.error_code == 0 {
+            render_phase(&mut self.ctx, &mut self.vm, &mut self.input);
         }
 
         // --- Start queued callbacks, then re-render ---
-        if error_code == 0 && vm.has_pending_callbacks() && vm.drain_callbacks(&mut ctx) {
-            render_phase(&mut ctx, &mut vm, &mut input);
+        if self.error_code == 0
+            && self.vm.has_pending_callbacks()
+            && self.vm.drain_callbacks(&mut self.ctx)
+        {
+            render_phase(&mut self.ctx, &mut self.vm, &mut self.input);
         }
 
         // --- A fault in a callback or on_paint stops the program too ---
-        if error_code == 0 {
-            error_code = check_vm_fault(&mut ctx, &vm);
+        if self.error_code == 0 {
+            self.error_code = check_vm_fault(&mut self.ctx, &self.vm);
         }
 
         // --- Commit EEPROM writes made this pass (one erase on flash-backed
         //     boards for a whole save; no-op on write-through chips) ---
-        ctx.eeprom.flush();
+        self.ctx.eeprom.flush();
 
         // --- End-of-frame hook (host window pump / present; no-op on device) ---
-        P::frame_end(&mut ctx);
+        P::frame_end(&mut self.ctx);
+    }
+
+    /// USART protocol: always serviced, even after an error, so a new program
+    /// or filesystem can be flashed to recover.
+    fn service_usart(&mut self) {
+        while let Some(byte) = self.ctx.usart.rx_read_byte() {
+            let ev = self.protocol.feed(byte, &self.ctx.flash);
+            // After feed: a flash erase it triggered is not idle time.
+            self.last_rx_ms = self.ctx.systick.millis();
+            if matches!(ev, RxEvent::None) {
+                continue;
+            }
+            if P::on_extra_rx(ev, &mut self.ctx, &mut self.vm, &mut self.touch) {
+                continue;
+            }
+            self.handle_event(ev);
+        }
+        // Ring drained. A message stalled mid-frame is dropped, so a stray
+        // byte (RX noise, an aborted host transfer) can't wedge the parser.
+        if !self.protocol.is_idle()
+            && self.ctx.systick.millis().wrapping_sub(self.last_rx_ms) > protocol::RX_RESYNC_MS
+        {
+            self.protocol.resync();
+        }
+        // A transfer the host gave up on: let other commands through again.
+        if self.protocol.in_transfer()
+            && self.ctx.systick.millis().wrapping_sub(self.last_rx_ms) > protocol::TRANSFER_IDLE_MS
+        {
+            self.protocol.end_transfer();
+        }
+    }
+
+    /// ACK of a WriteFs chunk: FsAck in sequence-ACK mode, else a pong.
+    fn ack_chunk(&self) {
+        if self.protocol.fs_seq_ack() {
+            let (next_seq, last_crc) = self.protocol.fs_ack_state();
+            protocol::send_fs_ack(&self.ctx.usart, next_seq, last_crc);
+        } else {
+            protocol::send_pong(&self.ctx.usart);
+        }
+    }
+
+    /// Acts on one finished USART message.
+    fn handle_event(&mut self, ev: RxEvent) {
+        match ev {
+            RxEvent::Ping => protocol::send_pong(&self.ctx.usart),
+            RxEvent::Restart => {
+                self.ctx.eeprom.flush();
+                P::reset()
+            }
+            RxEvent::MemInfo => {
+                let (free, _largest) = P::heap_stats();
+                protocol::send_meminfo(&self.ctx.usart, free as u32);
+            }
+            RxEvent::StackInfo => {
+                let (used, free) = P::stack_info();
+                protocol::send_stackinfo(&self.ctx.usart, used, free, P::stack_peak());
+            }
+            RxEvent::MemDetail => {
+                let entries = mem_detail(&self.ctx, &self.vm);
+                protocol::send_memdetail(&self.ctx.usart, &entries);
+            }
+            RxEvent::SetDateTime => {
+                let dt = self.protocol.datetime();
+                self.ctx.rtc.set_time(&dt);
+                protocol::send_pong(&self.ctx.usart);
+            }
+            RxEvent::ProgramReady => {
+                self.error_code =
+                    reload_program(&mut self.ctx, &mut self.vm, &mut self.input, &mut self.protocol);
+                if self.error_code != 0 {
+                    show_error(&mut self.ctx, self.error_code, None);
+                } else {
+                    P::initial_render(&mut self.ctx, &self.vm);
+                }
+            }
+            RxEvent::ProgramTooLarge => {
+                protocol::send_error(&self.ctx.usart, ERR_INSUFFICIENT_MEMORY);
+            }
+            RxEvent::FsReady => {
+                self.vm.reset();
+                #[cfg(feature = "audio")]
+                self.ctx.audio.stop();
+                self.ctx.objs.clear();
+                self.ctx.images.clear();
+                self.error_code = 0;
+                self.protocol.alloc_sector_buf();
+                if self.protocol.fs_crc_mode() {
+                    protocol::send_fs_caps(&self.ctx.usart, self.protocol.fs_caps());
+                } else {
+                    protocol::send_pong(&self.ctx.usart);
+                }
+            }
+            RxEvent::FsChunkDone => self.ack_chunk(),
+            // Dropped, nothing written: the host resends that header/chunk.
+            // Inside a sequence-ACK transfer the FsAck says so (and how far
+            // the device is); a bad header before one gets error 10.
+            RxEvent::FsTransferBad => {
+                if self.protocol.fs_seq_ack() && self.protocol.in_transfer() {
+                    self.ack_chunk();
+                } else {
+                    protocol::send_error(&self.ctx.usart, protocol::ERR_TRANSFER_CRC)
+                }
+            }
+            RxEvent::FsWriteComplete => {
+                // Check the image before rebooting into it: on a bad
+                // upload the host gets the error and can resend.
+                let ok = fs::Fs::mount(&self.ctx.flash, P::FS_BASE)
+                    .is_ok_and(|f| f.verify(&self.ctx.flash));
+                if !ok {
+                    self.ctx.fs = None;
+                    self.error_code = ERR_BAD_IMAGE;
+                    protocol::send_error(&self.ctx.usart, self.error_code);
+                    show_error(&mut self.ctx, self.error_code, None);
+                    return;
+                }
+                self.ack_chunk();
+                self.ctx.usart.flush();
+                self.ctx.eeprom.flush();
+                P::reset();
+            }
+            RxEvent::UserMessage => {
+                if self.vm.has_code() {
+                    if let Some(offset) = self
+                        .vm
+                        .find_by_kind(FunctionKind::OnUserMessage)
+                        .map(|e| e.offset as CodeAddr)
+                    {
+                        let msg = self.protocol.user_message();
+                        if !msg.is_empty() {
+                            if let Some(arr_id) = self.ctx.objs.arr_from_bytes(msg) {
+                                self.vm.enqueue_callback(offset, &[arr_id as i32]);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {} // None handled above; extras consumed by on_extra_rx
+        }
     }
 }
 

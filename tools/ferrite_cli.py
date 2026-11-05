@@ -53,13 +53,19 @@ TAG_TOUCHCAL_RESP = (4 << 3) | 2  # 0x22, payload (calibration result, 9 bytes)
 TAG_STACKINFO_RESP = (5 << 3) | 2  # 0x2A, payload (used + free [+ peak], 8 or 12 bytes)
 TAG_MEMDETAIL_RESP = (6 << 3) | 2  # 0x32, payload (version + count + 13-byte entries)
 TAG_FSCAPS_RESP = (7 << 3) | 2  # 0x3A, payload (1 byte flags): ACK of a CRC writefs header
+TAG_FSACK_RESP = (8 << 3) | 2  # 0x42, payload (12 B): next_seq + last_crc + CRC-32 (seq-ACK writefs)
 
 # WriteFs header flags (u32 after total_size + chunk_size) — FS_FLAG_* in protocol.rs
 FS_FLAG_CRC = 0x01  # chunks carry seq + CRC-32 and are retried
+FS_FLAG_SEQ_ACK = 0x02  # with CRC: every chunk answered by FsAck (next_seq + last_crc)
 # Error code for a header/chunk that failed its CRC — ERR_TRANSFER_CRC in protocol.rs
 ERR_TRANSFER_CRC = 10
 # Attempts per chunk in CRC mode before writefs gives up.
 CHUNK_TRIES = 8
+# At MIN_CRC_CHUNK: attempts, and a pause between them. Corruption comes in
+# bursts on some lines (exynos4412 UART2); the device has no retry limit.
+MIN_CHUNK_TRIES = 32
+MIN_CHUNK_PAUSE = 0.2
 # Smallest chunk the CRC-mode retry halves down to.
 MIN_CRC_CHUNK = 256
 # Probes asking whether the device took an unanswered chunk.
@@ -273,6 +279,21 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             if not payload:
                 return ("timeout", None)
             return ("fscaps", payload[0])
+
+        if tag == TAG_FSACK_RESP:
+            # Sequence-ACK writefs: next_seq u32 + last_crc u32 + CRC-32.
+            length = _read_varint(ser)
+            if length != 12:
+                continue
+            payload = ser.read(12)
+            if len(payload) < 12:
+                ser.timeout = orig_timeout
+                return ("timeout", None)
+            if zlib.crc32(payload[:8]) != int.from_bytes(payload[8:], "little"):
+                continue
+            ser.timeout = orig_timeout
+            return ("fsack", (int.from_bytes(payload[0:4], "little"),
+                              int.from_bytes(payload[4:8], "little")))
 
         if tag in (TAG_STACKINFO_RESP, TAG_MEMDETAIL_RESP, TAG_ERROR, TAG_TOUCHCAL_RESP):
             length = _read_varint(ser)
@@ -542,7 +563,7 @@ def writefs_data(ser: serial.Serial, data: bytes, log=None) -> bool:
 
 
 def _fs_header(total_size: int) -> bytes:
-    head = struct.pack("<III", total_size, CHUNK_SIZE, FS_FLAG_CRC)
+    head = struct.pack("<III", total_size, CHUNK_SIZE, FS_FLAG_CRC | FS_FLAG_SEQ_ACK)
     return head + struct.pack("<I", zlib.crc32(head))
 
 
@@ -559,6 +580,8 @@ def _send_header(ser: serial.Serial, total_size: int, log) -> str:
         ser.flush()
         resp_type, resp_val = read_response(ser)
         if resp_type == "fscaps":
+            if resp_val & FS_FLAG_SEQ_ACK:
+                return "seq"
             return "crc" if resp_val & FS_FLAG_CRC else "plain"
         if resp_type == "pong":
             return "plain"
@@ -584,6 +607,9 @@ def _writefs_once(ser: serial.Serial, data: bytes, log) -> str:
         log("no ACK for header (timeout)")
     if mode in ("timeout", "error"):
         return mode
+    if mode == "seq":
+        log("CRC chunks with sequence ACKs")
+        return _send_seq_chunks(ser, data, log)
     crc = mode == "crc"
     log("CRC chunks with retry" if crc else "device firmware has no CRC chunks: plain transfer")
 
@@ -633,6 +659,94 @@ def _probe_taken(ser: serial.Serial, seq: int):
     return None
 
 
+def _await_fsack(ser: serial.Serial, seq: int, versions: dict) -> tuple:
+    """Reads replies to chunk `seq` until one settles it: ("taken", length),
+    ("bad", None), ("timeout", None) or ("error", code). An FsAck is read by
+    content, so stale replies (extra answers to a damaged chunk) can't be
+    taken for this one: next_seq = seq + 1 with the CRC of a version sent
+    for this seq = taken (with that version's length); next_seq = seq = not
+    taken; older = stale, skipped. `versions` maps CRC field -> length."""
+    timeout = ser.timeout
+    deadline = time.time() + timeout
+    try:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return ("timeout", None)
+            ser.timeout = remaining
+            resp_type, resp_val = read_response(ser)
+            if resp_type == "timeout":
+                return ("timeout", None)
+            if resp_type == "error" and resp_val != ERR_TRANSFER_CRC:
+                return ("error", resp_val)
+            if resp_type != "fsack":
+                continue  # pong / error 10: not sent in this mode, noise
+            next_seq, last_crc = resp_val
+            if next_seq == seq + 1 and last_crc in versions:
+                return ("taken", versions[last_crc])
+            if next_seq == seq:
+                return ("bad", None)
+            if next_seq > seq + 1 or next_seq == seq + 1:
+                # Ahead of us, or a CRC we never sent for this seq: the
+                # host and the device disagree. Can't happen unless the
+                # reply was forged by corruption that passed its CRC.
+                return ("error", ERR_TRANSFER_CRC)
+            # next_seq < seq: a stale reply, keep reading.
+    finally:
+        ser.timeout = timeout
+
+
+def _send_seq_chunks(ser: serial.Serial, data: bytes, log) -> str:
+    """Sequence-ACK chunks (FS_FLAG_SEQ_ACK). Every reply says how far the
+    device is, so a failing chunk can be halved at any time: if the device
+    did take an earlier, longer version of this seq, its FsAck names that
+    version's CRC and the host moves on by that length."""
+    total_size = len(data)
+    size = CHUNK_SIZE
+    seq = pos = retries = fails = 0
+    versions = {}  # CRC field -> length, for the versions of this seq sent
+    while pos < total_size:
+        chunk = data[pos:pos + size]
+        body = _crc_chunk(seq, chunk)
+        versions[int.from_bytes(body[4:8], "little")] = len(chunk)
+        ser.write(build_payload_msg(TAG_WRITECHUNK, body))
+        ser.flush()
+        outcome, value = _await_fsack(ser, seq, versions)
+        if outcome == "taken":
+            pos += value
+            seq += 1
+            fails = 0
+            versions = {}
+            print(f"\r  {pos}/{total_size} bytes ({pos * 100 // total_size}%), chunk {size} B   ",
+                  end="", flush=True)
+            continue
+        if outcome == "error":
+            desc = ERROR_DESCRIPTIONS.get(value, "unknown")
+            log(f"\nerror: code {value} — {desc}")
+            return "error"
+        retries += 1
+        fails += 1
+        why = "CRC mismatch" if outcome == "bad" else "no ACK"
+        if outcome == "timeout":
+            resync(ser)
+        if size > MIN_CRC_CHUNK and fails >= 2:
+            size = max(MIN_CRC_CHUNK, size // 2)
+            fails = 0
+            log(f"\n  seq {seq}: {why}, chunk size -> {size} B")
+            continue
+        tries = MIN_CHUNK_TRIES if size <= MIN_CRC_CHUNK else CHUNK_TRIES
+        if fails >= tries:
+            log(f"\nseq {seq} (offset {pos}): gave up after {tries} attempts at {size} B")
+            return "error"
+        if size <= MIN_CRC_CHUNK:
+            time.sleep(MIN_CHUNK_PAUSE)
+        log(f"\n  seq {seq}: {why}, resending ({fails}/{tries})")
+
+    note = f", {retries} resend(s), last chunk size {size} B" if retries else ""
+    log(f" done{note} (device will restart)")
+    return "ok"
+
+
 def _send_crc_chunks(ser: serial.Serial, data: bytes, log) -> str:
     """CRC-mode chunks. The device accepts any chunk length here, so a chunk
     that keeps failing is halved (down to MIN_CRC_CHUNK): on a line that
@@ -666,6 +780,13 @@ def _send_crc_chunks(ser: serial.Serial, data: bytes, log) -> str:
             return "error"
         retries += 1
         fails += 1
+        if resp_type == "error":
+            # A chunk cut short by a damaged length leaves its data to be
+            # parsed as messages, and stray chunk/header tags in it answer
+            # with more errors. Drop those, or every later reply is read
+            # one behind (a taken chunk looks failed, then gets resent).
+            time.sleep(0.1)
+            drain_input(ser, quiet=0.1)
         why = "CRC mismatch" if resp_type == "error" else "no ACK"
         if resp_type != "error":
             # Bytes lost: the device drops the partial chunk after its
@@ -694,10 +815,13 @@ def _send_crc_chunks(ser: serial.Serial, data: bytes, log) -> str:
             fails = 0
             log(f"\n  seq {seq}: {why}, chunk size -> {size} B")
             continue
-        if fails >= CHUNK_TRIES:
-            log(f"\nseq {seq} (offset {pos}): gave up after {CHUNK_TRIES} attempts at {size} B")
+        tries = MIN_CHUNK_TRIES if size <= MIN_CRC_CHUNK else CHUNK_TRIES
+        if fails >= tries:
+            log(f"\nseq {seq} (offset {pos}): gave up after {tries} attempts at {size} B")
             return "error"
-        log(f"\n  seq {seq}: {why}, resending ({fails}/{CHUNK_TRIES})")
+        if size <= MIN_CRC_CHUNK:
+            time.sleep(MIN_CHUNK_PAUSE)
+        log(f"\n  seq {seq}: {why}, resending ({fails}/{tries})")
 
     note = f", {retries} resend(s), last chunk size {size} B" if retries else ""
     log(f" done{note} (device will restart)")

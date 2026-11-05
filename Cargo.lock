@@ -204,6 +204,8 @@ dependencies = [
 name = "bsp-exynos4412"
 version = "0.1.0"
 dependencies = [
+ "embassy-executor",
+ "embassy-futures",
  "exynos_4412_rs",
  "ferrite-core",
 ]

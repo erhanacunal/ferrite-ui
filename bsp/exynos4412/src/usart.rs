@@ -1,62 +1,114 @@
 //! USART backend — UART2, the board's console (115200 8N1, set up by U-Boot).
 //!
-//! UART2 has only a 16-byte RX FIFO, less than one main-loop pass at 115200
-//! baud, so RX is interrupt-driven into a ring (`handle_irq` in main.rs calls
-//! [`rx_isr`]). TX is polled. The HAL's `println!` uses the same UART: keep it
-//! to boot messages (the host tools skip boot-log text).
+//! RX runs on CPU1: the HAL's async `UartRx` takes UART2's interrupt there
+//! (its 16-byte FIFO lasts ~1.4 ms at 115200) and [`rx_task`] moves every
+//! byte into [`BUF`], which the runtime on CPU0 drains through
+//! [`HwUart::rx_read_byte`]. Whatever CPU0 does (vsync waits asleep with IRQs
+//! masked, long renders), nothing is lost. If CPU1 doesn't start, the task
+//! runs on CPU0 instead (main.rs). TX is polled. The HAL's `println!` uses
+//! the same UART: keep it to boot messages (the host tools skip boot-log
+//! text).
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+use exynos_4412_rs::drivers::gic::Gic;
 use exynos_4412_rs::drivers::uart::{Uart, UartId};
+use exynos_4412_rs::embassy::uart::UartRx;
 use ferrite_core::usart::UsartBackend;
 
 pub const UART: UartId = UartId::Uart2;
 
-const RING: usize = 16 * 1024;
+const RING: usize = 64 * 1024;
 const MASK: usize = RING - 1;
 
 static mut BUF: [u8; RING] = [0; RING];
-// Head is written only by the ISR, tail only by the main loop. Atomics (not
-// plain statics) so the compiler orders the ring bytes against the indices.
+// Single producer (rx_task) / single consumer (the runtime), on different
+// cores: the Release/Acquire pairs order the ring bytes against the indices.
 static HEAD: AtomicUsize = AtomicUsize::new(0);
 static TAIL: AtomicUsize = AtomicUsize::new(0);
 
-// DIAG: bytes received, bytes dropped (ring full), and per-kind counts of
-// the UERSTAT errors seen: overrun (IRQ came too late, bytes lost), parity,
-// frame (line noise / baud mismatch: byte corrupted), break. ISR-written.
+// DIAG: bytes received, bytes dropped (a full ring, here or in the HAL's), and
+// the UERSTAT errors seen (1 = seen since boot): overrun (bytes lost before
+// the interrupt ran), parity, frame (line noise / baud mismatch), break.
 pub static RX_TOTAL: AtomicU32 = AtomicU32::new(0);
 pub static RX_DROPPED: AtomicU32 = AtomicU32::new(0);
 pub static RX_ERR: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 
-fn count_errors(bits: u32) {
-    for (i, n) in RX_ERR.iter().enumerate() {
-        if bits & (1 << i) != 0 {
-            n.fetch_add(1, Ordering::Relaxed);
-        }
+// UART2 registers (Exynos 4412 UM ch. 28; serial_s3c.h).
+const UCON: usize = 0x04;
+const UFCON: usize = 0x08;
+const UMCON: usize = 0x0C;
+const UINTM: usize = 0x38;
+/// RX + TX in interrupt/polling mode, RX timeout on, level interrupts, RX
+/// error interrupt off (errors are read from UERSTAT). U-Boot leaves 0x3C5.
+const UCON_VALUE: u32 = 0b01 | (0b01 << 2) | (1 << 7) | (1 << 8) | (1 << 9);
+/// FIFOs on, both reset, RX trigger 8 bytes (16-byte FIFO), TX trigger 0.
+const UFCON_VALUE: u32 = 1 | (1 << 1) | (1 << 2) | (1 << 4);
+/// No auto flow control (bit 4), RTS inactive: with AFC on, TX stops while
+/// the board's CTS input is not asserted, and nothing leaves the UART.
+const UMCON_VALUE: u32 = 0;
+
+fn reg(off: usize) -> *mut u32 {
+    (UART.base() + off) as *mut u32
+}
+
+/// Sets UART2's mode registers instead of relying on what the bootloader
+/// left (uart_boot reaches ferrite on several paths: straight from CACHE, or
+/// after WiFi/HTTP with its buffered console).
+/// Baud registers (UBRDIV/UFRACVAL) and ULCON (8N1) are kept: see
+/// [`report_clock`].
+fn take_over() {
+    // SAFETY: UART2's MMIO block, mapped for good; only this core touches
+    // these registers here, before the RX interrupt is on.
+    unsafe {
+        // Let polled output already queued drain before the FIFO reset.
+        Uart::new(UART).flush();
+        core::ptr::write_volatile(reg(UINTM), 0xF);
+        core::ptr::write_volatile(reg(UMCON), UMCON_VALUE);
+        core::ptr::write_volatile(reg(UFCON), UFCON_VALUE);
+        core::ptr::write_volatile(reg(UCON), UCON_VALUE);
     }
 }
 
-/// Drains the RX FIFO into the ring. IRQ context.
-pub fn rx_isr() {
-    let uart = Uart::new(UART);
-    uart.clear_rx_interrupt();
-    count_errors(uart.take_errors());
-    let mut head = HEAD.load(Ordering::Relaxed);
-    let tail = TAIL.load(Ordering::Acquire);
-    while let Some(b) = uart.try_read_byte() {
-        RX_TOTAL.fetch_add(1, Ordering::Relaxed);
-        let next = (head + 1) & MASK;
-        if next != tail {
-            // SAFETY: slot `head` is outside [tail, head), which the main
-            // loop reads; it sees it only after the Release store below.
+/// Turns on interrupt-driven RX with the interrupt routed to `core`. Call on
+/// CPU0 after `Gic::init`, before `core` runs [`rx_task`].
+pub fn start(core: usize) -> UartRx {
+    take_over();
+    let rx = UartRx::new(UART).expect("UART2 has an interrupt");
+    if let Some(irq) = UART.irq() {
+        Gic::new().set_target(irq, core);
+    }
+    rx
+}
+
+/// Moves received bytes into the ring for the runtime.
+#[embassy_executor::task]
+pub async fn rx_task(rx: UartRx) {
+    let mut chunk = [0u8; 256];
+    let mut own_drops = 0u32;
+    loop {
+        let n = rx.read(&mut chunk).await;
+        let mut head = HEAD.load(Ordering::Relaxed);
+        let tail = TAIL.load(Ordering::Acquire);
+        for &b in &chunk[..n] {
+            let next = (head + 1) & MASK;
+            if next == tail {
+                own_drops += 1;
+                continue;
+            }
+            // SAFETY: slot `head` is outside [tail, head), which the consumer
+            // reads; it sees it only after the Release store below.
             unsafe { (*(&raw mut BUF))[head] = b };
             head = next;
-        } else {
-            RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        HEAD.store(head, Ordering::Release);
+        let st = rx.stats();
+        RX_TOTAL.store(st.received, Ordering::Relaxed);
+        RX_DROPPED.store(st.dropped + own_drops, Ordering::Relaxed);
+        for (i, e) in RX_ERR.iter().enumerate() {
+            e.store((st.errors >> i) & 1, Ordering::Relaxed);
         }
     }
-    HEAD.store(head, Ordering::Release);
-    count_errors(uart.take_errors());
 }
 
 pub struct HwUart;
@@ -110,9 +162,4 @@ pub fn report_clock() {
         mbaud / 1000, mbaud % 1000,
         if err < 0 { "-" } else { "+" }, err.abs() / 100, err.abs() % 100
     );
-}
-
-/// Unmasks the RX interrupt at the UART; the GIC side is in main.rs.
-pub fn init() {
-    Uart::new(UART).enable_rx_interrupt();
 }

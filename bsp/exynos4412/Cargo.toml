@@ -13,4 +13,7 @@ ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "poo
 # HAL: its panic handler prints file:line on the UART console and halts. A ferrite
 # panic screen (LCD + USART, like the other BSPs) can replace it later: turn
 # default features off then.
-exynos_4412_rs = { path = "../../vendor/exynos_4412_rs/exynos_4412_rs", features = ["heap", "fat"] }
+exynos_4412_rs = { path = "../../vendor/exynos_4412_rs/exynos_4412_rs", features = ["heap", "fat", "embassy"] }
+# Tasks (`#[task]`) and `yield_now`; the HAL provides the executor platform.
+embassy-executor = "0.10"
+embassy-futures = "0.1"
