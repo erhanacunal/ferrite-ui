@@ -58,7 +58,9 @@ static mut KEYS: Option<PowerKeys> = None;
 
 /// Temporary: a status line at the bottom of the screen for the writefs
 /// "flash image corrupted" investigation. Remove once resolved.
-const DIAG: bool = true;
+/// Off: it CRCs the whole FS image on every received byte, which skews the
+/// `perf` profile (each query sends bytes).
+const DIAG: bool = false;
 static mut DIAG_LAST: [u32; 7] = [u32::MAX; 7];
 
 /// `rx` bytes received / dropped, UART errors by kind (`ovr` overrun = IRQ
@@ -132,12 +134,28 @@ impl PlatformRuntime for Exynos4412Platform {
         heap::stats().size
     }
 
+    #[cfg(feature = "perf")]
+    fn cycles() -> u32 {
+        crate::perf::cycles()
+    }
+
+    #[cfg(feature = "perf")]
+    fn cycle_hz() -> u32 {
+        crate::perf::hz()
+    }
+
+    #[cfg(feature = "perf")]
+    fn perf_take_wait() -> u64 {
+        crate::perf::take_wait()
+    }
+
     fn boot(ctx: &mut Ctx<Self>, touch: &mut TouchImpl<Self::TouchB>) -> u8 {
         touch.cal = crate::touch::CAL;
         unsafe { *(&raw mut KEYS) = Some(PowerKeys::new()) };
 
         ctx.lcd.fill_rect(0, 0, PANEL.width as u16, PANEL.height as u16, COLOR_BLACK);
-        lcd::flush();
+        // Black on screen before the backlight comes up.
+        lcd::flush_wait();
         ctx.backlight.set_brightness(100);
 
         // Nothing saved on CACHE yet (or storage off): recovery, so the host
@@ -205,5 +223,5 @@ fn recovery_screen(ctx: &mut Ctx<Exynos4412Platform>) {
     };
     line(b"RECOVERY MODE", h / 2 - 10, COLOR_RED);
     line(b"Use writefs to flash a new program", h / 2 + 20, 0x8410);
-    lcd::flush();
+    lcd::flush_wait();
 }

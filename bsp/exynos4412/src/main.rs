@@ -13,7 +13,9 @@
 //!   a time (`Runtime::step`), yielding between passes;
 //! - CPU1: `usart::rx_task`, UART2 RX on its own core and interrupt, so
 //!   nothing CPU0 does can overrun the 16-byte FIFO.
-//! CPU2/3 stay parked. Audio is refilled from the `pdma0` interrupt (audio.rs).
+//! - CPU2: the LCD presenter (`lcd::start_presenter`), no executor: copies
+//!   the dirty box to the back scan buffer and switches the FIMD at vsync.
+//! CPU3 stays parked. Audio is refilled from the `pdma0` interrupt (audio.rs).
 //!
 //! Build (from this directory): `cargo build --release`
 
@@ -50,6 +52,8 @@ mod audio;
 mod backlight;
 mod flash;
 mod lcd;
+#[cfg(feature = "perf")]
+mod perf;
 mod platform;
 mod rtc;
 mod storage;
@@ -91,6 +95,8 @@ fn main(_args: BootArgs) -> ! {
     mct.start();
     mmu::enable();
     L2c::new().enable();
+    #[cfg(feature = "perf")]
+    perf::init(&mct);
     if let Err(e) = heap::init() {
         fail("heap", e);
     }
@@ -138,6 +144,13 @@ fn main(_args: BootArgs) -> ! {
             true
         }
     };
+    // CPU2: the LCD presenter (copy to the back scan buffer + switch at
+    // vsync), so CPU0 never waits for the display. Not fatal: presents then
+    // run on CPU0.
+    match lcd::start_presenter(2) {
+        Ok(()) => println!("ferrite: LCD presenter on CPU2"),
+        Err(e) => println!("ferrite: CPU2 ERROR {:?}, LCD presents on CPU0", e),
+    }
     println!("ferrite: up, entering runtime");
 
     let ctx = Box::new(Ctx::<Exynos4412Platform> {

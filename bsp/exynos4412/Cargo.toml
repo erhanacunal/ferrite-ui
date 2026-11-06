@@ -8,8 +8,13 @@ description = "BSP for the Exynos 4412 tablet — 4 × Cortex-A9 + 1280×800 LVD
 name = "ferrite-ui"
 path = "src/main.rs"
 
+[features]
+default = ["perf"]
+# Main-loop profiler: PMU cycle counter + `ferrite_cli.py perf` report.
+perf = ["ferrite-core/perf"]
+
 [dependencies]
-ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "pool_large", "wide_code", "wide_obj", "multi_program", "audio"] }
+ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "pool_large", "wide_code", "wide_obj", "multi_program", "audio", "fast_vm"] }
 # HAL: its panic handler prints file:line on the UART console and halts. A ferrite
 # panic screen (LCD + USART, like the other BSPs) can replace it later: turn
 # default features off then.
