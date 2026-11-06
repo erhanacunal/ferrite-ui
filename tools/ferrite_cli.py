@@ -101,6 +101,8 @@ MEM_POOLS = {
 }
 
 BAUD_RATE = 115200
+# exynos4412 protocol bridge over WiFi (bsp/exynos4412/src/net/mod.rs BRIDGE_PORT) — keep in sync.
+BRIDGE_PORT = 7000
 DEFAULT_TIMEOUT = 5.0  # seconds
 
 ERROR_DESCRIPTIONS = {
@@ -183,7 +185,18 @@ def open_port(port: str, timeout: float = DEFAULT_TIMEOUT) -> serial.Serial:
     and the ESP32-S3 USB-Serial-JTAG (epaper) reads those lines as the
     esptool reset/boot wiring: opening or closing the port then reset the
     chip. Boards on a plain UART ignore the lines.
+
+    `tcp://HOST[:PORT]` (or pyserial's `socket://HOST:PORT`) talks the same
+    protocol over the network: the exynos4412 BSP's protocol bridge (WiFi,
+    port `BRIDGE_PORT` 7000 by default).
     """
+    if port.startswith(("tcp://", "socket://")):
+        host = port.split("://", 1)[1].rstrip("/")
+        if ":" not in host:
+            host = f"{host}:{BRIDGE_PORT}"
+        ser = serial.serial_for_url(f"socket://{host}", timeout=timeout)
+        ser.baudrate = BAUD_RATE  # only used for transfer-time estimates
+        return ser
     ser = serial.Serial()
     ser.port = port
     ser.baudrate = BAUD_RATE
@@ -1384,7 +1397,7 @@ def main():
         prog="ferrite-cli",
         description="Host-side tool for ferrite-ui devices",
     )
-    parser.add_argument("-p", "--port", help="Serial port (e.g. COM3, /dev/ttyUSB0); required except for bootflash --host")
+    parser.add_argument("-p", "--port", help="Serial port (e.g. COM3, /dev/ttyUSB0) or tcp://HOST[:7000] (exynos4412 over WiFi); required except for bootflash --host")
     parser.add_argument("--host", nargs="?", const=os.environ.get("EXYNOS_HOST", "exynos"),
                         help="bootflash over WiFi: uart_boot's address (bare --host = $EXYNOS_HOST, else exynos)")
     parser.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT, help="Response timeout in seconds (default: 2.0)")

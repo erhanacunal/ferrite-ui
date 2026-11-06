@@ -1,3 +1,5 @@
 assets/
 *.bin
 *.dbg
+# WiFi passphrase (wifi.cfg) + BCM4334 firmware: never committed
+private/

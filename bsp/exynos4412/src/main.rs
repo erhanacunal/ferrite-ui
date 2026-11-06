@@ -17,7 +17,11 @@
 //!   the dirty box to the back scan buffer and switches the FIMD at vsync.
 //!   Not started with `g2d_present`: CPU0 drives the G2D copy instead (its
 //!   interrupt goes to CPU0).
-//! CPU3 stays parked. Audio is refilled from the `pdma0` interrupt (audio.rs).
+//! - CPU3 (`wifi` feature, net/): the BCM4334 WiFi chip, embassy-net, an
+//!   HTTP server (status / memory / profile / FS upload) and a TCP bridge to
+//!   the USART protocol (bridge.rs). Started only when FERRITE/WIFI.CFG
+//!   names a network; parked otherwise.
+//! Audio is refilled from the `pdma0` interrupt (audio.rs).
 //!
 //! Build (from this directory): `cargo build --release`
 
@@ -52,8 +56,13 @@ use ferrite_core::usart::UsartImpl;
 
 mod audio;
 mod backlight;
+// Without `wifi` nothing ever takes the bridge: UART2 only.
+#[cfg_attr(not(feature = "wifi"), allow(dead_code))]
+mod bridge;
 mod flash;
 mod lcd;
+#[cfg(feature = "wifi")]
+mod net;
 #[cfg(feature = "perf")]
 mod perf;
 mod platform;
@@ -156,6 +165,9 @@ fn main(_args: BootArgs) -> ! {
         Ok(how) => println!("ferrite: {}", how),
         Err(e) => println!("ferrite: CPU2 ERROR {:?}, LCD presents on CPU0", e),
     }
+    // WiFi: CPU0 powers the chip (PMIC on I2C0), CPU3 joins and serves.
+    #[cfg(feature = "wifi")]
+    net::start(pmic, mct);
     println!("ferrite: up, entering runtime");
 
     let ctx = Box::new(Ctx::<Exynos4412Platform> {

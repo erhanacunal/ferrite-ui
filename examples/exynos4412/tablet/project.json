@@ -325,5 +325,19 @@
       "name": "settings",
       "source": "settings.fl"
     }
+  ],
+  "files": [
+    {
+      "name": "wifi_cfg",
+      "source": "./private/wifi.cfg"
+    },
+    {
+      "name": "wifi_fw",
+      "source": "./private/brcmfmac4334-sdio.samsung,mehmet-board.bin"
+    },
+    {
+      "name": "wifi_nvram",
+      "source": "./private/brcmfmac4334-sdio.samsung,mehmet-board.txt"
+    }
   ]
 }

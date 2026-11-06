@@ -15,7 +15,7 @@ use ferrite_core::flash::FlashBackend;
 
 use crate::{storage, systick};
 
-const SIZE: usize = 64 << 20;
+pub const SIZE: usize = 64 << 20;
 const SECTOR: usize = 4096;
 
 static mut SHADOW: Vec<u8> = Vec::new();
@@ -74,6 +74,21 @@ pub fn save_if_dirty(force: bool) {
             DIRTY = false;
         }
     }
+}
+
+/// The first `n` bytes of the region (the config sector in front of the FS),
+/// for an image uploaded over HTTP (`net::install`). CPU0 only.
+#[cfg(feature = "wifi")]
+pub fn prefix(n: usize) -> &'static [u8] {
+    let s = shadow();
+    &s[..n.min(s.len())]
+}
+
+/// Drops the pending save: a new `FLASH.BIN` was written directly
+/// (`net::install`) and the restart must not overwrite it.
+#[cfg(feature = "wifi")]
+pub fn forget_changes() {
+    unsafe { DIRTY = false };
 }
 
 #[derive(Clone)]

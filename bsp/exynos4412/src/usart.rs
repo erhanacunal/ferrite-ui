@@ -8,6 +8,10 @@
 //! runs on CPU0 instead (main.rs). TX is polled. The HAL's `println!` uses
 //! the same UART: keep it to boot messages (the host tools skip boot-log
 //! text).
+//!
+//! While a network client holds the protocol (`bridge.rs`: the TCP bridge
+//! port, or an HTTP API request), RX and TX go through the bridge's rings
+//! instead.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -115,14 +119,27 @@ pub struct HwUart;
 
 impl UsartBackend for HwUart {
     fn write_byte(&self, byte: u8) {
-        Uart::new(UART).write_byte(byte);
+        if crate::bridge::active() {
+            crate::bridge::tx_push(byte, crate::systick::millis);
+        } else {
+            Uart::new(UART).write_byte(byte);
+        }
     }
 
     fn flush(&self) {
-        Uart::new(UART).flush();
+        if crate::bridge::active() {
+            crate::bridge::tx_drain(500, crate::systick::millis);
+        } else {
+            Uart::new(UART).flush();
+        }
     }
 
     fn rx_read_byte(&self) -> Option<u8> {
+        // A network session (bridge.rs) takes the protocol over; UART2's
+        // bytes wait in their ring meanwhile.
+        if crate::bridge::active() {
+            return crate::bridge::rx_pop();
+        }
         let tail = TAIL.load(Ordering::Relaxed);
         if tail == HEAD.load(Ordering::Acquire) {
             return None;
@@ -134,6 +151,9 @@ impl UsartBackend for HwUart {
     }
 
     fn rx_stats(&self) -> (usize, usize) {
+        if crate::bridge::active() {
+            return (crate::bridge::RX.len(), crate::bridge::RX.capacity());
+        }
         let (h, t) = (HEAD.load(Ordering::Relaxed), TAIL.load(Ordering::Relaxed));
         ((h.wrapping_sub(t)) & MASK, RING)
     }

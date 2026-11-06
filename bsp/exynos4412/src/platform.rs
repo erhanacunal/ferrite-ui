@@ -21,6 +21,12 @@ const SYS_REBOOT: u8 = 0x01;
 /// Main-loop passes since boot (`sysinfo::SYS_PASSES`), counted in `frame_end`.
 static PASSES: AtomicU32 = AtomicU32::new(0);
 
+/// Main-loop passes since boot (for `net`'s status page).
+#[cfg(feature = "wifi")]
+pub fn passes() -> u32 {
+    PASSES.load(Ordering::Relaxed)
+}
+
 pub struct Exynos4412Platform;
 
 impl Platform for Exynos4412Platform {
@@ -119,6 +125,15 @@ impl PlatformRuntime for Exynos4412Platform {
     type Input = FullInput;
 
     fn reset() -> ! {
+        // A reply to a network client (bridge.rs: the pong of a writefs or a
+        // Restart) leaves before the board goes away.
+        if crate::bridge::active() {
+            crate::bridge::tx_drain(500, crate::systick::millis);
+            let t = crate::systick::millis();
+            while crate::systick::millis().wrapping_sub(t) < 200 {
+                core::hint::spin_loop();
+            }
+        }
         // A finished writefs (or a config write) reaches the eMMC first.
         crate::flash::save_if_dirty(true);
         exynos_4412_rs::console::flush();
@@ -195,6 +210,9 @@ impl PlatformRuntime for Exynos4412Platform {
         lcd::flush();
         // Config writes (touch calibration…): save once they settle.
         crate::flash::save_if_dirty(false);
+        // An FS image uploaded over HTTP, a restart request (net/).
+        #[cfg(feature = "wifi")]
+        crate::net::service();
         // Power key: hold = off, + vol up = restart, + vol down = fastboot.
         if let Some(keys) = unsafe { (*(&raw mut KEYS)).as_mut() } {
             keys.service(Mct::new());

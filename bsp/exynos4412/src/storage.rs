@@ -16,6 +16,8 @@
 //! Code 9 + recovery, so a new `writefs` fixes it.
 
 use alloc::boxed::Box;
+#[cfg(feature = "wifi")]
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
 use exynos_4412_rs::drivers::i2c::{Bus, I2c};
@@ -104,7 +106,7 @@ fn clock() -> MctClock {
 /// Reads the image file into `region`; returns its length (0 = no file yet).
 pub fn load(region: &mut [u8]) -> usize {
     let Some(v) = volumes() else { return 0 };
-    match read_file(v, region) {
+    match read_file(v, FILE, region) {
         Ok(n) => {
             println!("ferrite: loaded {}/{}, {} bytes", DIR, FILE, n);
             n
@@ -120,11 +122,11 @@ pub fn load(region: &mut [u8]) -> usize {
     }
 }
 
-fn read_file(v: &Volumes, region: &mut [u8]) -> Result<usize, FsError> {
+fn read_file(v: &Volumes, name: &str, region: &mut [u8]) -> Result<usize, FsError> {
     let volume = v.open_volume(VolumeIdx(0))?;
     let root = volume.open_root_dir()?;
     let dir = root.open_dir(DIR)?;
-    let file = dir.open_file_in_dir(FILE, Mode::ReadOnly)?;
+    let file = dir.open_file_in_dir(name, Mode::ReadOnly)?;
     let len = (file.length() as usize).min(region.len());
     let mut done = 0;
     while done < len {
@@ -138,20 +140,53 @@ fn read_file(v: &Volumes, region: &mut [u8]) -> Result<usize, FsError> {
     Ok(done)
 }
 
+/// Reads [`DIR`]/`name` (an 8.3 name) whole, if it exists and is at most
+/// `max` bytes. CPU0 only, like every other call here.
+#[cfg(feature = "wifi")]
+pub fn read_named(name: &str, max: usize) -> Option<Vec<u8>> {
+    let v = volumes()?;
+    let len = {
+        let volume = v.open_volume(VolumeIdx(0)).ok()?;
+        let root = volume.open_root_dir().ok()?;
+        let dir = root.open_dir(DIR).ok()?;
+        let file = dir.open_file_in_dir(name, Mode::ReadOnly).ok()?;
+        let len = file.length() as usize;
+        file.close().ok()?;
+        len
+    };
+    if len > max {
+        println!("ferrite: {}/{} too large ({} bytes)", DIR, name, len);
+        return None;
+    }
+    let mut buf = alloc::vec![0u8; len];
+    match read_file(v, name, &mut buf) {
+        Ok(n) => {
+            buf.truncate(n);
+            Some(buf)
+        }
+        Err(_) => None,
+    }
+}
+
 /// Writes `data` as the image file (made or truncated), then flushes the
 /// device so it is on the card when this returns.
 pub fn save(data: &[u8]) -> bool {
+    save_named(FILE, data)
+}
+
+/// Writes [`DIR`]/`name` (an 8.3 name, made or truncated) and flushes.
+pub fn save_named(name: &str, data: &[u8]) -> bool {
     let Some(v) = volumes() else { return false };
-    match write_file(v, data).and_then(|()| Ok(v.device(|d| d.flush())?)) {
+    match write_file(v, name, data).and_then(|()| Ok(v.device(|d| d.flush())?)) {
         Ok(()) => true,
         Err(e) => {
-            println!("ferrite: save {}/{} ERROR {:?}", DIR, FILE, e);
+            println!("ferrite: save {}/{} ERROR {:?}", DIR, name, e);
             false
         }
     }
 }
 
-fn write_file(v: &Volumes, data: &[u8]) -> Result<(), FsError> {
+fn write_file(v: &Volumes, name: &str, data: &[u8]) -> Result<(), FsError> {
     let volume = v.open_volume(VolumeIdx(0))?;
     let root = volume.open_root_dir()?;
     match root.make_dir_in_dir(DIR) {
@@ -159,7 +194,7 @@ fn write_file(v: &Volumes, data: &[u8]) -> Result<(), FsError> {
         Err(e) => return Err(e),
     }
     let dir = root.open_dir(DIR)?;
-    let file = dir.open_file_in_dir(FILE, Mode::ReadWriteCreateOrTruncate)?;
+    let file = dir.open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)?;
     file.write(data)?;
     file.close()?;
     Ok(())
