@@ -679,7 +679,15 @@ fn resolved_text_bg(tree: &ObjPool, widget: &Widget, ext: &WidgetExt, fallback: 
 /// fills reduce to plain screen-bounded fills (one rect intersection each, the
 /// same clamp `fill_rect_screen` already does) — so the full path pays nothing
 /// for going through the clip.
-fn draw_widget<P: Platform>(
+fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
+    #[cfg(feature = "perf")]
+    let t0 = crate::perf::now();
+    draw_widget_body(ctx, id, abs, clip);
+    #[cfg(feature = "perf")]
+    crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
+}
+
+fn draw_widget_body<P: Platform>(
     ctx: &Ctx<P>,
     id: WidgetId,
     abs: &Rect,

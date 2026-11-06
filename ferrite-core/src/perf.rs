@@ -35,8 +35,63 @@ pub mod phase {
     /// (`perf_take_wait`): for vsync, or (exynos4412) for the presenter core
     /// to finish reading the shadow.
     pub const VSYNC_WAIT: u8 = 10;
+    /// Time inside `draw_widget` (inside `RENDER` / `CALLBACKS`; includes
+    /// the pixel writes and display waits it causes).
+    pub const DRAW: u8 = 11;
+    /// Time inside the LCD backend's pixel primitives, in any phase (timed by
+    /// the BSP through [`super::add_sub`], after its display wait).
+    pub const PIXELS: u8 = 12;
     /// Number of slots (ids 1..COUNT).
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 12;
+}
+
+/// Event counts, reported as plain numbers (ids from 0x80). Mirrored in
+/// `tools/ferrite_cli.py` (`PERF_COUNTS`).
+pub mod count {
+    /// `draw_widget` calls.
+    pub const DRAWS: u8 = 0x81;
+    /// Pixel primitive calls (`phase::PIXELS`).
+    pub const PIXEL_CALLS: u8 = 0x82;
+}
+
+/// A value only the runtime's own thread touches (the runtime and the
+/// renderer run on one core; the profiler is a diagnostic).
+struct Local<T>(core::cell::UnsafeCell<T>);
+// SAFETY: see the type's doc: never accessed from two threads.
+unsafe impl<T> Sync for Local<T> {}
+
+fn no_clock() -> u32 {
+    0
+}
+
+static CLOCK: Local<fn() -> u32> = Local(core::cell::UnsafeCell::new(no_clock));
+/// Cycles and calls of the sub-phases `DRAW`, `PIXELS`.
+static SUB: Local<([u64; 2], [u32; 2])> = Local(core::cell::UnsafeCell::new(([0; 2], [0; 2])));
+
+/// Sets the clock `now` reads (`PlatformRuntime::cycles`); the runtime does
+/// it at startup.
+pub fn set_clock(f: fn() -> u32) {
+    unsafe { *CLOCK.0.get() = f };
+}
+
+/// The profiler clock, for code that has no `PlatformRuntime` bound.
+#[inline]
+pub fn now() -> u32 {
+    unsafe { (*CLOCK.0.get())() }
+}
+
+/// Adds one call of `cycles` to sub-phase `id` (`phase::DRAW` / `PIXELS`).
+#[inline]
+pub fn add_sub(id: u8, cycles: u32) {
+    let i = (id == phase::PIXELS) as usize;
+    let s = unsafe { &mut *SUB.0.get() };
+    s.0[i] += cycles as u64;
+    s.1[i] += 1;
+}
+
+/// Sub-phase cycles and calls since the last call, then 0.
+pub fn take_sub() -> ([u64; 2], [u32; 2]) {
+    unsafe { core::mem::replace(&mut *SUB.0.get(), ([0; 2], [0; 2])) }
 }
 
 /// Accumulated cycles since the last report.

@@ -208,7 +208,13 @@ PERF_PHASES = {
     1: "vm", 2: "usart", 3: "input", 4: "animations", 5: "audio",
     6: "render", 7: "callbacks", 8: "tasks/misc", 9: "frame_end",
     10: "  display wait",
+    11: "  widget draws",
+    12: "  pixel writes",
 }
+# Sub-phases: already inside the step phases above.
+PERF_SUB_PHASES = (10, 11, 12)
+# Event counts (plain numbers, not microseconds): perf::count in perf.rs.
+PERF_COUNTS = {0x81: "draw_widget calls", 0x82: "pixel primitive calls"}
 
 
 def _perf_length_ok(length: int) -> bool:
@@ -547,14 +553,31 @@ def format_perf(p: dict) -> list[str]:
         "-" * 48,
     ]
     in_step = 0
+    times = {}
+    counts = []
     for pid, us in p["phases"]:
+        if pid in PERF_COUNTS:
+            counts.append((PERF_COUNTS[pid], us))
+            continue
+        times[pid] = us
         name = PERF_PHASES.get(pid, f"phase {pid}")
-        if pid != 10:
+        if pid not in PERF_SUB_PHASES:
             in_step += us
         lines.append(f"{name:<16}{us / 1000:>10.1f} ms{100 * us / window:>7.1f}%"
                      f"{us / max(p['passes'], 1):>9.1f} us")
     outside = max(window - in_step, 0)
     lines.append(f"{'outside step':<16}{outside / 1000:>10.1f} ms{100 * outside / window:>7.1f}%")
+    passes = max(p["passes"], 1)
+    if 11 in times:
+        render = times.get(6, 0) + times.get(7, 0)
+        walk = max(render - times[11], 0)
+        setup = max(times[11] - times.get(12, 0) - times.get(10, 0), 0)
+        lines.append(f"{'render walk':<16}{walk / 1000:>10.1f} ms{'':>8}{walk / passes:>9.1f} us"
+                     "  (render + callbacks - widget draws)")
+        lines.append(f"{'draw setup':<16}{setup / 1000:>10.1f} ms{'':>8}{setup / passes:>9.1f} us"
+                     "  (widget draws - pixel writes - display wait, approx.)")
+    for name, n in counts:
+        lines.append(f"{name}: {n} ({n / passes:.1f} per pass)")
     return lines
 
 

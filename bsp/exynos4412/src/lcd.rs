@@ -21,8 +21,10 @@
 //!
 //! **Presenter on CPU2** ([`start_presenter`]): CPU0 hands a dirty box over at
 //! [`flush`] and goes on; CPU2 copies, switches and waits for the vsync. CPU0
-//! only waits ([`fence`], at the start of every primitive) while CPU2 is still
-//! reading the shadow, never for the vsync. If CPU2 is still busy at the next
+//! only waits ([`fence`], at the start of every primitive) while CPU2 has not
+//! yet copied the rows the primitive writes, never for the vsync: CPU2 copies
+//! top to bottom and publishes its progress per row (`COPY_LO`), so CPU0,
+//! which mostly redraws top to bottom too, draws behind it. If CPU2 is still busy at the next
 //! flush, the box keeps growing and goes with a later one. Without CPU2
 //! (before it starts, or if it failed to) [`flush`] presents on CPU0, waiting
 //! for the switch.
@@ -37,7 +39,7 @@
 //! flushes.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use exynos_4412_rs::drivers::display::{self, Fimd, Framebuffer, LTN101AL03, LVDS_SETTLE_MS, Timing};
 use exynos_4412_rs::{mmu, smp};
@@ -132,10 +134,18 @@ fn clip(x: u16, y: u16, w: u16, h: u16) -> Option<(usize, usize, usize, usize)> 
 static STATE: AtomicU8 = AtomicU8::new(IDLE);
 /// No present in progress: CPU0 may hand a box over.
 const IDLE: u8 = 0;
-/// CPU2 is copying from the shadow: CPU0 must not draw ([`fence`]).
+/// CPU2 is copying from the shadow: CPU0 must not draw on the rows
+/// `COPY_LO..COPY_HI` ([`fence`]).
 const COPY: u8 = 1;
 /// The copy is done, CPU2 waits for the FIMD to switch: CPU0 may draw.
 const FLIP: u8 = 2;
+
+/// While `STATE` = COPY, the shadow rows CPU2 may still read: from `COPY_LO`
+/// (the first row not yet copied; CPU2 raises it after each row, Release, so
+/// its reads of the rows below are done) to `COPY_HI` (exclusive). CPU0 sets
+/// them to 0..H before handing a box over; CPU2 narrows them.
+static COPY_LO: AtomicUsize = AtomicUsize::new(0);
+static COPY_HI: AtomicUsize = AtomicUsize::new(0);
 
 /// CPU2 runs the presenter ([`start_presenter`] succeeded).
 static PRESENTER: AtomicBool = AtomicBool::new(false);
@@ -177,20 +187,41 @@ fn present_state() -> &'static mut Present {
 /// one frame.
 const POLL_LIMIT: u32 = 10_000_000;
 
-/// CPU0, before writing the shadow: waits while the presenter reads it.
+/// Times a pixel primitive for the profiler (`perf`: the `PIXELS` row),
+/// after its `fence`, so display waits stay in their own row.
+macro_rules! timed {
+    ($body:block) => {{
+        #[cfg(feature = "perf")]
+        let t0 = crate::perf::cycles();
+        let r = $body;
+        #[cfg(feature = "perf")]
+        ferrite_core::perf::add_sub(ferrite_core::perf::phase::PIXELS, crate::perf::cycles().wrapping_sub(t0));
+        r
+    }};
+}
+
+/// CPU0, before writing shadow rows `y0..y1`: waits while the presenter may
+/// still read one of them.
 #[inline]
-fn fence() {
+fn fence(y0: usize, y1: usize) {
     if STATE.load(Ordering::Relaxed) == COPY {
-        wait_copy();
+        wait_rows(y0, y1);
     }
 }
 
 #[cold]
 #[inline(never)]
-fn wait_copy() {
+fn wait_rows(y0: usize, y1: usize) {
     #[cfg(feature = "perf")]
     let t0 = crate::perf::cycles();
+    // `lo` is read before `hi`: CPU2 only raises `lo` and lowers `hi` within
+    // a copy, so the pair always covers what it may still read.
     while STATE.load(Ordering::Acquire) == COPY {
+        let lo = COPY_LO.load(Ordering::Acquire);
+        let hi = COPY_HI.load(Ordering::Acquire);
+        if y1 <= lo || y0 >= hi {
+            break;
+        }
         core::hint::spin_loop();
     }
     #[cfg(feature = "perf")]
@@ -209,7 +240,7 @@ pub fn flush() {
         let p = present_state();
         p.req = *d;
         *d = EMPTY;
-        present(p, || {});
+        present(p, |_, _| {}, || {});
         return;
     }
     if STATE.load(Ordering::Acquire) != IDLE {
@@ -217,6 +248,9 @@ pub fn flush() {
     }
     present_state().req = *d;
     *d = EMPTY;
+    // Every row is busy until CPU2 says which ones it copies.
+    COPY_LO.store(0, Ordering::Relaxed);
+    COPY_HI.store(H, Ordering::Relaxed);
     STATE.store(COPY, Ordering::Release);
     // SAFETY: wakes CPU2 from its `wfe`.
     unsafe { core::arch::asm!("dsb", "sev", options(nostack, preserves_flags)) };
@@ -234,16 +268,18 @@ pub fn flush_wait() {
     }
 }
 
-/// One present: copy `prev ∪ req` from the shadow into the back buffer, run
-/// `copied` (the shadow is free again), switch the FIMD to the back buffer
-/// and wait until it scans it.
-fn present(p: &mut Present, copied: impl FnOnce()) {
+/// One present: copy `prev ∪ req` from the shadow into the back buffer
+/// (`rows(lo, hi)` first, then `rows(y + 1, hi)` after each row: the shadow
+/// rows it may still read), run `copied` (the shadow is free again), switch
+/// the FIMD to the back buffer and wait until it scans it.
+fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) {
     let back_i = 1 - p.front;
     let r = union(p.prev, p.req);
     let src = buf_ptr(SHADOW);
     let (x, w) = (r[0], r[2] - r[0]);
     let nc = p.nc[back_i];
     let dst = if nc != 0 { nc as *mut u32 } else { buf_ptr(back_i) };
+    rows(r[1], r[3]);
     for y in r[1]..r[3] {
         let at = y * W + x;
         // SAFETY: both boxes are clipped to the screen (`mark` callers); the
@@ -252,6 +288,7 @@ fn present(p: &mut Present, copied: impl FnOnce()) {
         if nc == 0 {
             mmu::clean_dcache_range(dst as usize + at * 4, w * 4);
         }
+        rows(y + 1, r[3]);
     }
     // The copy has reached DRAM before the FIMD may scan it.
     // SAFETY: a barrier only.
@@ -292,7 +329,13 @@ fn presenter(_cpu: usize) -> ! {
             // just checks again.
             unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
         }
-        present(present_state(), || STATE.store(FLIP, Ordering::Release));
+        let rows = |lo, hi| {
+            // Each store only shrinks the busy range, so any pair CPU0 reads
+            // (`lo`, then `hi`) still covers what CPU2 may read.
+            COPY_HI.store(hi, Ordering::Release);
+            COPY_LO.store(lo, Ordering::Release);
+        };
+        present(present_state(), rows, || STATE.store(FLIP, Ordering::Release));
         STATE.store(IDLE, Ordering::Release);
     }
 }
@@ -322,56 +365,70 @@ impl LcdBackend for FimdLcd {
 
     fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
         let Some((x, y, w, h)) = clip(x, y, w, h) else { return };
-        fence();
-        let c = rgb565_to_xrgb(color);
-        let fb = back();
-        for r in y..y + h {
-            fb::fill_u32(unsafe { row(fb, x, r, w) }, c);
-        }
-        mark(x, y, w, h);
+        fence(y, y + h);
+        timed!({
+            let c = rgb565_to_xrgb(color);
+            let fb = back();
+            for r in y..y + h {
+                fb::fill_u32(unsafe { row(fb, x, r, w) }, c);
+            }
+            mark(x, y, w, h);
+        })
     }
 
     fn draw_pixel(&self, x: u16, y: u16, color: u16) {
         let (x, y) = (x as usize, y as usize);
         if x < W && y < H {
-            fence();
-            unsafe { *back().add(y * W + x) = rgb565_to_xrgb(color) };
-            mark(x, y, 1, 1);
+            fence(y, y + 1);
+            timed!({
+                unsafe { *back().add(y * W + x) = rgb565_to_xrgb(color) };
+                mark(x, y, 1, 1);
+            })
         }
     }
 
     // The stream writes (write_pixel/s, write_run) belong to the stream
     // `begin_pixels` opened, within one primitive: its fence covers them.
     fn begin_pixels(&self, x: u16, y: u16, w: u16, h: u16) {
-        fence();
+        // The stream writes only inside the clipped window.
+        let window = clip(x, y, w, h);
+        if let Some((_, wy, _, wh)) = window {
+            fence(wy, wy + wh);
+        }
         unsafe { (*(&raw mut CURSOR)).begin(x, y, w) };
-        if let Some((x, y, w, h)) = clip(x, y, w, h) {
+        if let Some((x, y, w, h)) = window {
             mark(x, y, w, h);
         }
     }
 
     fn write_pixel(&self, color: u16) {
-        if let Some((x, y)) = unsafe { (*(&raw mut CURSOR)).step(W, H) } {
-            unsafe { *back().add(y * W + x) = rgb565_to_xrgb(color) };
-        }
+        timed!({
+            if let Some((x, y)) = unsafe { (*(&raw mut CURSOR)).step(W, H) } {
+                unsafe { *back().add(y * W + x) = rgb565_to_xrgb(color) };
+            }
+        })
     }
 
     fn write_pixels(&self, colors: &[u16]) {
         let fb = back();
-        unsafe {
-            (*(&raw mut CURSOR)).advance(colors.len(), W, H, |x, y, len, skip| {
-                for (d, &c) in row(fb, x, y, len).iter_mut().zip(&colors[skip..skip + len]) {
-                    *d = rgb565_to_xrgb(c);
-                }
-            });
-        }
+        timed!({
+            unsafe {
+                (*(&raw mut CURSOR)).advance(colors.len(), W, H, |x, y, len, skip| {
+                    for (d, &c) in row(fb, x, y, len).iter_mut().zip(&colors[skip..skip + len]) {
+                        *d = rgb565_to_xrgb(c);
+                    }
+                });
+            }
+        })
     }
 
     fn write_run(&self, color: u16, n: usize) {
         let (fb, c) = (back(), rgb565_to_xrgb(color));
-        unsafe {
-            (*(&raw mut CURSOR)).advance(n, W, H, |x, y, len, _| fb::fill_u32(row(fb, x, y, len), c));
-        }
+        timed!({
+            unsafe {
+                (*(&raw mut CURSOR)).advance(n, W, H, |x, y, len, _| fb::fill_u32(row(fb, x, y, len), c));
+            }
+        })
     }
 
     fn send_command(&self, _cmd: u16) {}
@@ -385,14 +442,16 @@ impl LcdBackend for FimdLcd {
         if alpha == 0 {
             return;
         }
-        fence();
-        let (src, a, fb) = (rgb565_to_xrgb(color), fb::alpha8(alpha), back());
-        for r in y..y + h {
-            for p in unsafe { row(fb, x, r, w) } {
-                *p = fb::blend_argb8888(*p, src, a);
+        fence(y, y + h);
+        timed!({
+            let (src, a, fb) = (rgb565_to_xrgb(color), fb::alpha8(alpha), back());
+            for r in y..y + h {
+                for p in unsafe { row(fb, x, r, w) } {
+                    *p = fb::blend_argb8888(*p, src, a);
+                }
             }
-        }
-        mark(x, y, w, h);
+            mark(x, y, w, h);
+        })
     }
 
     fn blend_pixel(&self, x: u16, y: u16, color: u16, alpha: u8) {
@@ -400,11 +459,13 @@ impl LcdBackend for FimdLcd {
         if alpha == 0 || x >= W || y >= H {
             return;
         }
-        fence();
-        let p = unsafe { &mut *back().add(y * W + x) };
-        let src = rgb565_to_xrgb(color);
-        *p = if alpha == 255 { src } else { fb::blend_argb8888(*p, src, fb::alpha8(alpha)) };
-        mark(x, y, 1, 1);
+        fence(y, y + 1);
+        timed!({
+            let p = unsafe { &mut *back().add(y * W + x) };
+            let src = rgb565_to_xrgb(color);
+            *p = if alpha == 255 { src } else { fb::blend_argb8888(*p, src, fb::alpha8(alpha)) };
+            mark(x, y, 1, 1);
+        })
     }
 }
 

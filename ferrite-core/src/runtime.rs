@@ -429,6 +429,8 @@ impl<P: PlatformRuntime> Runtime<P> {
     /// Runs the startup sequence: ROM font, `P::boot`, mount, syscfg, root
     /// widget, `main` + `setup()`, first frame or error screen.
     pub fn new(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::TouchB>) -> Self {
+        #[cfg(feature = "perf")]
+        crate::perf::set_clock(P::cycles);
         // --- Embedded ROM font (always font 0) ---
         ctx.fonts.add(font::Font::from_embedded(
             &crate::embedded_font::GLYPHS,
@@ -635,11 +637,16 @@ impl<P: PlatformRuntime> Runtime<P> {
             instructions += vm.instructions;
             vm.instructions = 0;
         });
+        let (sub, calls) = crate::perf::take_sub();
+        self.perf.add_cycles(phase::DRAW, sub[0]);
+        self.perf.add_cycles(phase::PIXELS, sub[1]);
         let p = &self.perf;
-        let mut rows = [(0u8, 0u32); phase::COUNT];
-        for (i, row) in rows.iter_mut().enumerate() {
+        let mut rows = [(0u8, 0u32); phase::COUNT + 2];
+        for (i, row) in rows.iter_mut().take(phase::COUNT).enumerate() {
             *row = (i as u8 + 1, to_us(p.phase[i], hz));
         }
+        rows[phase::COUNT] = (crate::perf::count::DRAWS, calls[0]);
+        rows[phase::COUNT + 1] = (crate::perf::count::PIXEL_CALLS, calls[1]);
         let header = protocol::PerfHeader {
             cycle_hz: hz,
             window_us: to_us(p.window, hz),
