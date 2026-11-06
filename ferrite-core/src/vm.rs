@@ -1745,11 +1745,55 @@ impl Vm {
         self.read_u8() as i8
     }
 
-    #[cfg_attr(not(feature = "fast_vm"), inline(never))]
-    #[cfg_attr(feature = "fast_vm", inline(always))]
+    /// The next `N` code bytes. `fast_vm`: one bounds check for RAM code
+    /// instead of one per byte; flash code and the out-of-range fault go
+    /// byte by byte through `read_u8_slow` (first fault wins, as before).
+    #[cfg(feature = "fast_vm")]
+    #[inline(always)]
+    fn fetch<const N: usize>(&mut self) -> [u8; N] {
+        if let VmCode::Ram(data) = &self.code {
+            let pc = self.pc as usize;
+            if let Some(s) = data.get(pc..pc + N) {
+                let mut out = [0u8; N];
+                out.copy_from_slice(s);
+                self.pc += N as CodeAddr;
+                return out;
+            }
+        }
+        self.fetch_slow()
+    }
+
+    #[cfg(feature = "fast_vm")]
+    #[inline(never)]
+    fn fetch_slow<const N: usize>(&mut self) -> [u8; N] {
+        let mut out = [0u8; N];
+        for b in &mut out {
+            *b = self.read_u8_slow();
+        }
+        out
+    }
+
+    /// Byte-wise without `fast_vm` (superinstructions only).
+    #[cfg(all(feature = "superops", not(feature = "fast_vm")))]
+    fn fetch<const N: usize>(&mut self) -> [u8; N] {
+        let mut out = [0u8; N];
+        for b in &mut out {
+            *b = self.read_u8();
+        }
+        out
+    }
+
+    #[cfg(not(feature = "fast_vm"))]
+    #[inline(never)]
     fn read_u16(&mut self) -> u16 {
         let lo = self.read_u8() as u16;
         lo | (self.read_u8() as u16) << 8
+    }
+
+    #[cfg(feature = "fast_vm")]
+    #[inline(always)]
+    fn read_u16(&mut self) -> u16 {
+        u16::from_le_bytes(self.fetch())
     }
 
     #[inline(always)]
@@ -1757,10 +1801,17 @@ impl Vm {
         self.read_u16() as i16
     }
 
+    #[cfg(not(feature = "fast_vm"))]
     #[inline(never)]
     fn read_i32(&mut self) -> i32 {
         let lo = self.read_u16() as u32;
         (lo | (self.read_u16() as u32) << 16) as i32
+    }
+
+    #[cfg(feature = "fast_vm")]
+    #[inline(always)]
+    fn read_i32(&mut self) -> i32 {
+        i32::from_le_bytes(self.fetch())
     }
 
     #[inline(always)]
@@ -2871,18 +2922,15 @@ impl Vm {
             }
             #[cfg(feature = "superops")]
             OP_JCMP_VI => {
-                let cond = self.read_u8();
-                let raw = self.read_u8();
-                let imm = self.read_i16() as i32;
+                let [cond, raw, lo, hi] = self.fetch();
+                let imm = i16::from_le_bytes([lo, hi]) as i32;
                 let target = self.read_addr();
                 let a = self.var_get(self.resolve_slot(raw));
                 self.jump_if(cond, a, imm, target);
             }
             #[cfg(feature = "superops")]
             OP_JCMP_VV => {
-                let cond = self.read_u8();
-                let ra = self.read_u8();
-                let rb = self.read_u8();
+                let [cond, ra, rb] = self.fetch();
                 let target = self.read_addr();
                 let a = self.var_get(self.resolve_slot(ra));
                 let b = self.var_get(self.resolve_slot(rb));
@@ -2890,27 +2938,24 @@ impl Vm {
             }
             #[cfg(feature = "superops")]
             OP_BIN_I => {
-                let op = self.read_u8();
-                let imm = self.read_i16() as i32;
-                self.top_binop(op, imm);
+                let [op, lo, hi] = self.fetch();
+                self.top_binop(op, i16::from_le_bytes([lo, hi]) as i32);
             }
             #[cfg(feature = "superops")]
             OP_BIN_I32 => {
-                let op = self.read_u8();
-                let imm = self.read_i32();
-                self.top_binop(op, imm);
+                let [op, a, b, c, d] = self.fetch();
+                self.top_binop(op, i32::from_le_bytes([a, b, c, d]));
             }
             #[cfg(feature = "superops")]
             OP_BIN_V => {
-                let op = self.read_u8();
-                let raw = self.read_u8();
+                let [op, raw] = self.fetch();
                 let b = self.var_get(self.resolve_slot(raw));
                 self.top_binop(op, b);
             }
             #[cfg(feature = "superops")]
             OP_ADD_VI => {
-                let raw = self.read_u8();
-                let imm = self.read_i16() as i32;
+                let [raw, lo, hi] = self.fetch();
+                let imm = i16::from_le_bytes([lo, hi]) as i32;
                 if self.state != VmState::Error {
                     let slot = self.resolve_slot(raw);
                     let v = self.var_get(slot).wrapping_add(imm);
@@ -2919,8 +2964,7 @@ impl Vm {
             }
             #[cfg(feature = "superops")]
             OP_STORE_OP => {
-                let op = self.read_u8();
-                let raw = self.read_u8();
+                let [op, raw] = self.fetch();
                 let b = self.pop();
                 if self.state != VmState::Error {
                     let slot = self.resolve_slot(raw);
@@ -4873,6 +4917,63 @@ mod anim_tests {
         // BIN_I on an empty stack underflows.
         let vm = run_code(&[OP_BIN_I, OP_ADD, 1, 0]);
         assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
+    }
+
+    /// Dispatch speed on the host (`cargo test --release ... vm_dispatch_bench
+    /// -- --ignored --nocapture`): bench mode 0's loop, plain and fused.
+    #[cfg(feature = "superops")]
+    #[test]
+    #[ignore]
+    fn vm_dispatch_bench() {
+        const N: i16 = 20000;
+        let [nl, nh] = N.to_le_bytes();
+        // i = g1, acc = g2. Plain: while (i < N) { acc = acc + (i*7)%13; i = i + 1; }
+        let mut plain = std::vec![OP_PUSH_0, OP_STORE, 1, OP_PUSH_0, OP_STORE, 2];
+        let top = plain.len() as u16;
+        plain.extend_from_slice(&[OP_LOAD, 1, OP_PUSH_I16, nl, nh, OP_LT, OP_JZ]);
+        let exit_at = plain.len();
+        plain.extend_from_slice(&[0, 0]);
+        plain.extend_from_slice(&[
+            OP_LOAD, 2, OP_LOAD, 1, OP_PUSH_I8, 7, OP_MUL, OP_PUSH_I8, 13, OP_MOD, OP_ADD, OP_STORE, 2,
+            OP_LOAD, 1, OP_PUSH_1, OP_ADD, OP_STORE, 1, OP_JMP,
+        ]);
+        plain.extend_from_slice(&top.to_le_bytes());
+        let end = plain.len() as u16;
+        plain[exit_at..exit_at + 2].copy_from_slice(&end.to_le_bytes());
+        plain.push(OP_HALT);
+        // Fused, inverted: JMP test; body: ...; test: JCMP_VI i < N body
+        let mut fused = std::vec![OP_PUSH_0, OP_STORE, 1, OP_PUSH_0, OP_STORE, 2, OP_JMP, 0, 0];
+        let body = fused.len() as u16;
+        fused.extend_from_slice(&[
+            OP_LOAD, 1, OP_BIN_I, OP_MUL, 7, 0, OP_BIN_I, OP_MOD, 13, 0, OP_STORE_OP, OP_ADD, 2,
+            OP_ADD_VI, 1, 1, 0,
+        ]);
+        let test = fused.len() as u16;
+        fused[7..9].copy_from_slice(&test.to_le_bytes());
+        fused.extend_from_slice(&[OP_JCMP_VI, OP_LT, 1, nl, nh]);
+        fused.extend_from_slice(&body.to_le_bytes());
+        fused.push(OP_HALT);
+        for (name, code) in [("plain", &plain), ("fused", &fused)] {
+            let mut ctx = mock_ctx();
+            let mut vm = Vm::new();
+            vm.code = VmCode::Ram(code.clone());
+            let runs = 200;
+            let t0 = std::time::Instant::now();
+            let mut acc = 0;
+            for _ in 0..runs {
+                vm.pc = 0;
+                vm.sp = 0;
+                vm.state = VmState::Running;
+                while vm.state == VmState::Running {
+                    vm.tick(&mut ctx, 1 << 30);
+                }
+                assert!(vm.state == VmState::Halted);
+                acc = vm.var_get(2);
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            let iters = runs as f64 * N as f64;
+            std::println!("{name}: {:.1} M iterations/s ({:.2} ns/iter), acc {acc}", iters / dt / 1e6, dt / iters * 1e9);
+        }
     }
 
     #[cfg(not(feature = "superops"))]
