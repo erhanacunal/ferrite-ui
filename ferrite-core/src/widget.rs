@@ -18,7 +18,7 @@ pub const FLAG_FOCUSED: u16 = 1 << 6;
 pub const FLAG_CLIP_CHILDREN: u16 = 1 << 7;
 pub const FLAG_DIRTY_B: u16 = 1 << 8;
 
-/// Combined mask: dirty in both buffers. Used by mark_dirty().
+/// Combined mask: dirty in both buffers. Used by `ObjPool::mark_dirty`.
 pub const FLAG_DIRTY_AB: u16 = FLAG_DIRTY_A | FLAG_DIRTY_B;
 
 /// Set when the widget has been drawn at least once since its last erase.
@@ -213,11 +213,6 @@ impl Widget {
     pub fn is_dirty_buf(&self, buf: u8) -> bool {
         let mask = if buf == 0 { FLAG_DIRTY_A } else { FLAG_DIRTY_B };
         self.flags & mask != 0
-    }
-
-    /// Mark dirty in both buffers (used when widget content changes).
-    pub fn mark_dirty(&mut self) {
-        self.flags |= FLAG_DIRTY_AB;
     }
 
     /// Clear dirty flag for buffer A only (dirty render mode).
@@ -558,6 +553,8 @@ impl ObjPool {
         let p = self.alloc_obj(T_WIDGET, HDR_WORDS)?;
         *cast_mut::<Widget>(self.payload_mut(p, T_WIDGET)?) = Widget::NEW;
         self.dfs_valid = false;
+        // A new widget starts dirty (Widget::NEW).
+        self.maybe_dirty = true;
         Some(WidgetId(p))
     }
 
@@ -1120,11 +1117,13 @@ impl ObjPool {
         }
     }
 
-    /// Mark widget and all descendants as dirty in both buffers.
+    /// Mark widget and all descendants as dirty in both buffers. The only
+    /// way (with `alloc_widget`) to set a dirty bit: it raises `maybe_dirty`.
     pub fn mark_dirty(&mut self, id: WidgetId) {
         if !self.is_live(id) {
             return;
         }
+        self.maybe_dirty = true;
         self.get_mut(id).flags |= FLAG_DIRTY_AB;
         let mut child = self.get(id).first_child;
         while child.is_some() {

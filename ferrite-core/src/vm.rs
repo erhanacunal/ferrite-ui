@@ -590,10 +590,16 @@ impl ProgramRef {
 const STACK_SIZE: usize = 32;
 const MAX_SYSCALL_ARGS: usize = 16;
 /// Variable entry — sparse mapping from slot ID to value.
+#[cfg(not(feature = "fast_vm"))]
 struct VmVar {
     id: u16,
     val: i32,
 }
+
+/// Dense variable table size (`fast_vm`): a slot is a global (0..=127) or
+/// `frame_base` (u8) + a local index (0..=127), so always below 383.
+#[cfg(feature = "fast_vm")]
+const VAR_SLOTS: usize = 512;
 /// Default call stack depth (overridable via RES_SYSCFG `call_stack`).
 const CALL_STACK_SIZE: usize = 16;
 
@@ -739,7 +745,11 @@ pub struct Vm {
     // `configure` (RES_SYSCFG); each is at most 255 deep (u8 indices).
     stack: Box<[i32]>,
     sp: u8,
+    #[cfg(not(feature = "fast_vm"))]
     vars: Vec<VmVar>,
+    /// `fast_vm`: every slot, indexed directly (2 KB).
+    #[cfg(feature = "fast_vm")]
+    vars: Box<[i32]>,
     call_stack: Box<[CallFrame]>,
     call_sp: u8,
     target: WidgetId,
@@ -807,6 +817,10 @@ pub struct Vm {
     // The program's widget page (RES_PAGE) in flash; page_len 0 = none.
     page_base: u32,
     page_len: u32,
+    /// Instructions executed (`perf` feature; read and reset by the
+    /// runtime's perf report).
+    #[cfg(feature = "perf")]
+    pub instructions: u64,
 }
 
 const EMPTY_CB: CbRequest = CbRequest {
@@ -835,7 +849,10 @@ impl Vm {
             pc: 0,
             stack: alloc::vec![0; STACK_SIZE].into_boxed_slice(),
             sp: 0,
+            #[cfg(not(feature = "fast_vm"))]
             vars: Vec::new(),
+            #[cfg(feature = "fast_vm")]
+            vars: alloc::vec![0; VAR_SLOTS].into_boxed_slice(),
             call_stack: alloc::vec![EMPTY_FRAME; CALL_STACK_SIZE].into_boxed_slice(),
             call_sp: 0,
             target: WidgetId::NONE,
@@ -862,6 +879,8 @@ impl Vm {
             in_paint: false,
             page_base: 0,
             page_len: 0,
+            #[cfg(feature = "perf")]
+            instructions: 0,
             tree_hint: None,
             open_files: [None, None],
             program: ProgramRef::new(b"main", 0),
@@ -938,6 +957,7 @@ impl Vm {
         }
     }
 
+    #[cfg(not(feature = "fast_vm"))]
     fn var_get(&self, slot: u16) -> i32 {
         for v in &self.vars {
             if v.id == slot {
@@ -947,6 +967,7 @@ impl Vm {
         0
     }
 
+    #[cfg(not(feature = "fast_vm"))]
     #[inline]
     fn var_set(&mut self, slot: u16, val: i32) {
         for v in &mut self.vars {
@@ -956,6 +977,22 @@ impl Vm {
             }
         }
         self.vars.push(VmVar { id: slot, val });
+    }
+
+    // `fast_vm`: the mask keeps the index in bounds without a branch (slots
+    // never reach VAR_SLOTS, see there); unset slots read 0 as before.
+    #[cfg(feature = "fast_vm")]
+    #[inline(always)]
+    fn var_get(&self, slot: u16) -> i32 {
+        // SAFETY: masked to VAR_SLOTS - 1, and vars.len() == VAR_SLOTS.
+        unsafe { *self.vars.get_unchecked(slot as usize & (VAR_SLOTS - 1)) }
+    }
+
+    #[cfg(feature = "fast_vm")]
+    #[inline(always)]
+    fn var_set(&mut self, slot: u16, val: i32) {
+        // SAFETY: as in var_get.
+        unsafe { *self.vars.get_unchecked_mut(slot as usize & (VAR_SLOTS - 1)) = val };
     }
 
     // === Code loading ===
@@ -1142,6 +1179,7 @@ impl Vm {
             return;
         }
         let mut budget = budget.max(1);
+        #[cfg(not(feature = "fast_vm"))]
         loop {
             self.step(ctx);
             while self.critical && self.state == VmState::Running {
@@ -1150,6 +1188,34 @@ impl Vm {
             budget -= 1;
             if budget == 0 || self.state != VmState::Running {
                 break;
+            }
+        }
+        // Same loop with the instruction body inlined, so the burst pays the
+        // large prologue of `step` once instead of per instruction.
+        #[cfg(feature = "fast_vm")]
+        {
+            #[cfg(feature = "perf")]
+            let mut n: u64 = 0;
+            loop {
+                self.exec_one(ctx);
+                #[cfg(feature = "perf")]
+                {
+                    n += 1;
+                }
+                if self.state != VmState::Running {
+                    break;
+                }
+                if self.critical {
+                    continue;
+                }
+                budget -= 1;
+                if budget == 0 {
+                    break;
+                }
+            }
+            #[cfg(feature = "perf")]
+            {
+                self.instructions = self.instructions.wrapping_add(n);
             }
         }
     }
@@ -1520,7 +1586,10 @@ impl Vm {
         self.target = WidgetId::NONE;
         self.state = VmState::Ready;
         self.fault = fault::NONE;
+        #[cfg(not(feature = "fast_vm"))]
         self.vars.clear();
+        #[cfg(feature = "fast_vm")]
+        self.vars.fill(0);
         self.wait_until = 0;
         self.code = VmCode::None;
         self.functions.clear();
@@ -1570,8 +1639,29 @@ impl Vm {
 
     // --- Byte reading helpers (read from self.code) ---
 
+    /// `fast_vm`: RAM code is read inline; flash code and the out-of-range
+    /// fault go through `read_u8_slow`.
+    #[cfg(feature = "fast_vm")]
+    #[inline(always)]
+    fn read_u8(&mut self) -> u8 {
+        if let VmCode::Ram(data) = &self.code {
+            if let Some(&b) = data.get(self.pc as usize) {
+                self.pc += 1;
+                return b;
+            }
+        }
+        self.read_u8_slow()
+    }
+
+    #[cfg(not(feature = "fast_vm"))]
     #[inline(never)]
     fn read_u8(&mut self) -> u8 {
+        self.read_u8_slow()
+    }
+
+    #[cfg_attr(not(feature = "fast_vm"), inline(always))]
+    #[cfg_attr(feature = "fast_vm", inline(never))]
+    fn read_u8_slow(&mut self) -> u8 {
         let pos = self.pc as usize;
         if pos < self.code.len() {
             self.pc += 1;
@@ -1587,7 +1677,8 @@ impl Vm {
         self.read_u8() as i8
     }
 
-    #[inline(never)]
+    #[cfg_attr(not(feature = "fast_vm"), inline(never))]
+    #[cfg_attr(feature = "fast_vm", inline(always))]
     fn read_u16(&mut self) -> u16 {
         let lo = self.read_u8() as u16;
         lo | (self.read_u8() as u16) << 8
@@ -1624,6 +1715,17 @@ impl Vm {
     // --- Execute a single instruction ---
 
     pub fn step<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
+        #[cfg(feature = "perf")]
+        {
+            self.instructions = self.instructions.wrapping_add(1);
+        }
+        self.exec_one(ctx);
+    }
+
+    /// The instruction body of `step`. `fast_vm` inlines it into the burst
+    /// loop in `tick` as well.
+    #[cfg_attr(feature = "fast_vm", inline(always))]
+    fn exec_one<P: Platform>(&mut self, ctx: &mut Ctx<P>) {
         self.op_pc = self.pc;
         let op = self.read_u8();
         if self.state == VmState::Error {
@@ -2761,7 +2863,8 @@ impl Vm {
 
     // --- Stack operations ---
 
-    #[inline(never)]
+    #[cfg_attr(not(feature = "fast_vm"), inline(never))]
+    #[cfg_attr(feature = "fast_vm", inline(always))]
     fn push(&mut self, val: i32) {
         if (self.sp as usize) < self.stack.len() {
             self.stack[self.sp as usize] = val;
@@ -2773,7 +2876,9 @@ impl Vm {
 
     // Out of line: once unchecked it is small enough for LLVM to inline at
     // some call sites, which costs more flash than the `bl` it replaces.
-    #[inline(never)]
+    // `fast_vm` (RAM-rich boards) inlines it everywhere.
+    #[cfg_attr(not(feature = "fast_vm"), inline(never))]
+    #[cfg_attr(feature = "fast_vm", inline(always))]
     fn pop(&mut self) -> i32 {
         if self.sp > self.sp_floor {
             self.sp -= 1;
@@ -2804,8 +2909,10 @@ impl Vm {
         (f32::from_bits(a as u32), f32::from_bits(b as u32))
     }
 
-    /// `pop2` body, out of line so each call site is just `mov r0, vm; bl`.
-    #[inline(never)]
+    /// `pop2` body, out of line so each call site is just `mov r0, vm; bl`
+    /// (inlined with `fast_vm`).
+    #[cfg_attr(not(feature = "fast_vm"), inline(never))]
+    #[cfg_attr(feature = "fast_vm", inline(always))]
     fn pop2_raw(&mut self) -> StackPair {
         if self.sp as usize >= self.sp_floor as usize + 2 {
             self.sp -= 2;
@@ -3775,6 +3882,38 @@ mod anim_tests {
     // Allocate one widget and return its id.
     fn one_widget(ctx: &mut Ctx<MockPlatform>) -> WidgetId {
         ctx.objs.alloc_widget().expect("alloc")
+    }
+
+    #[test]
+    fn idle_render_skips_scan_until_marked() {
+        let mut ctx = mock_ctx();
+        let root = one_widget(&mut ctx);
+        ctx.objs.root = root;
+        let child = one_widget(&mut ctx);
+        ctx.objs.add_child(root, child);
+        assert!(ctx.objs.maybe_dirty, "new widgets start dirty");
+        crate::render::render_dirty(&mut ctx);
+        assert!(!ctx.objs.get(child).is_dirty());
+        // The pass that drew keeps the hint; the next scan finds nothing.
+        crate::render::render_dirty(&mut ctx);
+        assert!(!ctx.objs.maybe_dirty);
+        // Marking raises it again, and the widget is drawn.
+        ctx.objs.mark_dirty(child);
+        assert!(ctx.objs.maybe_dirty);
+        let mut paint = crate::render::PaintList::new();
+        crate::render::collect_dirty_paint(&mut ctx, &mut paint);
+        crate::render::render_dirty(&mut ctx);
+        assert!(!ctx.objs.get(child).is_dirty());
+        // Buffered: the other buffer's bit keeps the hint up.
+        ctx.objs.mark_dirty(child);
+        ctx.objs.get_mut(root).clear_dirty_buf(0);
+        ctx.objs.get_mut(child).clear_dirty_buf(0);
+        assert!(!crate::render::buffered_has_dirty(&mut ctx));
+        assert!(ctx.objs.maybe_dirty, "B bits still set");
+        ctx.objs.get_mut(root).clear_dirty_buf(1);
+        ctx.objs.get_mut(child).clear_dirty_buf(1);
+        assert!(!crate::render::buffered_has_dirty(&mut ctx));
+        assert!(!ctx.objs.maybe_dirty);
     }
 
     #[test]

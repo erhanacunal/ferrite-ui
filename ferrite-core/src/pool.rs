@@ -178,6 +178,11 @@ pub struct ObjPool {
     /// incrementally (gauge) trusts its on-screen pixels only if they were
     /// drawn in the current epoch.
     pub(crate) draw_epoch: u32,
+    /// Some widget may have a dirty bit set. Raised by everything that sets
+    /// one (`mark_dirty`, `alloc_widget`); lowered only by a render scan that
+    /// found no dirty widget. While it is down the render passes skip their
+    /// DFS scans, so an idle main-loop pass doesn't walk the tree.
+    pub(crate) maybe_dirty: bool,
 }
 
 impl ObjPool {
@@ -210,6 +215,7 @@ impl ObjPool {
             dfs_valid: false,
             dead: Widget::DEAD,
             draw_epoch: 0,
+            maybe_dirty: false,
         }
     }
 
@@ -277,6 +283,7 @@ impl ObjPool {
         self.root = WidgetId::NONE;
         self.dfs_cache.clear();
         self.dfs_valid = false;
+        self.maybe_dirty = false;
     }
 
     // --- Diagnostics ---

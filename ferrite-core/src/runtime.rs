@@ -184,6 +184,22 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
         ctx.lcd.end_frame();
         ctx.lcd.flush_dirty();
     }
+
+    /// Free-running 32-bit cycle counter for the `perf` profiler (0 = none).
+    fn cycles() -> u32 {
+        0
+    }
+
+    /// Rate of `cycles` in Hz (0 = unknown: the report shows no times).
+    fn cycle_hz() -> u32 {
+        0
+    }
+
+    /// Cycles spent waiting for vsync since the last call, then reset to 0
+    /// (the profiler's `VSYNC_WAIT` row, part of `frame_end`).
+    fn perf_take_wait() -> u64 {
+        0
+    }
 }
 
 /// Per-frame input handling. Owns whatever cross-frame state the strategy needs
@@ -404,6 +420,9 @@ pub struct Runtime<P: PlatformRuntime> {
     /// The open task-fault dialog (`multi_program`).
     #[cfg(feature = "multi_program")]
     fault_dialog: WidgetId,
+    /// Main-loop profile (`perf` feature).
+    #[cfg(feature = "perf")]
+    perf: crate::perf::Perf,
 }
 
 impl<P: PlatformRuntime> Runtime<P> {
@@ -474,6 +493,8 @@ impl<P: PlatformRuntime> Runtime<P> {
             last_rx_ms,
             #[cfg(feature = "multi_program")]
             fault_dialog: WidgetId::NONE,
+            #[cfg(feature = "perf")]
+            perf: crate::perf::Perf::new(),
         }
     }
 
@@ -485,12 +506,29 @@ impl<P: PlatformRuntime> Runtime<P> {
     /// One main-loop pass: VM, USART protocol, input, animations, audio,
     /// render, callbacks, `P::frame_end`.
     pub fn step(&mut self) {
+        #[cfg(feature = "perf")]
+        let mut t = {
+            let now = P::cycles();
+            self.perf.pass_start(now);
+            now
+        };
+        // Ends the phase that started at `t` (`perf` feature; else nothing).
+        macro_rules! lap {
+            ($id:ident) => {
+                #[cfg(feature = "perf")]
+                {
+                    t = self.perf.add(crate::perf::phase::$id, t, P::cycles());
+                }
+            };
+        }
+
         // `runProgram` ended the main program: load the next one (every
         // child task ends with it).
         if self.error_code == 0 && self.tasks.main.state == VmState::Exit {
             self.drop_children();
             self.error_code = switch_program(&mut self.ctx, &mut self.tasks.main, &mut self.input);
         }
+        lap!(MISC);
 
         // --- VM step, each task in turn ---
         // Resumes a suspended showModal whose result is now ready, then
@@ -506,8 +544,10 @@ impl<P: PlatformRuntime> Runtime<P> {
             });
             self.error_code = check_vm_fault(&mut self.ctx, &self.tasks.main);
         }
+        lap!(VM);
 
         self.service_usart();
+        lap!(USART);
 
         // --- Input ---
         if self.error_code == 0 {
@@ -520,6 +560,7 @@ impl<P: PlatformRuntime> Runtime<P> {
             #[cfg(feature = "multi_program")]
             self.close_fault_dialog_on_click();
         }
+        lap!(INPUT);
 
         // --- Advance property animations ---
         // Time-driven (millis), independent of VM state, so tweens keep running
@@ -530,15 +571,18 @@ impl<P: PlatformRuntime> Runtime<P> {
             let now = self.ctx.systick.millis();
             each_task(&mut self.ctx, &mut self.tasks, |ctx, vm| vm.tick_animations(ctx, now));
         }
+        lap!(ANIM);
 
         // --- Stream the playing sound (if any) into the audio backend ---
         #[cfg(feature = "audio")]
         self.ctx.audio.pump(&self.ctx.flash);
+        lap!(AUDIO);
 
         // --- Render (on_paint runs inside, for the widgets it drew) ---
         if self.error_code == 0 {
             render_phase(&mut self.ctx, &mut self.tasks, &mut self.input);
         }
+        lap!(RENDER);
 
         // --- Start queued callbacks, then re-render ---
         if self.error_code == 0 {
@@ -557,6 +601,7 @@ impl<P: PlatformRuntime> Runtime<P> {
         if self.error_code == 0 {
             self.error_code = check_vm_fault(&mut self.ctx, &self.tasks.main);
         }
+        lap!(CALLBACKS);
 
         // --- Child tasks: end the ones that exited or faulted, act on
         //     spawn / kill requests, deliver messages ---
@@ -568,9 +613,42 @@ impl<P: PlatformRuntime> Runtime<P> {
         // --- Commit EEPROM writes made this pass (one erase on flash-backed
         //     boards for a whole save; no-op on write-through chips) ---
         self.ctx.eeprom.flush();
+        lap!(MISC);
 
         // --- End-of-frame hook (host window pump / present; no-op on device) ---
         P::frame_end(&mut self.ctx);
+        lap!(FRAME_END);
+        #[cfg(feature = "perf")]
+        {
+            self.perf.add_cycles(crate::perf::phase::VSYNC_WAIT, P::perf_take_wait());
+            self.perf.pass_end(t);
+        }
+    }
+
+    /// Answers a `Perf` query: the profile since the last one, then resets it.
+    #[cfg(feature = "perf")]
+    fn send_perf(&mut self) {
+        use crate::perf::{phase, to_us};
+        let hz = P::cycle_hz();
+        let mut instructions = 0u64;
+        each_task(&mut self.ctx, &mut self.tasks, |_, vm| {
+            instructions += vm.instructions;
+            vm.instructions = 0;
+        });
+        let p = &self.perf;
+        let mut rows = [(0u8, 0u32); phase::COUNT];
+        for (i, row) in rows.iter_mut().enumerate() {
+            *row = (i as u8 + 1, to_us(p.phase[i], hz));
+        }
+        let header = protocol::PerfHeader {
+            cycle_hz: hz,
+            window_us: to_us(p.window, hz),
+            passes: p.passes,
+            max_pass_us: to_us(p.max_pass as u64, hz),
+            vm_instructions: instructions,
+        };
+        protocol::send_perf(&self.ctx.usart, &header, &rows);
+        self.perf.reset();
     }
 
     /// USART protocol: always serviced, even after an error, so a new program
@@ -633,6 +711,8 @@ impl<P: PlatformRuntime> Runtime<P> {
                 let entries = mem_detail(&self.ctx, &self.tasks.main);
                 protocol::send_memdetail(&self.ctx.usart, &entries);
             }
+            #[cfg(feature = "perf")]
+            RxEvent::Perf => self.send_perf(),
             RxEvent::SetDateTime => {
                 let dt = self.protocol.datetime();
                 self.ctx.rtc.set_time(&dt);

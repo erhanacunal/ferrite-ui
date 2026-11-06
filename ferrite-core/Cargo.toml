@@ -49,6 +49,17 @@ wide_obj = ["pool_large"]
 # task that set the handler. Costs 2 B per object pointer. Enabled by
 # `bsp-exynos4412`.
 multi_program = []
+# Faster interpreter for RAM-rich boards: a dense 2 KB variable table instead
+# of the sparse list, RAM code read and stack ops inlined, and `tick` runs its
+# burst with the instruction body inlined (one `step` prologue per burst, not
+# per instruction). Costs ~2 KB RAM per VM and some flash, so the GD32 build
+# leaves it off. Enabled by `bsp-exynos4412`.
+fast_vm = []
+# Main-loop profiler (`perf` module): CPU cycles per `Runtime::step` phase and
+# VM instruction count, reported over USART (`ferrite_cli.py perf`). Needs a
+# cycle counter from the BSP (`PlatformRuntime::cycles` / `cycle_hz`). Enabled
+# by `bsp-exynos4412`.
+perf = []
 
 # --- Optional device features, selected by the BSP that has the hardware ---
 # Off = the module, its `Platform` backend slot, its `Ctx` field and its VM

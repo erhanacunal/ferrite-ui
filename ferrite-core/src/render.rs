@@ -23,12 +23,22 @@ fn screen_rect<B: LcdBackend>(lcd: &LcdImpl<B>) -> Rect {
 
 /// Check if the back buffer has any dirty widgets.
 pub fn buffered_has_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
+    if !ctx.objs.maybe_dirty {
+        return false;
+    }
     let buf = ctx.lcd.back_buf();
     ctx.objs.ensure_dfs();
+    let mut other = false;
     for i in 0..ctx.objs.dfs_len() {
-        if ctx.objs.get(ctx.objs.dfs_at(i)).is_dirty_buf(buf) {
+        let w = ctx.objs.get(ctx.objs.dfs_at(i));
+        if w.is_dirty_buf(buf) {
             return true;
         }
+        other |= w.flags & FLAG_DIRTY_AB != 0;
+    }
+    // Nothing dirty in either buffer: idle passes can skip the scan.
+    if !other {
+        ctx.objs.maybe_dirty = false;
     }
     false
 }
@@ -70,6 +80,9 @@ impl PaintList {
 /// Dirty-mode counterpart of the list `render_buffered_content` returns: the
 /// dirty on_paint widgets, collected *before* `render_dirty` clears the flags.
 pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
+    if !ctx.objs.maybe_dirty {
+        return;
+    }
     ctx.objs.ensure_dfs();
     for i in 0..ctx.objs.dfs_len() {
         let id = ctx.objs.dfs_at(i);
@@ -321,6 +334,9 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>) {
 /// This prevents hidden panels from overwriting visible siblings that share
 /// the same screen area (e.g. tab panels stacked at the same position).
 pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
+    if !ctx.objs.maybe_dirty {
+        return;
+    }
     ctx.objs.ensure_dfs();
 
     let mut has_dirty = false;
@@ -331,6 +347,9 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         }
     }
     if !has_dirty {
+        // Dirty mode uses only the A bits: nothing left to draw until a
+        // widget is marked again.
+        ctx.objs.maybe_dirty = false;
         return;
     }
 

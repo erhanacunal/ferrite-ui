@@ -48,6 +48,8 @@ pub mod runtime;
 #[cfg(feature = "sdboot")]
 pub mod sdboot;
 pub mod pool;
+#[cfg(feature = "perf")]
+pub mod perf;
 pub mod strpool;
 pub mod syscfg;
 #[cfg(feature = "multi_program")]

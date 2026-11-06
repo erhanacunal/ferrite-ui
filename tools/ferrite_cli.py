@@ -2,12 +2,13 @@
 """ferrite-cli — Host-side tool for communicating with ferrite-ui devices.
 
 Implements the USART protobuf protocol (see protocol.rs).
-Commands: ping, restart, meminfo, memdetail, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime, monitor
+Commands: ping, restart, meminfo, memdetail, perf, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime, monitor
 
 Usage:
     python ferrite_cli.py -p COM3 ping
     python ferrite_cli.py -p COM3 meminfo
     python ferrite_cli.py -p COM3 memdetail                (per-pool memory usage)
+    python ferrite_cli.py -p COM3 perf --interval 2 --count 5  (main-loop profile)
     python ferrite_cli.py -p COM3 restart
     python ferrite_cli.py -p COM3 execute program.bin
     python ferrite_cli.py -p COM3 -l execute program.fxe   (execute + listen)
@@ -42,6 +43,7 @@ TAG_TOUCHCAL   = (8 << 3) | 0   # 0x40, varint (start touch calibration)
 TAG_STACKINFO  = (9 << 3) | 0   # 0x48, varint (query stack usage)
 TAG_SETDATETIME = (10 << 3) | 2  # 0x52, payload (7B: year/month/day/weekday/hour/min/sec)
 TAG_MEMDETAIL  = (11 << 3) | 0   # 0x58, varint (query per-pool memory usage)
+TAG_PERF       = (12 << 3) | 0   # 0x60, varint (query + reset the main-loop profile)
 
 CHUNK_SIZE = 4096  # Must match device sector buffer size
 
@@ -54,6 +56,7 @@ TAG_STACKINFO_RESP = (5 << 3) | 2  # 0x2A, payload (used + free [+ peak], 8 or 1
 TAG_MEMDETAIL_RESP = (6 << 3) | 2  # 0x32, payload (version + count + 13-byte entries)
 TAG_FSCAPS_RESP = (7 << 3) | 2  # 0x3A, payload (1 byte flags): ACK of a CRC writefs header
 TAG_FSACK_RESP = (8 << 3) | 2  # 0x42, payload (12 B): next_seq + last_crc + CRC-32 (seq-ACK writefs)
+TAG_PERF_RESP = (9 << 3) | 2  # 0x4A, payload: main-loop profile (protocol::send_perf)
 
 # WriteFs header flags (u32 after total_size + chunk_size) — FS_FLAG_* in protocol.rs
 FS_FLAG_CRC = 0x01  # chunks carry seq + CRC-32 and are retried
@@ -196,6 +199,22 @@ MEMDETAIL_VERSION = 1
 MEMDETAIL_ENTRY = 13                 # id u8 + used/capacity/extra u32
 
 
+PERF_VERSION = 1
+PERF_HEADER = 26                     # version + count + 4 x u32 + u64
+PERF_ENTRY = 5                       # phase id u8 + us u32
+# ferrite-core perf::phase — keep in sync. VSYNC_WAIT ("display wait") is part
+# of the other phases, so it is not added to the time inside step.
+PERF_PHASES = {
+    1: "vm", 2: "usart", 3: "input", 4: "animations", 5: "audio",
+    6: "render", 7: "callbacks", 8: "tasks/misc", 9: "frame_end",
+    10: "  display wait",
+}
+
+
+def _perf_length_ok(length: int) -> bool:
+    return length >= PERF_HEADER and (length - PERF_HEADER) % PERF_ENTRY == 0 and length <= 255
+
+
 def _memdetail_length_ok(length: int) -> bool:
     return length >= 2 and (length - 2) % MEMDETAIL_ENTRY == 0 and length <= 2 + 255 * MEMDETAIL_ENTRY
 
@@ -294,6 +313,19 @@ def read_response(ser: serial.Serial) -> tuple[str, int | None]:
             ser.timeout = orig_timeout
             return ("fsack", (int.from_bytes(payload[0:4], "little"),
                               int.from_bytes(payload[4:8], "little")))
+
+        if tag == TAG_PERF_RESP:
+            length = _read_varint(ser)
+            if length is None or not _perf_length_ok(length):
+                continue
+            payload = ser.read(length)
+            if len(payload) < length:
+                ser.timeout = orig_timeout
+                return ("timeout", None)
+            if payload[0] != PERF_VERSION or PERF_HEADER + payload[1] * PERF_ENTRY != length:
+                continue
+            ser.timeout = orig_timeout
+            return ("perf", parse_perf(payload))
 
         if tag in (TAG_STACKINFO_RESP, TAG_MEMDETAIL_RESP, TAG_ERROR, TAG_TOUCHCAL_RESP):
             length = _read_varint(ser)
@@ -482,6 +514,73 @@ def cmd_memdetail(ser: serial.Serial) -> bool:
     else:
         print("no response (timeout) — firmware may predate memdetail", file=sys.stderr)
         return False
+
+
+def parse_perf(payload: bytes) -> dict:
+    """Perf payload -> dict(hz, window_us, passes, max_pass_us, vm_instr, phases=[(id, us)])."""
+    count = payload[1]
+    hz, window_us, passes, max_pass_us, vm_instr = struct.unpack_from("<IIIIQ", payload, 2)
+    phases = [struct.unpack_from("<BI", payload, PERF_HEADER + i * PERF_ENTRY) for i in range(count)]
+    return {"hz": hz, "window_us": window_us, "passes": passes,
+            "max_pass_us": max_pass_us, "vm_instr": vm_instr, "phases": phases}
+
+
+def _fmt_rate(value: float) -> str:
+    for unit, scale in (("G", 1e9), ("M", 1e6), ("k", 1e3)):
+        if value >= scale:
+            return f"{value / scale:.2f} {unit}"
+    return f"{value:.0f} "
+
+
+def format_perf(p: dict) -> list[str]:
+    """Render a perf report as text lines."""
+    window = p["window_us"]
+    if p["hz"] == 0 or window == 0:
+        return [f"passes {p['passes']}, VM instructions {p['vm_instr']} (no cycle counter / empty window)"]
+    secs = window / 1e6
+    lines = [
+        f"CPU clock {p['hz'] / 1e6:.0f} MHz, window {window / 1000:.1f} ms",
+        f"passes {p['passes']} ({_fmt_rate(p['passes'] / secs)}passes/s, "
+        f"avg {window / max(p['passes'], 1):.1f} us, max {p['max_pass_us']} us)",
+        f"VM {_fmt_rate(p['vm_instr'] / secs)}instr/s ({p['vm_instr']} instructions)",
+        f"{'phase':<16}{'time':>12}{'share':>8}{'per pass':>12}",
+        "-" * 48,
+    ]
+    in_step = 0
+    for pid, us in p["phases"]:
+        name = PERF_PHASES.get(pid, f"phase {pid}")
+        if pid != 10:
+            in_step += us
+        lines.append(f"{name:<16}{us / 1000:>10.1f} ms{100 * us / window:>7.1f}%"
+                     f"{us / max(p['passes'], 1):>9.1f} us")
+    outside = max(window - in_step, 0)
+    lines.append(f"{'outside step':<16}{outside / 1000:>10.1f} ms{100 * outside / window:>7.1f}%")
+    return lines
+
+
+def cmd_perf(ser: serial.Serial, interval: float, count: int) -> bool:
+    """Main-loop profile: resets the device's counters, then prints a report
+    every `interval` seconds, `count` times (0 = until Ctrl+C)."""
+    resp_type, _ = request(ser, build_varint_msg(TAG_PERF))  # reset the window
+    if resp_type != "perf":
+        print("no response (timeout) — firmware built without the `perf` feature?", file=sys.stderr)
+        return False
+    n = 0
+    try:
+        while count == 0 or n < count:
+            time.sleep(interval)
+            resp_type, resp_val = request(ser, build_varint_msg(TAG_PERF))
+            if resp_type != "perf":
+                print("no response (timeout)", file=sys.stderr)
+                return False
+            if n:
+                print()
+            for line in format_perf(resp_val):
+                print(line)
+            n += 1
+    except KeyboardInterrupt:
+        pass
+    return True
 
 
 def cmd_stackinfo(ser: serial.Serial) -> bool:
@@ -1035,6 +1134,9 @@ def main():
     sub.add_parser("restart", help="Restart device")
     sub.add_parser("meminfo", help="Query free heap memory")
     sub.add_parser("memdetail", help="Query per-pool memory usage (heap, strings, UART, widgets, VM)")
+    p_perf = sub.add_parser("perf", help="Main-loop profile: time per phase, passes/s, VM instr/s (perf firmware)")
+    p_perf.add_argument("--interval", type=float, default=2.0, help="seconds per report (default 2)")
+    p_perf.add_argument("--count", type=int, default=1, help="reports to print (0 = until Ctrl+C; default 1)")
 
     p_exec = sub.add_parser("execute", help="Send bytecode for execution")
     p_exec.add_argument("file", help="Bytecode binary file")
@@ -1074,6 +1176,8 @@ def main():
             ok = cmd_meminfo(ser)
         elif args.command == "memdetail":
             ok = cmd_memdetail(ser)
+        elif args.command == "perf":
+            ok = cmd_perf(ser, args.interval, args.count)
         elif args.command == "execute":
             ok = cmd_execute(ser, args.file)
         elif args.command == "writefs":
