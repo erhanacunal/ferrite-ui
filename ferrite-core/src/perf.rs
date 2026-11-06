@@ -41,8 +41,12 @@ pub mod phase {
     /// Time inside the LCD backend's pixel primitives, in any phase (timed by
     /// the BSP through [`super::add_sub`], after its display wait).
     pub const PIXELS: u8 = 12;
+    /// Time another core spent presenting (copying frames to the display),
+    /// in parallel with the step: not part of the window's sum. Reported by
+    /// the BSP (exynos4412: CPU2's copies).
+    pub const PRESENT: u8 = 13;
     /// Number of slots (ids 1..COUNT).
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 }
 
 /// Event counts, reported as plain numbers (ids from 0x80). Mirrored in
@@ -52,6 +56,12 @@ pub mod count {
     pub const DRAWS: u8 = 0x81;
     /// Pixel primitive calls (`phase::PIXELS`).
     pub const PIXEL_CALLS: u8 = 0x82;
+    /// Presents (`phase::PRESENT`).
+    pub const PRESENTS: u8 = 0x83;
+    /// KiB the presents copied.
+    pub const PRESENT_KB: u8 = 0x84;
+    /// Number of counts (ids 0x81..).
+    pub const COUNT: usize = 4;
 }
 
 /// A value only the runtime's own thread touches (the runtime and the
@@ -65,8 +75,14 @@ fn no_clock() -> u32 {
 }
 
 static CLOCK: Local<fn() -> u32> = Local(core::cell::UnsafeCell::new(no_clock));
-/// Cycles and calls of the sub-phases `DRAW`, `PIXELS`.
-static SUB: Local<([u64; 2], [u32; 2])> = Local(core::cell::UnsafeCell::new(([0; 2], [0; 2])));
+/// Number of sub-phases (`DRAW`, `PIXELS`, `PRESENT`).
+pub const SUBS: usize = 3;
+
+type Sub = ([u64; SUBS], [u32; count::COUNT]);
+
+/// Cycles of the sub-phases (index id - `DRAW`) and the counts (index
+/// id - 0x81; a sub-phase call counts in the same index).
+static SUB: Local<Sub> = Local(core::cell::UnsafeCell::new(([0; SUBS], [0; count::COUNT])));
 
 /// Sets the clock `now` reads (`PlatformRuntime::cycles`); the runtime does
 /// it at startup.
@@ -80,18 +96,33 @@ pub fn now() -> u32 {
     unsafe { (*CLOCK.0.get())() }
 }
 
-/// Adds one call of `cycles` to sub-phase `id` (`phase::DRAW` / `PIXELS`).
+/// Adds one call of `cycles` to sub-phase `id` (`phase::DRAW` / `PIXELS` /
+/// `PRESENT`).
 #[inline]
 pub fn add_sub(id: u8, cycles: u32) {
-    let i = (id == phase::PIXELS) as usize;
-    let s = unsafe { &mut *SUB.0.get() };
-    s.0[i] += cycles as u64;
-    s.1[i] += 1;
+    add_sub_n(id, cycles as u64, 1);
 }
 
-/// Sub-phase cycles and calls since the last call, then 0.
-pub fn take_sub() -> ([u64; 2], [u32; 2]) {
-    unsafe { core::mem::replace(&mut *SUB.0.get(), ([0; 2], [0; 2])) }
+/// Adds `calls` calls taking `cycles` in all to sub-phase `id`.
+#[inline]
+pub fn add_sub_n(id: u8, cycles: u64, calls: u32) {
+    let i = (id - phase::DRAW) as usize;
+    let s = unsafe { &mut *SUB.0.get() };
+    s.0[i] += cycles;
+    s.1[i] = s.1[i].wrapping_add(calls);
+}
+
+/// Adds `n` to count `id` (`count::*`).
+#[inline]
+pub fn add_count(id: u8, n: u32) {
+    let s = unsafe { &mut *SUB.0.get() };
+    let c = &mut s.1[(id - 0x81) as usize];
+    *c = c.wrapping_add(n);
+}
+
+/// Sub-phase cycles and the counts since the last call, then 0.
+pub fn take_sub() -> Sub {
+    unsafe { core::mem::replace(&mut *SUB.0.get(), ([0; SUBS], [0; count::COUNT])) }
 }
 
 /// Accumulated cycles since the last report.

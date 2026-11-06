@@ -637,16 +637,19 @@ impl<P: PlatformRuntime> Runtime<P> {
             instructions += vm.instructions;
             vm.instructions = 0;
         });
-        let (sub, calls) = crate::perf::take_sub();
-        self.perf.add_cycles(phase::DRAW, sub[0]);
-        self.perf.add_cycles(phase::PIXELS, sub[1]);
+        use crate::perf::count;
+        let (sub, counts) = crate::perf::take_sub();
+        for (i, &c) in sub.iter().enumerate() {
+            self.perf.add_cycles(phase::DRAW + i as u8, c);
+        }
         let p = &self.perf;
-        let mut rows = [(0u8, 0u32); phase::COUNT + 2];
+        let mut rows = [(0u8, 0u32); phase::COUNT + count::COUNT];
         for (i, row) in rows.iter_mut().take(phase::COUNT).enumerate() {
             *row = (i as u8 + 1, to_us(p.phase[i], hz));
         }
-        rows[phase::COUNT] = (crate::perf::count::DRAWS, calls[0]);
-        rows[phase::COUNT + 1] = (crate::perf::count::PIXEL_CALLS, calls[1]);
+        for (i, &n) in counts.iter().enumerate() {
+            rows[phase::COUNT + i] = (count::DRAWS + i as u8, n);
+        }
         let header = protocol::PerfHeader {
             cycle_hz: hz,
             window_us: to_us(p.window, hz),

@@ -39,7 +39,7 @@
 //! flushes.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use exynos_4412_rs::drivers::display::{self, Fimd, Framebuffer, LTN101AL03, LVDS_SETTLE_MS, Timing};
 use exynos_4412_rs::{mmu, smp};
@@ -146,6 +146,21 @@ const FLIP: u8 = 2;
 /// them to 0..H before handing a box over; CPU2 narrows them.
 static COPY_LO: AtomicUsize = AtomicUsize::new(0);
 static COPY_HI: AtomicUsize = AtomicUsize::new(0);
+
+/// Present copy statistics for the profiler (`perf`): cycles, presents,
+/// bytes, added by whichever core presents; CPU0 takes them.
+static COPY_CYCLES: AtomicU32 = AtomicU32::new(0);
+static COPY_COUNT: AtomicU32 = AtomicU32::new(0);
+static COPY_BYTES: AtomicU32 = AtomicU32::new(0);
+
+/// (cycles, presents, bytes) of the present copies since the last call.
+pub fn take_present_stats() -> (u32, u32, u32) {
+    (
+        COPY_CYCLES.swap(0, Ordering::Relaxed),
+        COPY_COUNT.swap(0, Ordering::Relaxed),
+        COPY_BYTES.swap(0, Ordering::Relaxed),
+    )
+}
 
 /// CPU2 runs the presenter ([`start_presenter`] succeeded).
 static PRESENTER: AtomicBool = AtomicBool::new(false);
@@ -280,11 +295,13 @@ fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) 
     let nc = p.nc[back_i];
     let dst = if nc != 0 { nc as *mut u32 } else { buf_ptr(back_i) };
     rows(r[1], r[3]);
+    #[cfg(feature = "perf")]
+    let t0 = crate::perf::cycles();
     for y in r[1]..r[3] {
         let at = y * W + x;
         // SAFETY: both boxes are clipped to the screen (`mark` callers); the
         // shadow and the scan buffers are distinct.
-        unsafe { core::ptr::copy_nonoverlapping(src.add(at), dst.add(at), w) };
+        unsafe { copy_row(src.add(at), dst.add(at), w) };
         if nc == 0 {
             mmu::clean_dcache_range(dst as usize + at * 4, w * 4);
         }
@@ -293,6 +310,12 @@ fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) 
     // The copy has reached DRAM before the FIMD may scan it.
     // SAFETY: a barrier only.
     unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+    #[cfg(feature = "perf")]
+    {
+        COPY_CYCLES.fetch_add(crate::perf::cycles().wrapping_sub(t0), Ordering::Relaxed);
+        COPY_COUNT.fetch_add(1, Ordering::Relaxed);
+        COPY_BYTES.fetch_add(((r[3] - r[1]) * w * 4) as u32, Ordering::Relaxed);
+    }
     copied();
 
     let fimd = Fimd::new();
@@ -320,9 +343,51 @@ pub fn start_presenter(cpu: usize) -> Result<(), smp::StartError> {
     Ok(())
 }
 
+/// Copies `n` pixels from `src` (the cached shadow) to `dst`: NEON, 64 bytes
+/// per step, with the source prefetched (`pld`) 256 bytes ahead. The shadow
+/// box is mostly not in the caches (a full screen is 4 MB, the L2 1 MB), so
+/// the loads would wait for DRAM line by line without it.
+///
+/// # Safety
+/// `src..src+n` readable, `dst..dst+n` writable, not overlapping; both 4-byte
+/// aligned (NEON `vld1.32`/`vst1.32` allow that: SCTLR.A is clear).
+#[inline(always)]
+unsafe fn copy_row(mut src: *const u32, mut dst: *mut u32, n: usize) {
+    let mut blocks = n / 16;
+    if blocks != 0 {
+        // SAFETY: the caller's ranges; d0-d7 are clobbered.
+        unsafe {
+            core::arch::asm!(
+                "2:",
+                "pld [{s}, #256]",
+                "pld [{s}, #288]",
+                "vld1.32 {{d0-d3}}, [{s}]!",
+                "vld1.32 {{d4-d7}}, [{s}]!",
+                "subs {b}, {b}, #1",
+                "vst1.32 {{d0-d3}}, [{d}]!",
+                "vst1.32 {{d4-d7}}, [{d}]!",
+                "bne 2b",
+                s = inout(reg) src,
+                d = inout(reg) dst,
+                b = inout(reg) blocks,
+                out("d0") _, out("d1") _, out("d2") _, out("d3") _,
+                out("d4") _, out("d5") _, out("d6") _, out("d7") _,
+                options(nostack),
+            );
+        }
+    }
+    let _ = blocks;
+    for i in 0..n % 16 {
+        // SAFETY: the tail of the caller's ranges.
+        unsafe { *dst.add(i) = *src.add(i) };
+    }
+}
+
 /// The presenter core: waits for a hand-over, presents, repeats. No
 /// interrupts: `sev` from CPU0 wakes it.
 fn presenter(_cpu: usize) -> ! {
+    #[cfg(feature = "perf")]
+    crate::perf::enable_counter();
     loop {
         while STATE.load(Ordering::Acquire) != COPY {
             // SAFETY: sleeps until an event (CPU0's `sev`); a spurious wake

@@ -27,14 +27,7 @@ static mut WAIT: u64 = 0;
 /// Turns the cycle counter on and measures its rate. CPU0, with the MCT
 /// running. Prints the CPU clock.
 pub fn init(mct: &Mct) {
-    // SAFETY: CP15 PMU registers of this core; nothing else uses the PMU.
-    unsafe {
-        let mut pmcr: u32;
-        core::arch::asm!("mrc p15, 0, {}, c9, c12, 0", out(reg) pmcr, options(nomem, nostack));
-        pmcr = (pmcr | PMCR_E | PMCR_C) & !(1 << 3);
-        core::arch::asm!("mcr p15, 0, {}, c9, c12, 0", in(reg) pmcr, options(nomem, nostack));
-        core::arch::asm!("mcr p15, 0, {}, c9, c12, 1", in(reg) CNTEN_CYCLES, options(nomem, nostack));
-    }
+    enable_counter();
     let start = mct.count();
     while mct.count() == start {}
     let (m0, c0) = (mct.count(), cycles());
@@ -43,6 +36,19 @@ pub fn init(mct: &Mct) {
     let hz = c1.wrapping_sub(c0) as u64 * soc::MCT_CLOCK_HZ as u64 / (m1 - m0);
     unsafe { HZ = hz as u32 };
     exynos_4412_rs::println!("ferrite: CPU0 clock {} MHz (PMU vs MCT)", hz / 1_000_000);
+}
+
+/// Turns this core's PMU cycle counter on (every core has its own; they
+/// all run at the CPU clock).
+pub fn enable_counter() {
+    // SAFETY: CP15 PMU registers of this core; nothing else uses the PMU.
+    unsafe {
+        let mut pmcr: u32;
+        core::arch::asm!("mrc p15, 0, {}, c9, c12, 0", out(reg) pmcr, options(nomem, nostack));
+        pmcr = (pmcr | PMCR_E | PMCR_C) & !(1 << 3);
+        core::arch::asm!("mcr p15, 0, {}, c9, c12, 0", in(reg) pmcr, options(nomem, nostack));
+        core::arch::asm!("mcr p15, 0, {}, c9, c12, 1", in(reg) CNTEN_CYCLES, options(nomem, nostack));
+    }
 }
 
 /// PMCCNTR: CPU cycles, wraps every ~3 s at 1.4 GHz.
@@ -63,7 +69,13 @@ pub fn add_wait(c: u32) {
     unsafe { WAIT += c as u64 };
 }
 
-/// Vsync wait since the last call, then 0.
+/// Vsync wait since the last call, then 0. Also hands the presenter's copy
+/// statistics to the profiler (`PRESENT` row).
 pub fn take_wait() -> u64 {
+    let (cycles, n, bytes) = crate::lcd::take_present_stats();
+    if n != 0 {
+        ferrite_core::perf::add_sub_n(ferrite_core::perf::phase::PRESENT, cycles as u64, n);
+        ferrite_core::perf::add_count(ferrite_core::perf::count::PRESENT_KB, bytes >> 10);
+    }
     unsafe { core::mem::replace(&mut *(&raw mut WAIT), 0) }
 }

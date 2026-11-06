@@ -210,11 +210,14 @@ PERF_PHASES = {
     10: "  display wait",
     11: "  widget draws",
     12: "  pixel writes",
+    13: "present copy",
 }
 # Sub-phases: already inside the step phases above.
-PERF_SUB_PHASES = (10, 11, 12)
+# (13 runs on another core, in parallel with the step.)
+PERF_SUB_PHASES = (10, 11, 12, 13)
 # Event counts (plain numbers, not microseconds): perf::count in perf.rs.
-PERF_COUNTS = {0x81: "draw_widget calls", 0x82: "pixel primitive calls"}
+PERF_COUNTS = {0x81: "draw_widget calls", 0x82: "pixel primitive calls",
+               0x83: "presents", 0x84: "present KiB"}
 
 
 def _perf_length_ok(length: int) -> bool:
@@ -558,6 +561,7 @@ def format_perf(p: dict) -> list[str]:
     for pid, us in p["phases"]:
         if pid in PERF_COUNTS:
             counts.append((PERF_COUNTS[pid], us))
+            times[pid] = us
             continue
         times[pid] = us
         name = PERF_PHASES.get(pid, f"phase {pid}")
@@ -578,6 +582,10 @@ def format_perf(p: dict) -> list[str]:
                      "  (widget draws - pixel writes - display wait, approx.)")
     for name, n in counts:
         lines.append(f"{name}: {n} ({n / passes:.1f} per pass)")
+    if times.get(13) and times.get(0x84):
+        rate = times[0x84] * 1024 / times[13] / 1000  # bytes/us = MB/s -> GB/s
+        per = times[13] / max(times.get(0x83, 0), 1)
+        lines.append(f"present copy rate: {rate:.2f} GB/s ({per:.0f} us per present)")
     return lines
 
 
