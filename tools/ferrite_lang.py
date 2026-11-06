@@ -1176,8 +1176,10 @@ class CodeGen:
     # opt into strict checking.
     T_ANY = "any"
 
-    def __init__(self, wide=False):
+    def __init__(self, wide=False, superops=False):
         self.asm = Asm(wide=wide)
+        # Emit superinstructions (device caps.superops; firmware `superops`).
+        self.superops = superops
         self.vars = {}          # name -> slot
         self.var_types = {}     # name -> T_INT | T_FLOAT
         self.global_vars = {}   # name -> slot (global variables visible to all functions)
@@ -2218,6 +2220,31 @@ class CodeGen:
             # The variable now holds another widget id (c = get(next_sibling)).
             if self._current_target == node.name:
                 self._current_target = None
+            v = node.value
+            if isinstance(v, BinOp) and v.op in ('+', '-'):
+                k = None
+                if isinstance(v.left, VarRef) and v.left.name == node.name:
+                    k = self._add_imm_target(node.name, v.right, v.op)
+                elif (v.op == '+' and isinstance(v.right, VarRef)
+                        and v.right.name == node.name):
+                    k = self._add_imm_target(node.name, v.left)
+                if k is not None:
+                    self.asm.add_var_imm(self._var_slot(node.name, node.line), k)
+                    return
+            op = self._SUPER_OPS.get(v.op) if isinstance(v, BinOp) else None
+            if op is not None and self._gen_store_op(node.name, v, node.line):
+                # x = x op e  (or e op x for commutative op), e pure
+                other = None
+                if isinstance(v.left, VarRef) and v.left.name == node.name:
+                    other = v.right
+                elif (v.op in self._COMMUTATIVE and isinstance(v.right, VarRef)
+                        and v.right.name == node.name):
+                    other = v.left
+                if (other is not None and self._is_pure(other)
+                        and self._infer_type(other) != self.T_FLOAT):
+                    self._gen_expr(other)
+                    self.asm.store_op(op, self._var_slot(node.name, node.line))
+                    return
             self._gen_expr(node.value)
             var_type = self.var_types.get(node.name, self.T_INT)
             val_type = self._infer_type(node.value)
@@ -2230,9 +2257,181 @@ class CodeGen:
             slot = self._var_slot(node.name, node.line)
             self.asm.store(slot)
 
+    # --- Constant folding and superinstructions ---
+
+    # Int binary ops by source operator: their opcode (the superinstruction
+    # sub-op) and the fold.
+    _SUPER_OPS = {
+        '+': Op.ADD, '-': Op.SUB, '*': Op.MUL, '/': Op.DIV, '%': Op.MOD,
+        '&': Op.AND, '|': Op.OR, '<<': Op.SHL, '>>': Op.SHR,
+        '==': Op.EQ, '!=': Op.NE, '<': Op.LT, '<=': Op.LE, '>': Op.GT, '>=': Op.GE,
+    }
+    _CMP_OPS = ('==', '!=', '<', '<=', '>', '>=')
+    # cond → the cond that is true when it is false / with operands swapped
+    _NEG_COND = {Op.EQ: Op.NE, Op.NE: Op.EQ, Op.LT: Op.GE, Op.GE: Op.LT,
+                 Op.LE: Op.GT, Op.GT: Op.LE}
+    _SWAP_COND = {Op.EQ: Op.EQ, Op.NE: Op.NE, Op.LT: Op.GT, Op.GT: Op.LT,
+                  Op.LE: Op.GE, Op.GE: Op.LE}
+    _COMMUTATIVE = ('+', '*', '&', '|', '==', '!=')
+
+    @staticmethod
+    def _wrap32(v):
+        return ((v + 0x80000000) & 0xFFFFFFFF) - 0x80000000
+
+    @classmethod
+    def _fold(cls, op, a, b):
+        """`a op b` exactly as the VM computes it (i32 wrap, division
+        truncates toward zero, x / 0 = x % 0 = 0, shifts by b & 31)."""
+        w = cls._wrap32
+        a, b = w(a), w(b)
+        if op == '+': return w(a + b)
+        if op == '-': return w(a - b)
+        if op == '*': return w(a * b)
+        if op in ('/', '%'):
+            if b == 0:
+                return 0
+            q = abs(a) // abs(b)
+            if (a < 0) != (b < 0):
+                q = -q
+            return w(q) if op == '/' else w(a - b * q)
+        if op == '&': return w(a & b)
+        if op == '|': return w(a | b)
+        if op == '<<': return w(a << (b & 31))
+        if op == '>>': return a >> (b & 31)
+        return int({'==': a == b, '!=': a != b, '<': a < b, '<=': a <= b,
+                    '>': a > b, '>=': a >= b}[op])
+
+    def _const_int(self, node):
+        """The value of an int constant expression (literals, int consts and
+        the ops above on them), else None."""
+        if isinstance(node, NumLit):
+            return node.value if isinstance(node.value, int) else None
+        if isinstance(node, BoolLit):
+            return 1 if node.value else 0
+        if isinstance(node, VarRef):
+            cv = self.const_values.get(node.name)
+            if cv is not None and cv[1] != self.T_FLOAT and isinstance(cv[0], int):
+                return cv[0]
+            return None
+        if isinstance(node, UnaryOp) and node.op in ('-', '!'):
+            v = self._const_int(node.operand)
+            if v is None:
+                return None
+            return self._wrap32(-v) if node.op == '-' else int(self._wrap32(v) == 0)
+        if isinstance(node, BinOp) and node.op in self._SUPER_OPS:
+            a = self._const_int(node.left)
+            if a is None:
+                return None
+            b = self._const_int(node.right)
+            if b is None:
+                return None
+            return self._fold(node.op, a, b)
+        return None
+
+    def _int_var_slot(self, node):
+        """Slot of a plain variable read on the int path (no const, array or
+        float; untyped `any` vars use the int ops too), else None."""
+        if (isinstance(node, VarRef) and node.name not in self.const_values
+                and node.name not in self.array_vars
+                and self._infer_type(node) != self.T_FLOAT):
+            return self._var_slot(node.name, node.line)
+        return None
+
+    def _is_pure(self, node):
+        """No side effects and no variable writes (may run later or in
+        another order)."""
+        if isinstance(node, (NumLit, BoolLit, VarRef)):
+            return True
+        if isinstance(node, UnaryOp):
+            return self._is_pure(node.operand)
+        if isinstance(node, BinOp):
+            return self._is_pure(node.left) and self._is_pure(node.right)
+        return False
+
+    def _gen_super_binop(self, node):
+        """Int `left op right` with an immediate or variable operand as one
+        superinstruction. Returns False when it doesn't apply."""
+        op = self._SUPER_OPS.get(node.op)
+        if op is None:
+            return False
+        c = self._const_int(node.right)
+        if c is not None:
+            self._gen_expr(node.left)
+            self.asm.bin_imm(op, c)
+            return True
+        c = self._const_int(node.left)
+        if c is not None and node.op in self._COMMUTATIVE:
+            # left has no side effects, so the order doesn't matter
+            self._gen_expr(node.right)
+            self.asm.bin_imm(op, c)
+            return True
+        slot = self._int_var_slot(node.right)
+        if slot is not None:
+            self._gen_expr(node.left)
+            self.asm.bin_var(op, slot)
+            return True
+        return False
+
+    def _gen_cond_jz_fwd(self, cond):
+        """Evaluate `cond` and jump forward when it is false. Returns the
+        patch position."""
+        return self._gen_cond_jump(cond, False)
+
+    def _gen_cond_jump(self, cond, when):
+        """Evaluate `cond` and jump when it is `when` (true/false); returns
+        the patch position of the jump target. Int comparisons become one
+        compare-and-branch superinstruction."""
+        neg = (lambda c: c) if when else (lambda c: self._NEG_COND[c])
+        if (self.superops and isinstance(cond, BinOp) and cond.op in self._CMP_OPS
+                and self._const_int(cond) is None
+                and self._infer_type(cond.left) != self.T_FLOAT
+                and self._infer_type(cond.right) != self.T_FLOAT):
+            cc = self._SUPER_OPS[cond.op]
+            l, r = cond.left, cond.right
+            lslot, rslot = self._int_var_slot(l), self._int_var_slot(r)
+            lc, rc = self._const_int(l), self._const_int(r)
+            if lslot is not None and rc is not None and -32768 <= rc <= 32767:
+                return self.asm.jcmp_vi_fwd(neg(cc), lslot, rc)
+            if rslot is not None and lc is not None and -32768 <= lc <= 32767:
+                return self.asm.jcmp_vi_fwd(neg(self._SWAP_COND[cc]), rslot, lc)
+            if lslot is not None and rslot is not None:
+                return self.asm.jcmp_vv_fwd(neg(cc), lslot, rslot)
+            self._gen_expr(l)
+            self._gen_expr(r)
+            return self.asm.jcmp_fwd(neg(cc))
+        self._gen_expr(cond)
+        return self.asm.jnz_fwd() if when else self.asm.jz_fwd()
+
+    def _gen_store_op(self, name, value, line):
+        """`name = name op value` / `name op= value` for an int variable and
+        a side-effect-free `value`, as value; STORE_OP. False if not."""
+        if (not self.superops or name in self.array_vars or name in self.const_values
+                or self.var_types.get(name, self.T_INT) not in (self.T_INT, self.T_ANY)):
+            return False
+        return True
+
+    def _loop_cond_back(self, cond, body_start):
+        """Bottom test of an inverted loop: jump back to `body_start` while
+        `cond` holds. Reached from the entry jump and from the body, so it
+        assumes nothing about the current target."""
+        self._current_target = None
+        self._last_alltar_var = None
+        self.asm.patch(self._gen_cond_jump(cond, True), body_start)
+
+    def _add_imm_target(self, name, value, op='+'):
+        """The i16 to add for `name = name op value` / `name op= value` on an
+        int variable, else None."""
+        if (not self.superops or name in self.array_vars or name in self.const_values
+                or self.var_types.get(name, self.T_INT) not in (self.T_INT, self.T_ANY)):
+            return None
+        c = self._const_int(value)
+        if c is None or op not in ('+', '-'):
+            return None
+        k = c if op == '+' else self._wrap32(-c)
+        return k if -32768 <= k <= 32767 else None
+
     def _gen_if(self, node):
-        self._gen_expr(node.cond)
-        exit_patch = self.asm.jz_fwd()
+        exit_patch = self._gen_cond_jz_fwd(node.cond)
         for stmt in node.then_body:
             self._gen_stmt(stmt)
         if node.else_body:
@@ -2245,12 +2444,27 @@ class CodeGen:
             self.asm.patch(exit_patch)
 
     def _gen_while(self, node):
+        if self.superops:
+            # Inverted: jump to the test at the bottom, which jumps back while
+            # it holds (one dispatch less per iteration than test + JMP).
+            entry = self.asm.jmp_fwd()
+            body_start = self.asm.pos
+            ctx = {'continue_target': None, 'continue_patches': [], 'break_patches': []}
+            self._loop_stack.append(ctx)
+            for stmt in node.body:
+                self._gen_stmt(stmt)
+            for p in ctx['continue_patches'] + [entry]:
+                self.asm.patch(p)
+            self._loop_cond_back(node.cond, body_start)
+            for p in ctx['break_patches']:
+                self.asm.patch(p)
+            self._loop_stack.pop()
+            return
         start = self.asm.pos
         ctx = {'continue_target': start, 'continue_patches': [], 'break_patches': []}
         self._loop_stack.append(ctx)
 
-        self._gen_expr(node.cond)
-        exit_patch = self.asm.jz_fwd()
+        exit_patch = self._gen_cond_jz_fwd(node.cond)
 
         for stmt in node.body:
             self._gen_stmt(stmt)
@@ -2267,13 +2481,32 @@ class CodeGen:
         if node.init:
             self._gen_stmt(node.init)
 
+        if self.superops:
+            # Inverted like `while`: body, update, then the test.
+            entry = self.asm.jmp_fwd()
+            body_start = self.asm.pos
+            ctx = {'continue_target': None, 'continue_patches': [], 'break_patches': []}
+            self._loop_stack.append(ctx)
+            for stmt in node.body:
+                self._gen_stmt(stmt)
+            ctx['continue_target'] = self.asm.pos
+            for p in ctx['continue_patches']:
+                self.asm.patch(p)
+            if node.update:
+                self._gen_stmt(node.update)
+            self.asm.patch(entry)
+            self._loop_cond_back(node.cond, body_start)
+            for p in ctx['break_patches']:
+                self.asm.patch(p)
+            self._loop_stack.pop()
+            return
+
         loop_start = self.asm.pos
         ctx = {'continue_target': None, 'continue_patches': [], 'break_patches': []}
         self._loop_stack.append(ctx)
 
         # cond
-        self._gen_expr(node.cond)
-        exit_patch = self.asm.jz_fwd()
+        exit_patch = self._gen_cond_jz_fwd(node.cond)
 
         # body
         for stmt in node.body:
@@ -2329,6 +2562,13 @@ class CodeGen:
             ctx['continue_patches'].append(self.asm.jmp_fwd())
 
     def _gen_expr_stmt(self, node):
+        e = node.expr
+        if isinstance(e, IncDecExpr):
+            self._check_const(e.name, e.line)
+            k = self._add_imm_target(e.name, NumLit(1, e.line), e.op)
+            if k is not None:
+                self.asm.add_var_imm(self._var_slot(e.name, e.line), k)
+                return
         self._gen_expr(node.expr)
         # Discard value if expression leaves one on stack
         if self._expr_has_value(node.expr):
@@ -2370,11 +2610,19 @@ class CodeGen:
             if node.name not in self.array_vars:
                 raise CompileError(f"'{node.name}' is not an array", node.line)
             slot = self._var_slot(node.name, node.line)
+            if self.superops and self._is_pure(node.index):
+                # The index can't change the array variable: read it after.
+                self._gen_expr(node.index)
+                self.asm.arr_load_var(slot)
+                return
             self.asm.load(slot)           # arr_id
-            self._gen_expr(node.index)    # index (herhangi bir expression)
+            self._gen_expr(node.index)    # index (any expression)
             self.asm.arr_load()
         elif isinstance(node, DotExpr):
             self._gen_dot_read(node)
+        elif isinstance(node, (BinOp, UnaryOp)) and self._const_int(node) is not None:
+            # Constant folding (every device: the VM computes the same).
+            self.asm.push(self._const_int(node))
         elif isinstance(node, BinOp):
             self._gen_binop(node)
         elif isinstance(node, UnaryOp):
@@ -2443,6 +2691,8 @@ class CodeGen:
 
         # Bitwise/shift — always int, no float promotion
         if node.op in ('&', '|', '<<', '>>'):
+            if self.superops and self._gen_super_binop(node):
+                return
             self._gen_expr(node.left)
             self._gen_expr(node.right)
             getattr(self.asm, self._INT_OPS[node.op])()
@@ -2475,6 +2725,8 @@ class CodeGen:
             raise CompileError("modulo (%) is not supported for float operands", node.line)
 
         # Pure int path
+        if self.superops and self._gen_super_binop(node):
+            return
         self._gen_expr(node.left)
         self._gen_expr(node.right)
         if node.op not in self._INT_OPS:
@@ -2551,6 +2803,16 @@ class CodeGen:
             self.asm.arr_store()
         else:
             slot = self._var_slot(node.name, node.line)
+            k = self._add_imm_target(node.name, node.value, node.op)
+            if k is not None:
+                self.asm.add_var_imm(slot, k)
+                return
+            if (node.op in self._SUPER_OPS and self._gen_store_op(node.name, node.value, node.line)
+                    and self._is_pure(node.value)
+                    and self._infer_type(node.value) != self.T_FLOAT):
+                self._gen_expr(node.value)
+                self.asm.store_op(self._SUPER_OPS[node.op], slot)
+                return
             use_float = self.var_types.get(node.name, self.T_INT) == self.T_FLOAT
             val_type = self._infer_type(node.value)
             self.asm.load(slot)
@@ -2590,8 +2852,7 @@ class CodeGen:
 
     def _gen_ternary(self, node):
         """Compile cond ? then_expr : else_expr."""
-        self._gen_expr(node.cond)
-        else_patch = self.asm.jz_fwd()
+        else_patch = self._gen_cond_jz_fwd(node.cond)
         self._gen_expr(node.then_expr)
         end_patch = self.asm.jmp_fwd()
         self.asm.patch(else_patch)
@@ -3830,7 +4091,7 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
 
 
 def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty",
-                widget_page=False, portrait=False):
+                widget_page=False, portrait=False, superops=False):
     """Compile source to VM image format (v4 header + opcodes).
 
     Image format (v4):
@@ -3852,6 +4113,9 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
     widget_page=True moves static widget setup to a widget page, returned as
     the image's `.page` (b'' if nothing moved); store it as a RES_PAGE
     resource with the program's name.
+
+    superops=True emits superinstructions (opcodes 0x45..0x4D): only for
+    devices with caps.superops, whose firmware has the `superops` feature.
     """
     try:
         # Extract #hint_widgets from raw source before preprocessing strips the directive.
@@ -3881,7 +4145,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         # Compact u16 jump targets unless the bytecode outgrows 64 KB; then
         # regenerate from a fresh parse with u32 targets (wide-address image).
         wide = False
-        codegen = CodeGen()
+        codegen = CodeGen(superops=superops)
         codegen.widget_page = widget_page
         try:
             bytecode = codegen.generate_image(parse_program())
@@ -3889,7 +4153,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         except AddrOverflow:
             wide = True
         if wide:
-            codegen = CodeGen(wide=True)
+            codegen = CodeGen(wide=True, superops=superops)
             codegen.widget_page = widget_page
             bytecode = codegen.generate_image(parse_program())
         debug_symbols = codegen.debug_info(filename)

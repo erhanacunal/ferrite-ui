@@ -25,7 +25,7 @@ use crate::usart::UsartBackend;
 // (`P::CAPS & CAP_AUDIO != 0` folds to a constant). Alpha blending is NOT
 // here — it lives on `LcdBackend::HAS_ALPHA`, next to the blend methods.
 // Each bit must be mirrored in the board's `tools/devices/<id>.json`
-// (`caps.audio` / `caps.video` / `caps.jpeg` / `caps.multi_program`) so the designer and build tools agree
+// (`caps.audio` / `caps.video` / `caps.jpeg` / `caps.multi_program` / `caps.superops`) so the designer and build tools agree
 // with the firmware.
 
 /// Board has a real audio output backend (`audio` feature, `Platform::AudioB`).
@@ -36,6 +36,8 @@ pub const CAP_VIDEO: u32 = 1 << 1;
 pub const CAP_JPEG: u32 = 1 << 2;
 /// Board runs several programs at once (`multi_program` feature: task opcodes).
 pub const CAP_MULTI_PROGRAM: u32 = 1 << 3;
+/// Board's VM runs superinstructions (`superops` feature, opcodes 0x45..=0x4D).
+pub const CAP_SUPEROPS: u32 = 1 << 4;
 
 pub trait Platform {
     type LcdB: LcdBackend;

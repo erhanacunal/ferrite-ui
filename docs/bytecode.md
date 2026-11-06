@@ -204,6 +204,26 @@ A missing page, a block past its end or a malformed op is VM fault 15
 | `0x40` | `F_READ` | `u32 addr, u16 len` | read flash bytes into array, push array id |
 | `0x41` | `F_WRITE` | `u32 addr, u8 len, bytes` | write inline bytes to flash |
 
+## Superinstructions
+
+Only in firmware built with the ferrite-core `superops` feature (`caps.superops`, Exynos 4412 and the sim); elsewhere they are bad opcodes (fault 2). The compiler emits them only for such devices. Each one does exactly what the plain sequence it replaces does, with one dispatch and no stack traffic between the fused parts.
+
+`cond` / `op` is the opcode of the fused integer operation: `ADD` `SUB` `MUL` `DIV` `MOD` `AND` `OR` `SHL` `SHR` (0x04–0x0B, 0x1E, 0x1F, not `NEG`/`NOT`) or a comparison `EQ`…`GE` (0x0D–0x12, 0/1 as a value). Any other value faults with 2. `slot` is a variable slot byte (bit 7 = local), `addr` a jump target (u16, u32 in wide-address images).
+
+| Opcode | Mnemonic | Operands | Replaces / behavior |
+| --- | --- | --- | --- |
+| `0x45` | `JCMP` | `u8 cond, addr` | `<cond>; JZ` (cond negated): pop b, pop a; jump if `a cond b` |
+| `0x46` | `JCMP_VI` | `u8 cond, u8 slot, i16 imm, addr` | `LOAD slot; PUSH imm; <cond>; JZ`: jump if `var cond imm` |
+| `0x47` | `JCMP_VV` | `u8 cond, u8 slot_a, u8 slot_b, addr` | `LOAD a; LOAD b; <cond>; JZ`: jump if `a cond b` |
+| `0x48` | `BIN_I` | `u8 op, i16 imm` | `PUSH imm; <op>`: top = top op imm |
+| `0x49` | `BIN_I32` | `u8 op, i32 imm` | the same with an i32 immediate |
+| `0x4A` | `BIN_V` | `u8 op, u8 slot` | `LOAD slot; <op>`: top = top op var |
+| `0x4B` | `ADD_VI` | `u8 slot, i16 imm` | `LOAD; PUSH imm; ADD; STORE` (`x++`, `x += 3`, `x = x - 1`): var += imm |
+| `0x4C` | `ARR_LOAD_V` | `u8 slot` | `LOAD slot; <index>; ARR_LOAD` with a side-effect-free index: pop index, push element of the array in var |
+| `0x4D` | `STORE_OP` | `u8 op, u8 slot` | `LOAD x; <e>; <op>; STORE x` with a side-effect-free `e`: pop b; var = var op b |
+
+The compiler also inverts loops for these devices (`JMP test; body: …; test: JCMP… body`), so an iteration runs one jump instead of two. On every device it folds integer constant expressions (`16 * 12`, `-(5 - 9)`, int `const`s) to one `PUSH`, with the VM's semantics: 32-bit wrap, division truncating toward zero, `x / 0` = `x % 0` = 0, `i32::MIN / -1` = `i32::MIN`, shifts by `b & 31`.
+
 ## Builtin Opcodes
 
 Builtins are single-byte opcodes. Operands are passed on the stack unless noted.

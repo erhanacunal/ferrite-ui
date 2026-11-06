@@ -101,6 +101,19 @@ class Op:
     W_PARENT_S = 0x43  # parent id from stack (dynamic parent)
     W_LOAD     = 0x44  # + u16 block offset in the widget page (RES_PAGE)
 
+    # Superinstructions (firmware `superops` feature, caps.superops). The
+    # cond/op operand is the fused binary opcode (ADD..OR, SHL, SHR, EQ..GE).
+    # Keep in sync with ferrite-core/src/vm.rs.
+    JCMP       = 0x45  # + u8 cond + addr: pop a, b; jump if a <cond> b
+    JCMP_VI    = 0x46  # + u8 cond + u8 slot + i16 imm + addr
+    JCMP_VV    = 0x47  # + u8 cond + u8 slot_a + u8 slot_b + addr
+    BIN_I      = 0x48  # + u8 op + i16: top = top <op> imm
+    BIN_I32    = 0x49  # + u8 op + i32
+    BIN_V      = 0x4A  # + u8 op + u8 slot: top = top <op> var
+    ADD_VI     = 0x4B  # + u8 slot + i16: var += imm
+    ARR_LOAD_V = 0x4C  # + u8 slot: pop index, push array(var)[index]
+    STORE_OP   = 0x4D  # + u8 op + u8 slot: pop b; var = var <op> b
+
     # Builtins as first-class opcodes (all no-arg, operands on stack)
     FILL_RECT       = 0x80
     RECT            = 0x81
@@ -652,6 +665,65 @@ class Asm:
             self._emit(Op.STORE)
             self._emit_u8(slot)
 
+    # --- Superinstructions (caps.superops) ---
+
+    def jcmp_fwd(self, cond):
+        """JCMP placeholder (jump if a <cond> b). Returns patch position."""
+        self._emit(Op.JCMP)
+        self._emit_u8(cond)
+        pos = self.pos
+        self._emit_addr(0)
+        return pos
+
+    def jcmp_vi_fwd(self, cond, slot, imm):
+        self._emit(Op.JCMP_VI)
+        self._emit_u8(cond)
+        self._emit_u8(slot)
+        self._emit_i16(imm)
+        pos = self.pos
+        self._emit_addr(0)
+        return pos
+
+    def jcmp_vv_fwd(self, cond, slot_a, slot_b):
+        self._emit(Op.JCMP_VV)
+        self._emit_u8(cond)
+        self._emit_u8(slot_a)
+        self._emit_u8(slot_b)
+        pos = self.pos
+        self._emit_addr(0)
+        return pos
+
+    def bin_imm(self, op, imm):
+        """top = top <op> imm (BIN_I, or BIN_I32 past i16)."""
+        if -32768 <= imm <= 32767:
+            self._emit(Op.BIN_I)
+            self._emit_u8(op)
+            self._emit_i16(imm)
+        else:
+            self._emit(Op.BIN_I32)
+            self._emit_u8(op)
+            self._emit_i32(imm)
+
+    def bin_var(self, op, slot):
+        self._emit(Op.BIN_V)
+        self._emit_u8(op)
+        self._emit_u8(slot)
+
+    def add_var_imm(self, slot, imm):
+        self._emit(Op.ADD_VI)
+        self._emit_u8(slot)
+        self._emit_i16(imm)
+
+    def store_op(self, op, slot):
+        """var = var <op> top (popped)."""
+        self._emit(Op.STORE_OP)
+        self._emit_u8(op)
+        self._emit_u8(slot)
+
+    def arr_load_var(self, slot):
+        self._emit(Op.ARR_LOAD_V)
+        self._emit_u8(slot)
+
     def frame(self, local_count):
         """Emit FRAME instruction (function prologue)."""
         self._emit(Op.FRAME)
@@ -1087,6 +1159,8 @@ OP_NAMES = {
     0x42: 'W_TARGET_S',
     0x43: 'W_PARENT_S',
     0x44: 'W_LOAD',
+    0x45: 'JCMP', 0x46: 'JCMP_VI', 0x47: 'JCMP_VV',
+    0x48: 'BIN_I', 0x49: 'BIN_I32', 0x4A: 'BIN_V', 0x4B: 'ADD_VI', 0x4C: 'ARR_LOAD_V', 0x4D: 'STORE_OP',
 
     0x80: 'fillRect', 0x81: 'rect', 0x82: 'line', 0x83: 'circle',
     0x84: 'fillCircle', 0x85: 'drawImage', 0x86: 'drawTextLit',
@@ -1143,6 +1217,24 @@ PROP_NAMES = {
     0x40: 'LOCATION', 0x41: 'SIZE',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
+
+# Superinstruction cond/op operand names (the fused opcode).
+_SUPER_SUB_NAMES = {
+    0x04: '+', 0x05: '-', 0x06: '*', 0x07: '/', 0x08: '%', 0x0A: '&', 0x0B: '|',
+    0x1E: '<<', 0x1F: '>>', 0x0D: '==', 0x0E: '!=', 0x0F: '<', 0x10: '<=',
+    0x11: '>', 0x12: '>=',
+}
+
+
+def superop_size(op, wide=False):
+    """Total size of superinstruction `op` (opcode + operands), or None."""
+    addr = 4 if wide else 2
+    return {
+        Op.JCMP: 2 + addr, Op.JCMP_VI: 5 + addr, Op.JCMP_VV: 4 + addr,
+        Op.BIN_I: 4, Op.BIN_I32: 6, Op.BIN_V: 3, Op.ADD_VI: 4, Op.ARR_LOAD_V: 2,
+        Op.STORE_OP: 3,
+    }.get(op)
+
 
 # Set of no-arg opcodes for disassembler
 _NO_ARG_OPS = (
@@ -1263,6 +1355,46 @@ def disassemble(data, labels=None, symbols=None, wide=False):
                 target = struct.unpack_from('<H', data, pos)[0]
                 pos += 2
             lines.append(f'{addr:04X}: {name} @{target:04X}')
+
+        # Superinstructions
+        elif op in (Op.JCMP, Op.JCMP_VI, Op.JCMP_VV):
+            cond = _SUPER_SUB_NAMES.get(data[pos], f'0x{data[pos]:02X}'); pos += 1
+            if op == Op.JCMP_VI:
+                slot = data[pos]
+                imm = struct.unpack_from('<h', data, pos + 1)[0]
+                pos += 3
+                args = f'{_slot_name(slot, symbols, addr)} {cond} {imm}'
+            elif op == Op.JCMP_VV:
+                args = (f'{_slot_name(data[pos], symbols, addr)} {cond} '
+                        f'{_slot_name(data[pos + 1], symbols, addr)}')
+                pos += 2
+            else:
+                args = cond
+            if wide:
+                target = struct.unpack_from('<I', data, pos)[0]
+                pos += 4
+            else:
+                target = struct.unpack_from('<H', data, pos)[0]
+                pos += 2
+            lines.append(f'{addr:04X}: {name} {args} @{target:04X}')
+        elif op in (Op.BIN_I, Op.BIN_I32):
+            sub = _SUPER_SUB_NAMES.get(data[pos], f'0x{data[pos]:02X}'); pos += 1
+            fmt = '<h' if op == Op.BIN_I else '<i'
+            imm = struct.unpack_from(fmt, data, pos)[0]
+            pos += struct.calcsize(fmt)
+            lines.append(f'{addr:04X}: {name} {sub} {imm}')
+        elif op in (Op.BIN_V, Op.STORE_OP):
+            sub = _SUPER_SUB_NAMES.get(data[pos], f'0x{data[pos]:02X}')
+            slot = data[pos + 1]; pos += 2
+            lines.append(f'{addr:04X}: {name} {sub} {_slot_name(slot, symbols, addr)}')
+        elif op == Op.ADD_VI:
+            slot = data[pos]
+            imm = struct.unpack_from('<h', data, pos + 1)[0]
+            pos += 3
+            lines.append(f'{addr:04X}: {name} {_slot_name(slot, symbols, addr)} {imm:+d}')
+        elif op == Op.ARR_LOAD_V:
+            slot = data[pos]; pos += 1
+            lines.append(f'{addr:04X}: {name} {_slot_name(slot, symbols, addr)}')
 
         # W_ALLTAR with u8 var slot
         elif op == Op.W_ALLTAR:

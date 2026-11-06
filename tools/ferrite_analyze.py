@@ -25,7 +25,7 @@ import os
 # Add tools directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ferrite_cc import Op, OP_NAMES, PROP_NAMES, _NO_ARG_OPS, IMAGE_FLAG_WIDE_ADDR
+from ferrite_cc import Op, OP_NAMES, PROP_NAMES, _NO_ARG_OPS, IMAGE_FLAG_WIDE_ADDR, superop_size
 
 
 # ============================================================
@@ -616,6 +616,11 @@ def walk_bytecode(data, start=0, end=None, wide=False):
             length = data[pos]; pos += 1
             pos += length
             yield addr, op, 2 + length
+
+        elif superop_size(op, wide) is not None:
+            n = superop_size(op, wide)
+            pos += n - 1
+            yield addr, op, n
 
         else:
             # Unknown opcode --treat as 1-byte

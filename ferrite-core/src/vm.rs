@@ -346,6 +346,74 @@ const OP_W_TARGET_S: u8 = 0x42; // widget id from stack (dynamic target)
 const OP_W_PARENT_S: u8 = 0x43; // parent id from stack (dynamic parent)
 const OP_W_LOAD: u8 = 0x44; // + u16 block offset in the widget page (RES_PAGE)
 
+// Superinstructions (`superops` feature, 0x45..=0x4D). `cond`/`op` operand = the opcode
+// of the fused binary op (OP_ADD..=OP_OR, OP_SHL, OP_SHR, OP_EQ..=OP_GE).
+// Keep in sync with tools/ferrite_cc.py (Op, OP_NAMES, disassembler).
+#[cfg(feature = "superops")]
+const OP_JCMP: u8 = 0x45; // + u8 cond + addr: pop a, b; jump if a <cond> b
+#[cfg(feature = "superops")]
+const OP_JCMP_VI: u8 = 0x46; // + u8 cond + u8 slot + i16 imm + addr: jump if var <cond> imm
+#[cfg(feature = "superops")]
+const OP_JCMP_VV: u8 = 0x47; // + u8 cond + u8 slot_a + u8 slot_b + addr
+#[cfg(feature = "superops")]
+const OP_BIN_I: u8 = 0x48; // + u8 op + i16: top = top <op> imm
+#[cfg(feature = "superops")]
+const OP_BIN_I32: u8 = 0x49; // + u8 op + i32: top = top <op> imm
+#[cfg(feature = "superops")]
+const OP_BIN_V: u8 = 0x4A; // + u8 op + u8 slot: top = top <op> var
+#[cfg(feature = "superops")]
+const OP_ADD_VI: u8 = 0x4B; // + u8 slot + i16: var += imm (no stack)
+#[cfg(feature = "superops")]
+const OP_ARR_LOAD_V: u8 = 0x4C; // + u8 slot: pop index, push array(var)[index]
+#[cfg(feature = "superops")]
+const OP_STORE_OP: u8 = 0x4D; // + u8 op + u8 slot: pop b; var = var <op> b
+
+/// The integer binary ops (and comparisons, as 0/1) by opcode, as the plain
+/// opcodes compute them. None = not a binary op.
+#[cfg(feature = "superops")]
+#[inline(always)]
+fn int_binop(op: u8, a: i32, b: i32) -> Option<i32> {
+    Some(match op {
+        OP_ADD => a.wrapping_add(b),
+        OP_SUB => a.wrapping_sub(b),
+        OP_MUL => a.wrapping_mul(b),
+        OP_DIV => {
+            if b != 0 {
+                a.wrapping_div(b)
+            } else {
+                0
+            }
+        }
+        OP_MOD => {
+            if b != 0 {
+                a.wrapping_rem(b)
+            } else {
+                0
+            }
+        }
+        OP_AND => a & b,
+        OP_OR => a | b,
+        OP_SHL => a << (b as u32 & 31),
+        OP_SHR => a >> (b as u32 & 31),
+        _ => return int_cmp(op, a, b).map(|c| c as i32),
+    })
+}
+
+/// The comparisons by opcode (OP_EQ..=OP_GE).
+#[cfg(feature = "superops")]
+#[inline(always)]
+fn int_cmp(op: u8, a: i32, b: i32) -> Option<bool> {
+    Some(match op {
+        OP_EQ => a == b,
+        OP_NE => a != b,
+        OP_LT => a < b,
+        OP_LE => a <= b,
+        OP_GT => a > b,
+        OP_GE => a >= b,
+        _ => return None,
+    })
+}
+
 // Widget page (RES_PAGE) ops: static widget setup the compiler moved out of
 // the bytecode. 0x01..=0x3F = W_SET <tag> + zigzag varint, 0x40..=0x7F =
 // W_SET_LEN <tag> + u8 len + payload, the rest below + operands.
@@ -1767,11 +1835,11 @@ impl Vm {
             }
             OP_DIV => {
                 let (a, b) = self.pop2();
-                self.push(if b != 0 { a / b } else { 0 });
+                self.push(if b != 0 { a.wrapping_div(b) } else { 0 });
             }
             OP_MOD => {
                 let (a, b) = self.pop2();
-                self.push(if b != 0 { a % b } else { 0 });
+                self.push(if b != 0 { a.wrapping_rem(b) } else { 0 });
             }
             OP_NEG => {
                 let a = self.pop();
@@ -2794,7 +2862,119 @@ impl Vm {
                 self.push(libm::ceilf(v).to_bits() as i32);
             }
 
+            #[cfg(feature = "superops")]
+            OP_JCMP => {
+                let cond = self.read_u8();
+                let target = self.read_addr();
+                let (a, b) = self.pop2();
+                self.jump_if(cond, a, b, target);
+            }
+            #[cfg(feature = "superops")]
+            OP_JCMP_VI => {
+                let cond = self.read_u8();
+                let raw = self.read_u8();
+                let imm = self.read_i16() as i32;
+                let target = self.read_addr();
+                let a = self.var_get(self.resolve_slot(raw));
+                self.jump_if(cond, a, imm, target);
+            }
+            #[cfg(feature = "superops")]
+            OP_JCMP_VV => {
+                let cond = self.read_u8();
+                let ra = self.read_u8();
+                let rb = self.read_u8();
+                let target = self.read_addr();
+                let a = self.var_get(self.resolve_slot(ra));
+                let b = self.var_get(self.resolve_slot(rb));
+                self.jump_if(cond, a, b, target);
+            }
+            #[cfg(feature = "superops")]
+            OP_BIN_I => {
+                let op = self.read_u8();
+                let imm = self.read_i16() as i32;
+                self.top_binop(op, imm);
+            }
+            #[cfg(feature = "superops")]
+            OP_BIN_I32 => {
+                let op = self.read_u8();
+                let imm = self.read_i32();
+                self.top_binop(op, imm);
+            }
+            #[cfg(feature = "superops")]
+            OP_BIN_V => {
+                let op = self.read_u8();
+                let raw = self.read_u8();
+                let b = self.var_get(self.resolve_slot(raw));
+                self.top_binop(op, b);
+            }
+            #[cfg(feature = "superops")]
+            OP_ADD_VI => {
+                let raw = self.read_u8();
+                let imm = self.read_i16() as i32;
+                if self.state != VmState::Error {
+                    let slot = self.resolve_slot(raw);
+                    let v = self.var_get(slot).wrapping_add(imm);
+                    self.var_set(slot, v);
+                }
+            }
+            #[cfg(feature = "superops")]
+            OP_STORE_OP => {
+                let op = self.read_u8();
+                let raw = self.read_u8();
+                let b = self.pop();
+                if self.state != VmState::Error {
+                    let slot = self.resolve_slot(raw);
+                    match int_binop(op, self.var_get(slot), b) {
+                        Some(v) => self.var_set(slot, v),
+                        None => self.fail(fault::BAD_OPCODE),
+                    }
+                }
+            }
+            #[cfg(feature = "superops")]
+            OP_ARR_LOAD_V => {
+                let raw = self.read_u8();
+                let idx = self.pop();
+                if self.state != VmState::Error {
+                    let arr_id = self.var_get(self.resolve_slot(raw));
+                    self.arr_load(ctx, arr_id, idx);
+                }
+            }
+
             _ => self.fail(fault::BAD_OPCODE),
+        }
+    }
+
+    /// Superinstruction tail: jump to `target` if `a <cond> b`.
+    #[cfg(feature = "superops")]
+    #[inline(always)]
+    fn jump_if(&mut self, cond: u8, a: i32, b: i32, target: CodeAddr) {
+        if self.state == VmState::Error {
+            return;
+        }
+        match int_cmp(cond, a, b) {
+            Some(true) => self.pc = target,
+            Some(false) => {}
+            None => self.fail(fault::BAD_OPCODE),
+        }
+    }
+
+    /// Superinstruction tail: top of stack = top <op> b, in place.
+    #[cfg(feature = "superops")]
+    #[inline(always)]
+    fn top_binop(&mut self, op: u8, b: i32) {
+        if self.state == VmState::Error {
+            return;
+        }
+        if self.sp <= self.sp_floor {
+            self.fail(fault::STACK_UNDERFLOW);
+            return;
+        }
+        let i = (self.sp - 1) as usize;
+        // SAFETY: sp <= stack.len() (see pop2_raw) and sp > sp_floor >= 0.
+        let top = unsafe { self.stack.get_unchecked_mut(i) };
+        match int_binop(op, *top, b) {
+            Some(v) => *top = v,
+            None => self.fail(fault::BAD_OPCODE),
         }
     }
 
@@ -4570,6 +4750,138 @@ mod anim_tests {
         assert!(vm.state == VmState::Error);
         assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
         assert_eq!(vm.fault_pc(), 2);
+    }
+
+    /// Each superinstruction against the plain sequence it replaces, over
+    /// operand values around the edges (overflow, division by 0 and -1).
+    #[cfg(feature = "superops")]
+    #[test]
+    fn superops_match_plain_sequences() {
+        const VALS: [i32; 9] = [0, 1, -1, 7, -13, 255, 32767, i32::MAX, i32::MIN];
+        const IMMS: [i16; 7] = [0, 1, -1, 3, -7, i16::MAX, i16::MIN];
+        const OPS: [u8; 15] = [
+            OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_AND, OP_OR, OP_SHL, OP_SHR, OP_EQ, OP_NE, OP_LT,
+            OP_LE, OP_GT, OP_GE,
+        ];
+        fn push32(c: &mut std::vec::Vec<u8>, v: i32) {
+            c.push(OP_PUSH_I32);
+            c.extend_from_slice(&v.to_le_bytes());
+        }
+        // Result of a program that leaves one value on the stack (or the
+        // value of global 1 when `var`).
+        fn result(code: &[u8], var: bool) -> i32 {
+            let mut c = code.to_vec();
+            c.push(OP_HALT);
+            let vm = run_code(&c);
+            assert!(vm.state == VmState::Halted, "{code:x?}");
+            if var { vm.var_get(1) } else { vm.stack[vm.sp as usize - 1] }
+        }
+        for &a in &VALS {
+            for &op in &OPS {
+                for &imm in &IMMS {
+                    let b = imm as i32;
+                    // BIN_I vs PUSH a; PUSH b; op
+                    let mut plain = std::vec::Vec::new();
+                    push32(&mut plain, a);
+                    push32(&mut plain, b);
+                    plain.push(op);
+                    let mut fused = std::vec::Vec::new();
+                    push32(&mut fused, a);
+                    fused.extend_from_slice(&[OP_BIN_I, op]);
+                    fused.extend_from_slice(&imm.to_le_bytes());
+                    let want = result(&plain, false);
+                    assert_eq!(result(&fused, false), want, "BIN_I {op:#x} {a} {b}");
+                    // BIN_V: global 1 = b
+                    let mut fused = std::vec::Vec::new();
+                    push32(&mut fused, b);
+                    fused.extend_from_slice(&[OP_STORE, 1]);
+                    push32(&mut fused, a);
+                    fused.extend_from_slice(&[OP_BIN_V, op, 1]);
+                    assert_eq!(result(&fused, false), want, "BIN_V {op:#x} {a} {b}");
+                    // STORE_OP: global 1 = a; push b; var = var op b
+                    let mut fused = std::vec::Vec::new();
+                    push32(&mut fused, a);
+                    fused.extend_from_slice(&[OP_STORE, 1]);
+                    push32(&mut fused, b);
+                    fused.extend_from_slice(&[OP_STORE_OP, op, 1]);
+                    assert_eq!(result(&fused, true), want, "STORE_OP {op:#x} {a} {b}");
+                }
+                for &b in &VALS {
+                    let mut plain = std::vec::Vec::new();
+                    push32(&mut plain, a);
+                    push32(&mut plain, b);
+                    plain.push(op);
+                    let mut fused = std::vec::Vec::new();
+                    push32(&mut fused, a);
+                    fused.extend_from_slice(&[OP_BIN_I32, op]);
+                    fused.extend_from_slice(&b.to_le_bytes());
+                    assert_eq!(result(&fused, false), result(&plain, false), "BIN_I32 {op:#x} {a} {b}");
+                }
+            }
+            // ADD_VI vs LOAD; PUSH; ADD; STORE (global 1)
+            for &imm in &IMMS {
+                let mut c = std::vec::Vec::new();
+                push32(&mut c, a);
+                c.extend_from_slice(&[OP_STORE, 1, OP_ADD_VI, 1]);
+                c.extend_from_slice(&imm.to_le_bytes());
+                assert_eq!(result(&c, true), a.wrapping_add(imm as i32), "ADD_VI {a} {imm}");
+            }
+        }
+        // Compare-and-branch: the jump lands on PUSH_1, else PUSH_0.
+        // layout: <setup> JCMP.. @T ; PUSH_0 ; HALT ; T: PUSH_1 ; HALT
+        fn branch(setup: &[u8], jcmp: &[u8]) -> i32 {
+            let mut c = setup.to_vec();
+            c.extend_from_slice(jcmp);
+            let t = (c.len() + 2 + 2) as u16;
+            c.extend_from_slice(&t.to_le_bytes());
+            c.extend_from_slice(&[OP_PUSH_0, OP_HALT, OP_PUSH_1, OP_HALT]);
+            let vm = run_code(&c);
+            assert!(vm.state == VmState::Halted);
+            vm.stack[vm.sp as usize - 1]
+        }
+        for &a in &VALS {
+            for cond in OP_EQ..=OP_GE {
+                for &b in &VALS {
+                    let want = int_cmp(cond, a, b).unwrap() as i32;
+                    let mut s = std::vec::Vec::new();
+                    push32(&mut s, a);
+                    push32(&mut s, b);
+                    assert_eq!(branch(&s, &[OP_JCMP, cond]), want, "JCMP {cond:#x} {a} {b}");
+                    let mut s = std::vec::Vec::new();
+                    push32(&mut s, a);
+                    s.extend_from_slice(&[OP_STORE, 1]);
+                    push32(&mut s, b);
+                    s.extend_from_slice(&[OP_STORE, 2]);
+                    assert_eq!(branch(&s, &[OP_JCMP_VV, cond, 1, 2]), want, "JCMP_VV");
+                }
+                for &imm in &IMMS {
+                    let want = int_cmp(cond, a, imm as i32).unwrap() as i32;
+                    let mut s = std::vec::Vec::new();
+                    push32(&mut s, a);
+                    s.extend_from_slice(&[OP_STORE, 1]);
+                    let mut j = std::vec![OP_JCMP_VI, cond, 1];
+                    j.extend_from_slice(&imm.to_le_bytes());
+                    assert_eq!(branch(&s, &j), want, "JCMP_VI {cond:#x} {a} {imm}");
+                }
+            }
+        }
+        // A sub-op that is not a binary op faults.
+        let vm = run_code(&[OP_PUSH_1, OP_BIN_I, OP_POP, 0, 0]);
+        assert_eq!(vm.fault(), fault::BAD_OPCODE);
+        let vm = run_code(&[OP_PUSH_1, OP_PUSH_1, OP_JCMP, OP_ADD, 0, 0]);
+        assert_eq!(vm.fault(), fault::BAD_OPCODE);
+        // BIN_I on an empty stack underflows.
+        let vm = run_code(&[OP_BIN_I, OP_ADD, 1, 0]);
+        assert_eq!(vm.fault(), fault::STACK_UNDERFLOW);
+    }
+
+    #[cfg(not(feature = "superops"))]
+    #[test]
+    fn superops_are_bad_opcodes_without_the_feature() {
+        for op in 0x45..=0x4D {
+            let vm = run_code(&[OP_PUSH_1, op, OP_ADD, 0, 0, 0, 0]);
+            assert_eq!(vm.fault(), fault::BAD_OPCODE, "op {op:#x}");
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ default = ["perf"]
 perf = ["ferrite-core/perf"]
 
 [dependencies]
-ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "pool_large", "wide_code", "wide_obj", "multi_program", "audio", "fast_vm", "render_cache"] }
+ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "pool_large", "wide_code", "wide_obj", "multi_program", "audio", "fast_vm", "render_cache", "superops"] }
 # HAL: its panic handler prints file:line on the UART console and halts. A ferrite
 # panic screen (LCD + USART, like the other BSPs) can replace it later: turn
 # default features off then.

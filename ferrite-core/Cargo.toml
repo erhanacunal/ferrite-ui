@@ -66,6 +66,13 @@ perf = []
 # Costs ~24 B of heap per widget, so the GD32 build leaves it off. Enabled by
 # `bsp-exynos4412` and the sim.
 render_cache = []
+# Superinstructions (`docs/bytecode.md`, opcodes 0x45..=0x4D): fused
+# compare-and-branch, binary op with an immediate / variable operand,
+# `var += k` and array load from a variable, emitted by the compiler for
+# devices with `caps.superops` (CAP_SUPEROPS). Fewer dispatches and no stack
+# traffic between the fused parts. Enabled by `bsp-exynos4412` and the sim;
+# elsewhere they are bad opcodes.
+superops = []
 
 # --- Optional device features, selected by the BSP that has the hardware ---
 # Off = the module, its `Platform` backend slot, its `Ctx` field and its VM
