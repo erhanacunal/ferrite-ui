@@ -2,7 +2,7 @@
 """ferrite-cli — Host-side tool for communicating with ferrite-ui devices.
 
 Implements the USART protobuf protocol (see protocol.rs).
-Commands: ping, restart, meminfo, memdetail, perf, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime, monitor
+Commands: ping, restart, meminfo, memdetail, perf, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime, monitor, bootflash <file>
 
 Usage:
     python ferrite_cli.py -p COM3 ping
@@ -20,9 +20,17 @@ Usage:
     python ferrite_cli.py -p COM3 send "hello world"
     python ferrite_cli.py -p COM3 settime                  (use current system time)
     python ferrite_cli.py -p COM3 settime "2025-05-17 14:30:00"
+
+exynos4412 (uart_boot loads FERRITE/FLASH.BIN into the flash shadow at boot):
+    python ferrite_cli.py -p COM3 bootflash flash.bin --reset         (UART; restarts the app first)
+    python ferrite_cli.py --host 192.168.1.50 bootflash flash.bin --wait 30   (WiFi, no serial port)
+    python ferrite_cli.py -p COM3 --host exynos bootflash flash.bin --reset  (restart over UART, upload over WiFi)
 """
 
 import argparse
+import http.client
+import os
+import socket
 import struct
 import sys
 import time
@@ -1148,12 +1156,237 @@ def cmd_settime(ser: serial.Serial, dt_str: str | None) -> bool:
 # --- Main ---
 
 
+# --- exynos4412 uart_boot: FERRITE/FLASH.BIN ---
+#
+# The exynos4412 BSP has no writable NOR: its flash is a 64 MB RAM shadow that
+# is loaded at boot from FERRITE/FLASH.BIN on the eMMC. The loader, uart_boot,
+# takes a new FLASH.BIN on the UART (header EXYNFLSH) or over WiFi (HTTP
+# POST /flash), as vendor/exynos_4412_rs/tools/uartboot.py / httpboot.py do.
+# Wire header: magic[8] + length u32 LE + CRC-32 u32 LE, then the data.
+
+UB_MAGIC_BOOT = b"EXYNBOOT"
+UB_MAGIC_SAVE = b"EXYNSAVE"
+UB_MAGIC_FLASH = b"EXYNFLSH"
+UB_CHUNK = 1024
+UB_ANSWER_S = 5.0
+UB_FIRST_TRY_S = 1.2       # a uart_boot that is already waiting answers at once
+UB_RESET_WAIT_S = 20.0     # application restart → uart_boot listening
+UB_SAVE_S = 30.0           # writing the file to the eMMC
+# uart_boot's lines that say it now listens for a header.
+UB_READY_LINES = ["send a .bin", "unless an image arrives", "waiting for an image", "waiting again"]
+UB_HTTP_PORT = 80
+UB_HTTP_CONNECT_S = 2.0
+UB_HTTP_ANSWER_S = 60.0
+FS_MAGIC = b"FERR"
+
+
+def flash_bin_payload(data: bytes, fs_base: int) -> bytes:
+    """FLASH.BIN = the whole flash region from address 0. An FS image built by
+    ferrite_build (starts with "FERR") gets `fs_base` bytes of 0xFF (erased
+    flash) in front; an image that already has the FS at `fs_base` goes as is."""
+    if data[:4] == FS_MAGIC:
+        return b"\xFF" * fs_base + data
+    if data[fs_base:fs_base + 4] == FS_MAGIC:
+        return data
+    raise ValueError(f'no ferrite FS image ("FERR" neither at 0 nor at 0x{fs_base:X})')
+
+
+def _ub_header(magic: bytes, data: bytes) -> bytes:
+    return magic + struct.pack("<II", len(data), zlib.crc32(data) & 0xFFFFFFFF)
+
+
+class _UbLines:
+    """Reads uart_boot's text lines; bytes after a matched line are kept."""
+
+    def __init__(self, ser: serial.Serial):
+        self.ser = ser
+        self.pending = b""
+        self.heard = 0
+
+    def wait_for(self, wanted: list[str], timeout: float) -> str | None:
+        end = time.monotonic() + timeout
+        while True:
+            while b"\n" in self.pending:
+                line, self.pending = self.pending.split(b"\n", 1)
+                text = line.decode("ascii", "replace").strip()
+                if text:
+                    print(f"  board: {text}")
+                for word in wanted:
+                    if word in text:
+                        return word
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            self.ser.timeout = min(left, 0.2)
+            chunk = self.ser.read(max(1, self.ser.in_waiting))
+            if chunk:
+                self.heard += len(chunk)
+                self.pending += chunk
+
+    def fail(self) -> str:
+        if self.heard == 0:
+            return ("nothing came from the board: uart_boot listens only for 3 s after a restart, "
+                    "so the application was probably running (use --reset, or --wait 30 and reset "
+                    "the board; hold volume up to stay in uart_boot)")
+        last = self.pending.decode("ascii", "replace").strip()
+        return f"the board sent {self.heard} bytes, but not uart_boot's answer" + (
+            f": last {last[-80:]!r}" if last else "")
+
+
+def ub_uart_send(ser: serial.Serial, lines: _UbLines, magic: bytes, data: bytes,
+                 wait: float, reset: bool) -> bool:
+    """Sends one file to uart_boot on the UART. True once it is taken (and, for
+    FLASH/SAVE, saved on the eMMC)."""
+    header = _ub_header(magic, data)
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    print(f"uart_boot: {magic.decode()} {len(data)} bytes, CRC {crc:08x}")
+    ser.write(header)
+    got = lines.wait_for(["receiving", "ERROR"], UB_FIRST_TRY_S if (wait > 0 or reset) else UB_ANSWER_S)
+    if got != "receiving" and reset:
+        # Over a second of silence has let the application's parser resync
+        # after the header bytes (RX_RESYNC_MS): now its restart message.
+        print("uart_boot: not listening; restarting the application")
+        ser.write(build_varint_msg(TAG_RESTART))
+        ser.flush()
+        wait = max(wait, UB_RESET_WAIT_S)
+    if got != "receiving" and wait > 0:
+        # Send the header only when uart_boot announces itself: blind repeats
+        # could land in U-Boot and stop its autoboot.
+        print(f"uart_boot: waiting up to {wait:.0f} s; power on or reset the board")
+        end = time.monotonic() + wait
+        while got != "receiving":
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            got = lines.wait_for(["receiving", "ERROR"] + UB_READY_LINES, left)
+            if got is None:
+                break
+            if got in UB_READY_LINES:
+                ser.write(header)
+                got = lines.wait_for(["receiving", "ERROR"], UB_ANSWER_S)
+    if got != "receiving":
+        print(f"uart_boot: no answer; {lines.fail()}", file=sys.stderr)
+        return False
+    begin = time.monotonic()
+    for off in range(0, len(data), UB_CHUNK):
+        ser.write(data[off:off + UB_CHUNK])
+        if off // UB_CHUNK % 64 == 0:
+            print(f"\r  {off * 100 // len(data):3d}%  {off}/{len(data)} bytes", end="", flush=True)
+    print(f"\r  100%  {len(data)}/{len(data)} bytes")
+    # The output queue drains at the line rate: wait for the verdict.
+    result = lines.wait_for(["CRC OK", "ERROR"], len(data) * 10 / ser.baudrate + UB_ANSWER_S)
+    print(f"uart_boot: sent in {time.monotonic() - begin:.1f} s")
+    if result != "CRC OK":
+        print("uart_boot: the board did not take the file", file=sys.stderr)
+        return False
+    if magic in (UB_MAGIC_FLASH, UB_MAGIC_SAVE):
+        if lines.wait_for(["saved", "save ERROR"], UB_SAVE_S) != "saved":
+            print("uart_boot: NOT saved on the eMMC", file=sys.stderr)
+            return False
+    if magic == UB_MAGIC_FLASH:
+        lines.wait_for(["waiting again"], UB_ANSWER_S)
+    return True
+
+
+def _ub_connect(host: str, wait: float) -> socket.socket:
+    deadline = time.monotonic() + wait
+    first = True
+    while True:
+        try:
+            return socket.create_connection((host, UB_HTTP_PORT), timeout=UB_HTTP_CONNECT_S)
+        except OSError as e:
+            if time.monotonic() >= deadline:
+                hint = "" if wait else " (is uart_boot waiting? --wait retries)"
+                raise ConnectionError(f"{host}:{UB_HTTP_PORT}: {e}{hint}") from e
+            if first:
+                print(f"uart_boot: waiting for {host}:{UB_HTTP_PORT} ...")
+                first = False
+            time.sleep(0.5)
+
+
+def ub_http_send(host: str, path: str, data: bytes, wait: float) -> bool:
+    """POSTs a file to uart_boot's HTTP server (/flash, /boot, /save) with its
+    CRC-32 in X-CRC32. True if the board answered 200."""
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    try:
+        conn = http.client.HTTPConnection(host, UB_HTTP_PORT, timeout=UB_HTTP_ANSWER_S)
+        conn.sock = _ub_connect(host, wait)
+        conn.sock.settimeout(UB_HTTP_ANSWER_S)
+        print(f"uart_boot: {len(data)} bytes, CRC {crc:08x}, to http://{host}{path}")
+        begin = time.monotonic()
+        conn.request("POST", path, body=data, headers={
+            "Content-Type": "application/octet-stream",
+            "X-CRC32": f"{crc:08x}",
+        })
+        resp = conn.getresponse()
+        answer = resp.read().decode("utf-8", "replace").strip()
+    except (OSError, http.client.HTTPException) as e:
+        print(f"uart_boot: {e}", file=sys.stderr)
+        return False
+    secs = max(time.monotonic() - begin, 1e-3)
+    print(f"uart_boot: {resp.status} {resp.reason} in {secs:.1f} s "
+          f"({len(data) / 1024 / secs:.0f} KiB/s): {answer}")
+    return resp.status == 200
+
+
+def cmd_bootflash(ser: serial.Serial | None, path: str, host: str | None, fs_base: int,
+                  wait: float, reset: bool, app: str | None, save: bool, run: bool) -> bool:
+    """Saves an FS image as FERRITE/FLASH.BIN through uart_boot, then starts the
+    application: `app` sent to /boot (or /save) if given, else uart_boot's 'r'
+    console key (restart → autoboot loads the new FLASH.BIN)."""
+    try:
+        with open(path, "rb") as f:
+            payload = flash_bin_payload(f.read(), fs_base)
+        app_data = None
+        if app:
+            with open(app, "rb") as f:
+                app_data = f.read()
+    except (OSError, ValueError) as e:
+        print(f"bootflash: {e}", file=sys.stderr)
+        return False
+    lines = _UbLines(ser) if ser else None
+    if host:
+        if reset:
+            if ser is None:
+                print("bootflash: --reset needs -p (the restart goes over the UART)", file=sys.stderr)
+                return False
+            ser.write(build_varint_msg(TAG_RESTART))
+            ser.flush()
+            print("bootflash: application restart sent")
+            wait = max(wait, UB_RESET_WAIT_S)
+        ok = ub_http_send(host, "/flash", payload, wait)
+        if ok and app_data is not None:
+            ok = ub_http_send(host, "/save" if save else "/boot", app_data, 0.0)
+    else:
+        ok = ub_uart_send(ser, lines, UB_MAGIC_FLASH, payload, wait, reset)
+        if ok and app_data is not None:
+            ok = ub_uart_send(ser, lines, UB_MAGIC_SAVE if save else UB_MAGIC_BOOT, app_data, 0.0, False)
+    if not ok:
+        return False
+    print("bootflash: FERRITE/FLASH.BIN saved")
+    if app_data is not None:
+        return True
+    if run and ser is not None:
+        # uart_boot's console key: restart; after its 3 s UART (+ 5 s WiFi)
+        # window, autoboot runs FERRITE.BIN, which loads FLASH.BIN.
+        ser.reset_input_buffer()
+        ser.write(b"r")
+        ser.flush()
+        print("bootflash: restart sent ('r'); the application starts in a few seconds")
+    else:
+        print("bootflash: uart_boot keeps waiting; reset the board (or press 'r' on its "
+              "console) to start the application")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="ferrite-cli",
         description="Host-side tool for ferrite-ui devices",
     )
-    parser.add_argument("-p", "--port", required=True, help="Serial port (e.g. COM3, /dev/ttyUSB0)")
+    parser.add_argument("-p", "--port", help="Serial port (e.g. COM3, /dev/ttyUSB0); required except for bootflash --host")
+    parser.add_argument("--host", nargs="?", const=os.environ.get("EXYNOS_HOST", "exynos"),
+                        help="bootflash over WiFi: uart_boot's address (bare --host = $EXYNOS_HOST, else exynos)")
     parser.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT, help="Response timeout in seconds (default: 2.0)")
     parser.add_argument("-l", "--listen", action="store_true",
                         help="After command, keep printing what the device sends, e.g. the boot "
@@ -1190,7 +1423,31 @@ def main():
                            metavar="YYYY-MM-DD HH:MM:SS",
                            help="Date/time string (default: current system time)")
 
+    p_bf = sub.add_parser("bootflash",
+                          help="exynos4412: save an FS image as FERRITE/FLASH.BIN through uart_boot "
+                               "(UART with -p, WiFi with --host)")
+    p_bf.add_argument("file", help="FS image from ferrite_build (or a whole FLASH.BIN)")
+    p_bf.add_argument("--fs-base", type=lambda v: int(v, 0), default=0x1000,
+                      help="FS offset in the flash region (default 0x1000)")
+    p_bf.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
+                      help="wait this long for uart_boot (power on or reset the board meanwhile)")
+    p_bf.add_argument("--reset", action="store_true",
+                      help="restart the running ferrite application first (over -p) so uart_boot starts")
+    p_bf.add_argument("--app", metavar="IMAGE", help="then send this application image (<app>.bin) to run")
+    p_bf.add_argument("--save", action="store_true", help="with --app: save it to the eMMC too")
+    p_bf.add_argument("--no-run", action="store_true",
+                      help="leave uart_boot waiting (default with -p: send its 'r' key to restart into the app)")
+
     args = parser.parse_args()
+
+    if args.command == "bootflash" and args.port is None:
+        if args.host is None:
+            parser.error("bootflash needs -p PORT (UART) or --host (WiFi)")
+        ok = cmd_bootflash(None, args.file, args.host, args.fs_base, args.wait, args.reset,
+                           args.app, args.save, False)
+        sys.exit(0 if ok else 1)
+    if args.port is None:
+        parser.error("-p/--port is required")
 
     try:
         ser = open_port(args.port, args.timeout)
@@ -1221,6 +1478,9 @@ def main():
             ok = cmd_stackinfo(ser)
         elif args.command == "settime":
             ok = cmd_settime(ser, args.datetime)
+        elif args.command == "bootflash":
+            ok = cmd_bootflash(ser, args.file, args.host, args.fs_base, args.wait, args.reset,
+                               args.app, args.save, not args.no_run)
         elif args.command == "monitor":
             listen_serial(ser, hex_dump=args.hex, timestamps=not args.no_time)
             ok = True
