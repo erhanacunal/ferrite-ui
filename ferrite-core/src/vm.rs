@@ -2338,7 +2338,7 @@ impl Vm {
                 let (x, y) = unpack_pair(xy);
                 let image_id = image_id as u8;
                 if let Some(img) = ctx.images.find(image_id) {
-                    img.draw(&ctx.lcd, &ctx.flash, x, y);
+                    img.draw(&ctx.lcd, &ctx.flash, x as i16, y as i16);
                 }
             }
             OP_DRAW_TEXT_LIT => {
@@ -3350,6 +3350,9 @@ impl Vm {
         // Base widget fields (no extension needed)
         let mut dirty = false;
         let mut prop_set = false;
+        if matches!(prop_id, PROP_LOC_X | PROP_LOC_Y | PROP_SIZE_W | PROP_SIZE_H) {
+            ctx.objs.will_move(target);
+        }
         match prop_id {
             PROP_LOC_X => {
                 ctx.objs.get_mut(target).location.x = val as i16;
@@ -3692,6 +3695,7 @@ impl Vm {
         // Base fields
         match prop_id {
             PROP_LOCATION if count >= 2 => {
+                ctx.objs.will_move(self.target);
                 let w = ctx.objs.get_mut(self.target);
                 w.location = Offset {
                     x: vals[0] as i16,
@@ -3701,6 +3705,7 @@ impl Vm {
                 return;
             }
             PROP_SIZE if count >= 2 => {
+                ctx.objs.will_move(self.target);
                 let w = ctx.objs.get_mut(self.target);
                 w.size = Size {
                     w: vals[0] as u16,

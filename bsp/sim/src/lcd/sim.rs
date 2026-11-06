@@ -124,8 +124,8 @@ fn blend_argb(dst: u32, src: u32, alpha: u8) -> u32 {
 }
 
 impl LcdBackend for SimLcd {
-    const WIDTH: u16 = 800;
-    const HEIGHT: u16 = 480;
+    const WIDTH: u16 = WIDTH;
+    const HEIGHT: u16 = HEIGHT;
 
     // The sim deliberately supports alpha even though nextion.json says
     // caps.alpha = false: it is the host test vehicle for the tdo_y13

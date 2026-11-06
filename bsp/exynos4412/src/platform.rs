@@ -6,7 +6,10 @@ use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::heap;
 use ferrite_core::ctx::Ctx;
 use ferrite_core::platform::Platform;
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use ferrite_core::pool::ObjPool;
+use ferrite_core::sysinfo;
 use ferrite_core::runtime::{ERR_EMPTY_RUN, FullInput, PlatformRuntime};
 use ferrite_core::touch::{TouchBackend, TouchImpl};
 use ferrite_core::types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
@@ -14,6 +17,9 @@ use ferrite_core::types::{COLOR_BLACK, COLOR_RED, COLOR_WHITE};
 use crate::lcd::{self, PANEL};
 
 const SYS_REBOOT: u8 = 0x01;
+
+/// Main-loop passes since boot (`sysinfo::SYS_PASSES`), counted in `frame_end`.
+static PASSES: AtomicU32 = AtomicU32::new(0);
 
 pub struct Exynos4412Platform;
 
@@ -119,11 +125,22 @@ impl PlatformRuntime for Exynos4412Platform {
         power::restart(BootMode::Normal)
     }
 
-    fn syscall(id: u8, args: &[i32], _objs: &mut ObjPool) -> Option<i32> {
-        let _ = args;
+    fn syscall(id: u8, args: &[i32], objs: &mut ObjPool) -> Option<i32> {
         match id {
             SYS_REBOOT => Self::reset(),
-            _ => None,
+            _ => sysinfo::syscall(id, args, objs, || {
+                let heap = heap::stats();
+                sysinfo::Info {
+                    passes: PASSES.load(Ordering::Relaxed),
+                    frames: lcd::frames(),
+                    heap_used: heap.used,
+                    heap_total: heap.size,
+                    #[cfg(feature = "perf")]
+                    cpu_mhz: crate::perf::hz() / 1_000_000,
+                    #[cfg(not(feature = "perf"))]
+                    cpu_mhz: 0,
+                }
+            }),
         }
     }
 
@@ -170,6 +187,7 @@ impl PlatformRuntime for Exynos4412Platform {
     }
 
     fn frame_end(ctx: &mut Ctx<Self>) {
+        PASSES.fetch_add(1, Ordering::Relaxed);
         if DIAG {
             draw_diag(ctx);
         }

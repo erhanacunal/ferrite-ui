@@ -107,7 +107,8 @@ fn main() {
     ferrite_core::runtime::run::<SimPlatform>(ctx, touch)
 }
 
-/// `--fsimage <path>`, any number of `--tap X,Y,MS` (scripted presses),
+/// `--fsimage <path>`, any number of `--tap X,Y,MS` / `--swipe X0,Y0,X1,Y1,MS[,DUR]`
+/// (scripted presses),
 /// `--eeprom <path>` (file that keeps the virtual EEPROM across runs) and
 /// `--audio-out <path.wav>` (records the audio output).
 fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>, Option<String>, Option<String>) {
@@ -125,9 +126,36 @@ fn parse_args() -> (Option<String>, Vec<platform::ScriptedTap>, Option<String>, 
                 let spec = args.next().unwrap_or_default();
                 let parts: Vec<u32> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
                 match parts[..] {
-                    [x, y, at_ms] => taps.push(platform::ScriptedTap { x: x as u16, y: y as u16, at_ms }),
+                    [x, y, at_ms] => taps.push(platform::ScriptedTap {
+                        x: x as u16,
+                        y: y as u16,
+                        x1: x as u16,
+                        y1: y as u16,
+                        at_ms,
+                        dur_ms: platform::TAP_HOLD_MS,
+                    }),
                     _ => eprintln!("ignoring --tap {spec:?}: expected X,Y,MS"),
                 }
+            }
+            "--swipe" => {
+                let spec = args.next().unwrap_or_default();
+                let parts: Vec<u32> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                let (x, y, x1, y1, at_ms, dur_ms) = match parts[..] {
+                    [x, y, x1, y1, at] => (x, y, x1, y1, at, 250),
+                    [x, y, x1, y1, at, dur] => (x, y, x1, y1, at, dur),
+                    _ => {
+                        eprintln!("ignoring --swipe {spec:?}: expected X0,Y0,X1,Y1,MS[,DUR]");
+                        continue;
+                    }
+                };
+                taps.push(platform::ScriptedTap {
+                    x: x as u16,
+                    y: y as u16,
+                    x1: x1 as u16,
+                    y1: y1 as u16,
+                    at_ms,
+                    dur_ms,
+                });
             }
             _ => {}
         }

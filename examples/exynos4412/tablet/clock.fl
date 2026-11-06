@@ -1,0 +1,250 @@
+// clock.fl — analog clock, digital time and a stopwatch with laps.
+//
+// The hands are polygon widgets the size of the face: each second their
+// point lists are rebuilt from sin/cos. The face dots are small circles.
+#include "ui.fl"
+#include "shapes.fl"
+
+const CX = 360;          // face centre (screen)
+const CY = 438;
+const R = 270;           // face radius
+const FACE = 540;        // face box
+const LAPS = 5;
+
+var face; var hand_h; var hand_m; var hand_s; var hub;
+var dig_time; var dig_sec; var dig_date;
+var sw_lbl; var sw_start; var sw_start_t; var sw_lap; var sw_lap_t;
+var lap_lbl[5];
+
+var last_sec = -1;
+var sw_run = 0;
+var sw_base = 0;          // millis() at start minus time already counted
+var sw_ms = 0;            // shown time while stopped
+var lap_n = 0;
+var lap_prev = 0;
+
+// A hand polygon: angle `a` (radians, clockwise from 12), length `len`,
+// tail `tail`, half width `hw` at the hub. Points are relative to the face
+// box. Returns the point list.
+fn hand_points(a: float, len, tail, hw) -> string {
+    var dx = sin(a);
+    var dy = 0.0 - cos(a);
+    var c = itof(FACE / 2);
+    var tx = c + dx * itof(len);
+    var ty = c + dy * itof(len);
+    var bx = c - dx * itof(tail);
+    var by = c - dy * itof(tail);
+    // Perpendicular: (-dy, dx).
+    var px = (0.0 - dy) * itof(hw);
+    var py = dx * itof(hw);
+    return sprintf("%d,%d %d,%d %d,%d %d,%d",
+        ftoi(bx + px), ftoi(by + py),
+        ftoi(tx + px * 0.25), ftoi(ty + py * 0.25),
+        ftoi(tx - px * 0.25), ftoi(ty - py * 0.25),
+        ftoi(bx - px), ftoi(by - py));
+}
+
+fn style_hand(color) {
+    set(kind, KIND_POLYGON);
+    set(location, CX - FACE / 2, CY - FACE / 2);
+    set(size, FACE, FACE);
+    set(bg_color, color);
+    set(border_color, color);
+}
+
+fn fmt_sw(ms) -> string {
+    var cs = (ms / 10) % 100;
+    var s = (ms / 1000) % 60;
+    var m = ms / 60000;
+    return sprintf("%d:%02d.%02d", m, s, cs);
+}
+
+fn build_face() {
+    face = alloc();
+    target(face);
+    set(kind, KIND_CIRCLE);
+    set(location, CX - R, CY - R);
+    set(size, FACE, FACE);
+    set(bg_color, SURFACE);
+    set(border_color, SURFACE_HI);
+    set(border, 6, 6, 6, 6);
+    parent(0);
+
+    // 60 minute dots, the 12 hour ones bigger.
+    for (var i = 0; i < 60; i++) {
+        var a = itof(i) * 0.1047198;
+        var big = (i % 5) == 0;
+        var rr = big ? 236 : 240;
+        var d = big ? 14 : 5;
+        var x = CX + ftoi(sin(a) * itof(rr));
+        var y = CY - ftoi(cos(a) * itof(rr));
+        var dot = alloc();
+        target(dot);
+        set(kind, KIND_CIRCLE);
+        set(location, x - d / 2, y - d / 2);
+        set(size, d, d);
+        set(bg_color, big ? WHITE : FAINT);
+        set(border_color, big ? WHITE : FAINT);
+        parent(0);
+    }
+
+    var brand = alloc();
+    style_label(CX - 150, CY + 70, 300, 30, F20, DIM, ALIGN_CENTER, "ferrite");
+    parent(0);
+
+    hand_h = alloc(); style_hand(WHITE); parent(0);
+    hand_m = alloc(); style_hand(WHITE); parent(0);
+    hand_s = alloc(); style_hand(C_CLOCK); parent(0);
+    hub = alloc();
+    target(hub);
+    set(kind, KIND_CIRCLE);
+    set(location, CX - 12, CY - 12);
+    set(size, 24, 24);
+    set(bg_color, C_CLOCK);
+    set(border_color, WHITE);
+    set(border, 4, 4, 4, 4);
+    parent(0);
+}
+
+fn build_right() {
+    dig_time = alloc();
+    style_label(640, 132, 450, 150, F120, WHITE, ALIGN_RIGHT, "");
+    parent(0);
+    dig_sec = alloc();
+    style_label(1100, 186, 140, 80, F60, DIM, ALIGN_LEFT, "");
+    parent(0);
+    dig_date = alloc();
+    style_label(708, 282, 520, 40, F26, DIM, ALIGN_LEFT, "");
+    parent(0);
+
+    var card = alloc();
+    style_box(700, 346, 540, 394, SURFACE, 28);
+    parent(0);
+    var t = alloc();
+    style_label(28, 18, 300, 30, F20, DIM, ALIGN_LEFT, "Stopwatch");
+    parent(card);
+    sw_lbl = alloc();
+    style_label(24, 50, 492, 80, F60, WHITE, ALIGN_LEFT, "0:00.00");
+    parent(card);
+
+    sw_start = alloc();
+    style_button(28, 140, 230, 64, C_CLOCK, 32);
+    parent(card);
+    sw_start_t = alloc();
+    style_label(0, 0, 230, 64, F26, WHITE, ALIGN_CENTER, "Start");
+    parent(sw_start);
+    sw_lap = alloc();
+    style_button(282, 140, 230, 64, SURFACE_HI, 32);
+    parent(card);
+    sw_lap_t = alloc();
+    style_label(0, 0, 230, 64, F26, WHITE, ALIGN_CENTER, "Reset");
+    parent(sw_lap);
+
+    for (var i = 0; i < LAPS; i++) {
+        var l = alloc();
+        style_label(32, 222 + i * 32, 480, 30, F20, DIM, ALIGN_LEFT, "");
+        parent(card);
+        lap_lbl[i] = l;
+    }
+}
+
+fn show_time() {
+    var now = rtcRead();
+    var s = now[0];
+    var m = now[1];
+    var h = now[2];
+    var dd = now[3];
+    var wd = now[4];
+    var mo = now[5];
+    arrFree(now);
+    if (s == last_sec) {
+        return 0;
+    }
+    last_sec = s;
+
+    var as = itof(s) * 0.1047198;
+    var am = (itof(m) + itof(s) / 60.0) * 0.1047198;
+    var ah = (itof(h % 12) + itof(m) / 60.0) * 0.5235988;
+    target(hand_h); set(text, hand_points(ah, 150, 26, 11)); dirty();
+    target(hand_m); set(text, hand_points(am, 222, 30, 8)); dirty();
+    target(hand_s); set(text, hand_points(as, 238, 50, 3)); dirty();
+    target(hub); dirty();
+
+    target(dig_time); set(text, sprintf("%d:%02d", h, m)); dirty();
+    target(dig_sec); set(text, sprintf("%02d", s)); dirty();
+    target(dig_date); set(text, sprintf("%s, %d %s", day_name(wd), dd, month_name(mo))); dirty();
+    strClear();
+}
+
+fn sw_now() {
+    return sw_run ? millis() - sw_base : sw_ms;
+}
+
+fn show_sw() {
+    target(sw_lbl); set(text, fmt_sw(sw_now())); dirty();
+    target(sw_start); set(bg_color, sw_run ? RED : C_CLOCK); set(press_color, lighten(sw_run ? RED : C_CLOCK)); dirty();
+    target(sw_start_t); set(text, sw_run ? "Stop" : "Start"); dirty();
+    target(sw_lap_t); set(text, sw_run ? "Lap" : "Reset"); dirty();
+    strClear();
+}
+
+fn on_start(w) {
+    playSound("click");
+    if (sw_run) {
+        sw_ms = millis() - sw_base;
+        sw_run = 0;
+    } else {
+        sw_base = millis() - sw_ms;
+        sw_run = 1;
+    }
+    show_sw();
+}
+
+fn on_lap(w) {
+    playSound("click");
+    if (sw_run) {
+        var t = millis() - sw_base;
+        // Newest lap on top.
+        for (var i = LAPS - 1; i > 0; i--) {
+            target(lap_lbl[i - 1]);
+            var prev = get(text);
+            target(lap_lbl[i]);
+            set(text, prev);
+            dirty();
+        }
+        lap_n++;
+        target(lap_lbl[0]);
+        set(text, sprintf("Lap %d     %s     +%s", lap_n, fmt_sw(t), fmt_sw(t - lap_prev)));
+        dirty();
+        lap_prev = t;
+    } else {
+        sw_ms = 0;
+        lap_n = 0;
+        lap_prev = 0;
+        for (var j = 0; j < LAPS; j++) {
+            target(lap_lbl[j]); set(text, ""); dirty();
+        }
+    }
+    show_sw();
+}
+
+fn setup() {
+    ui_app(APP_CLOCK, "Clock");
+    build_face();
+    build_right();
+    target(sw_start); set(on_click, @on_start);
+    target(sw_lap); set(on_click, @on_lap);
+    show_time();
+    show_sw();
+    return 0;
+}
+
+fn loop() {
+    ui_tick();
+    show_time();
+    if (sw_run) {
+        target(sw_lbl); set(text, fmt_sw(sw_now())); dirty();
+        strClear();
+    }
+    delay(30);
+}

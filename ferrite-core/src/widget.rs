@@ -818,6 +818,22 @@ impl ObjPool {
         }
     }
 
+    /// Called before `id`'s location or size changes: remember where it is
+    /// on screen now (buffer A's prev rect), so the next dirty render restores
+    /// what is behind the old position instead of leaving a trail. Only for a
+    /// widget that is drawn and has no pending rect yet (an animation changes
+    /// x, y, w and h each frame: the first change keeps the drawn rect).
+    pub fn will_move(&mut self, id: WidgetId) {
+        if !self.is_live(id) || self.get(id).flags & FLAG_RENDERED == 0 {
+            return;
+        }
+        if !self.prev_rect(id, 0).is_empty() {
+            return;
+        }
+        let abs = self.absolute_rect(id);
+        self.set_prev_rect(id, 0, abs);
+    }
+
     /// The value `id` was last fully drawn with, if its pixels are still that
     /// drawing: same appearance `key` (never 0) and drawn in the current
     /// epoch. None means redraw it whole.

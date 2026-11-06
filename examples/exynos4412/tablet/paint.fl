@@ -1,0 +1,209 @@
+// paint.fl — finger painting. Strokes are drawn straight to the screen
+// with fillCircle stamps spaced along each move, so a fast finger still
+// leaves a solid line. Colours, three brush sizes, eraser, clear.
+#include "ui.fl"
+
+const CV_X = 160;          // canvas
+const CV_Y = 128;
+const CV_W = 1096;
+const CV_H = 620;
+const CANVAS_BG = 0xFFFF;
+const NCOL = 10;
+
+var colors[10] = [0x0000, 0xF800, 0xFD20, 0xFFE0, 0x07E0, 0x065F, 0x001F, 0x801F, 0xF81F, 0x8410];
+var canvas;
+var sw0; var sw1; var sw2; var sw3; var sw4; var sw5; var sw6; var sw7; var sw8; var sw9;
+var sz0; var sz1; var sz2;
+var eraser; var clear_btn;
+var sel_ring;
+
+var brush_col = 0x0000;
+var brush_r = 8;
+var erasing = 0;
+var down = 0;
+var last_x = 0;
+var last_y = 0;
+
+fn make_swatch(s: widget, i) {
+    target(s);
+    style_button(28 + (i % 2) * 56, CV_Y + 8 + (i / 2) * 56, 44, 44, colors[i], 22);
+    set(border_color, FAINT);
+    set(border, 2, 2, 2, 2);
+    parent(0);
+}
+
+fn swatch_index(w) {
+    if (w == sw0) { return 0; }
+    if (w == sw1) { return 1; }
+    if (w == sw2) { return 2; }
+    if (w == sw3) { return 3; }
+    if (w == sw4) { return 4; }
+    if (w == sw5) { return 5; }
+    if (w == sw6) { return 6; }
+    if (w == sw7) { return 7; }
+    if (w == sw8) { return 8; }
+    if (w == sw9) { return 9; }
+    return -1;
+}
+
+// Size buttons: a dot of the brush size on a round button.
+fn make_size(b: widget, i, d) {
+    target(b);
+    style_button(28 + i * 38 - (i == 2 ? 0 : 0), CV_Y + 300, 34, 44, SURFACE_HI, 12);
+    parent(0);
+    var dot = alloc();
+    style_box(17 - d / 2, 22 - d / 2, d, d, WHITE, d / 2);
+    parent(b);
+}
+
+fn show_tools() {
+    target(sz0); set(bg_color, brush_r == 4 ? C_PAINT : SURFACE_HI); dirty();
+    target(sz1); set(bg_color, brush_r == 8 ? C_PAINT : SURFACE_HI); dirty();
+    target(sz2); set(bg_color, brush_r == 16 ? C_PAINT : SURFACE_HI); dirty();
+    target(eraser); set(bg_color, erasing ? C_PAINT : SURFACE_HI); dirty();
+    // Ring around the selected colour.
+    var i = 0;
+    for (var k = 0; k < NCOL; k++) {
+        if (colors[k] == brush_col) {
+            i = k;
+        }
+    }
+    target(sel_ring);
+    set(location, 28 + (i % 2) * 56 - 5, CV_Y + 8 + (i / 2) * 56 - 5);
+    set(visible, !erasing);
+    dirty();
+}
+
+fn on_swatch(w) {
+    var i = swatch_index(w);
+    if (i >= 0) {
+        brush_col = colors[i];
+        erasing = 0;
+        show_tools();
+    }
+}
+
+fn on_size(w) {
+    if (w == sz0) { brush_r = 4; }
+    if (w == sz1) { brush_r = 8; }
+    if (w == sz2) { brush_r = 16; }
+    show_tools();
+}
+
+fn on_eraser(w) {
+    erasing = !erasing;
+    show_tools();
+}
+
+fn on_clear(w) {
+    playSound("click");
+    target(canvas);
+    dirty();
+}
+
+fn in_canvas(x, y) {
+    return x >= CV_X && x < CV_X + CV_W && y >= CV_Y && y < CV_Y + CV_H;
+}
+
+// One brush stamp, kept inside the canvas.
+fn stamp(x, y) {
+    var r = erasing ? brush_r * 2 : brush_r;
+    if (x < CV_X + r) { x = CV_X + r; }
+    if (y < CV_Y + r) { y = CV_Y + r; }
+    if (x > CV_X + CV_W - 1 - r) { x = CV_X + CV_W - 1 - r; }
+    if (y > CV_Y + CV_H - 1 - r) { y = CV_Y + CV_H - 1 - r; }
+    fillCircle(x, y, r, erasing ? CANVAS_BG : brush_col);
+}
+
+fn stroke_to(x, y) {
+    var dx = x - last_x;
+    var dy = y - last_y;
+    var adx = dx < 0 ? -dx : dx;
+    var ady = dy < 0 ? -dy : dy;
+    var d = adx > ady ? adx : ady;
+    var step = brush_r / 2;
+    if (step < 1) { step = 1; }
+    var n = d / step;
+    for (var i = 1; i <= n; i++) {
+        stamp(last_x + dx * i / n, last_y + dy * i / n);
+    }
+    stamp(x, y);
+    last_x = x;
+    last_y = y;
+}
+
+fn on_touch_down(x, y) {
+    if (!in_canvas(x, y)) {
+        return 0;
+    }
+    down = 1;
+    last_x = x;
+    last_y = y;
+    stamp(x, y);
+}
+
+fn on_touch_move(x, y) {
+    if (down) {
+        stroke_to(x, y);
+    }
+}
+
+fn on_touch_up() {
+    down = 0;
+}
+
+fn setup() {
+    ui_app(APP_PAINT, "Paint");
+    var side = alloc();
+    style_box(16, CV_Y, 128, CV_H, SURFACE, 20);
+    parent(0);
+    canvas = alloc();
+    style_box(CV_X, CV_Y, CV_W, CV_H, CANVAS_BG, 0);
+    parent(0);
+
+    sel_ring = alloc();
+    style_box(0, 0, 54, 54, 0, 27);
+    set(kind, KIND_LABEL);   // transparent: only the ring
+    set(border_color, WHITE);
+    set(border, 3, 3, 3, 3);
+    parent(0);
+    sw0 = alloc(); make_swatch(sw0, 0); target(sw0); set(on_click, @on_swatch);
+    sw1 = alloc(); make_swatch(sw1, 1); target(sw1); set(on_click, @on_swatch);
+    sw2 = alloc(); make_swatch(sw2, 2); target(sw2); set(on_click, @on_swatch);
+    sw3 = alloc(); make_swatch(sw3, 3); target(sw3); set(on_click, @on_swatch);
+    sw4 = alloc(); make_swatch(sw4, 4); target(sw4); set(on_click, @on_swatch);
+    sw5 = alloc(); make_swatch(sw5, 5); target(sw5); set(on_click, @on_swatch);
+    sw6 = alloc(); make_swatch(sw6, 6); target(sw6); set(on_click, @on_swatch);
+    sw7 = alloc(); make_swatch(sw7, 7); target(sw7); set(on_click, @on_swatch);
+    sw8 = alloc(); make_swatch(sw8, 8); target(sw8); set(on_click, @on_swatch);
+    sw9 = alloc(); make_swatch(sw9, 9); target(sw9); set(on_click, @on_swatch);
+
+    sz0 = alloc(); make_size(sz0, 0, 8); target(sz0); set(on_click, @on_size);
+    sz1 = alloc(); make_size(sz1, 1, 16); target(sz1); set(on_click, @on_size);
+    sz2 = alloc(); make_size(sz2, 2, 28); target(sz2); set(on_click, @on_size);
+
+    eraser = alloc();
+    style_button(28, CV_Y + 360, 104, 56, SURFACE_HI, 16);
+    set(on_click, @on_eraser);
+    parent(0);
+    add_icon(eraser, 104, 56, IMG_ERASER);
+
+    clear_btn = alloc();
+    style_button(28, CV_Y + 428, 104, 56, SURFACE_HI, 16);
+    set(on_click, @on_clear);
+    parent(0);
+    add_icon(clear_btn, 104, 56, IMG_DELETE);
+
+    var hint = alloc();
+    style_label(16, CV_Y + 500, 128, 100, F16, DIM, ALIGN_CENTER, "Draw with\nyour finger");
+    set(multi_line, ON);
+    parent(0);
+
+    show_tools();
+    return 0;
+}
+
+fn loop() {
+    ui_tick();
+    delay(100);
+}

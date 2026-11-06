@@ -1,0 +1,195 @@
+// notes.fl — sticky notes: a list on the left, a multi-line editor with
+// the on-screen keyboard on the right. Each note's text lives in its list
+// row's label (a shown string survives strClear). No EEPROM on this board:
+// the notes last until the app is closed.
+#include "ui.fl"
+
+const MAXN = 6;
+const ROW_H = 84;
+
+var nr0; var nr1; var nr2; var nr3; var nr4; var nr5;
+var row_lbl[6];
+var editor; var add_btn; var del_btn; var count_lbl; var empty_lbl;
+var count = 3;
+var sel = 0;
+
+fn note_color(i) {
+    if (i % 3 == 0) { return 0xFE8C; }
+    if (i % 3 == 1) { return 0xB7F5; }
+    return 0x9E5F;
+}
+
+fn make_row(r: widget, i) {
+    target(r);
+    style_button(24, 200 + i * (ROW_H + 10), 400, ROW_H, SURFACE, 18);
+    parent(0);
+    var l = alloc();
+    style_label(20, 8, 360, ROW_H - 16, F20, WHITE, ALIGN_LEFT, "");
+    set(multi_line, ON);
+    parent(r);
+    row_lbl[i] = l;
+}
+
+fn row_index(w) {
+    if (w == nr0) { return 0; }
+    if (w == nr1) { return 1; }
+    if (w == nr2) { return 2; }
+    if (w == nr3) { return 3; }
+    if (w == nr4) { return 4; }
+    if (w == nr5) { return 5; }
+    return -1;
+}
+
+fn show_rows() {
+    for (var i = 0; i < MAXN; i++) {
+        var r = i == 0 ? nr0 : (i == 1 ? nr1 : (i == 2 ? nr2 : (i == 3 ? nr3 : (i == 4 ? nr4 : nr5))));
+        target(r);
+        set(visible, i < count);
+        set(bg_color, i == sel ? darken(note_color(i)) : SURFACE);
+        set(press_color, SURFACE_HI);
+        dirty();
+    }
+    target(count_lbl);
+    set(text, sprintf("%d of %d notes", count, MAXN));
+    dirty();
+    target(editor);
+    set(visible, count > 0);
+    dirty();
+    target(empty_lbl);
+    set(visible, count == 0);
+    dirty();
+    target(del_btn);
+    set(visible, count > 0);
+    dirty();
+    strClear();
+}
+
+fn load_editor() {
+    if (count == 0) {
+        return 0;
+    }
+    target(row_lbl[sel]);
+    var t = get(text);
+    target(editor);
+    set(text, t);
+    set(bg_color, note_color(sel));
+    dirty();
+}
+
+fn select(i) {
+    sel = i;
+    load_editor();
+    show_rows();
+}
+
+fn on_row(w) {
+    var i = row_index(w);
+    if (i >= 0 && i < count) {
+        select(i);
+    }
+}
+
+fn on_edit(w, xx) {
+    if (count == 0) {
+        return 0;
+    }
+    target(editor);
+    var t = get(text);
+    target(row_lbl[sel]);
+    set(text, t);
+    dirty();
+}
+
+fn on_add(w) {
+    playSound("click");
+    if (count >= MAXN) {
+        return 0;
+    }
+    target(row_lbl[count]);
+    set(text, "");
+    dirty();
+    count++;
+    select(count - 1);
+}
+
+fn on_del(w) {
+    playSound("click");
+    if (count == 0) {
+        return 0;
+    }
+    for (var i = sel; i < count - 1; i++) {
+        target(row_lbl[i + 1]);
+        var t = get(text);
+        target(row_lbl[i]);
+        set(text, t);
+        dirty();
+    }
+    count--;
+    if (sel >= count && sel > 0) {
+        sel--;
+    }
+    load_editor();
+    show_rows();
+}
+
+fn setup() {
+    ui_app(APP_NOTES, "Notes");
+
+    count_lbl = alloc();
+    style_label(28, 140, 240, 44, F20, DIM, ALIGN_LEFT, "");
+    parent(0);
+    add_btn = alloc();
+    style_button(312, 132, 112, 56, C_NOTES, 28);
+    set(on_click, @on_add);
+    parent(0);
+    add_icon(add_btn, 112, 56, IMG_ADD);
+
+    nr0 = alloc(); make_row(nr0, 0); target(nr0); set(on_click, @on_row);
+    nr1 = alloc(); make_row(nr1, 1); target(nr1); set(on_click, @on_row);
+    nr2 = alloc(); make_row(nr2, 2); target(nr2); set(on_click, @on_row);
+    nr3 = alloc(); make_row(nr3, 3); target(nr3); set(on_click, @on_row);
+    nr4 = alloc(); make_row(nr4, 4); target(nr4); set(on_click, @on_row);
+    nr5 = alloc(); make_row(nr5, 5); target(nr5); set(on_click, @on_row);
+
+    editor = alloc();
+    target(editor);
+    set(kind, KIND_INPUT);
+    set(location, 456, 132);
+    set(size, 800, 300);
+    set(bg_color, note_color(0));
+    set(border_radius, 20);
+    set(padding, 24, 20, 24, 20);
+    set(text_color, 0x2104);
+    set(font_id, F26);
+    set(multi_line, ON);
+    set(max_length, 400);
+    set(clickable, ON);
+    set(on_change, @on_edit);
+    parent(0);
+
+    empty_lbl = alloc();
+    style_label(456, 132, 800, 300, F26, DIM, ALIGN_CENTER, "No notes. Tap + to add one.");
+    set(visible, OFF);
+    parent(0);
+
+    del_btn = alloc();
+    style_button(1144, 448, 112, 56, SURFACE_HI, 28);
+    set(on_click, @on_del);
+    parent(0);
+    add_icon(del_btn, 112, 56, IMG_DELETE);
+
+    var hint = alloc();
+    style_label(456, 448, 660, 56, F20, DIM, ALIGN_LEFT, "Tap the note to type. Notes last until you close the app.");
+    parent(0);
+
+    target(row_lbl[0]); set(text, "Shopping: milk, bread, coffee beans, AA batteries");
+    target(row_lbl[1]); set(text, "Every pixel on this tablet is drawn by ferrite-ui, a bare-metal Rust UI.");
+    target(row_lbl[2]); set(text, "Try the stress test in Monitor and watch the frame rate.");
+    select(0);
+    return 0;
+}
+
+fn loop() {
+    ui_tick();
+    delay(100);
+}

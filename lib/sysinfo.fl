@@ -1,0 +1,23 @@
+// sysinfo.fl — system information syscalls (exynos4412, sim).
+//
+// Ids are duplicated in ferrite-core/src/sysinfo.rs — keep them in sync.
+// Other boards don't answer them: the call stops the program with a VM
+// error, so use these only on boards that do.
+
+const SYS_PASSES        = 0x40;  // main-loop passes since boot (wraps)
+const SYS_FRAMES        = 0x41;  // frames presented since boot (wraps)
+const SYS_HEAP_USED_KB  = 0x42;  // heap in use, KiB (0 = unknown)
+const SYS_HEAP_TOTAL_KB = 0x43;  // heap size, KiB (0 = unknown)
+const SYS_OBJ_USED_KB   = 0x44;  // object arena in use, KiB
+const SYS_OBJ_TOTAL_KB  = 0x45;  // object arena size, KiB
+const SYS_OBJ_COUNT     = 0x46;  // live objects: arg 0 all, 1 widgets, 2 strings, 3 arrays
+const SYS_CPU_MHZ       = 0x47;  // CPU clock, MHz (0 = unknown)
+
+fn sysPasses() { return syscall(SYS_PASSES); }
+fn sysFrames() { return syscall(SYS_FRAMES); }
+fn sysHeapUsedKb() { return syscall(SYS_HEAP_USED_KB); }
+fn sysHeapTotalKb() { return syscall(SYS_HEAP_TOTAL_KB); }
+fn sysObjUsedKb() { return syscall(SYS_OBJ_USED_KB); }
+fn sysObjTotalKb() { return syscall(SYS_OBJ_TOTAL_KB); }
+fn sysObjCount(kind) { return syscall(SYS_OBJ_COUNT, kind); }
+fn sysCpuMhz() { return syscall(SYS_CPU_MHZ); }

@@ -165,6 +165,14 @@ static COPY_CYCLES: AtomicU32 = AtomicU32::new(0);
 static COPY_COUNT: AtomicU32 = AtomicU32::new(0);
 static COPY_BYTES: AtomicU32 = AtomicU32::new(0);
 
+/// Presents since boot, every present path (`sysinfo::SYS_FRAMES`).
+static FRAMES: AtomicU32 = AtomicU32::new(0);
+
+/// Frames presented since boot (wraps).
+pub fn frames() -> u32 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 /// (cycles, presents, bytes) of the present copies since the last call.
 pub fn take_present_stats() -> (u32, u32, u32) {
     (
@@ -490,6 +498,7 @@ fn g2d_finish(j: &G2dJob) {
     }
     #[cfg(not(feature = "perf"))]
     let _ = j;
+    FRAMES.fetch_add(1, Ordering::Relaxed);
     let p = present_state();
     if let Some(fb) = p.fb[1 - p.front].as_ref() {
         let _ = Fimd::new().show(fb);
@@ -546,6 +555,7 @@ fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) 
         COPY_COUNT.fetch_add(1, Ordering::Relaxed);
         COPY_BYTES.fetch_add(((r[3] - r[1]) * w * 4) as u32, Ordering::Relaxed);
     }
+    FRAMES.fetch_add(1, Ordering::Relaxed);
     copied();
 
     let fimd = Fimd::new();

@@ -1,0 +1,203 @@
+// settings.fl — display and sound settings, two switches that the home
+// screen reads back (performance overlay, alternate wallpaper: carried in
+// the program argument), and an About card with live system figures.
+#include "ui.fl"
+
+var bright_sl; var bright_lbl;
+var vol_sl; var vol_lbl;
+var sw_perf; var knob_perf;
+var sw_wall; var knob_wall;
+var chime_btn; var restart_btn; var restart_txt;
+var about_cpu; var about_mem; var about_obj; var about_up;
+var restart_armed = 0;
+
+fn section(x, y, w, h, title) {
+    var c = alloc();
+    style_box(x, y, w, h, SURFACE, 24);
+    parent(0);
+    var t = alloc();
+    style_label(28, 16, w - 56, 32, F20, ACCENT, ALIGN_LEFT, title);
+    parent(c);
+    return c;
+}
+
+fn row_label(c: widget, y, text) {
+    var l = alloc();
+    style_label(28, y, 440, 48, F26, WHITE, ALIGN_LEFT, text);
+    parent(c);
+}
+
+// A switch: a rounded track with a knob that slides.
+fn make_switch(s: widget, k: widget, c: widget, x, y) {
+    target(s);
+    style_button(x, y, 88, 48, SURFACE_HI, 24);
+    parent(c);
+    target(k);
+    style_box(4, 4, 40, 40, WHITE, 20);
+    parent(s);
+}
+
+fn show_switch(s: widget, k: widget, on) {
+    target(s);
+    set(bg_color, on ? ACCENT : SURFACE_HI);
+    set(press_color, on ? lighten(ACCENT) : lighten(SURFACE_HI));
+    dirty();
+    animate(k, PROP_LOC_X, on ? 44 : 4, 160, EASE_OUT);
+}
+
+fn show_switches() {
+    show_switch(sw_perf, knob_perf, ui_flags & 1);
+    show_switch(sw_wall, knob_wall, (ui_flags >> 1) & 1);
+}
+
+fn on_perf(w) {
+    playSound("click");
+    ui_flags = (ui_flags & 1) ? ui_flags - 1 : ui_flags + 1;
+    show_switches();
+}
+
+fn on_wall(w) {
+    playSound("click");
+    ui_flags = (ui_flags & 2) ? ui_flags - 2 : ui_flags + 2;
+    show_switches();
+}
+
+fn on_bright(w, v) {
+    if (v < 5) {
+        v = 5;
+    }
+    setBrightness(v);
+    target(bright_lbl); set(text, sprintf("%d%%", v)); dirty();
+    ui_status_levels();
+    strClear();
+}
+
+fn on_vol(w, v) {
+    ui_volume = v;
+    setVolume(v);
+    target(vol_lbl); set(text, sprintf("%d%%", v)); dirty();
+    ui_status_levels();
+    strClear();
+}
+
+fn on_chime(w) {
+    playSound("chime");
+}
+
+// Restart: tap twice (the first tap arms it).
+fn on_restart(w) {
+    if (restart_armed) {
+        syscall(0x01);   // SYS_REBOOT
+    }
+    restart_armed = 1;
+    target(restart_btn); set(bg_color, RED); set(press_color, lighten(RED)); dirty();
+    target(restart_txt); set(text, "Tap again to restart"); dirty();
+}
+
+fn show_about() {
+    var mhz = sysCpuMhz();
+    target(about_cpu);
+    if (mhz > 0) {
+        set(text, sprintf("Samsung Exynos 4412  ·  4x Cortex-A9, CPU0 at %d MHz", mhz));
+    } else {
+        set(text, "Samsung Exynos 4412  ·  4x Cortex-A9");
+    }
+    dirty();
+    var ht = sysHeapTotalKb();
+    target(about_mem);
+    if (ht > 0) {
+        set(text, sprintf("Heap %d / %d MB  ·  object arena %d / %d KB",
+            sysHeapUsedKb() / 1024, ht / 1024, sysObjUsedKb(), sysObjTotalKb()));
+    } else {
+        set(text, sprintf("Object arena %d / %d KB", sysObjUsedKb(), sysObjTotalKb()));
+    }
+    dirty();
+    target(about_obj);
+    set(text, sprintf("%d widgets  ·  %d strings  ·  %d arrays", sysObjCount(1), sysObjCount(2), sysObjCount(3)));
+    dirty();
+    var s = millis() / 1000;
+    target(about_up);
+    set(text, sprintf("Up %d:%02d:%02d  ·  display 1280 x 800, G2D present", s / 3600, (s / 60) % 60, s % 60));
+    dirty();
+    strClear();
+}
+
+fn setup() {
+    ui_app(APP_SETTINGS, "Settings");
+
+    // --- Display ---
+    var d: widget = section(24, 128, 600, 300, "Display");
+    row_label(d, 60, "Brightness");
+    bright_sl = alloc();
+    style_slider(28, 116, 440, ACCENT);
+    set(value, brightness());
+    set(on_click, @on_bright);
+    parent(d);
+    bright_lbl = alloc();
+    style_label(480, 108, 92, 48, F20, WHITE, ALIGN_RIGHT, sprintf("%d%%", brightness()));
+    parent(d);
+    row_label(d, 170, "Performance overlay");
+    sw_perf = alloc(); knob_perf = alloc();
+    make_switch(sw_perf, knob_perf, d, 484, 170);
+    target(sw_perf); set(on_click, @on_perf);
+    row_label(d, 230, "Alternate wallpaper");
+    sw_wall = alloc(); knob_wall = alloc();
+    make_switch(sw_wall, knob_wall, d, 484, 230);
+    target(sw_wall); set(on_click, @on_wall);
+
+    // --- Sound ---
+    var so: widget = section(656, 128, 600, 300, "Sound");
+    row_label(so, 60, "Volume");
+    vol_sl = alloc();
+    style_slider(28, 116, 440, ACCENT);
+    set(value, ui_volume);
+    set(on_click, @on_vol);
+    parent(so);
+    vol_lbl = alloc();
+    style_label(480, 108, 92, 48, F20, WHITE, ALIGN_RIGHT, sprintf("%d%%", ui_volume));
+    parent(so);
+    chime_btn = alloc();
+    style_text_button(28, 180, 260, 64, SURFACE_HI, F20, "Play a chime");
+    set(on_click, @on_chime);
+    parent(so);
+    restart_btn = alloc();
+    style_button(312, 180, 260, 64, SURFACE_HI, 32);
+    set(on_click, @on_restart);
+    parent(so);
+    restart_txt = alloc();
+    style_label(0, 0, 260, 64, F20, WHITE, ALIGN_CENTER, "Restart");
+    parent(restart_btn);
+
+    // --- About ---
+    var ab: widget = section(24, 448, 1232, 300, "About this tablet");
+    var fw = alloc();
+    style_label(28, 60, 1176, 44, F26, WHITE, ALIGN_LEFT, "ferrite-ui  ·  bare-metal Rust widget framework + bytecode VM");
+    parent(ab);
+    about_cpu = alloc();
+    style_label(28, 112, 1176, 36, F20, DIM, ALIGN_LEFT, "");
+    parent(ab);
+    about_mem = alloc();
+    style_label(28, 152, 1176, 36, F20, DIM, ALIGN_LEFT, "");
+    parent(ab);
+    about_obj = alloc();
+    style_label(28, 192, 1176, 36, F20, DIM, ALIGN_LEFT, "");
+    parent(ab);
+    about_up = alloc();
+    style_label(28, 232, 1176, 36, F20, DIM, ALIGN_LEFT, "");
+    parent(ab);
+
+    show_switches();
+    show_about();
+    return 0;
+}
+
+var next_about = 0;
+
+fn loop() {
+    ui_tick();
+    if (millis() >= next_about) {
+        next_about = millis() + 1000;
+        show_about();
+    }
+    delay(50);
+}

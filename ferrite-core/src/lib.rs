@@ -53,6 +53,7 @@ pub mod pool;
 pub mod perf;
 pub mod strpool;
 pub mod syscfg;
+pub mod sysinfo;
 #[cfg(feature = "multi_program")]
 pub mod task;
 pub mod types;

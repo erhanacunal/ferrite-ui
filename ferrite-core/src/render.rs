@@ -232,6 +232,23 @@ fn redraw_behind<P: Platform>(ctx: &mut Ctx<P>, target_idx: usize, stale: Rect) 
     redraw_behind_region(ctx, target_idx, &clip, &stale);
 }
 
+/// Dirty mode: put back what widget `idx` covered at `area` (it moved away
+/// or was hidden). The widgets behind are redrawn there; that overwrites
+/// visible widgets in front of it which are not dirty, so mark those for
+/// pass 2 (they are later in DFS order, so pass 2 still reaches them).
+fn restore_behind<P: Platform>(ctx: &mut Ctx<P>, idx: usize, area: Rect) {
+    redraw_behind(ctx, idx, area);
+    let end = ctx.objs.sub_end_at(idx);
+    for j in end..ctx.objs.dfs_len() {
+        if ctx.objs.vis_at(j) && ctx.objs.abs_at(j).intersects(&area) {
+            let jid = ctx.objs.dfs_at(j);
+            if !ctx.objs.get(jid).is_dirty() {
+                ctx.objs.mark_dirty(jid);
+            }
+        }
+    }
+}
+
 /// `redraw_behind` over a prebuilt clip region (`bounds` is its enclosing
 /// rect, used for the cheap intersection pre-test). Also used to restore the
 /// pixels under a translucent widget before it is re-blended — without this,
@@ -364,9 +381,11 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
             if ctx.objs.get(id).flags & FLAG_RENDERED != 0 {
                 let abs = ctx.objs.abs_at(di);
                 if !abs.is_empty() {
+                    // Restore what is behind it (ancestors and earlier
+                    // siblings, not just the nearest ancestor's bg: a hidden
+                    // popup would otherwise leave a blank hole).
                     erase_widget_area(&ctx.objs, &ctx.lcd, id, abs);
-                    // The erase may cover visible widgets that stay as they are.
-                    ctx.objs.screen_touched();
+                    restore_behind(ctx, di, abs);
                 }
                 ctx.objs.get_mut(id).flags &= !FLAG_RENDERED;
             }
@@ -386,15 +405,17 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         if stale.is_empty() {
             continue;
         }
-        let current = if w.is_visible() {
+        let current = if ctx.objs.vis_at(di) {
             ctx.objs.abs_at(di)
         } else {
             Rect::new(0, 0, 0, 0)
         };
+        // Recorded by `will_move`: used once.
+        ctx.objs.set_prev_rect(id, 0, Rect::new(0, 0, 0, 0));
         if stale == current {
             continue;
         }
-        redraw_behind(ctx, di, stale);
+        restore_behind(ctx, di, stale);
     }
 
     // Pass 2: draw dirty visible widgets with clipping. A dirty widget is
@@ -584,7 +605,10 @@ fn shows_behind(tree: &ObjPool, id: WidgetId) -> bool {
     if is_freeform_shape(w.kind) || tree.border_radius(id) != 0 {
         return true;
     }
-    w.kind == KIND_LABEL
+    // Without a background a label shows only its text, an image only its
+    // opaque pixels (an alpha icon swapped for another must not keep the
+    // old one's pixels).
+    (w.kind == KIND_LABEL || w.kind == KIND_IMAGE)
         && effective_bg(tree, w, &tree.ext(id)) == 0
 }
 
@@ -1181,9 +1205,7 @@ fn draw_bg_image<P: Platform>(ctx: &Ctx<P>, image_id: u8, inner: &Rect) {
         return;
     }
     if let Some(img) = ctx.images.find(image_id) {
-        let x = if inner.x < 0 { 0u16 } else { inner.x as u16 };
-        let y = if inner.y < 0 { 0u16 } else { inner.y as u16 };
-        img.draw(&ctx.lcd, &ctx.flash, x, y);
+        img.draw(&ctx.lcd, &ctx.flash, inner.x, inner.y);
     }
 }
 
@@ -1208,9 +1230,9 @@ fn draw_widget_image<P: Platform>(ctx: &Ctx<P>, abs: &Rect, ext: &WidgetExt) {
         } else {
             inner.y
         };
-        let x = if dx < 0 { 0u16 } else { dx as u16 };
-        let y = if dy < 0 { 0u16 } else { dy as u16 };
-        img.draw(&ctx.lcd, &ctx.flash, x, y);
+        // May be negative: a widget partly off the top/left edge (a page
+        // sliding out) shows the part of its image that is on screen.
+        img.draw(&ctx.lcd, &ctx.flash, dx, dy);
     }
 }
 
@@ -1252,52 +1274,38 @@ fn draw_label_text<P: Platform>(
 
     let lh = font.line_height() as i16;
 
-    // Multi-line mode: split on '\n', center block vertically
+    // Multi-line mode: newlines and word wrap, block centred vertically.
     if widget.flags & FLAG_MULTI_LINE != 0 {
-        // Count lines (first pass) — max 16 lines
-        let mut line_count: usize = 0;
-        let mut has_content = false;
         let bytes = text;
-        let mut i: usize = 0;
-        while i < bytes.len() {
-            let end = memchr_byte(b'\n', bytes, i);
-            if !bytes[i..end].is_empty() {
-                has_content = true;
-            }
+        let mut line_count: i16 = 0;
+        let mut i = 0;
+        while i <= bytes.len() {
+            let (_, next) = font.wrap_line(bytes, i, cw);
             line_count += 1;
-            if end >= bytes.len() {
-                break;
-            }
-            i = end + 1;
+            i = next;
         }
-        if !has_content || line_count == 0 {
-            return;
-        }
+        let block_h = line_count.saturating_mul(lh);
+        // Text taller than the box starts at its top (the first lines show).
+        let base_y = cy + ((ch as i16 - block_h) / 2).max(0);
 
-        let block_h = (line_count as i16).saturating_mul(lh);
-        let base_y = cy + (ch as i16 - block_h) / 2;
-
-        // Second pass: draw each line
-        let mut li: usize = 0;
-        let mut i: usize = 0;
-        while i < bytes.len() {
-            let end = memchr_byte(b'\n', bytes, i);
+        let mut li: i16 = 0;
+        let mut i = 0;
+        while i <= bytes.len() {
+            let (end, next) = font.wrap_line(bytes, i, cw);
             let line = &bytes[i..end];
-            if !line.is_empty() {
+            let ly = base_y + li * lh;
+            // Only lines that fit completely.
+            if !line.is_empty() && ly >= cy && ly + lh <= cy + ch as i16 {
                 let lw = font.text_width(line) as i16;
                 let lx = match ext.text_align {
                     ALIGN_CENTER => cx + (cw as i16 - lw) / 2,
                     ALIGN_RIGHT => cx + cw as i16 - lw,
                     _ => cx,
                 };
-                let ly = base_y + li as i16 * lh + (lh * 3) / 4;
-                font.draw_str(&ctx.lcd, &ctx.flash, line, lx, ly, ext.text_color, bg);
+                font.draw_str(&ctx.lcd, &ctx.flash, line, lx, ly + (lh * 3) / 4, ext.text_color, bg);
             }
             li += 1;
-            if end >= bytes.len() {
-                break;
-            }
-            i = end + 1;
+            i = next;
         }
     } else {
         // Single-line mode (original behavior)
@@ -1312,15 +1320,24 @@ fn draw_label_text<P: Platform>(
     }
 }
 
-/// Scan for `byte` in `data[start..]`, returning the index of the first
-/// match or `data.len()` if not found (analogous to memchr).
-fn memchr_byte(byte: u8, data: &[u8], start: usize) -> usize {
-    for i in start..data.len() {
-        if data[i] == byte {
-            return i;
+/// Multi-line input: the first line to show (word-wrapped to `cw`), so the
+/// line holding the byte offset `cursor` stays in view in `ch` pixels.
+/// Shared with the touch-to-cursor code in `runtime`.
+pub(crate) fn input_first_line(font: &crate::font::Font, text: &[u8], cw: u16, ch: u16, cursor: usize) -> usize {
+    let lh = (font.line_height() as usize).max(1);
+    let rows = (ch as usize / lh).max(1);
+    let mut li: usize = 0;
+    let mut cur_line = None;
+    let mut i = 0;
+    while i <= text.len() {
+        let (end, next) = font.wrap_line(text, i, cw);
+        if cur_line.is_none() && cursor >= i && cursor <= end {
+            cur_line = Some(li);
         }
+        li += 1;
+        i = next;
     }
-    data.len()
+    cur_line.unwrap_or(li.saturating_sub(1)).saturating_sub(rows - 1)
 }
 
 /// Draw input text with cursor in the content area.
@@ -1350,6 +1367,11 @@ fn draw_input_text<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: 
 
     let bg_color = effective_bg(&ctx.objs, widget, ext);
     let bg = if bg_color == 0 { None } else { Some(bg_color) };
+
+    if widget.flags & FLAG_MULTI_LINE != 0 {
+        draw_input_lines(ctx, widget, ext, font, cx, cy, cw, ch, bg);
+        return;
+    }
 
     // Draw text if present
     let has_text = ext.text_id != crate::pool::PTR_NONE && ext.font_id != 0xFF;
@@ -1388,6 +1410,56 @@ fn draw_input_text<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: 
                 ext.text_color,
             );
         }
+    }
+}
+
+/// Multi-line input: word-wrapped lines from the top of the content box,
+/// scrolled to keep the cursor line visible, and the cursor.
+#[allow(clippy::too_many_arguments)]
+fn draw_input_lines<P: Platform>(
+    ctx: &Ctx<P>,
+    widget: &Widget,
+    ext: &WidgetExt,
+    font: &crate::font::Font,
+    cx: i16,
+    cy: i16,
+    cw: u16,
+    ch: u16,
+    bg: Option<Color>,
+) {
+    let lh = font.line_height() as i16;
+    let has_text = ext.text_id != crate::pool::PTR_NONE && ext.font_id != 0xFF;
+    let text: &[u8] = if has_text { ctx.objs.str_get(ext.text_id) } else { &[] };
+    let cursor = (ext.value.max(0) as usize).min(text.len());
+    let first = input_first_line(font, text, cw, ch, cursor);
+    let rows = (ch as i16 / lh.max(1)).max(1);
+    let focused = widget.flags & FLAG_FOCUSED != 0 && ctx.cursor_visible;
+
+    let mut li = 0usize;
+    let mut i = 0;
+    let mut cursor_done = false;
+    while i <= text.len() {
+        let (end, next) = font.wrap_line(text, i, cw);
+        if li >= first {
+            let row = (li - first) as i16;
+            if row >= rows {
+                break;
+            }
+            let ly = cy + row * lh;
+            let line = &text[i..end];
+            if !line.is_empty() {
+                font.draw_str(&ctx.lcd, &ctx.flash, line, cx, ly + (lh * 3) / 4, ext.text_color, bg);
+            }
+            if focused && !cursor_done && cursor >= i && cursor <= end {
+                cursor_done = true;
+                let x = cx + font.text_width(&text[i..cursor]) as i16;
+                if x < cx + cw as i16 {
+                    fill_rect_screen(&ctx.lcd, Rect::new(x, ly, 2, lh as u16), ext.text_color);
+                }
+            }
+        }
+        li += 1;
+        i = next;
     }
 }
 
@@ -1750,7 +1822,8 @@ fn draw_graph<B: LcdBackend>(
     }
     let mut y_span = (y_max - y_min) as i64;
     if y_span <= 0 {
-        y_span = 1;
+        y_min = y_min.saturating_sub(1);
+        y_span = 2;
     }
 
     let inner_x0 = inner.x as i32;

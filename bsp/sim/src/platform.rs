@@ -41,6 +41,9 @@ impl Platform for SimPlatform {
     // Software JPEG decoder (sim/src/jpeg.rs) + silent real-time audio
     // output (sim/src/audio.rs).
     const CAPS: u32 = CAP_AUDIO | CAP_JPEG;
+    // The tablet demo animates more widgets at once (exynos4412 has 64).
+    #[cfg(feature = "tablet")]
+    const ANIM_SLOTS: usize = 64;
 
     const VERIFY_FS_ON_BOOT: bool = true;
 }
@@ -54,18 +57,35 @@ struct Host {
     taps: Vec<ScriptedTap>,
 }
 
-/// A scripted press (`--tap X,Y,MS`): the touch reads as held at (x, y) for
-/// `TAP_HOLD_MS` starting `at_ms` after launch. minifb samples the real mouse,
-/// so synthetic OS input cannot drive the sim — this lets tests click.
+/// A scripted press: `--tap X,Y,MS` holds (x, y) for `TAP_HOLD_MS`;
+/// `--swipe X0,Y0,X1,Y1,MS[,DUR]` presses at (x, y) and moves to (x1, y1)
+/// over `dur` ms (default 250), then releases. Times are from launch.
+/// minifb samples the real mouse, so synthetic OS input cannot drive the
+/// sim — this lets tests click and swipe.
 #[derive(Clone, Copy)]
 pub struct ScriptedTap {
     pub x: u16,
     pub y: u16,
+    pub x1: u16,
+    pub y1: u16,
     pub at_ms: u32,
+    pub dur_ms: u32,
+}
+
+impl ScriptedTap {
+    /// Where the press is `t` ms after it started.
+    fn at(&self, t: u32) -> (u16, u16) {
+        let lerp = |a: u16, b: u16| (a as i64 + (b as i64 - a as i64) * t.min(self.dur_ms) as i64 / self.dur_ms.max(1) as i64) as u16;
+        (lerp(self.x, self.x1), lerp(self.y, self.y1))
+    }
 }
 
 /// How long a scripted tap holds the press (well under long-press timing).
-const TAP_HOLD_MS: u32 = 150;
+pub const TAP_HOLD_MS: u32 = 150;
+
+/// Main-loop passes (`sysinfo::SYS_PASSES`).
+static PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+use std::sync::atomic::Ordering;
 
 thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
@@ -93,14 +113,19 @@ impl PlatformRuntime for SimPlatform {
         std::process::exit(0)
     }
 
-    fn syscall(id: u8, _args: &[i32], _strpool: &mut ObjPool) -> Option<i32> {
+    fn syscall(id: u8, args: &[i32], objs: &mut ObjPool) -> Option<i32> {
         match id {
             0x00 => Some(systick::millis() as i32), // SYS_UPTIME
-            _ => None,
+            // No heap figures on the host; frames = passes.
+            _ => ferrite_core::sysinfo::syscall(id, args, objs, || {
+                let passes = PASSES.load(Ordering::Relaxed);
+                ferrite_core::sysinfo::Info { passes, frames: passes, heap_used: 0, heap_total: 0, cpu_mhz: 0 }
+            }),
         }
     }
 
     fn frame_end(_ctx: &mut Ctx<Self>) {
+        PASSES.fetch_add(1, Ordering::Relaxed);
         HOST.with(|h| {
             let mut guard = h.borrow_mut();
             let host = match guard.as_mut() {
@@ -123,8 +148,11 @@ impl PlatformRuntime for SimPlatform {
                 None => (0, 0),
             };
             let now = systick::millis();
-            match host.taps.iter().find(|t| now >= t.at_ms && now < t.at_ms + TAP_HOLD_MS) {
-                Some(t) => host.mouse.update(t.x, t.y, true),
+            match host.taps.iter().find(|t| now >= t.at_ms && now < t.at_ms + t.dur_ms) {
+                Some(t) => {
+                    let (x, y) = t.at(now - t.at_ms);
+                    host.mouse.update(x, y, true)
+                }
                 None => host.mouse.update(mx, my, pressed && pos.is_some()),
             }
 

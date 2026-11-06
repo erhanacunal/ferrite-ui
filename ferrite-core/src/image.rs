@@ -41,6 +41,7 @@ use crate::fs::{Fs, RES_IMAGE, ResourceEntry};
 use crate::jpeg::{AlignedBuf, BUF_ALIGN, JpegBackend, JpegImpl};
 use alloc::vec;
 use crate::lcd::{LcdBackend, LcdImpl};
+use crate::types::Rect;
 
 const MAGIC: u16 = 0x4649; // "FI"
 const HEADER_SIZE: u32 = 9;
@@ -255,30 +256,32 @@ impl Image {
         None
     }
 
-    /// Draw the image at screen coordinates (x, y).
+    /// Draw the image at screen coordinates (x, y), which may be negative
+    /// (partly off the top/left edge).
     /// Streaming decode — image is NOT loaded into RAM.
     ///
-    /// Honors the LCD scissor: only the part of the image inside it is
-    /// written, raw images read just the visible rows/columns, and RLE decode
-    /// stops after the last visible row. Without a scissor the whole image is
-    /// drawn.
+    /// Honors the LCD scissor (or, without one, the screen): only the part
+    /// of the image inside it is written, raw images read just the visible
+    /// rows/columns, and RLE decode stops after the last visible row.
     pub fn draw<B: LcdBackend, F: FlashBackend>(
         &self,
         lcd: &LcdImpl<B>,
         flash: &FlashImpl<F>,
-        x: u16,
-        y: u16,
+        x: i16,
+        y: i16,
     ) {
         let Some(win) = self.window(lcd, x, y) else {
             return;
         };
+        // The window starts inside the scissor / screen, so these are >= 0.
+        let (x0, y0) = ((x as i32 + win.x0 as i32) as u16, (y as i32 + win.y0 as i32) as u16);
 
         #[cfg(feature = "jpeg")]
         if self.mode == MODE_JPEG {
             self.draw_decoded(
                 lcd,
-                x + win.x0 as u16,
-                y + win.y0 as u16,
+                x0,
+                y0,
                 win.x0 as u16,
                 win.y0 as u16,
                 (win.x1 - win.x0) as u16,
@@ -295,11 +298,11 @@ impl Image {
             match self.mode {
                 MODE_RAW => self.draw_raw_alpha(lcd, flash, x, y, &win),
                 MODE_RLE => {
-                    let mut cur = PixelCursor::new(x, y, self.width);
+                    let mut cur = PixelCursor::new(x as i32, y as i32, self.width);
                     self.draw_rle_alpha(lcd, flash, &mut cur, limit)
                 }
                 MODE_INDEXED_RLE => {
-                    let mut cur = PixelCursor::new(x, y, self.width);
+                    let mut cur = PixelCursor::new(x as i32, y as i32, self.width);
                     self.draw_indexed_rle_alpha(lcd, flash, &mut cur, limit)
                 }
                 _ => {}
@@ -312,8 +315,8 @@ impl Image {
             self.draw_region(
                 lcd,
                 flash,
-                x + win.x0 as u16,
-                y + win.y0 as u16,
+                x0,
+                y0,
                 win.x0 as u16,
                 win.y0 as u16,
                 (win.x1 - win.x0) as u16,
@@ -323,8 +326,8 @@ impl Image {
         }
 
         lcd.begin_pixels(
-            x + win.x0 as u16,
-            y + win.y0 as u16,
+            x0,
+            y0,
             (win.x1 - win.x0) as u16,
             (win.y1 - win.y0) as u16,
         );
@@ -336,16 +339,14 @@ impl Image {
         }
     }
 
-    /// Part of the image at (x, y) inside the LCD scissor, in image
-    /// coordinates; `None` when nothing is visible.
-    fn window<B: LcdBackend>(&self, lcd: &LcdImpl<B>, x: u16, y: u16) -> Option<Window> {
+    /// Part of the image at (x, y) inside the LCD scissor (or the screen,
+    /// without one), in image coordinates; `None` when nothing is visible.
+    fn window<B: LcdBackend>(&self, lcd: &LcdImpl<B>, x: i16, y: i16) -> Option<Window> {
         let (w, h) = (self.width as i32, self.height as i32);
         if w == 0 || h == 0 {
             return None;
         }
-        let Some(c) = lcd.scissor() else {
-            return Some(Window { x0: 0, x1: w as u32, y0: 0, y1: h as u32 });
-        };
+        let c = lcd.scissor().unwrap_or(Rect::new(0, 0, lcd.width(), lcd.height()));
         let (x, y) = (x as i32, y as i32);
         let x0 = (c.x as i32 - x).clamp(0, w);
         let x1 = (c.x as i32 + c.w as i32 - x).clamp(0, w);
@@ -450,8 +451,8 @@ impl Image {
         &self,
         lcd: &LcdImpl<B>,
         flash: &FlashImpl<F>,
-        x: u16,
-        y: u16,
+        x: i16,
+        y: i16,
         win: &Window,
     ) {
         // Random access: read only the visible columns of each visible row.
@@ -459,7 +460,7 @@ impl Image {
         for row in win.y0..win.y1 {
             let addr = self.data_addr + (row * self.width as u32 + win.x0) * 3;
             let mut reader = FlashReader::new(addr, w * 3);
-            let mut cur = PixelCursor::new(x + win.x0 as u16, y + row as u16, w as u16);
+            let mut cur = PixelCursor::new(x as i32 + win.x0 as i32, y as i32 + row as i32, w as u16);
             for _ in 0..w {
                 let lo = reader.next(flash).unwrap_or(0);
                 let hi = reader.next(flash).unwrap_or(0);
@@ -679,8 +680,12 @@ impl Image {
 // ImageList — application-wide image registry
 // ============================================================
 
-/// Maximum number of loaded images
+/// Maximum number of loaded images (~24 B of metadata each): 8 on small
+/// boards, 64 on the RAM-rich ones (`pool_large`) and the host.
+#[cfg(not(any(feature = "pool_large", feature = "host")))]
 const MAX_IMAGES: usize = 8;
+#[cfg(any(feature = "pool_large", feature = "host"))]
+const MAX_IMAGES: usize = 64;
 
 /// Application-wide image list. Holds loaded image metadata and supports
 /// lookup by image_id with lazy loading from flash.
@@ -827,26 +832,30 @@ impl Sink {
 /// Tracks the (x, y) raster position for alpha image decode, emitting each
 /// pixel through `blend_pixel` (positioned read-modify-write) instead of the
 /// streaming `write_pixel` cursor.
+/// Screen position of the next decoded pixel (alpha paths). Signed: an
+/// image may start off the top/left edge; those pixels are skipped.
 struct PixelCursor {
-    x: u16,
-    y: u16,
-    start_x: u16,
-    end_x: u16,
+    x: i32,
+    y: i32,
+    start_x: i32,
+    end_x: i32,
 }
 
 impl PixelCursor {
-    fn new(x: u16, y: u16, w: u16) -> Self {
+    fn new(x: i32, y: i32, w: u16) -> Self {
         Self {
             x,
             y,
             start_x: x,
-            end_x: x + w,
+            end_x: x + w as i32,
         }
     }
 
     #[inline]
     fn emit<B: LcdBackend>(&mut self, lcd: &LcdImpl<B>, color: u16, alpha: u8) {
-        lcd.blend_pixel(self.x, self.y, color, alpha);
+        if self.x >= 0 && self.y >= 0 {
+            lcd.blend_pixel(self.x as u16, self.y as u16, color, alpha);
+        }
         self.x += 1;
         if self.x >= self.end_x {
             self.x = self.start_x;
@@ -1121,7 +1130,7 @@ mod tests {
             let (mut img, flash, jpeg) = make_jpeg(23, 17, false);
             assert!(img.decode_jpeg(&flash, &jpeg));
             assert_eq!(jpeg.backend().calls.get(), 1);
-            let (x, y) = (4u16, 6u16);
+            let (x, y) = (4i16, 6i16);
             let full = render(&img, &flash, x, y, None);
             for py in 0..H {
                 for px in 0..W {
@@ -1139,7 +1148,7 @@ mod tests {
         fn jpeg_clipped_draw_matches_masked_full_draw() {
             let (mut img, flash, jpeg) = make_jpeg(23, 17, false);
             assert!(img.decode_jpeg(&flash, &jpeg));
-            for &(x, y) in &[(4u16, 6u16), (0, 0), (30, 28)] {
+            for &(x, y) in &[(4i16, 6i16), (0, 0), (30, 28)] {
                 let full = render(&img, &flash, x, y, None);
                 for sc in &[Rect::new(5, 3, 10, 7), Rect::new(13, 9, 1, 1), Rect::new(-5, -5, 12, 12), Rect::new(40, 30, 30, 30)] {
                     let got = render(&img, &flash, x, y, Some(*sc));
@@ -1189,7 +1198,7 @@ mod tests {
         }
     }
 
-    fn render(img: &Image, flash: &FlashImpl<MemFlash>, x: u16, y: u16, sc: Option<Rect>) -> Vec<u16> {
+    fn render(img: &Image, flash: &FlashImpl<MemFlash>, x: i16, y: i16, sc: Option<Rect>) -> Vec<u16> {
         let lcd = LcdImpl::with_backend(FbLcd {
             px: RefCell::new(vec![SENTINEL; W * H]),
             cur: RefCell::new(crate::fb::StreamCursor::new()),
@@ -1221,7 +1230,7 @@ mod tests {
         ] {
             let (img, data) = make(mode, alpha, 23, 17);
             let flash = FlashImpl::with_backend(MemFlash(data));
-            for &(x, y) in &[(4u16, 6u16), (0, 0), (30, 28)] {
+            for &(x, y) in &[(4i16, 6i16), (0, 0), (30, 28)] {
                 let full = render(&img, &flash, x, y, None);
                 for sc in &scissors {
                     let got = render(&img, &flash, x, y, Some(*sc));
@@ -1234,6 +1243,39 @@ mod tests {
                                 "mode={mode} alpha={alpha} at=({x},{y}) scissor=({},{},{},{}) px=({px},{py})",
                                 sc.x, sc.y, sc.w, sc.h
                             );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An image partly off the top/left edge shows the matching part of
+    /// itself (a widget sliding out), in every mode, with and without a
+    /// scissor.
+    #[test]
+    fn draw_at_negative_position_shows_the_visible_part() {
+        for &(mode, alpha) in &[
+            (MODE_RAW, false),
+            (MODE_RLE, false),
+            (MODE_INDEXED_RLE, false),
+            (MODE_RAW, true),
+            (MODE_RLE, true),
+            (MODE_INDEXED_RLE, true),
+        ] {
+            let (iw, ih) = (23usize, 17usize);
+            let (img, data) = make(mode, alpha, iw as u16, ih as u16);
+            let flash = FlashImpl::with_backend(MemFlash(data));
+            let origin = render(&img, &flash, 0, 0, None);
+            for &(dx, dy) in &[(5usize, 0usize), (0, 4), (9, 11), (22, 16), (23, 0)] {
+                for sc in [None, Some(Rect::new(0, 0, W as u16, H as u16)), Some(Rect::new(2, 1, 6, 5))] {
+                    let got = render(&img, &flash, -(dx as i16), -(dy as i16), sc);
+                    for py in 0..H {
+                        for px in 0..W {
+                            let inside = px + dx < iw && py + dy < ih;
+                            let clipped = sc.is_some_and(|c| !Rect::new(px as i16, py as i16, 1, 1).intersects(&c));
+                            let want = if inside && !clipped { origin[(py + dy) * W + px + dx] } else { SENTINEL };
+                            assert_eq!(got[py * W + px], want, "mode={mode} alpha={alpha} at=(-{dx},-{dy}) px=({px},{py})");
                         }
                     }
                 }

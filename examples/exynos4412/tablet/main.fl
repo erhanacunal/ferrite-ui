@@ -1,0 +1,683 @@
+// main.fl — the tablet demo's home screen.
+//
+// - Two pages (swipe left/right): a glance clock + live performance card
+//   with four apps, and an "about" card with live system figures.
+// - The dock holds four more apps; swipe up for the app drawer (all eight).
+// - Swipe down for the shade: brightness and volume sliders (real backlight
+//   and codec volume), quick tiles and a notification.
+// - Tapping an app grows its colour from the icon to the full screen, then
+//   starts the app's program; coming back shrinks it into the icon again.
+//
+// State shared with the apps travels in the runProgram argument (ui.fl).
+
+#include "ui.fl"
+
+#hint_widgets 140 140
+
+// --- Layout ---
+const ICON_D   = 104;   // home / drawer icon circle
+const DOCK_D   = 88;
+const DOCK_Y   = 652;
+const ROW_Y    = 430;   // centre of the page-0 app row
+const SHADE_H  = 480;
+const HIST     = 48;    // performance graph samples
+
+// --- Hit table: every app icon (home, dock, drawer) ---
+var hit_w[20];
+var hit_app[20];
+var hit_x[20];      // centre, in its container
+var hit_y[20];
+var hit_where[20];  // 0 page 0, 1 page 1, 2 dock, 3 drawer
+var hits = 0;
+
+// Clickable widgets need one file-scope variable each (on_click wiring).
+var ic0; var ic1; var ic2; var ic3;           // page 0
+var dk0; var dk1; var dk2; var dk3;           // dock
+var dr0; var dr1; var dr2; var dr3; var dr4; var dr5; var dr6; var dr7;  // drawer
+var bright_sl; var vol_sl;
+var tile_perf; var tile_wall; var tile_chime; var tile_restart;
+var scrim;
+var drawer_handle;
+var notif;
+
+var pager;
+var page_dot0; var page_dot1;
+var glance_time; var glance_date;
+var perf_big; var perf_sub; var perf_graph;
+var about_sys; var about_obj;
+var shade; var shade_time; var shade_date; var bright_lbl; var vol_lbl;
+var drawer;
+var launch;
+var perf_lbl;
+var dock;
+
+var perf_hist[48];
+var perf_seeded = 0;
+var shade_open = 0;
+var drawer_open = 0;
+var launching = 0;
+var launch_app = 0;
+var restart_armed = 0;
+var restart_at = 0;
+var notif_gone = 0;
+
+var last_sec = 0;
+var last_passes = 0;
+var last_frames = 0;
+
+// ============================================================
+// Building
+// ============================================================
+
+// An app icon centred at (cx, cy) in `p`: coloured circle + glyph, and the
+// app's name under it when `named`. `b` is the circle (clickable).
+fn make_icon(b: widget, p: widget, app, cx, cy, d, named, where) {
+    target(b);
+    style_button(cx - d / 2, cy - d / 2, d, d, app_color(app), d / 2);
+    parent(p);
+    add_icon(b, d, d, app_glyph(app));
+    if (named) {
+        var l = alloc();
+        style_label(cx - 80, cy + d / 2 + 6, 160, 32, F20, WHITE, ALIGN_CENTER, app_title(app));
+        parent(p);
+    }
+    hit_w[hits] = b;
+    hit_app[hits] = app;
+    hit_x[hits] = cx;
+    hit_y[hits] = cy;
+    hit_where[hits] = where;
+    hits++;
+}
+
+// Translucent rounded panel ("glass").
+fn style_glass(x, y, w, h, a) {
+    style_box(x, y, w, h, WHITE, 28);
+    set(alpha, a);
+}
+
+// Transparent container (a label without text draws nothing).
+fn style_group(x, y, w, h) {
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+}
+
+fn build_wallpaper() {
+    target(0);
+    if (ui_flags & 2) {
+        set(bg_color, WALL2_TOP);
+        set(gradient_color, WALL2_BOT);
+    } else {
+        set(bg_color, WALL_TOP);
+        set(gradient_color, WALL_BOT);
+    }
+    set(gradient_dir, 2);
+    var b1 = alloc();
+    style_box(-260, 300, 760, 760, BLOB1, 380);
+    set(alpha, 70);
+    parent(0);
+    var b2 = alloc();
+    style_box(860, -260, 640, 640, BLOB2, 320);
+    set(alpha, 52);
+    parent(0);
+    var b3 = alloc();
+    style_box(700, 560, 420, 420, BLOB3, 210);
+    set(alpha, 40);
+    parent(0);
+}
+
+fn build_page0(pg: widget) {
+    glance_time = alloc();
+    style_label(60, 70, 700, 150, F120, WHITE, ALIGN_LEFT, "");
+    parent(pg);
+    glance_date = alloc();
+    style_label(68, 222, 700, 40, F26, WHITE, ALIGN_LEFT, "");
+    parent(pg);
+    var sub = alloc();
+    style_label(68, 262, 700, 32, F20, DIM, ALIGN_LEFT, "ferrite-ui  ·  bare-metal Rust, no OS");
+    parent(pg);
+
+    // Live performance card
+    var card = alloc();
+    style_glass(808, 70, 420, 250, 34);
+    parent(pg);
+    var t = alloc();
+    style_label(28, 18, 360, 28, F20, DIM, ALIGN_LEFT, "Live performance");
+    parent(card);
+    perf_big = alloc();
+    style_label(26, 52, 360, 64, F60, WHITE, ALIGN_LEFT, "- fps");
+    parent(card);
+    perf_sub = alloc();
+    style_label(28, 118, 380, 28, F16, DIM, ALIGN_LEFT, "");
+    parent(card);
+    perf_graph = alloc();
+    target(perf_graph);
+    set(kind, KIND_GRAPH);
+    set(location, 24, 150);
+    set(size, 372, 84);
+    set(alpha, 0);
+    set(text_color, ACCENT);
+    set(gradient_color, 0x2A4F);
+    set(graph_flags, 2);
+    set(graph_arr, perf_hist);
+    set(visible, OFF);   // until the first sample
+    parent(card);
+
+    ic0 = alloc(); make_icon(ic0, pg, APP_CLOCK, 340, ROW_Y, ICON_D, 1, 0); target(ic0); set(on_click, @on_icon);
+    ic1 = alloc(); make_icon(ic1, pg, APP_CALC, 540, ROW_Y, ICON_D, 1, 0); target(ic1); set(on_click, @on_icon);
+    ic2 = alloc(); make_icon(ic2, pg, APP_PAINT, 740, ROW_Y, ICON_D, 1, 0); target(ic2); set(on_click, @on_icon);
+    ic3 = alloc(); make_icon(ic3, pg, APP_MONITOR, 940, ROW_Y, ICON_D, 1, 0); target(ic3); set(on_click, @on_icon);
+}
+
+fn build_page1(pg: widget) {
+    var card = alloc();
+    style_glass(160, 70, 960, 470, 30);
+    parent(pg);
+    var t = alloc();
+    style_label(48, 30, 860, 50, F36, WHITE, ALIGN_LEFT, "About this tablet");
+    parent(card);
+    var body = alloc();
+    style_label(48, 96, 860, 200, F20, WHITE, ALIGN_LEFT,
+        "Every pixel here comes from ferrite-ui: a widget framework and\nbytecode VM written in Rust, running bare metal on the\nSamsung Exynos 4412 (4x Cortex-A9). No Linux, no Android.\nThe G2D engine copies each frame to the display.");
+    set(multi_line, ON);
+    parent(card);
+    about_sys = alloc();
+    style_label(48, 320, 860, 40, F26, ACCENT, ALIGN_LEFT, "");
+    parent(card);
+    about_obj = alloc();
+    style_label(48, 364, 860, 40, F26, ACCENT, ALIGN_LEFT, "");
+    parent(card);
+    var hint = alloc();
+    style_label(48, 414, 860, 32, F16, DIM, ALIGN_LEFT, "Swipe up for all apps, down for quick settings.");
+    parent(card);
+}
+
+fn build_dock() {
+    dock = alloc();
+    style_glass(360, DOCK_Y - 4, 560, 120, 40);
+    set(border_radius, 40);
+    parent(0);
+    dk0 = alloc(); make_icon(dk0, dock, APP_GALLERY, 100, 60, DOCK_D, 0, 2); target(dk0); set(on_click, @on_icon);
+    dk1 = alloc(); make_icon(dk1, dock, APP_MUSIC, 220, 60, DOCK_D, 0, 2); target(dk1); set(on_click, @on_icon);
+    dk2 = alloc(); make_icon(dk2, dock, APP_NOTES, 340, 60, DOCK_D, 0, 2); target(dk2); set(on_click, @on_icon);
+    dk3 = alloc(); make_icon(dk3, dock, APP_SETTINGS, 460, 60, DOCK_D, 0, 2); target(dk3); set(on_click, @on_icon);
+}
+
+fn build_drawer() {
+    drawer = alloc();
+    style_box(0, SCREEN_H, SCREEN_W, SCREEN_H - STATUS_H, APP_BG, 32);
+    set(alpha, 238);
+    parent(0);
+    drawer_handle = alloc();
+    target(drawer_handle);
+    set(kind, KIND_LABEL);
+    set(location, 440, 0);
+    set(size, 400, 44);
+    set(clickable, ON);
+    set(on_click, @on_drawer_handle);
+    parent(drawer);
+    var bar = alloc();
+    style_box(160, 18, 80, 6, DIM, 3);
+    parent(drawer_handle);
+    var t = alloc();
+    style_label(80, 44, 600, 50, F26, WHITE, ALIGN_LEFT, "All apps");
+    parent(drawer);
+    dr0 = alloc(); make_icon(dr0, drawer, 1, 280, 220, ICON_D, 1, 3); target(dr0); set(on_click, @on_icon);
+    dr1 = alloc(); make_icon(dr1, drawer, 2, 520, 220, ICON_D, 1, 3); target(dr1); set(on_click, @on_icon);
+    dr2 = alloc(); make_icon(dr2, drawer, 3, 760, 220, ICON_D, 1, 3); target(dr2); set(on_click, @on_icon);
+    dr3 = alloc(); make_icon(dr3, drawer, 4, 1000, 220, ICON_D, 1, 3); target(dr3); set(on_click, @on_icon);
+    dr4 = alloc(); make_icon(dr4, drawer, 5, 280, 420, ICON_D, 1, 3); target(dr4); set(on_click, @on_icon);
+    dr5 = alloc(); make_icon(dr5, drawer, 6, 520, 420, ICON_D, 1, 3); target(dr5); set(on_click, @on_icon);
+    dr6 = alloc(); make_icon(dr6, drawer, 7, 760, 420, ICON_D, 1, 3); target(dr6); set(on_click, @on_icon);
+    dr7 = alloc(); make_icon(dr7, drawer, 8, 1000, 420, ICON_D, 1, 3); target(dr7); set(on_click, @on_icon);
+}
+
+// Quick tile: icon + caption in a pill.
+fn make_tile(b: widget, x, img, text) {
+    target(b);
+    style_button(x, 300, 270, 76, SURFACE_HI, 38);
+    parent(shade);
+    var i = alloc();
+    style_image(22, 0, 40, 76, img);
+    parent(b);
+    var l = alloc();
+    style_label(72, 0, 190, 76, F20, WHITE, ALIGN_LEFT, text);
+    parent(b);
+}
+
+fn build_shade() {
+    scrim = alloc();
+    style_box(0, 0, SCREEN_W, SCREEN_H, BLACK, 0);
+    set(alpha, 0);
+    set(visible, OFF);
+    set(clickable, ON);
+    set(on_click, @on_scrim);
+    parent(0);
+
+    shade = alloc();
+    style_box(0, -SHADE_H - 32, SCREEN_W, SHADE_H + 32, SURFACE, 32);
+    set(alpha, 245);
+    parent(0);
+    // Content sits 32 px down: the top corners stay off screen.
+    shade_time = alloc();
+    style_label(44, 50, 400, 70, F60, WHITE, ALIGN_LEFT, "");
+    parent(shade);
+    shade_date = alloc();
+    style_label(48, 118, 600, 30, F20, DIM, ALIGN_LEFT, "");
+    parent(shade);
+
+    var bi = alloc();
+    style_image(44, 168, 40, 44, IMG_QS_BRIGHT);
+    parent(shade);
+    bright_sl = alloc();
+    style_slider(100, 174, 1020, ACCENT);
+    set(value, brightness());
+    set(on_click, @on_bright);
+    parent(shade);
+    bright_lbl = alloc();
+    style_label(1136, 168, 100, 44, F20, WHITE, ALIGN_RIGHT, "");
+    parent(shade);
+
+    var vi = alloc();
+    style_image(44, 228, 40, 44, IMG_QS_VOLUME);
+    parent(shade);
+    vol_sl = alloc();
+    style_slider(100, 234, 1020, ACCENT);
+    set(value, ui_volume);
+    set(on_click, @on_volume);
+    parent(shade);
+    vol_lbl = alloc();
+    style_label(1136, 228, 100, 44, F20, WHITE, ALIGN_RIGHT, "");
+    parent(shade);
+
+    tile_perf = alloc();    make_tile(tile_perf, 44, IMG_QS_PERF, "Performance"); target(tile_perf); set(on_click, @on_tile);
+    tile_wall = alloc();    make_tile(tile_wall, 346, IMG_QS_DARK, "Wallpaper"); target(tile_wall); set(on_click, @on_tile);
+    tile_chime = alloc();   make_tile(tile_chime, 648, IMG_QS_VOLUME, "Chime"); target(tile_chime); set(on_click, @on_tile);
+    tile_restart = alloc(); make_tile(tile_restart, 950, IMG_QS_RESTART, "Restart"); target(tile_restart); set(on_click, @on_tile);
+
+    notif = alloc();
+    style_button(44, 400, 1192, 64, SURFACE_HI, 20);
+    set(on_click, @on_notif);
+    parent(shade);
+    var nt = alloc();
+    style_label(24, 0, 1140, 64, F20, WHITE, ALIGN_LEFT,
+        "Welcome to ferrite-ui  ·  tap to dismiss");
+    parent(notif);
+
+    var grip = alloc();
+    style_box(600, SHADE_H + 14, 80, 6, DIM, 3);
+    parent(shade);
+    show_levels();
+    show_tiles();
+}
+
+fn build_launch() {
+    launch = alloc();
+    style_box(0, 0, ICON_D, ICON_D, WHITE, ICON_D / 2);
+    set(visible, OFF);
+    parent(0);
+}
+
+// ============================================================
+// Updating
+// ============================================================
+
+fn show_clock() {
+    var now = rtcRead();
+    var s = sprintf("%d:%02d", now[2], now[1]);
+    var d = sprintf("%s, %d %s", day_name(now[4]), now[3], month_name(now[5]));
+    arrFree(now);
+    target(glance_time); set(text, s); dirty();
+    target(glance_date); set(text, d); dirty();
+    target(shade_time); set(text, s); dirty();
+    target(shade_date); set(text, d); dirty();
+    strClear();
+}
+
+fn show_levels() {
+    target(bright_lbl); set(text, sprintf("%d%%", brightness())); dirty();
+    target(vol_lbl); set(text, sprintf("%d%%", ui_volume)); dirty();
+    ui_status_levels();
+    strClear();
+}
+
+fn show_tiles() {
+    target(tile_perf);
+    set(bg_color, (ui_flags & 1) ? ACCENT : SURFACE_HI);
+    dirty();
+    target(tile_wall);
+    set(bg_color, (ui_flags & 2) ? ACCENT : SURFACE_HI);
+    dirty();
+    target(tile_restart);
+    set(bg_color, restart_armed ? RED : SURFACE_HI);
+    dirty();
+    target(perf_lbl);
+    set(visible, ui_flags & 1);
+    dirty();
+}
+
+fn show_page() {
+    target(page_dot0);
+    set(bg_color, ui_page == 0 ? WHITE : FAINT);
+    dirty();
+    target(page_dot1);
+    set(bg_color, ui_page == 1 ? WHITE : FAINT);
+    dirty();
+}
+
+// Once a second: frames and loop passes per second, the graph, the about
+// card's figures.
+fn sample_perf(dt) {
+    var p = sysPasses();
+    var f = sysFrames();
+    var fps = (f - last_frames) * 1000 / dt;
+    var pps = (p - last_passes) * 1000 / dt;
+    last_frames = f;
+    last_passes = p;
+    for (var i = 0; i < HIST - 1; i++) {
+        // The first sample fills the whole graph.
+        perf_hist[i] = perf_seeded ? perf_hist[i + 1] : fps;
+    }
+    perf_hist[HIST - 1] = fps;
+    perf_seeded = 1;
+    target(perf_graph); set(visible, ON); dirty();
+    target(perf_big); set(text, sprintf("%d fps", fps)); dirty();
+    var mhz = sysCpuMhz();
+    target(perf_sub);
+    if (mhz > 0) {
+        set(text, sprintf("%d loop passes/s  ·  CPU0 %d MHz", pps, mhz));
+    } else {
+        set(text, sprintf("%d loop passes/s", pps));
+    }
+    dirty();
+    target(perf_lbl);
+    set(text, sprintf("%d fps  ·  %d passes/s", fps, pps));
+    dirty();
+    target(about_sys);
+    var ht = sysHeapTotalKb();
+    if (ht > 0) {
+        set(text, sprintf("Heap %d / %d MB  ·  object arena %d / %d KB", sysHeapUsedKb() / 1024, ht / 1024,
+                          sysObjUsedKb(), sysObjTotalKb()));
+    } else {
+        set(text, sprintf("Object arena %d / %d KB", sysObjUsedKb(), sysObjTotalKb()));
+    }
+    dirty();
+    target(about_obj);
+    set(text, sprintf("%d widgets  ·  %d strings  ·  %d arrays", sysObjCount(1), sysObjCount(2), sysObjCount(3)));
+    dirty();
+    strClear();
+}
+
+// ============================================================
+// Pages, drawer, shade
+// ============================================================
+
+fn go_page(p) {
+    if (p == ui_page) {
+        return 0;
+    }
+    ui_page = p;
+    animate(pager, PROP_LOC_X, -SCREEN_W * p, 360, EASE_OUT);
+    show_page();
+}
+
+fn open_drawer(open) {
+    drawer_open = open;
+    animate(drawer, PROP_LOC_Y, open ? STATUS_H : SCREEN_H, 320, EASE_OUT);
+}
+
+fn open_shade(open) {
+    shade_open = open;
+    animate(shade, PROP_LOC_Y, open ? -32 : -SHADE_H - 32, 320, EASE_OUT);
+    target(scrim);
+    if (open) {
+        set(visible, ON);
+        animate(scrim, PROP_ALPHA, 140, 320, EASE_OUT);
+    } else {
+        animate(scrim, PROP_ALPHA, 0, 320, EASE_OUT, @on_scrim_faded);
+    }
+    restart_armed = 0;
+    show_tiles();
+}
+
+fn on_scrim_faded(w, prop) {
+    if (!shade_open) {
+        target(scrim);
+        set(visible, OFF);
+        dirty();
+    }
+}
+
+fn on_swipe(dir, w, delta) {
+    if (launching) {
+        return 0;
+    }
+    if (shade_open) {
+        if (dir == SWIPE_UP) { open_shade(0); }
+        return 0;
+    }
+    if (drawer_open) {
+        if (dir == SWIPE_DOWN) { open_drawer(0); }
+        return 0;
+    }
+    if (dir == SWIPE_LEFT) { go_page(1); }
+    if (dir == SWIPE_RIGHT) { go_page(0); }
+    if (dir == SWIPE_DOWN) { open_shade(1); }
+    if (dir == SWIPE_UP) { open_drawer(1); }
+}
+
+fn on_scrim(w) {
+    open_shade(0);
+}
+
+fn on_drawer_handle(w) {
+    open_drawer(0);
+}
+
+// ============================================================
+// Launch / close animation
+// ============================================================
+
+// Screen centre of hit-table entry i.
+fn hit_screen_x(i) {
+    var where = hit_where[i];
+    if (where == 0) { return hit_x[i] - ui_page * SCREEN_W; }
+    if (where == 2) { return 360 + hit_x[i]; }
+    return hit_x[i];
+}
+
+fn hit_screen_y(i) {
+    var where = hit_where[i];
+    if (where == 0) { return STATUS_H + hit_y[i]; }
+    if (where == 2) { return DOCK_Y - 4 + hit_y[i]; }
+    if (where == 3) { return STATUS_H + hit_y[i]; }
+    return hit_y[i];
+}
+
+fn grow(i, app) {
+    var x = hit_screen_x(i);
+    var y = hit_screen_y(i);
+    target(launch);
+    set(location, x - ICON_D / 2, y - ICON_D / 2);
+    set(size, ICON_D, ICON_D);
+    set(border_radius, ICON_D / 2);
+    set(bg_color, app_color(app));
+    set(alpha, 255);
+    set(visible, ON);
+    dirty();
+    animate(launch, PROP_LOC_X, 0, 260, EASE_IN_OUT);
+    animate(launch, PROP_LOC_Y, 0, 260, EASE_IN_OUT);
+    animate(launch, PROP_BORDER_RADIUS, 0, 260, EASE_IN_OUT);
+    animate(launch, PROP_SIZE_H, SCREEN_H, 260, EASE_IN_OUT);
+    animate(launch, PROP_SIZE_W, SCREEN_W, 260, EASE_IN_OUT, @on_grown);
+}
+
+fn on_grown(w, prop) {
+    runProgram(app_program(launch_app), ui_arg(0));
+}
+
+fn on_icon(w) {
+    if (launching) {
+        return 0;
+    }
+    for (var i = 0; i < hits; i++) {
+        if (hit_w[i] == w) {
+            launching = 1;
+            launch_app = hit_app[i];
+            playSound("click");
+            grow(i, launch_app);
+        }
+    }
+}
+
+// Coming back from an app: its colour shrinks into its home icon.
+fn shrink(app) {
+    var x = SCREEN_W / 2;
+    var y = SCREEN_H / 2;
+    for (var i = 0; i < hits; i++) {
+        if (hit_app[i] == app && hit_where[i] != 3) {
+            if (hit_where[i] == 2 || hit_where[i] == ui_page) {
+                x = hit_screen_x(i);
+                y = hit_screen_y(i);
+            }
+        }
+    }
+    target(launch);
+    set(location, 0, 0);
+    set(size, SCREEN_W, SCREEN_H);
+    set(border_radius, 0);
+    set(bg_color, app_color(app));
+    set(visible, ON);
+    animate(launch, PROP_LOC_X, x - ICON_D / 2, 300, EASE_IN_OUT);
+    animate(launch, PROP_LOC_Y, y - ICON_D / 2, 300, EASE_IN_OUT);
+    animate(launch, PROP_SIZE_W, ICON_D, 300, EASE_IN_OUT);
+    animate(launch, PROP_SIZE_H, ICON_D, 300, EASE_IN_OUT);
+    animate(launch, PROP_BORDER_RADIUS, ICON_D / 2, 300, EASE_IN_OUT);
+    animate(launch, PROP_ALPHA, 0, 300, EASE_IN, @on_shrunk);
+}
+
+fn on_shrunk(w, prop) {
+    target(launch);
+    set(visible, OFF);
+    dirty();
+}
+
+// ============================================================
+// Shade controls
+// ============================================================
+
+fn toggle(v, bit) {
+    if (v & bit) {
+        return v - bit;
+    }
+    return v | bit;
+}
+
+fn on_bright(w, val) {
+    if (val < 5) {
+        val = 5;
+    }
+    setBrightness(val);
+    show_levels();
+}
+
+fn on_volume(w, val) {
+    ui_volume = val;
+    setVolume(val);
+    show_levels();
+}
+
+fn on_tile(w) {
+    if (w == tile_perf) {
+        ui_flags = toggle(ui_flags, 1);
+    }
+    if (w == tile_wall) {
+        ui_flags = toggle(ui_flags, 2);
+        target(0);
+        set(bg_color, (ui_flags & 2) ? WALL2_TOP : WALL_TOP);
+        set(gradient_color, (ui_flags & 2) ? WALL2_BOT : WALL_BOT);
+        dirty();
+    }
+    if (w == tile_chime) {
+        playSound("chime");
+    }
+    if (w == tile_restart) {
+        if (restart_armed) {
+            syscall(0x01);   // SYS_REBOOT
+        }
+        restart_armed = 1;
+        restart_at = millis();
+    }
+    show_tiles();
+}
+
+fn on_notif(w) {
+    if (notif_gone) {
+        return 0;
+    }
+    notif_gone = 1;
+    animate(notif, PROP_LOC_X, SCREEN_W, 300, EASE_IN);
+}
+
+// ============================================================
+
+fn setup() {
+    ui_read_arg();
+    build_wallpaper();
+    ui_status_bar();
+    perf_lbl = alloc();
+    style_label(440, 0, 400, STATUS_H, F16, ACCENT, ALIGN_CENTER, "");
+    set(visible, OFF);
+    parent(0);
+
+    pager = alloc();
+    style_group(-SCREEN_W * ui_page, STATUS_H, SCREEN_W * 2, 560);
+    parent(0);
+    var pg0 = alloc();
+    style_group(0, 0, SCREEN_W, 560);
+    parent(pager);
+    build_page0(pg0);
+    var pg1 = alloc();
+    style_group(SCREEN_W, 0, SCREEN_W, 560);
+    parent(pager);
+    build_page1(pg1);
+
+    page_dot0 = alloc();
+    style_box(624, 618, 12, 12, WHITE, 6);
+    parent(0);
+    page_dot1 = alloc();
+    style_box(644, 618, 12, 12, FAINT, 6);
+    parent(0);
+
+    build_dock();
+    build_drawer();
+    build_shade();
+    build_launch();
+
+    show_page();
+    show_clock();
+    last_sec = millis();
+    last_passes = sysPasses();
+    last_frames = sysFrames();
+    if (ui_closing != 0) {
+        shrink(ui_closing);
+    }
+    return 0;
+}
+
+fn loop() {
+    if (ui_tick()) {
+        show_clock();
+    }
+    var t = millis();
+    var dt = t - last_sec;
+    if (dt >= 1000) {
+        last_sec = t;
+        sample_perf(dt);
+    }
+    if (restart_armed && t - restart_at > 3000) {
+        restart_armed = 0;
+        show_tiles();
+    }
+    delay(50);
+}

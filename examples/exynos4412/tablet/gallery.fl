@@ -1,0 +1,160 @@
+// gallery.fl — a 3 x 2 thumbnail grid and a full-size viewer. In the
+// viewer: arrows or a swipe go to the next / previous picture (it slides
+// in), the back button returns to the grid.
+#include "ui.fl"
+
+const NPIC = 6;
+const TH_W = 288;
+const TH_H = 168;
+const PIC_X = 160;
+const PIC_Y = 140;
+const PIC_W = 960;
+const PIC_H = 560;
+const GRID_Y = 70;     // in the grid container (below the app bar)
+
+var grid;
+var th0; var th1; var th2; var th3; var th4; var th5;
+var viewer; var pic; var cap; var count_lbl; var prev_btn; var next_btn;
+var cur = -1;      // picture in the viewer, -1 = grid
+
+fn pic_name(i) -> string {
+    if (i == 0) { return str("Dusk over the hills"); }
+    if (i == 1) { return str("Sunset at sea"); }
+    if (i == 2) { return str("Aurora"); }
+    if (i == 3) { return str("Dunes"); }
+    if (i == 4) { return str("Forest"); }
+    return str("City at night");
+}
+
+fn make_thumb(t: widget, i) {
+    target(t);
+    style_button(168 + (i % 3) * (TH_W + 40), GRID_Y + (i / 3) * (TH_H + 120), TH_W, TH_H, SURFACE, 0);
+    set(press_color, SURFACE_HI);
+    parent(grid);
+    add_icon(t, TH_W, TH_H, IMG_THUMB0 + i);
+    var c = alloc();
+    style_label(168 + (i % 3) * (TH_W + 40), GRID_Y + (i / 3) * (TH_H + 120) + TH_H + 10, TH_W, 30, F20, DIM, ALIGN_LEFT, pic_name(i));
+    parent(grid);
+}
+
+fn thumb_index(w) {
+    if (w == th0) { return 0; }
+    if (w == th1) { return 1; }
+    if (w == th2) { return 2; }
+    if (w == th3) { return 3; }
+    if (w == th4) { return 4; }
+    if (w == th5) { return 5; }
+    return -1;
+}
+
+fn show_pic(i, from_dir) {
+    cur = i;
+    target(pic);
+    set(image_id, IMG_PIC0 + i);
+    set(location, PIC_X + from_dir * 320, PIC_Y - APPBAR_H);
+    dirty();
+    if (from_dir != 0) {
+        animate(pic, PROP_LOC_X, PIC_X, 260, EASE_OUT);
+    }
+    target(cap); set(text, pic_name(i)); dirty();
+    target(count_lbl); set(text, sprintf("%d / %d", i + 1, NPIC)); dirty();
+    strClear();
+}
+
+fn open_viewer(i) {
+    target(grid); set(visible, OFF); dirty();
+    target(viewer); set(visible, ON); dirty();
+    show_pic(i, 0);
+}
+
+fn close_viewer() {
+    cur = -1;
+    stopAnim(pic);
+    target(viewer); set(visible, OFF); dirty();
+    target(grid); set(visible, ON); dirty();
+}
+
+fn step(d) {
+    if (cur < 0) {
+        return 0;
+    }
+    show_pic((cur + d + NPIC) % NPIC, d);
+}
+
+fn on_thumb(w) {
+    playSound("click");
+    var i = thumb_index(w);
+    if (i >= 0) {
+        open_viewer(i);
+    }
+}
+
+fn on_prev(w) { step(-1); }
+fn on_next(w) { step(1); }
+
+fn on_back(w) {
+    playSound("click");
+    if (cur >= 0) {
+        close_viewer();
+    } else {
+        ui_go_home(w);
+    }
+}
+
+fn on_swipe(dir, w, delta) {
+    if (dir == SWIPE_LEFT) { step(1); }
+    if (dir == SWIPE_RIGHT) { step(-1); }
+}
+
+fn setup() {
+    ui_app(APP_GALLERY, "Gallery");
+    ui_back_custom = 1;
+    target(ui_back_btn);
+    set(on_click, @on_back);
+
+    grid = alloc();
+    target(grid);
+    set(kind, KIND_LABEL);
+    set(location, 0, APPBAR_H);
+    set(size, SCREEN_W, NAV_Y - APPBAR_H);
+    parent(0);
+    th0 = alloc(); make_thumb(th0, 0); target(th0); set(on_click, @on_thumb);
+    th1 = alloc(); make_thumb(th1, 1); target(th1); set(on_click, @on_thumb);
+    th2 = alloc(); make_thumb(th2, 2); target(th2); set(on_click, @on_thumb);
+    th3 = alloc(); make_thumb(th3, 3); target(th3); set(on_click, @on_thumb);
+    th4 = alloc(); make_thumb(th4, 4); target(th4); set(on_click, @on_thumb);
+    th5 = alloc(); make_thumb(th5, 5); target(th5); set(on_click, @on_thumb);
+
+    viewer = alloc();
+    target(viewer);
+    set(kind, KIND_LABEL);
+    set(location, 0, APPBAR_H);
+    set(size, SCREEN_W, NAV_Y - APPBAR_H);
+    set(visible, OFF);
+    parent(0);
+    pic = alloc();
+    style_image(PIC_X, PIC_Y - APPBAR_H, PIC_W, PIC_H, IMG_PIC0);
+    parent(viewer);
+    cap = alloc();
+    style_label(PIC_X, PIC_Y - APPBAR_H + PIC_H + 8, 700, 40, F26, WHITE, ALIGN_LEFT, "");
+    parent(viewer);
+    count_lbl = alloc();
+    style_label(PIC_X + PIC_W - 200, PIC_Y - APPBAR_H + PIC_H + 8, 200, 40, F20, DIM, ALIGN_RIGHT, "");
+    parent(viewer);
+    prev_btn = alloc();
+    style_button(40, PIC_Y - APPBAR_H + PIC_H / 2 - 40, 80, 80, SURFACE_HI, 40);
+    set(on_click, @on_prev);
+    parent(viewer);
+    add_icon(prev_btn, 80, 80, IMG_LEFT);
+    next_btn = alloc();
+    style_button(SCREEN_W - 120, PIC_Y - APPBAR_H + PIC_H / 2 - 40, 80, 80, SURFACE_HI, 40);
+    set(on_click, @on_next);
+    parent(viewer);
+    add_icon(next_btn, 80, 80, IMG_RIGHT);
+    return 0;
+}
+
+fn loop() {
+    ui_tick();
+    delay(100);
+}

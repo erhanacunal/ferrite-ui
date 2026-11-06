@@ -1,0 +1,391 @@
+// ui.fl — shared look of the tablet demo: palette, fonts, images, the
+// status bar, the app bar (back button + title) and the home gesture bar.
+//
+// Every program is started with an int argument (programArg) that carries
+// the state the whole tablet shares, since a program switch drops
+// everything else:
+//   bits 0-7   volume + 1 (0 = not set yet: boot)
+//   bits 8-11  home screen page
+//   bits 12-15 app that is closing (1-8), for the home screen's animation
+//   bit 16     performance overlay on the home screen
+//   bit 17     alternate wallpaper
+
+#include "core.fl"
+#include "anim.fl"
+#include "touch.fl"
+#include "sysinfo.fl"
+
+const SCREEN_W = 1280;
+const SCREEN_H = 800;
+const STATUS_H = 40;
+const APPBAR_H = 112;   // status bar + title row
+const NAV_Y    = 764;   // home gesture bar
+
+// Fonts (assets/fNN.font, Ubuntu Regular, 2 bpp)
+const F16  = 1;
+const F20  = 2;
+const F26  = 3;
+const F36  = 4;
+const F60  = 5;
+const F120 = 6;   // digits, ':' and '.' only
+
+// Palette (RGB565)
+const WHITE      = 0xFFFF;
+const BLACK      = 0x0000;
+const WALL_TOP   = 0x08A6;  // 14,22,52
+const WALL_BOT   = 0x38CA;  // 58,26,80
+const WALL2_TOP  = 0x0965;  // 8,44,40
+const WALL2_BOT  = 0x1209;  // 16,64,72
+const APP_BG     = 0x1083;  // 16,18,24
+const SURFACE    = 0x1905;  // 30,33,42
+const SURFACE_HI = 0x2987;  // 46,50,62
+const DIM        = 0xA536;  // 160,166,182
+const FAINT      = 0x632E;  // 96,102,118
+const ACCENT     = 0x8DBF;  // 138,180,248
+const GREEN      = 0x362B;
+const RED        = 0xFA27;
+const ORANGE     = 0xFCE1;
+const YELLOW     = 0xFEA1;
+const BLUE       = 0x0C3F;
+const PURPLE     = 0xBADE;
+const TEAL       = 0x669F;
+const PINK       = 0xF9AB;
+const BLOB1      = 0x4A3C;  // 79,70,229
+const BLOB2      = 0xEA53;  // 236,72,153
+const BLOB3      = 0x15D4;  // 20,184,166
+
+// Apps: index (1-8), program name, colour, glyph
+const APP_CLOCK    = 1;
+const APP_CALC     = 2;
+const APP_PAINT    = 3;
+const APP_MONITOR  = 4;
+const APP_GALLERY  = 5;
+const APP_MUSIC    = 6;
+const APP_NOTES    = 7;
+const APP_SETTINGS = 8;
+
+const C_CLOCK    = 0x1B9D;
+const C_CALC     = 0xEB81;
+const C_PAINT    = 0xE132;
+const C_MONITOR  = 0x1C07;
+const C_GALLERY  = 0xD984;
+const C_MUSIC    = 0xA21E;
+const C_NOTES    = 0xFD40;
+const C_SETTINGS = 0x5B0D;
+
+// Images (project.json image_id)
+const IMG_APP_CLOCK    = 1;
+const IMG_APP_CALC     = 2;
+const IMG_APP_PAINT    = 3;
+const IMG_APP_MONITOR  = 4;
+const IMG_APP_GALLERY  = 5;
+const IMG_APP_MUSIC    = 6;
+const IMG_APP_NOTES    = 7;
+const IMG_APP_SETTINGS = 8;
+const IMG_ST_VOLUME    = 9;
+const IMG_ST_MUTE      = 10;
+const IMG_ST_BRIGHT    = 11;
+const IMG_QS_BRIGHT    = 12;
+const IMG_QS_VOLUME    = 13;
+const IMG_QS_DARK      = 14;
+const IMG_QS_RESTART   = 15;
+const IMG_QS_PERF      = 16;
+const IMG_BACK         = 17;
+const IMG_ADD          = 18;
+const IMG_DELETE       = 19;
+const IMG_ERASER       = 20;
+const IMG_UNDO         = 21;
+const IMG_FLAG         = 22;
+const IMG_RESET        = 23;
+const IMG_CHECK        = 24;
+const IMG_PLAY         = 25;
+const IMG_PAUSE        = 26;
+const IMG_PREV         = 27;
+const IMG_NEXT         = 28;
+const IMG_LEFT         = 29;
+const IMG_RIGHT        = 30;
+const IMG_PIC0         = 31;   // 6 pictures, 960x560
+const IMG_THUMB0       = 37;   // 6 thumbnails, 288x168
+
+// --- Shared state (programArg) ---
+var ui_volume = 70;
+var ui_page = 0;
+var ui_flags = 0;        // bit 0 perf overlay, bit 1 alternate wallpaper
+var ui_closing = 0;      // app closing (home screen only)
+var ui_app_id = 0;       // this program's app index (0 = home)
+
+fn ui_read_arg() {
+    var a = programArg();
+    if ((a & 0xFF) != 0) {
+        ui_volume = (a & 0xFF) - 1;
+    }
+    ui_page = (a >> 8) & 0xF;
+    ui_closing = (a >> 12) & 0xF;
+    ui_flags = (a >> 16) & 0x3;
+    setVolume(ui_volume);
+}
+
+// The argument for the next program; `closing` = the app that is closing.
+fn ui_arg(closing) {
+    return (ui_volume + 1) | (ui_page << 8) | (closing << 12) | (ui_flags << 16);
+}
+
+fn app_program(i) -> string {
+    if (i == APP_CLOCK) { return str("clock"); }
+    if (i == APP_CALC) { return str("calc"); }
+    if (i == APP_PAINT) { return str("paint"); }
+    if (i == APP_MONITOR) { return str("monitor"); }
+    if (i == APP_GALLERY) { return str("gallery"); }
+    if (i == APP_MUSIC) { return str("music"); }
+    if (i == APP_NOTES) { return str("notes"); }
+    return str("settings");
+}
+
+fn app_title(i) -> string {
+    if (i == APP_CLOCK) { return str("Clock"); }
+    if (i == APP_CALC) { return str("Calculator"); }
+    if (i == APP_PAINT) { return str("Paint"); }
+    if (i == APP_MONITOR) { return str("Monitor"); }
+    if (i == APP_GALLERY) { return str("Gallery"); }
+    if (i == APP_MUSIC) { return str("Music"); }
+    if (i == APP_NOTES) { return str("Notes"); }
+    return str("Settings");
+}
+
+fn app_color(i) {
+    if (i == APP_CLOCK) { return C_CLOCK; }
+    if (i == APP_CALC) { return C_CALC; }
+    if (i == APP_PAINT) { return C_PAINT; }
+    if (i == APP_MONITOR) { return C_MONITOR; }
+    if (i == APP_GALLERY) { return C_GALLERY; }
+    if (i == APP_MUSIC) { return C_MUSIC; }
+    if (i == APP_NOTES) { return C_NOTES; }
+    return C_SETTINGS;
+}
+
+fn app_glyph(i) {
+    return IMG_APP_CLOCK + i - 1;
+}
+
+// A colour 3/8 of the way to white: pressed state of a coloured button.
+fn lighten(c) {
+    var r = (c >> 11) & 31;
+    var g = (c >> 5) & 63;
+    var b = c & 31;
+    r = r + (31 - r) * 3 / 8;
+    g = g + (63 - g) * 3 / 8;
+    b = b + (31 - b) * 3 / 8;
+    return (r << 11) | (g << 5) | b;
+}
+
+// A colour at 5/8 brightness.
+fn darken(c) {
+    var r = ((c >> 11) & 31) * 5 / 8;
+    var g = ((c >> 5) & 63) * 5 / 8;
+    var b = (c & 31) * 5 / 8;
+    return (r << 11) | (g << 5) | b;
+}
+
+// --- Widget styling: these style the current target (alloc() leaves the
+// new widget targeted); the caller does parent(). ---
+
+fn style_label(x, y, w, h, font, color, align, text) {
+    set(kind, KIND_LABEL);
+    set(location, x, y);
+    set(size, w, h);
+    set(font_id, font);
+    set(text_color, color);
+    set(text_align, align);
+    set(text, text);
+}
+
+fn style_box(x, y, w, h, color, radius) {
+    set(location, x, y);
+    set(size, w, h);
+    set(bg_color, color);
+    set(border_radius, radius);
+}
+
+fn style_image(x, y, w, h, img) {
+    set(kind, KIND_IMAGE);
+    set(location, x, y);
+    set(size, w, h);
+    set(image_id, img);
+}
+
+// Round clickable button; put an icon or a label in it.
+fn style_button(x, y, w, h, color, radius) {
+    style_box(x, y, w, h, color, radius);
+    set(press_color, lighten(color));
+    set(clickable, ON);
+}
+
+// Text button.
+fn style_text_button(x, y, w, h, color, font, text) {
+    style_button(x, y, w, h, color, h / 2);
+    set(kind, KIND_LABEL);
+    set(font_id, font);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(text, text);
+}
+
+// Slider (value 0..100), filled with `color`.
+fn style_slider(x, y, w, color) {
+    set(kind, KIND_SLIDER);
+    set(location, x, y);
+    set(size, w, 32);
+    set(bg_color, SURFACE_HI);
+    set(press_color, color);
+    set(border_color, WHITE);
+    set(border_radius, 16);
+    set(clickable, ON);
+}
+
+// An image centred in widget `p` (w x h). Targets the new image.
+fn add_icon(p: widget, w, h, img) {
+    var i = alloc();
+    style_image(0, 0, w, h, img);
+    parent(p);
+}
+
+// --- Status bar ---
+var ui_time_lbl;
+var ui_vol_icon;
+var ui_vol_lbl;
+var ui_bright_lbl;
+var ui_last_min = -1;
+
+fn ui_status_bar() {
+    ui_time_lbl = alloc();
+    style_label(28, 0, 240, STATUS_H, F20, WHITE, ALIGN_LEFT, "");
+    parent(0);
+
+    var bi = alloc();
+    style_image(1098, 0, 24, STATUS_H, IMG_ST_BRIGHT);
+    parent(0);
+    ui_bright_lbl = alloc();
+    style_label(1126, 0, 56, STATUS_H, F16, WHITE, ALIGN_LEFT, "");
+    parent(0);
+    ui_vol_icon = alloc();
+    style_image(1186, 0, 24, STATUS_H, IMG_ST_VOLUME);
+    parent(0);
+    ui_vol_lbl = alloc();
+    style_label(1214, 0, 56, STATUS_H, F16, WHITE, ALIGN_LEFT, "");
+    parent(0);
+    ui_status_levels();
+    ui_tick();
+}
+
+fn day_name(d) -> string {
+    if (d == 0) { return str("Sunday"); }
+    if (d == 1) { return str("Monday"); }
+    if (d == 2) { return str("Tuesday"); }
+    if (d == 3) { return str("Wednesday"); }
+    if (d == 4) { return str("Thursday"); }
+    if (d == 5) { return str("Friday"); }
+    return str("Saturday");
+}
+
+fn month_name(m) -> string {
+    if (m == 1) { return str("January"); }
+    if (m == 2) { return str("February"); }
+    if (m == 3) { return str("March"); }
+    if (m == 4) { return str("April"); }
+    if (m == 5) { return str("May"); }
+    if (m == 6) { return str("June"); }
+    if (m == 7) { return str("July"); }
+    if (m == 8) { return str("August"); }
+    if (m == 9) { return str("September"); }
+    if (m == 10) { return str("October"); }
+    if (m == 11) { return str("November"); }
+    return str("December");
+}
+
+// Volume and brightness figures in the status bar.
+fn ui_status_levels() {
+    target(ui_vol_icon);
+    set(image_id, ui_volume == 0 ? IMG_ST_MUTE : IMG_ST_VOLUME);
+    dirty();
+    target(ui_vol_lbl);
+    set(text, sprintf("%d%%", ui_volume));
+    dirty();
+    target(ui_bright_lbl);
+    set(text, sprintf("%d%%", brightness()));
+    dirty();
+}
+
+// Once per loop(): the clock, once a minute. Returns 1 when the minute
+// changed (callers update their own clocks then).
+fn ui_tick() {
+    var now = rtcRead();
+    var m = now[1];
+    var h = now[2];
+    arrFree(now);
+    if (m == ui_last_min) {
+        return 0;
+    }
+    ui_last_min = m;
+    target(ui_time_lbl);
+    set(text, sprintf("%d:%02d", h, m));
+    dirty();
+    strClear();
+    return 1;
+}
+
+// --- App frame: coloured app bar (status bar + back + title), dark body,
+// home gesture bar. ---
+var ui_back_btn;
+var ui_home_bar;
+// An app that handles the back button itself (sets this and wires its own
+// on_click to ui_back_btn): the generated dispatcher calls every handler
+// registered for a widget, so ui_back must then stay out of the way.
+var ui_back_custom = 0;
+
+fn ui_app(app, title) {
+    ui_app_id = app;
+    ui_read_arg();
+    var color = app_color(app);
+    target(0);
+    set(bg_color, APP_BG);
+
+    var bar = alloc();
+    style_box(0, 0, SCREEN_W, APPBAR_H, color, 0);
+    parent(0);
+    // Before the status bar: its clock update runs strClear(), which would
+    // free `title` while no widget shows it yet.
+    var t = alloc();
+    style_label(96, STATUS_H, 800, 72, F36, WHITE, ALIGN_LEFT, title);
+    parent(0);
+    ui_status_bar();
+
+    ui_back_btn = alloc();
+    style_button(16, STATUS_H + 4, 64, 64, color, 32);
+    set(on_click, @ui_back);
+    parent(0);
+    add_icon(ui_back_btn, 64, 64, IMG_BACK);
+
+    // Gesture bar: a tap anywhere along the bottom edge goes home.
+    ui_home_bar = alloc();
+    target(ui_home_bar);
+    set(kind, KIND_LABEL);   // transparent
+    set(location, 440, NAV_Y);
+    set(size, 400, SCREEN_H - NAV_Y);
+    set(clickable, ON);
+    set(on_click, @ui_go_home);
+    parent(0);
+    var pill = alloc();
+    style_box(140, 16, 120, 6, DIM, 3);
+    parent(ui_home_bar);
+}
+
+fn ui_back(wid) {
+    if (!ui_back_custom) {
+        ui_go_home(wid);
+    }
+}
+
+fn ui_go_home(wid) {
+    playSound("click");
+    runProgram("main", ui_arg(ui_app_id));
+}

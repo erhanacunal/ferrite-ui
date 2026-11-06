@@ -1868,7 +1868,7 @@ impl FullInput {
 
             if ctx.objs.get(hit).kind == widget::KIND_INPUT {
                 self.focus_input(ctx, hit);
-                self.position_cursor(ctx, hit, x);
+                self.position_cursor(ctx, hit, x, y);
             }
 
             if ctx.objs.get(hit).kind == widget::KIND_SLIDER {
@@ -2025,7 +2025,7 @@ impl FullInput {
 
         // Input: reposition cursor on tap.
         if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_INPUT {
-            self.position_cursor(ctx, clicked_id, x);
+            self.position_cursor(ctx, clicked_id, x, y);
             ctx.objs.mark_dirty(clicked_id);
         }
 
@@ -2106,7 +2106,17 @@ impl FullInput {
         }
     }
 
-    fn position_cursor<P: PlatformRuntime>(&self, ctx: &mut Ctx<P>, id: WidgetId, touch_x: u16) {
+    fn position_cursor<P: PlatformRuntime>(
+        &self,
+        ctx: &mut Ctx<P>,
+        id: WidgetId,
+        touch_x: u16,
+        touch_y: u16,
+    ) {
+        if ctx.objs.get(id).flags & widget::FLAG_MULTI_LINE != 0 {
+            self.position_cursor_lines(ctx, id, touch_x, touch_y);
+            return;
+        }
         let ext = &ctx.objs.ext(id);
         let text_id = ext.text_id;
         let font_id = ext.font_id;
@@ -2149,6 +2159,78 @@ impl FullInput {
         ctx.objs.update_ext(id, |ext| {
             ext.value = cursor_pos as WValue;
         });
+    }
+
+    /// `position_cursor` for a multi-line input: the wrapped line under
+    /// `touch_y` (as drawn, scrolled to the current cursor), then the
+    /// character under `touch_x` in it.
+    fn position_cursor_lines<P: PlatformRuntime>(
+        &self,
+        ctx: &mut Ctx<P>,
+        id: WidgetId,
+        touch_x: u16,
+        touch_y: u16,
+    ) {
+        let ext = ctx.objs.ext(id);
+        let font = match ctx.fonts.resolve(ext.font_id) {
+            Some(f) => f,
+            None => return,
+        };
+        let abs = ctx.objs.absolute_rect(id);
+        let (b, p) = (ext.border, ext.padding);
+        let cx = abs.x + b.left as i16 + p.left as i16;
+        let cy = abs.y + b.top as i16 + p.top as i16;
+        let cw = abs
+            .w
+            .saturating_sub(b.left as u16 + b.right as u16 + p.left as u16 + p.right as u16);
+        let ch = abs
+            .h
+            .saturating_sub(b.top as u16 + b.bottom as u16 + p.top as u16 + p.bottom as u16);
+        let pos = {
+            let text: &[u8] = if ext.text_id != crate::pool::PTR_NONE {
+                ctx.objs.str_get(ext.text_id)
+            } else {
+                &[]
+            };
+            let cur = (ext.value.max(0) as usize).min(text.len());
+            let first = render::input_first_line(font, text, cw, ch, cur);
+            let lh = (font.line_height() as i16).max(1);
+            let want = first + ((touch_y as i16 - cy).max(0) / lh) as usize;
+            let (mut ls, mut le) = (0, 0);
+            let (mut li, mut i) = (0usize, 0usize);
+            while i <= text.len() {
+                let (end, next) = font.wrap_line(text, i, cw);
+                ls = i;
+                le = end;
+                if li == want {
+                    break;
+                }
+                li += 1;
+                i = next;
+            }
+            let tx = touch_x as i16;
+            let mut acc = cx;
+            let mut pos = ls;
+            let mut bp = ls;
+            while bp < le {
+                let at = bp;
+                match font::utf8_next(text, &mut bp) {
+                    Some(0xFFFF) => continue,
+                    Some(cp) => {
+                        let w = font.char_width_cp(cp) as i16;
+                        if tx < acc + w / 2 {
+                            pos = at;
+                            break;
+                        }
+                        acc += w;
+                        pos = bp;
+                    }
+                    None => break,
+                }
+            }
+            pos
+        };
+        ctx.objs.update_ext(id, |e| e.value = pos as WValue);
     }
 
     fn handle_key_action<P: PlatformRuntime>(
@@ -2212,6 +2294,12 @@ impl FullInput {
                 ctx.cursor_visible = true;
             }
             keyboard::KeyAction::Enter => {
+                // A multi-line input takes the newline; tapping outside
+                // it closes the keyboard.
+                if ctx.objs.get(id).flags & widget::FLAG_MULTI_LINE != 0 {
+                    self.handle_key_action(ctx, tasks, keyboard::KeyAction::Char(b'\n'));
+                    return;
+                }
                 self.fire_on_change(ctx, tasks, id);
                 self.dismiss_keyboard(ctx);
             }

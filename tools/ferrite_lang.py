@@ -1382,7 +1382,7 @@ class CodeGen:
             else:
                 vtype = self.T_INT
             # widget is stored as int on the stack; string/array keep their type
-            stored_type = declared if declared != 'widget' else self.T_INT
+            stored_type = self._stored_type(declared, vtype)
             if stmt.array_size is not None:
                 stored_type = self.T_ARRAY
             self.var_types[stmt.name] = stored_type
@@ -1847,6 +1847,17 @@ class CodeGen:
             return True
         return False
 
+    def _stored_type(self, declared, init_type):
+        """Compile-time type of a variable declared `declared` (`any` when
+        unannotated) with an initializer of type `init_type`. An unannotated
+        variable set from a float is float: otherwise `x + y` on two such
+        variables would compile to the int ops."""
+        if declared == 'widget':
+            return self.T_INT
+        if declared == self.T_ANY and init_type == self.T_FLOAT:
+            return self.T_FLOAT
+        return declared
+
     def _check_type_match(self, expected: str, actual: str, msg: str, line: int):
         """Raise CompileError if types are incompatible, with a descriptive message."""
         if not self._types_compatible(expected, actual):
@@ -2097,7 +2108,7 @@ class CodeGen:
                     f"'{node.name}' declared {declared} but initialized with {vtype}",
                     node.line)
                 # widget is stored as int on the stack; string/array keep their type
-                self.var_types[node.name] = declared if declared != 'widget' else self.T_INT
+                self.var_types[node.name] = self._stored_type(declared, vtype)
                 if declared == 'widget':
                     self.widget_ids.setdefault(node.name, -1)  # e.g. = get(first_child)
                 if isinstance(node.init, CallExpr) and node.init.name == 'alloc':

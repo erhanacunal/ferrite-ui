@@ -315,6 +315,41 @@ impl Font {
         w
     }
 
+    /// Word wrap: the line of `text` that starts at byte `start` and fits in
+    /// `max_w` pixels. Returns `(end, next)`: the line is `text[start..end]`
+    /// and the following one starts at `next`. A line ends at a `'\n'`
+    /// (skipped), after the last space that fits (skipped), or inside a word
+    /// too long for a line (at least one character per line). At the end of
+    /// the text `next` is `text.len() + 1`; after a final `'\n'` there is one
+    /// more, empty, line.
+    pub fn wrap_line(&self, text: &[u8], start: usize, max_w: u16) -> (usize, usize) {
+        let mut pos = start;
+        let mut w: u16 = 0;
+        let mut space: Option<usize> = None;
+        while pos < text.len() {
+            if text[pos] == b'\n' {
+                return (pos, pos + 1);
+            }
+            let at = pos;
+            let cp = match utf8_next(text, &mut pos) {
+                Some(cp) => cp,
+                None => break,
+            };
+            let cw = if cp == 0xFFFF { 0 } else { self.char_width_cp(cp) as u16 };
+            if cp == b' ' as u16 {
+                // A space may hang past the edge: the line breaks there.
+                space = Some(at);
+            } else if w.saturating_add(cw) > max_w && at > start {
+                return match space {
+                    Some(s) => (s, s + 1),
+                    None => (at, at),
+                };
+            }
+            w = w.saturating_add(cw);
+        }
+        (text.len(), text.len() + 1)
+    }
+
     /// Draw a single Unicode character.
     pub fn draw_char<L: LcdBackend, F: FlashBackend>(
         &self,
@@ -810,5 +845,49 @@ impl FontList {
     /// Resolve a font_id: try exact match, fall back to embedded (id=0).
     pub fn resolve(&self, font_id: u8) -> Option<&Font> {
         self.find(font_id).or_else(|| self.find(EMBEDDED_FONT_ID))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rom() -> Font {
+        Font::from_embedded(
+            &crate::embedded_font::GLYPHS,
+            &crate::embedded_font::CODEPOINTS,
+            &crate::embedded_font::BITMAP,
+            crate::embedded_font::Y_ADVANCE,
+            crate::embedded_font::BPP,
+        )
+    }
+
+    /// All lines of `text` wrapped to the width of `fit` in the ROM font.
+    fn lines(text: &str, fit: &str) -> alloc::vec::Vec<alloc::string::String> {
+        let f = rom();
+        let w = f.text_width(fit.as_bytes());
+        let b = text.as_bytes();
+        let mut out = alloc::vec::Vec::new();
+        let mut i = 0;
+        while i <= b.len() {
+            let (end, next) = f.wrap_line(b, i, w);
+            out.push(alloc::string::String::from_utf8(b[i..end].to_vec()).unwrap());
+            assert!(next > i, "no progress at {i}");
+            i = next;
+        }
+        out
+    }
+
+    #[test]
+    fn wrap_line_breaks_at_spaces_newlines_and_long_words() {
+        assert_eq!(lines("one two three", "one two"), ["one two", "three"]);
+        // The space that would overflow ends the line and is dropped.
+        assert_eq!(lines("abc abc", "abc"), ["abc", "abc"]);
+        assert_eq!(lines("ab\ncd", "abcdefgh"), ["ab", "cd"]);
+        // A final newline leaves an empty last line (for the cursor).
+        assert_eq!(lines("ab\n", "abcdefgh"), ["ab", ""]);
+        // A word longer than a line is cut.
+        assert_eq!(lines("aaaaaaa", "aaa"), ["aaa", "aaa", "a"]);
+        assert_eq!(lines("", "aaa"), [""]);
     }
 }
