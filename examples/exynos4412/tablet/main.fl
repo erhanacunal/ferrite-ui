@@ -248,7 +248,7 @@ fn make_tile(b: widget, x, img, text) {
 fn build_shade() {
     scrim = alloc();
     style_box(0, 0, SCREEN_W, SCREEN_H, BLACK, 0);
-    set(alpha, 0);
+    set(alpha, 140);
     set(visible, OFF);
     set(clickable, ON);
     set(on_click, @on_scrim);
@@ -426,21 +426,26 @@ fn open_drawer(open) {
     animate(drawer, PROP_LOC_Y, open ? STATUS_H : SCREEN_H, 320, EASE_OUT);
 }
 
+// The scrim dims the home screen behind the shade. It switches at once
+// (on as the shade starts to open, off once it has closed) rather than
+// fading: a translucent full-screen widget changing in place recomposites
+// everything under it, so a fade cost a whole-screen redraw every frame of
+// the slide.
 fn open_shade(open) {
     shade_open = open;
-    animate(shade, PROP_LOC_Y, open ? -32 : -SHADE_H - 32, 320, EASE_OUT);
-    target(scrim);
     if (open) {
+        animate(shade, PROP_LOC_Y, -32, 320, EASE_OUT);
+        target(scrim);
         set(visible, ON);
-        animate(scrim, PROP_ALPHA, 140, 320, EASE_OUT);
+        dirty();
     } else {
-        animate(scrim, PROP_ALPHA, 0, 320, EASE_OUT, @on_scrim_faded);
+        animate(shade, PROP_LOC_Y, -SHADE_H - 32, 320, EASE_OUT, @on_shade_closed);
     }
     restart_armed = 0;
     show_tiles();
 }
 
-fn on_scrim_faded(w, prop) {
+fn on_shade_closed(w, prop) {
     if (!shade_open) {
         target(scrim);
         set(visible, OFF);

@@ -162,7 +162,7 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
         // Translucent widgets and transparent labels must not blend over
         // their own previous output in this buffer — restore what is behind
         // them first, unless this pass already repainted all of it.
-        if ctx.lcd.has_alpha() && shows_behind(&ctx.objs, id) && !behind_is_fresh(&ctx.objs, 0, i, &abs, None)
+        if ctx.lcd.has_alpha() && shows_behind(&ctx.objs, id) && !behind_is_fresh(&ctx.objs, 0, i, &abs, false)
         {
             redraw_behind(ctx, i, abs);
         }
@@ -454,9 +454,9 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
             }
         }
 
-        // Where pass 1b put back what is behind this subtree (it moved), so
-        // its see-through widgets need not restore it again.
-        let fresh = restores.fresh_behind(di).and_then(|r| r.intersection(&screen_rect(&ctx.lcd)));
+        // Pass 1b put back what is behind this subtree (it moved): its
+        // see-through widgets inside the root's box need not restore it again.
+        let moved_fresh = restores.fresh_behind(di, abs);
 
         // Flat iteration over dirty widget + its descendants
         for si in di..sub_end {
@@ -516,7 +516,7 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
                 // everywhere this widget's clip reaches.
                 if ctx.lcd.has_alpha()
                     && shows_behind(&ctx.objs, sid)
-                    && !behind_is_fresh(&ctx.objs, di, si, &sabs.intersection(&screen_rect(&ctx.lcd)).unwrap_or(sabs), fresh)
+                    && !behind_is_fresh(&ctx.objs, di, si, &sabs, moved_fresh && contains(&abs, &sabs))
                 {
                     redraw_behind_region(ctx, si, &clip, &sabs);
                 }
@@ -579,19 +579,23 @@ impl Restores {
         }
     }
 
-    /// Where the pixels behind the dirty subtree root at `di` hold only what
-    /// is behind it: its own restore (it moved), unless a later restore for a
-    /// widget at or past `di` drew the subtree back into part of it (that one
-    /// redraws everything before its widget, so the subtree too). A sound
-    /// under-estimate: the first such overlap drops the whole rect.
-    fn fresh_behind(&self, di: usize) -> Option<Rect> {
+    /// Whether the screen holds nothing the dirty subtree rooted at `di`
+    /// (now at `current`) drew before, inside its root's box: true when its
+    /// own restore put back what was behind its old box (it moved) — outside
+    /// that box it never drew. Unless a later restore for a widget past `di`
+    /// touched the old or new box: that one redraws everything before its
+    /// widget, so the subtree too.
+    fn fresh_behind(&self, di: usize, current: Rect) -> bool {
         if self.full {
-            return None;
+            return false;
         }
-        let at = self.list[..self.n].iter().position(|&(i, _)| i == di)?;
-        let rect = self.list[at].1;
-        let spoiled = self.list[at + 1..self.n].iter().any(|&(i, r)| i > di && r.intersects(&rect));
-        (!spoiled).then_some(rect)
+        let Some(at) = self.list[..self.n].iter().position(|&(i, _)| i == di) else {
+            return false;
+        };
+        let old = self.list[at].1;
+        !self.list[at + 1..self.n]
+            .iter()
+            .any(|&(i, r)| i > di && (r.intersects(&old) || r.intersects(&current)))
     }
 }
 
@@ -626,9 +630,9 @@ fn clear_painted(tree: &mut ObjPool) {
 /// Walks back from `idx` (down to `lo`) over the visible widgets that touch
 /// `rect`: every one must be `FLAG_PAINTED`, until one is found that paints
 /// all of `rect` opaquely — nothing behind that one can show through — or,
-/// past the subtree root `lo`, the visible part of `rect` lies inside
-/// `fresh` (what is behind the subtree was restored there this pass).
-fn behind_is_fresh(tree: &ObjPool, lo: usize, idx: usize, rect: &Rect, fresh: Option<Rect>) -> bool {
+/// past the subtree root `lo`, `fresh`: nothing the subtree drew before is
+/// left behind `rect` (see `Restores::fresh_behind`).
+fn behind_is_fresh(tree: &ObjPool, lo: usize, idx: usize, rect: &Rect, fresh: bool) -> bool {
     for k in (lo..idx).rev() {
         if !tree.vis_at(k) {
             continue;
@@ -645,8 +649,7 @@ fn behind_is_fresh(tree: &ObjPool, lo: usize, idx: usize, rect: &Rect, fresh: Op
             return true;
         }
     }
-    // Both are clipped to the screen (see the caller).
-    fresh.is_some_and(|f| contains(&f, rect))
+    fresh
 }
 
 /// `inner` lies entirely within `outer`.
@@ -2553,26 +2556,27 @@ mod tests {
     #[test]
     fn restores_fresh_behind_only_until_the_subtree_is_redrawn() {
         let r = |x, w| Rect::new(x, 0, w, 10);
+        let now = r(20, 100);
         let mut s = Restores::new();
         s.push(3, r(0, 100));
-        // Not restored itself: nothing is known.
-        assert!(s.fresh_behind(2).is_none());
-        assert!(s.fresh_behind(3) == Some(r(0, 100)));
+        // Not restored itself (did not move): nothing is known.
+        assert!(!s.fresh_behind(2, now));
+        assert!(s.fresh_behind(3, now));
         // A restore behind a widget before 3 draws only what is behind 3.
         s.push(1, r(0, 50));
-        assert!(s.fresh_behind(3) == Some(r(0, 100)));
+        assert!(s.fresh_behind(3, now));
         // One for a widget past 3 elsewhere leaves it alone...
-        s.push(9, r(200, 10));
-        assert!(s.fresh_behind(3) == Some(r(0, 100)));
-        // ...but where it overlaps, it drew the subtree back in.
-        s.push(7, r(90, 20));
-        assert!(s.fresh_behind(3).is_none());
+        s.push(9, r(300, 10));
+        assert!(s.fresh_behind(3, now));
+        // ...but one over its new box drew the subtree back in.
+        s.push(7, r(110, 5));
+        assert!(!s.fresh_behind(3, now));
         // Overflow: no claims at all.
         let mut s = Restores::new();
         for i in 0..17 {
             s.push(i, r(0, 10));
         }
-        assert!(s.fresh_behind(0).is_none());
+        assert!(!s.fresh_behind(0, now));
     }
 
     #[test]
