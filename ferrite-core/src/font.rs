@@ -704,6 +704,13 @@ impl Font {
         // Row/column counters — no per-pixel divide (see draw_transparent).
         let mut col: i16 = 0;
         let mut py = draw_y;
+        // One glyph row's coverage, handed over as a span (`blend_span`:
+        // one call per row instead of one per pixel). Wider glyphs go in
+        // pieces of `SPAN`.
+        const SPAN: usize = 64;
+        let mut row = [0u8; SPAN];
+        let mut n = 0usize;
+        let mut span_x = draw_x;
 
         while bytes_read < total_bytes {
             let chunk = (total_bytes - bytes_read).min(BITMAP_BUF_SIZE as u32) as usize;
@@ -716,18 +723,20 @@ impl Font {
                     if pixel_idx >= total_pixels {
                         return;
                     }
-                    let alpha = ALPHA[((byte >> shift) & 0x03) as usize];
-                    if alpha != 0 {
-                        let px = draw_x + col;
-                        if px >= 0 && py >= 0 {
-                            lcd.blend_pixel(px as u16, py as u16, fg, alpha);
-                        }
-                    }
+                    row[n] = ALPHA[((byte >> shift) & 0x03) as usize];
+                    n += 1;
                     pixel_idx += 1;
                     col += 1;
-                    if col == width as i16 {
+                    let row_end = col == width as i16;
+                    if row_end || n == SPAN {
+                        blend_coverage(lcd, span_x, py, fg, &row[..n]);
+                        n = 0;
+                        span_x = draw_x + col;
+                    }
+                    if row_end {
                         col = 0;
                         py += 1;
+                        span_x = draw_x;
                     }
                 }
             }
@@ -735,6 +744,16 @@ impl Font {
             bytes_read += chunk as u32;
         }
     }
+}
+
+/// Blend a row of glyph coverage at (x, y), without its uncovered ends.
+#[inline]
+fn blend_coverage<L: LcdBackend>(lcd: &LcdImpl<L>, x: i16, y: i16, fg: u16, row: &[u8]) {
+    let Some(first) = row.iter().position(|&a| a != 0) else {
+        return;
+    };
+    let last = row.iter().rposition(|&a| a != 0).unwrap_or(first);
+    lcd.blend_span(x as i32 + first as i32, y as i32, fg, &row[first..=last]);
 }
 
 // ============================================================

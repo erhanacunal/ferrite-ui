@@ -91,6 +91,29 @@ pub trait LcdBackend {
             self.draw_pixel(x, y, color);
         }
     }
+
+    /// Blend one row of `color` from (x, y) rightwards, pixel `i` with
+    /// coverage `alphas[i]` (0 = left as is, 255 = written). The span lies
+    /// on the panel (`LcdImpl` clips it). Same as `blend_pixel` per pixel;
+    /// frame-buffer backends override it to fence/mark once and blend
+    /// straight into the row (anti-aliased text is drawn this way).
+    fn blend_span(&self, x: u16, y: u16, color: u16, alphas: &[u8]) {
+        for (i, &a) in alphas.iter().enumerate() {
+            if a != 0 {
+                self.blend_pixel(x + i as u16, y, color, a);
+            }
+        }
+    }
+
+    /// `blend_span` with a colour per pixel (`colors.len() == alphas.len()`):
+    /// alpha images.
+    fn blend_row(&self, x: u16, y: u16, colors: &[u16], alphas: &[u8]) {
+        for (i, (&c, &a)) in colors.iter().zip(alphas).enumerate() {
+            if a != 0 {
+                self.blend_pixel(x + i as u16, y, c, a);
+            }
+        }
+    }
 }
 
 /// Generic LCD wrapper — backend-agnostic drawing primitives.
@@ -450,6 +473,67 @@ impl<B: LcdBackend> LcdImpl<B> {
             return;
         }
         self.be.blend_pixel(x, y, color, alpha)
+    }
+
+    /// The part of the row `x .. x + n` at `y` inside the scissor and the
+    /// logical screen: (first index, its x, count).
+    #[inline]
+    fn span_clip(&self, x: i32, y: i32, n: usize) -> Option<(usize, u16, usize)> {
+        let (mut x0, mut x1) = (x, x + n as i32);
+        let (mut y0, mut y1) = (0, self.height() as i32);
+        x0 = x0.max(0);
+        x1 = x1.min(self.width() as i32);
+        if let Some(c) = self.scissor.get() {
+            x0 = x0.max(c.x as i32);
+            x1 = x1.min(c.x as i32 + c.w as i32);
+            y0 = c.y as i32;
+            y1 = y1.min(c.y as i32 + c.h as i32);
+        }
+        if x1 <= x0 || y < y0.max(0) || y >= y1 {
+            return None;
+        }
+        Some(((x0 - x) as usize, x0 as u16, (x1 - x0) as usize))
+    }
+
+    /// Blend a row of `color` with per-pixel coverage `alphas` starting at
+    /// (x, y), clipped to the scissor and screen (signed: a glyph may start
+    /// off the left or top edge). See `LcdBackend::blend_span`.
+    #[inline]
+    pub fn blend_span(&self, x: i32, y: i32, color: u16, alphas: &[u8]) {
+        let Some((i, x0, n)) = self.span_clip(x, y, alphas.len()) else {
+            return;
+        };
+        let alphas = &alphas[i..i + n];
+        if self.portrait.get() {
+            // Each pixel lands in a different panel row.
+            for (k, &a) in alphas.iter().enumerate() {
+                if a != 0 {
+                    self.be.blend_pixel(B::WIDTH - 1 - y as u16, x0 + k as u16, color, a);
+                }
+            }
+            return;
+        }
+        self.be.blend_span(x0, y as u16, color, alphas)
+    }
+
+    /// `blend_span` with a colour per pixel (alpha images). See
+    /// `LcdBackend::blend_row`.
+    #[inline]
+    pub fn blend_row(&self, x: i32, y: i32, colors: &[u16], alphas: &[u8]) {
+        let n = colors.len().min(alphas.len());
+        let Some((i, x0, n)) = self.span_clip(x, y, n) else {
+            return;
+        };
+        let (colors, alphas) = (&colors[i..i + n], &alphas[i..i + n]);
+        if self.portrait.get() {
+            for (k, (&c, &a)) in colors.iter().zip(alphas).enumerate() {
+                if a != 0 {
+                    self.be.blend_pixel(B::WIDTH - 1 - y as u16, x0 + k as u16, c, a);
+                }
+            }
+            return;
+        }
+        self.be.blend_row(x0, y as u16, colors, alphas)
     }
 
     #[inline(always)]
@@ -1624,6 +1708,47 @@ mod tests {
         }
         fn send_command(&self, _: u16) {}
         fn send_data(&self, _: u16) {}
+    }
+
+    /// `blend_span` / `blend_row` give the pixels that `blend_pixel` per
+    /// pixel gives (the old text and image path): clipped to the screen and
+    /// the scissor, from off-screen starts, in both orientations.
+    #[test]
+    fn blend_span_and_row_match_per_pixel_blends() {
+        let panel = || Panel { px: RefCell::new(vec![0; PW * PH]), win: Cell::new((0, 0, 0, 0)), pos: Cell::new(0) };
+        let alphas = [255u8, 0, 170, 85, 255, 255, 0, 200, 255, 130];
+        let colors: Vec<u16> = (1..=alphas.len() as u16).collect();
+        for portrait in [false, true] {
+            for scissor in [None, Some(Rect::new(1, 1, 3, 2))] {
+                for x in -4i32..10 {
+                    for y in -1i32..9 {
+                        let (span, row, each) = (
+                            LcdImpl::with_backend(panel()),
+                            LcdImpl::with_backend(panel()),
+                            LcdImpl::with_backend(panel()),
+                        );
+                        for l in [&span, &row, &each] {
+                            l.set_portrait(portrait);
+                            l.set_scissor(scissor);
+                        }
+                        span.blend_span(x, y, 7, &alphas);
+                        row.blend_row(x, y, &colors, &alphas);
+                        for (i, &a) in alphas.iter().enumerate() {
+                            let (px, py) = (x + i as i32, y);
+                            // Real backends drop off-panel pixels; this one doesn't.
+                            if px >= 0 && py >= 0 && px < each.width() as i32 && py < each.height() as i32 {
+                                each.blend_pixel(px as u16, py as u16, 7, a);
+                            }
+                        }
+                        let case = format!("portrait {portrait} scissor {} at ({x}, {y})", scissor.is_some());
+                        assert_eq!(*span.backend().px.borrow(), *each.backend().px.borrow(), "span, {case}");
+                        // Same coverage, a colour per pixel: same pixels set.
+                        let set = |l: &LcdImpl<Panel>| l.backend().px.borrow().iter().map(|&c| c != 0).collect::<Vec<_>>();
+                        assert_eq!(set(&row), set(&each), "row, {case}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

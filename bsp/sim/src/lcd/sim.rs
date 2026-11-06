@@ -239,6 +239,40 @@ impl LcdBackend for SimLcd {
             blend_argb(fb[i], src, alpha)
         };
     }
+
+    // One frame-buffer borrow per row, not per pixel.
+    fn blend_span(&self, x: u16, y: u16, color: u16, alphas: &[u8]) {
+        if x >= WIDTH || y >= HEIGHT {
+            return;
+        }
+        let src = rgb565_to_argb(color);
+        let mut fb = self.fb.draw();
+        let at = y as usize * WIDTH as usize + x as usize;
+        let n = alphas.len().min((WIDTH - x) as usize);
+        for (p, &a) in fb[at..at + n].iter_mut().zip(alphas) {
+            match a {
+                0 => {}
+                255 => *p = src,
+                _ => *p = blend_argb(*p, src, a),
+            }
+        }
+    }
+
+    fn blend_row(&self, x: u16, y: u16, colors: &[u16], alphas: &[u8]) {
+        if x >= WIDTH || y >= HEIGHT {
+            return;
+        }
+        let mut fb = self.fb.draw();
+        let at = y as usize * WIDTH as usize + x as usize;
+        let n = colors.len().min(alphas.len()).min((WIDTH - x) as usize);
+        for ((p, &c), &a) in fb[at..at + n].iter_mut().zip(colors).zip(alphas) {
+            match a {
+                0 => {}
+                255 => *p = rgb565_to_argb(c),
+                _ => *p = blend_argb(*p, rgb565_to_argb(c), a),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

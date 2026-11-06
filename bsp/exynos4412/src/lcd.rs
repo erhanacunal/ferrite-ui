@@ -803,6 +803,41 @@ impl LcdBackend for FimdLcd {
             mark(x, y, 1, 1);
         })
     }
+
+    // Text and alpha images: one fence, timer and mark per row instead of
+    // per pixel (each `blend_pixel` paid all three).
+    fn blend_span(&self, x: u16, y: u16, color: u16, alphas: &[u8]) {
+        let Some((x, y, w, _)) = clip(x, y, alphas.len() as u16, 1) else { return };
+        fence(y, y + 1);
+        timed!({
+            let src = rgb565_to_xrgb(color);
+            for (p, &a) in unsafe { row(back(), x, y, w) }.iter_mut().zip(alphas) {
+                match a {
+                    0 => {}
+                    255 => *p = src,
+                    _ => *p = fb::blend_argb8888(*p, src, fb::alpha8(a)),
+                }
+            }
+            mark(x, y, w, 1);
+        })
+    }
+
+    fn blend_row(&self, x: u16, y: u16, colors: &[u16], alphas: &[u8]) {
+        let n = colors.len().min(alphas.len());
+        let Some((x, y, w, _)) = clip(x, y, n as u16, 1) else { return };
+        fence(y, y + 1);
+        timed!({
+            let px = unsafe { row(back(), x, y, w) };
+            for ((p, &c), &a) in px.iter_mut().zip(colors).zip(alphas) {
+                match a {
+                    0 => {}
+                    255 => *p = rgb565_to_xrgb(c),
+                    _ => *p = fb::blend_argb8888(*p, rgb565_to_xrgb(c), fb::alpha8(a)),
+                }
+            }
+            mark(x, y, w, 1);
+        })
+    }
 }
 
 /// Powers the FIMD, starts it on scan buffer A and turns on LVDS + backlight.

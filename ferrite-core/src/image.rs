@@ -291,19 +291,22 @@ impl Image {
         }
 
         if self.has_alpha {
-            // Alpha images blend per positioned pixel — the streaming
-            // begin_pixels/write_pixel cursor cannot read back the target.
-            // `blend_pixel` applies the scissor; `limit` ends decode early.
+            // Alpha images blend at positioned pixels (`PixelCursor`) — the
+            // streaming begin_pixels/write_pixel cursor cannot read back the
+            // target. `blend_row` applies the scissor; `limit` ends decode
+            // early.
             let limit = win.y1 * self.width as u32;
             match self.mode {
                 MODE_RAW => self.draw_raw_alpha(lcd, flash, x, y, &win),
                 MODE_RLE => {
                     let mut cur = PixelCursor::new(x as i32, y as i32, self.width);
-                    self.draw_rle_alpha(lcd, flash, &mut cur, limit)
+                    self.draw_rle_alpha(lcd, flash, &mut cur, limit);
+                    cur.flush(lcd);
                 }
                 MODE_INDEXED_RLE => {
                     let mut cur = PixelCursor::new(x as i32, y as i32, self.width);
-                    self.draw_indexed_rle_alpha(lcd, flash, &mut cur, limit)
+                    self.draw_indexed_rle_alpha(lcd, flash, &mut cur, limit);
+                    cur.flush(lcd);
                 }
                 _ => {}
             }
@@ -829,16 +832,24 @@ impl Sink {
 
 // === Positioned pixel cursor (alpha decode) ===
 
-/// Tracks the (x, y) raster position for alpha image decode, emitting each
-/// pixel through `blend_pixel` (positioned read-modify-write) instead of the
-/// streaming `write_pixel` cursor.
-/// Screen position of the next decoded pixel (alpha paths). Signed: an
-/// image may start off the top/left edge; those pixels are skipped.
+/// Tracks the (x, y) raster position for alpha image decode and blends the
+/// decoded pixels (positioned read-modify-write, not the streaming
+/// `write_pixel` cursor) in runs of up to `RUN` along a row, through
+/// `blend_row`: one call per run instead of one per pixel. Signed: an image
+/// may start off the top/left edge; `blend_row` clips those pixels. Call
+/// `flush` when the decode stops before the end of a row.
+const RUN: usize = 32;
+
 struct PixelCursor {
     x: i32,
     y: i32,
     start_x: i32,
     end_x: i32,
+    /// Pending run: `n` pixels from `run_x` on row `y`.
+    run_x: i32,
+    n: usize,
+    colors: [u16; RUN],
+    alphas: [u8; RUN],
 }
 
 impl PixelCursor {
@@ -848,16 +859,35 @@ impl PixelCursor {
             y,
             start_x: x,
             end_x: x + w as i32,
+            run_x: x,
+            n: 0,
+            colors: [0; RUN],
+            alphas: [0; RUN],
+        }
+    }
+
+    /// Blend the pending run.
+    fn flush<B: LcdBackend>(&mut self, lcd: &LcdImpl<B>) {
+        if self.n != 0 {
+            lcd.blend_row(self.run_x, self.y, &self.colors[..self.n], &self.alphas[..self.n]);
+            self.n = 0;
         }
     }
 
     #[inline]
     fn emit<B: LcdBackend>(&mut self, lcd: &LcdImpl<B>, color: u16, alpha: u8) {
-        if self.x >= 0 && self.y >= 0 {
-            lcd.blend_pixel(self.x as u16, self.y as u16, color, alpha);
+        if self.n == 0 {
+            self.run_x = self.x;
         }
+        self.colors[self.n] = color;
+        self.alphas[self.n] = alpha;
+        self.n += 1;
         self.x += 1;
-        if self.x >= self.end_x {
+        let row_end = self.x >= self.end_x;
+        if row_end || self.n == RUN {
+            self.flush(lcd);
+        }
+        if row_end {
             self.x = self.start_x;
             self.y += 1;
         }
