@@ -63,8 +63,24 @@ The round panel has no reachable corner, so recovery mode on this board is enter
 | Touch | Atmel mXT1664S | Capacitive, I2C (the first finger is the pointer) |
 | Storage | 16GB eMMC | Filesystem image saved as `FERRITE/FLASH.BIN` on the CACHE partition (FAT32) |
 | PMIC / RTC | MAX77686 | Power, RTC |
-| Audio / Wi-Fi | WM8758, BCM4334 | Not used yet |
+| Audio / Wi-Fi | WM8758, BCM4334 | `playSound` through I2S + DMA (speakers / headphone jack); Wi-Fi on core 3: HTTP dashboard + FS upload, `ferrite_cli -p tcp://HOST` protocol bridge |
 | UART | UART2 (115200) | Console, `uart_boot` and the ferrite protocol |
+
+**Tablet demo** ([`examples/exynos4412/tablet`](examples/exynos4412/tablet)): an Android-like launcher and eight apps, each its own program. Screenshots from the simulator (`cargo build -p bsp-sim --features tablet`):
+
+<p>
+  <img src="docs/images/tablet/home.png" width="49%" alt="Home screen: clock, live performance card, apps and dock">
+  <img src="docs/images/tablet/shade.png" width="49%" alt="Pull-down shade: brightness and volume, quick tiles">
+  <img src="docs/images/tablet/drawer.png" width="49%" alt="App drawer">
+  <img src="docs/images/tablet/clock.png" width="49%" alt="Clock: analog clock and stopwatch">
+  <img src="docs/images/tablet/calc.png" width="49%" alt="Calculator">
+  <img src="docs/images/tablet/paint.png" width="49%" alt="Paint">
+  <img src="docs/images/tablet/monitor.png" width="49%" alt="Monitor: frame rate, loop passes, memory">
+  <img src="docs/images/tablet/gallery.png" width="49%" alt="Gallery">
+  <img src="docs/images/tablet/music.png" width="49%" alt="Music player">
+  <img src="docs/images/tablet/notes.png" width="49%" alt="Notes">
+  <img src="docs/images/tablet/settings.png" width="49%" alt="Settings">
+</p>
 
 HAL: [exynos-4412-rs](https://github.com/erhanacunal/exynos-4412-rs) (git submodule `vendor/exynos_4412_rs`).
 

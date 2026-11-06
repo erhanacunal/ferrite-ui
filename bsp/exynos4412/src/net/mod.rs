@@ -245,6 +245,11 @@ fn set_state(s: State) {
     STATE.store(s as u8, Ordering::Release);
 }
 
+/// Whether CPU3's executor runs (joined, with or without an address).
+pub fn running() -> bool {
+    matches!(STATE.load(Ordering::Acquire), 2 | 3 | 5)
+}
+
 pub fn state_name() -> &'static str {
     match STATE.load(Ordering::Acquire) {
         0 => "off",

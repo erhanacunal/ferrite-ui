@@ -1,7 +1,12 @@
 //! `Exynos4412Platform` — binds the backends to ferrite-core and implements
 //! the runtime hooks.
 
+use exynos_4412_rs::drivers::gic::Gic;
+use exynos_4412_rs::drivers::i2c::{Bus, I2c};
+use exynos_4412_rs::drivers::max77686::Max77686;
 use exynos_4412_rs::drivers::power::{self, BootMode, PowerKeys};
+use exynos_4412_rs::standby::{self, PowerButton, Press};
+use exynos_4412_rs::{println, soc};
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::heap;
 use ferrite_core::ctx::Ctx;
@@ -69,6 +74,10 @@ impl Platform for Exynos4412Platform {
 }
 
 static mut KEYS: Option<PowerKeys> = None;
+/// Short presses of the power key → [`standby`]. Shares the pin with
+/// [`KEYS`] (both read it as a plain input): KEYS acts on 2 s holds, the
+/// button on presses released before that.
+static mut BUTTON: Option<PowerButton> = None;
 
 /// Temporary: a status line at the bottom of the screen for the writefs
 /// "flash image corrupted" investigation. Remove once resolved.
@@ -186,6 +195,7 @@ impl PlatformRuntime for Exynos4412Platform {
     fn boot(ctx: &mut Ctx<Self>, touch: &mut TouchImpl<Self::TouchB>) -> u8 {
         touch.cal = crate::touch::CAL;
         unsafe { *(&raw mut KEYS) = Some(PowerKeys::new()) };
+        unsafe { *(&raw mut BUTTON) = Some(PowerButton::new()) };
 
         ctx.lcd.fill_rect(0, 0, PANEL.width as u16, PANEL.height as u16, COLOR_BLACK);
         // Black on screen before the backlight comes up.
@@ -217,6 +227,63 @@ impl PlatformRuntime for Exynos4412Platform {
         if let Some(keys) = unsafe { (*(&raw mut KEYS)).as_mut() } {
             keys.service(Mct::new());
         }
+        // Short press = light standby until the next press.
+        if let Some(button) = unsafe { (*(&raw mut BUTTON)).as_mut() }
+            && button.poll(Mct::new()) == Some(Press::Short)
+        {
+            enter_standby(ctx, button);
+        }
+    }
+}
+
+/// Light standby (HAL `standby::enter`): backlight, LVDS and FIMD off, CPU
+/// at 200 MHz, CPU0 asleep in `wfi` (IRQs masked) until the power key.
+/// The runtime simply resumes on the next pass.
+///
+/// What the HAL leaves to the caller:
+/// - display: no present may be in flight (its G2D / vsync completion is a
+///   CPU0 interrupt): `flush_wait` first.
+/// - audio: stopped, its ring silenced: the DMA keeps looping the ring while
+///   the refill interrupt (CPU0) cannot run.
+/// - WiFi stays joined; CPU3 keeps serving at the lower clock. Its timers
+///   need the MCT comparator interrupt, which normally goes to CPU0: during
+///   standby it goes to CPU0 and CPU3, so CPU3 services it and CPU0 is only
+///   woken by it (which also lets the HAL time a long press). HTTP requests
+///   that need the runtime (bridge, `/flash`) wait until the wake.
+/// - UART2 RX runs on CPU1 and keeps filling its ring. Touch is polled, so
+///   nothing touched meanwhile is delivered.
+fn enter_standby(ctx: &mut Ctx<Exynos4412Platform>, button: &mut PowerButton) {
+    let mct = Mct::new();
+    lcd::flush_wait();
+    ctx.audio.stop();
+    let gic = Gic::new();
+    let shared_timer = crate::net_running();
+    if shared_timer {
+        gic.set_targets(soc::MCT_G0_IRQ, 0b1001);
+    }
+    let pmic = Max77686::new(I2c::new(Bus::I2c0));
+    let result = standby::enter(mct, Some(pmic), button);
+    if shared_timer {
+        gic.set_target(soc::MCT_G0_IRQ, 0);
+    }
+    match result {
+        Ok(r) => {
+            println!(
+                "ferrite: standby {} s, asleep {}%, {} -> {} -> {} MHz",
+                r.standby_us / 1_000_000,
+                r.slept_us * 100 / r.standby_us.max(1),
+                r.before_hz / 1_000_000,
+                r.standby_hz / 1_000_000,
+                r.after_hz / 1_000_000
+            );
+            if r.press == Press::Long {
+                // Held 2 s while asleep: power off, as when awake.
+                crate::flash::save_if_dirty(true);
+                exynos_4412_rs::console::flush();
+                power::power_off();
+            }
+        }
+        Err(e) => println!("ferrite: standby ERROR {:?}", e),
     }
 }
 

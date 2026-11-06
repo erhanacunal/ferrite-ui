@@ -196,6 +196,15 @@ fn main(_args: BootArgs) -> ! {
     })
 }
 
+/// Whether CPU3 runs the network executor (its timers need the MCT
+/// interrupt: see `platform::enter_standby`).
+pub fn net_running() -> bool {
+    #[cfg(feature = "wifi")]
+    return net::running();
+    #[cfg(not(feature = "wifi"))]
+    false
+}
+
 /// The UART RX handle for CPU1's task, set before CPU1 starts.
 static mut RX: Option<exynos_4412_rs::embassy::uart::UartRx> = None;
 
