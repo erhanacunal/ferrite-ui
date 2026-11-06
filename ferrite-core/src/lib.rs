@@ -38,6 +38,7 @@ pub mod embedded_font;
 pub mod fat;
 pub mod font;
 pub mod fs;
+pub mod geo;
 pub mod heap;
 pub mod image;
 pub mod keyboard;

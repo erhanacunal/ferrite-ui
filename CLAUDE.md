@@ -96,6 +96,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   1. `mark_dirty(id)` → marks widget + entire subtree as dirty
   2. `render_dirty()` → computes DFS order. Skipped without a scan while `ObjPool::maybe_dirty` is down: raised by `mark_dirty`/`alloc_widget` (the only ways to set a dirty bit), lowered by a render scan that finds nothing dirty (`render_dirty`, `buffered_has_dirty`; `collect_dirty_paint` also checks it)
   3. For each dirty widget, collects occluders (later in DFS, not descendants)
+     - **Geometry table (`render_cache` feature, `geo.rs`; exynos4412 + sim):** each render pass (`render_dirty`, `render_buffered_content`, `render_all`) brackets itself with `geo_begin`/`geo_end`; in between, `abs_at`/`vis_at`/`scroll_parent_at`/`sub_end_at` (by DFS index) read a table built in one pre-order pass instead of walking the parent chain (the occluder search is O(n²) lookups: 192 dirty boxes 436 → 67 µs on the host). Without the feature (GD32) or if the table can't be allocated they compute live. Only valid while nothing changes geometry/visibility/tree shape — the passes change only flags and recorded rects. Test: `geo::tests::table_matches_live_walks`.
   4. Subtracts occluder rects from ClipRegion
   5. Widget is drawn over remaining visible rects
   6. Child widgets are drawn recursively with the same occluder list

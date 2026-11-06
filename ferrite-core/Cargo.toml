@@ -60,6 +60,12 @@ fast_vm = []
 # cycle counter from the BSP (`PlatformRuntime::cycles` / `cycle_hz`). Enabled
 # by `bsp-exynos4412`.
 perf = []
+# Render passes read widget geometry (absolute rect, visibility, scroll parent,
+# subtree end) from a table built once per pass (`geo.rs`) instead of walking
+# the parent chain for every lookup: the occluder search is O(n^2) lookups.
+# Costs ~24 B of heap per widget, so the GD32 build leaves it off. Enabled by
+# `bsp-exynos4412` and the sim.
+render_cache = []
 
 # --- Optional device features, selected by the BSP that has the hardware ---
 # Off = the module, its `Platform` backend slot, its `Ctx` field and its VM

@@ -106,6 +106,7 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
     let mut paint = PaintList::new();
     let buf = ctx.lcd.back_buf();
     ctx.objs.ensure_dfs();
+    ctx.objs.geo_begin();
     // The two buffers hold different frames: no incremental redraws.
     ctx.objs.screen_touched();
     // Whole-screen clip for the unclipped Pass-2 draws (built once).
@@ -124,7 +125,7 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
             continue;
         }
         let current = if w.is_visible() {
-            ctx.objs.absolute_rect(id)
+            ctx.objs.abs_at(i)
         } else {
             Rect::new(0, 0, 0, 0)
         };
@@ -139,14 +140,14 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
     for i in 0..ctx.objs.dfs_len() {
         let id = ctx.objs.dfs_at(i);
         let w = ctx.objs.get(id);
-        if !w.is_dirty_buf(buf) || !ctx.objs.is_tree_visible(id) {
+        if !w.is_dirty_buf(buf) || !ctx.objs.vis_at(i) {
             continue;
         }
 
-        let abs = ctx.objs.absolute_rect(id);
+        let abs = ctx.objs.abs_at(i);
 
         // Viewport clipping for children of scroll containers
-        let sp = ctx.objs.scroll_parent(id);
+        let sp = ctx.objs.scroll_parent_at(i);
         if sp.is_some() {
             let viewport = ctx.objs.scroll_viewport(sp);
             if abs.x < viewport.x
@@ -177,9 +178,9 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
         let id = ctx.objs.dfs_at(i);
         if ctx.objs.get(id).flags & FLAG_CLIP_CHILDREN != 0
             && ctx.objs.get(id).is_dirty_buf(buf)
-            && ctx.objs.is_tree_visible(id)
+            && ctx.objs.vis_at(i)
         {
-            let abs = ctx.objs.absolute_rect(id);
+            let abs = ctx.objs.abs_at(i);
             draw_scrollbar(ctx, id, &abs);
         }
     }
@@ -190,8 +191,8 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
     for i in 0..ctx.objs.dfs_len() {
         let id = ctx.objs.dfs_at(i);
         if ctx.objs.get(id).is_dirty_buf(buf) {
-            let drawn_rect = if ctx.objs.is_tree_visible(id) {
-                ctx.objs.absolute_rect(id)
+            let drawn_rect = if ctx.objs.vis_at(i) {
+                ctx.objs.abs_at(i)
             } else {
                 Rect::new(0, 0, 0, 0)
             };
@@ -199,6 +200,7 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
         }
         ctx.objs.get_mut(id).clear_dirty_buf(buf);
     }
+    ctx.objs.geo_end();
     paint
 }
 
@@ -242,11 +244,11 @@ fn redraw_behind_region<P: Platform>(
     bounds: &Rect,
 ) {
     for i in 0..target_idx {
-        let uid = ctx.objs.dfs_at(i);
-        if !ctx.objs.is_tree_visible(uid) {
+        if !ctx.objs.vis_at(i) {
             continue;
         }
-        let u_abs = ctx.objs.absolute_rect(uid);
+        let uid = ctx.objs.dfs_at(i);
+        let u_abs = ctx.objs.abs_at(i);
         if !u_abs.intersects(bounds) {
             continue;
         }
@@ -269,25 +271,22 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
 /// Children of scroll containers are clipped to the viewport.
 fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>) {
     ctx.objs.ensure_dfs();
+    ctx.objs.geo_begin();
     // Whole-screen clip for the full redraw — built once, reused for every
     // widget so we don't pay region setup in the per-widget loop.
     let full = ClipRegion::from_rect(screen_rect(&ctx.lcd));
     let mut i = 0;
     while i < ctx.objs.dfs_len() {
         let id = ctx.objs.dfs_at(i);
-        if !ctx.objs.is_tree_visible(id) {
+        if !ctx.objs.vis_at(i) {
             // Skip entire subtree of this invisible widget
-            let mut end = i + 1;
-            while end < ctx.objs.dfs_len() && ctx.objs.is_descendant(ctx.objs.dfs_at(end), id) {
-                end += 1;
-            }
-            i = end;
+            i = ctx.objs.sub_end_at(i);
             continue;
         }
-        let abs = ctx.objs.absolute_rect(id);
+        let abs = ctx.objs.abs_at(i);
 
         // Viewport clipping for children of scroll containers
-        let sp = ctx.objs.scroll_parent(id);
+        let sp = ctx.objs.scroll_parent_at(i);
         if sp.is_some() {
             let viewport = ctx.objs.scroll_viewport(sp);
             // Only draw if FULLY inside viewport (text can't be partially clipped)
@@ -301,11 +300,7 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>) {
                 record_drawn(ctx, id, &abs);
             } else {
                 // Outside or partially visible — skip entire subtree
-                let mut end = i + 1;
-                while end < ctx.objs.dfs_len() && ctx.objs.is_descendant(ctx.objs.dfs_at(end), id) {
-                    end += 1;
-                }
-                i = end;
+                i = ctx.objs.sub_end_at(i);
                 continue;
             }
         } else {
@@ -319,11 +314,12 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>) {
     // Draw scrollbars on top of all children
     for i in 0..ctx.objs.dfs_len() {
         let id = ctx.objs.dfs_at(i);
-        if ctx.objs.get(id).flags & FLAG_CLIP_CHILDREN != 0 && ctx.objs.is_tree_visible(id) {
-            let abs = ctx.objs.absolute_rect(id);
+        if ctx.objs.get(id).flags & FLAG_CLIP_CHILDREN != 0 && ctx.objs.vis_at(i) {
+            let abs = ctx.objs.abs_at(i);
             draw_scrollbar(ctx, id, &abs);
         }
     }
+    ctx.objs.geo_end();
 }
 
 // --- Dirty render (painter's algorithm + clip) ---
@@ -352,6 +348,7 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         ctx.objs.maybe_dirty = false;
         return;
     }
+    ctx.objs.geo_begin();
 
     // Pass 1: erase dirty widgets that became invisible.
     // Only erase widgets that were actually drawn before (FLAG_RENDERED).
@@ -363,9 +360,9 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         if !ctx.objs.get(id).is_dirty() {
             continue;
         }
-        if !ctx.objs.is_tree_visible(id) {
+        if !ctx.objs.vis_at(di) {
             if ctx.objs.get(id).flags & FLAG_RENDERED != 0 {
-                let abs = ctx.objs.absolute_rect(id);
+                let abs = ctx.objs.abs_at(di);
                 if !abs.is_empty() {
                     erase_widget_area(&ctx.objs, &ctx.lcd, id, abs);
                     // The erase may cover visible widgets that stay as they are.
@@ -390,7 +387,7 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
             continue;
         }
         let current = if w.is_visible() {
-            ctx.objs.absolute_rect(id)
+            ctx.objs.abs_at(di)
         } else {
             Rect::new(0, 0, 0, 0)
         };
@@ -410,25 +407,22 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     while di < ctx.objs.dfs_len() {
         let id = ctx.objs.dfs_at(di);
 
-        if !ctx.objs.get(id).is_dirty() || !ctx.objs.is_tree_visible(id) {
+        if !ctx.objs.get(id).is_dirty() || !ctx.objs.vis_at(di) {
             di += 1;
             continue;
         }
 
         // Find subtree end: contiguous descendants after di
-        let mut sub_end = di + 1;
-        while sub_end < ctx.objs.dfs_len() && ctx.objs.is_descendant(ctx.objs.dfs_at(sub_end), id) {
-            sub_end += 1;
-        }
+        let sub_end = ctx.objs.sub_end_at(di);
 
         // Collect occluder rects: visible widgets after this subtree in DFS
         let mut occluders = [Rect::new(0, 0, 0, 0); 32];
         let mut occ_count: usize = 0;
-        let abs = ctx.objs.absolute_rect(id);
+        let abs = ctx.objs.abs_at(di);
 
         for j in sub_end..ctx.objs.dfs_len() {
-            if ctx.objs.is_tree_visible(ctx.objs.dfs_at(j)) {
-                let other_abs = ctx.objs.absolute_rect(ctx.objs.dfs_at(j));
+            if ctx.objs.vis_at(j) {
+                let other_abs = ctx.objs.abs_at(j);
                 if abs.intersects(&other_abs) && occ_count < 32 {
                     occluders[occ_count] = other_abs;
                     occ_count += 1;
@@ -439,17 +433,17 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         // Flat iteration over dirty widget + its descendants
         for si in di..sub_end {
             let sid = ctx.objs.dfs_at(si);
-            if !ctx.objs.is_tree_visible(sid) {
+            if !ctx.objs.vis_at(si) {
                 continue;
             }
 
-            let sabs = ctx.objs.absolute_rect(sid);
+            let sabs = ctx.objs.abs_at(si);
 
             let mut clip = ClipRegion::from_rect(sabs);
             clip.clip_to_bounds(&screen_rect(&ctx.lcd));
 
             // Viewport clipping for children of scroll containers
-            let sp = ctx.objs.scroll_parent(sid);
+            let sp = ctx.objs.scroll_parent_at(si);
             if sp.is_some() {
                 let viewport = ctx.objs.scroll_viewport(sp);
                 // Only draw if fully inside viewport (text can't be partially clipped)
@@ -505,11 +499,12 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     for di in 0..ctx.objs.dfs_len() {
         let id = ctx.objs.dfs_at(di);
         let w = ctx.objs.get(id);
-        if w.flags & FLAG_CLIP_CHILDREN != 0 && w.is_dirty() && ctx.objs.is_tree_visible(id) {
-            let abs = ctx.objs.absolute_rect(id);
+        if w.flags & FLAG_CLIP_CHILDREN != 0 && w.is_dirty() && ctx.objs.vis_at(di) {
+            let abs = ctx.objs.abs_at(di);
             draw_scrollbar(ctx, id, &abs);
         }
     }
+    ctx.objs.geo_end();
 
     clear_all_dirty(ctx);
 }
@@ -541,11 +536,11 @@ fn clear_painted(tree: &mut ObjPool) {
 /// all of `rect` opaquely — nothing behind that one can show through.
 fn behind_is_fresh(tree: &ObjPool, lo: usize, idx: usize, rect: &Rect) -> bool {
     for k in (lo..idx).rev() {
-        let id = tree.dfs_at(k);
-        if !tree.is_tree_visible(id) {
+        if !tree.vis_at(k) {
             continue;
         }
-        let abs = tree.absolute_rect(id);
+        let id = tree.dfs_at(k);
+        let abs = tree.abs_at(k);
         if !abs.intersects(rect) {
             continue;
         }

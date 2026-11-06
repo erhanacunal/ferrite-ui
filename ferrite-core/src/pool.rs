@@ -183,6 +183,13 @@ pub struct ObjPool {
     /// found no dirty widget. While it is down the render passes skip their
     /// DFS scans, so an idle main-loop pass doesn't walk the tree.
     pub(crate) maybe_dirty: bool,
+    /// Geometry by DFS index for the current render pass (`geo.rs`).
+    #[cfg(feature = "render_cache")]
+    pub(crate) geo: Vec<crate::geo::Geo>,
+    #[cfg(feature = "render_cache")]
+    pub(crate) geo_stack: Vec<u32>,
+    #[cfg(feature = "render_cache")]
+    pub(crate) geo_valid: bool,
 }
 
 impl ObjPool {
@@ -216,6 +223,12 @@ impl ObjPool {
             dead: Widget::DEAD,
             draw_epoch: 0,
             maybe_dirty: false,
+            #[cfg(feature = "render_cache")]
+            geo: Vec::new(),
+            #[cfg(feature = "render_cache")]
+            geo_stack: Vec::new(),
+            #[cfg(feature = "render_cache")]
+            geo_valid: false,
         }
     }
 
@@ -284,6 +297,10 @@ impl ObjPool {
         self.dfs_cache.clear();
         self.dfs_valid = false;
         self.maybe_dirty = false;
+        #[cfg(feature = "render_cache")]
+        {
+            self.geo_valid = false;
+        }
     }
 
     // --- Diagnostics ---
@@ -329,10 +346,15 @@ impl ObjPool {
     pub fn heap_bytes(&self) -> usize {
         use core::mem::size_of;
         let tasks = if cfg!(feature = "multi_program") { 2 * self.table.len() } else { 0 };
+        #[cfg(feature = "render_cache")]
+        let geo = self.geo.capacity() * size_of::<crate::geo::Geo>() + self.geo_stack.capacity() * 4;
+        #[cfg(not(feature = "render_cache"))]
+        let geo = 0;
         self.arena.len() * 4
             + self.table.len() * size_of::<Off>()
             + self.dfs_cache.capacity() * size_of::<WidgetId>()
             + tasks
+            + geo
     }
     /// Pointers handed out so far: every live pointer is below this. Used as
     /// the iteration bound and as a loop guard for tree walks.

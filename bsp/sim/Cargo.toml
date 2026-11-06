@@ -13,6 +13,6 @@ path = "src/main.rs"
 no-readback = []
 
 [dependencies]
-ferrite-core = { path = "../../ferrite-core", features = ["host", "wide_code", "audio", "jpeg"] }
+ferrite-core = { path = "../../ferrite-core", features = ["host", "wide_code", "audio", "jpeg", "render_cache"] }
 jpeg-decoder = { version = "0.3", default-features = false }
 minifb = "0.27"
