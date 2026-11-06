@@ -191,6 +191,15 @@ class Op:
     FFLOOR = 0xD2
     FCEIL  = 0xD3
 
+    # Tasks (several programs at once; boards with caps.multi_program)
+    TASK_SPAWN   = 0xD4  # pop arg, pop name str_id → push task id, or -1
+    TASK_KILL    = 0xD5  # pop id → push 1 if it will end, 0
+    TASK_ID      = 0xD6  # push the running task's id (0 = main)
+    TASK_ALIVE   = 0xD7  # pop id → push 1 while starting / running
+    TASK_SEND    = 0xD8  # pop b, pop a, pop id → push 1 queued / 0
+    TASK_SET_FG  = 0xD9  # pop id → push 1 if it now gets the global input events
+    TASK_FG      = 0xDA  # push the foreground task's id
+
 
 # Backwards compatibility -- Builtin constants map to method IDs (0-based).
 # Used by ferrite_lang.py via asm.builtin(Builtin.XXX)
@@ -255,6 +264,14 @@ class Builtin:
     RUN_PROGRAM = 61       # (name_str_id, arg) → 0 if missing; else this program ends
     PROGRAM_ARG = 62       # () → arg given by runProgram (0 at boot)
     PROGRAM_NAME = 63      # (index) → str_id; "" past the end, -1 = this program
+    # 64..83 = float ops (emitted directly)
+    TASK_SPAWN = 84        # (name_str_id, arg) → task id, or -1
+    TASK_KILL = 85         # (id) → 1 / 0
+    TASK_ID = 86           # () → running task id
+    TASK_ALIVE = 87        # (id) → 1 / 0
+    TASK_SEND = 88         # (id, a, b) → 1 queued / 0
+    TASK_SET_FG = 89       # (id) → 1 / 0
+    TASK_FG = 90           # () → foreground task id
 
 
 class Prop:
@@ -1102,6 +1119,8 @@ OP_NAMES = {
     0xCA: 'fgt', 0xCB: 'fge', 0xCC: 'fne',
     0xCD: 'fsin', 0xCE: 'fcos', 0xCF: 'fsqrt',
     0xD0: 'fabs', 0xD1: 'fatan2', 0xD2: 'ffloor', 0xD3: 'fceil',
+    0xD4: 'spawnProgram', 0xD5: 'killProgram', 0xD6: 'taskId', 0xD7: 'taskAlive',
+    0xD8: 'sendMessage', 0xD9: 'setForeground', 0xDA: 'foregroundTask',
 }
 
 PROP_NAMES = {
@@ -1136,7 +1155,8 @@ _NO_ARG_OPS = (
     {0xAD, 0xAE, 0xAF} |               # animate, stopAnim, stopAnimProp
     {0xB0, 0xB1, 0xB2} |               # pinMode, pinWrite, pinRead
     set(range(0xB3, 0xC0)) |           # eepromSize .. strByte, playSound .. soundPlaying, runProgram .. programName
-    set(range(0xC0, 0xCD))             # 0xC0-0xCC
+    set(range(0xC0, 0xCD)) |           # 0xC0-0xCC
+    set(range(0xD4, 0xDB))             # spawnProgram .. foregroundTask
 )
 
 
@@ -1447,6 +1467,8 @@ class FunctionKind:
     ON_CLICK = 12
     ON_TAP = 13
     ON_PAINT = 14
+    ON_TASK_MESSAGE = 15
+    ON_TASK_EXIT = 16
 
 
 # Map system callback names to FunctionKind values
@@ -1462,6 +1484,8 @@ SYSTEM_CALLBACK_KINDS = {
     'on_touch_move':    FunctionKind.ON_TOUCH_MOVE,
     'on_swipe':              FunctionKind.ON_SWIPE,
     'on_long_press':         FunctionKind.ON_LONG_PRESS,
+    'on_task_message':       FunctionKind.ON_TASK_MESSAGE,
+    'on_task_exit':          FunctionKind.ON_TASK_EXIT,
     # Generated compile-time dispatchers (names reserved, prefixed with __)
     '__on_click_dispatch':   FunctionKind.ON_CLICK,
     '__on_tap_dispatch':     FunctionKind.ON_TAP,

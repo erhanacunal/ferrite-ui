@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use crate::pool::{ObjPool, T_WIDGET};
+use crate::pool::{ObjPool, ObjPtr, PTR_NONE, T_WIDGET};
 use crate::render::SCROLLBAR_W;
 use crate::types::{Color, Edges, Offset, Rect, Size};
 use alloc::vec::Vec;
@@ -82,30 +82,50 @@ pub const ALIGN_RIGHT: u8 = 2;
 
 /// Widget pointer (an `ObjPtr` naming a `T_WIDGET` object). NONE = no link.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct WidgetId(pub u16);
+pub struct WidgetId(pub ObjPtr);
 
 impl WidgetId {
-    pub const NONE: Self = Self(0xFFFF);
+    pub const NONE: Self = Self(PTR_NONE);
 
     pub fn index(self) -> usize {
         self.0 as usize
     }
 
     pub fn is_none(self) -> bool {
-        self.0 == 0xFFFF
+        self.0 == PTR_NONE
     }
 
     pub fn is_some(self) -> bool {
-        self.0 != 0xFFFF
+        self.0 != PTR_NONE
+    }
+
+    /// The id a VM value names: the low pointer bits, so -1 (and any value
+    /// outside the pointer range that truncates to it) reads as NONE.
+    #[inline]
+    pub fn from_vm(v: i32) -> Self {
+        Self(v as ObjPtr)
+    }
+
+    /// The VM value of this id: NONE reads as -1.
+    #[inline]
+    pub fn to_vm(self) -> i32 {
+        if self.is_none() { -1 } else { self.0 as i32 }
     }
 }
 
+/// `Widget::value`: progress/slider value, input cursor, scroll offset, and
+/// the graph's array id -- so it is as wide as an object pointer.
+#[cfg(not(feature = "wide_obj"))]
+pub type WValue = i16;
+#[cfg(feature = "wide_obj")]
+pub type WValue = i32;
+
 // --- Widget object layout ---
 //
-// A widget is one pool object: the `Widget` header (6 words) followed by the
-// optional sections its `sections` mask names, in bit order. A section is
-// added (the object grows) the first time one of its fields gets a non-default
-// value, so a plain container is 6 words and a label 8.
+// A widget is one pool object: the `Widget` header (6 words, 8 with
+// `wide_obj`) followed by the optional sections its `sections` mask names, in
+// bit order. A section is added (the object grows) the first time one of its
+// fields gets a non-default value.
 
 /// Section bits (`Widget::sections`) and their sizes in words.
 const SEC_BOX: u8 = 1 << 0;
@@ -114,7 +134,14 @@ const SEC_STYLE: u8 = 1 << 2;
 const SEC_EXTRA: u8 = 1 << 3;
 const SEC_PREV: u8 = 1 << 4;
 const SEC_DRAWN: u8 = 1 << 5;
-const SEC_WORDS: [usize; 6] = [2, 2, 2, 2, 4, 3];
+const SEC_WORDS: [usize; 6] = [
+    size_of::<SecBox>() / 4,
+    size_of::<SecText>() / 4,
+    size_of::<SecStyle>() / 4,
+    size_of::<SecExtra>() / 4,
+    size_of::<SecPrev>() / 4,
+    size_of::<SecDrawn>() / 4,
+];
 
 /// Header words of every widget object.
 const HDR_WORDS: usize = size_of::<Widget>() / 4;
@@ -144,10 +171,13 @@ pub struct Widget {
     pub border_color: Color,
 
     /// Progress/slider value, input cursor, scroll offset, graph array id.
-    pub value: i16,
+    pub value: WValue,
 }
 
+#[cfg(not(feature = "wide_obj"))]
 const _: () = assert!(size_of::<Widget>() == 24 && align_of::<Widget>() <= 4);
+#[cfg(feature = "wide_obj")]
+const _: () = assert!(size_of::<Widget>() == 32 && align_of::<Widget>() <= 4);
 
 impl Widget {
     /// Placeholder for an id that names no live widget.
@@ -222,13 +252,16 @@ struct SecBox {
 #[repr(C, align(4))]
 #[derive(Clone, Copy, PartialEq)]
 struct SecText {
-    text_id: u16,
+    text_id: ObjPtr,
     text_color: Color,
     font_id: u8,
     text_align: u8,
     max_length: u8,
-    _pad: u8,
+    _pad: [u8; TEXT_PAD],
 }
+
+/// Pads `SecText` to whole words (8 B, 12 B with a u32 text id).
+const TEXT_PAD: usize = size_of::<ObjPtr>() - 1;
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy, PartialEq)]
@@ -266,14 +299,13 @@ struct SecPrev {
 struct SecDrawn {
     key: u32,
     epoch: u32,
-    value: i16,
-    _pad: u16,
+    value: i32,
 }
 
 const _: () = assert!(
     size_of::<SecDrawn>() == 12 &&
     size_of::<SecBox>() == 8
-        && size_of::<SecText>() == 8
+        && size_of::<SecText>() == 4 + 2 * size_of::<ObjPtr>()
         && size_of::<SecStyle>() == 8
         && size_of::<SecExtra>() == 8
         && size_of::<SecPrev>() == 16
@@ -294,12 +326,12 @@ impl Section for SecBox {
 impl Section for SecText {
     const BIT: u8 = SEC_TEXT;
     const DEFAULT: Self = Self {
-        text_id: 0xFFFF,
+        text_id: PTR_NONE,
         text_color: 0xFFFF,
         font_id: 0,
         text_align: ALIGN_LEFT,
         max_length: 0,
-        _pad: 0,
+        _pad: [0; TEXT_PAD],
     };
     fn read(e: &WidgetExt) -> Self {
         Self {
@@ -308,7 +340,7 @@ impl Section for SecText {
             font_id: e.font_id,
             text_align: e.text_align,
             max_length: e.max_length,
-            _pad: 0,
+            _pad: [0; TEXT_PAD],
         }
     }
     fn write(&self, e: &mut WidgetExt) {
@@ -378,7 +410,7 @@ impl Section for SecExtra {
 
 impl Section for SecDrawn {
     const BIT: u8 = SEC_DRAWN;
-    const DEFAULT: Self = Self { key: 0, epoch: 0, value: 0, _pad: 0 };
+    const DEFAULT: Self = Self { key: 0, epoch: 0, value: 0 };
     fn read(_: &WidgetExt) -> Self {
         Self::DEFAULT
     }
@@ -461,7 +493,7 @@ pub struct WidgetExt {
     pub text_color: Color,
     pub font_id: u8,
     pub text_align: u8,
-    pub text_id: u16,
+    pub text_id: ObjPtr,
 
     // Appearance extras
     pub border_radius: u16,
@@ -472,7 +504,7 @@ pub struct WidgetExt {
     pub max_length: u8,
 
     /// Mirrors `Widget::value` (kept here so drawing code reads one struct).
-    pub value: i16,
+    pub value: WValue,
 
     // Gradient
     pub gradient_color: Color, // End color (background_color is start)
@@ -503,7 +535,7 @@ impl WidgetExt {
         text_color: 0xFFFF,
         font_id: 0,
         text_align: ALIGN_LEFT,
-        text_id: 0xFFFF,
+        text_id: PTR_NONE,
         border_radius: 0,
         press_color: 0,
         image_id: 0,
@@ -713,12 +745,12 @@ impl ObjPool {
         self.sec::<SecText>(id).map_or(ALIGN_LEFT, |s| s.text_align)
     }
 
-    pub fn text_id(&self, id: WidgetId) -> u16 {
-        self.sec::<SecText>(id).map_or(0xFFFF, |s| s.text_id)
+    pub fn text_id(&self, id: WidgetId) -> ObjPtr {
+        self.sec::<SecText>(id).map_or(PTR_NONE, |s| s.text_id)
     }
 
     /// Set the widget's text string (no-op when `id` is no widget).
-    pub fn set_text_id(&mut self, id: WidgetId, text: u16) -> bool {
+    pub fn set_text_id(&mut self, id: WidgetId, text: ObjPtr) -> bool {
         match self.sec_mut::<SecText>(id) {
             Some(s) => {
                 s.text_id = text;
@@ -744,7 +776,7 @@ impl ObjPool {
         self.sec::<SecText>(id).map_or(0, |s| s.max_length)
     }
 
-    pub fn value(&self, id: WidgetId) -> i16 {
+    pub fn value(&self, id: WidgetId) -> WValue {
         self.get(id).value
     }
 
@@ -792,16 +824,16 @@ impl ObjPool {
     /// The value `id` was last fully drawn with, if its pixels are still that
     /// drawing: same appearance `key` (never 0) and drawn in the current
     /// epoch. None means redraw it whole.
-    pub(crate) fn drawn_value(&self, id: WidgetId, key: u32) -> Option<i16> {
+    pub(crate) fn drawn_value(&self, id: WidgetId, key: u32) -> Option<WValue> {
         let s = self.sec::<SecDrawn>(id)?;
-        (s.key == key && s.epoch == self.draw_epoch).then_some(s.value)
+        (s.key == key && s.epoch == self.draw_epoch).then_some(s.value as WValue)
     }
 
     /// Record that `id` is now fully drawn with appearance `key` and `value`.
-    pub(crate) fn set_drawn(&mut self, id: WidgetId, key: u32, value: i16) {
+    pub(crate) fn set_drawn(&mut self, id: WidgetId, key: u32, value: WValue) {
         let epoch = self.draw_epoch;
         if let Some(s) = self.ensure_sec::<SecDrawn>(id) {
-            *s = SecDrawn { key, epoch, value, _pad: 0 };
+            *s = SecDrawn { key, epoch, value: value as i32 };
         }
     }
 
@@ -879,7 +911,7 @@ impl ObjPool {
             }
             // Scroll offset: shift children by -scroll_y
             if p.flags & FLAG_CLIP_CHILDREN != 0 {
-                y -= p.value;
+                y -= p.value as i16;
             }
             pid = p.parent;
         }
@@ -1066,7 +1098,7 @@ impl ObjPool {
         let parent = self.get(id).parent;
         let group = self.group_id(id);
         let siblings_only = kind == KIND_RADIO && group == 0;
-        for p in 0..self.count() as u16 {
+        for p in 0..self.count() as ObjPtr {
             let other = WidgetId(p);
             if other == id || !self.is_live(other) {
                 continue;
@@ -1189,7 +1221,7 @@ mod tests {
         let w = tree.alloc_widget().unwrap();
         let other = tree.alloc_widget().unwrap();
         let plain = tree.bytes_of(T_WIDGET) / 2;
-        assert_eq!(plain, 4 + 24, "header only");
+        assert_eq!(plain, 4 * crate::pool::HDR + size_of::<Widget>(), "header only");
 
         // Sections out of bit order: STYLE first, then BOX (inserted before it).
         assert!(tree.update_ext(w, |e| e.border_radius = 7));
@@ -1202,11 +1234,11 @@ mod tests {
         assert_eq!(e.text_id, 42);
         assert_eq!(e.value, -5);
         assert_eq!(e.alpha, 255, "untouched fields keep defaults");
-        assert_eq!(tree.bytes_of(T_WIDGET), plain + 28 + 3 * 8);
+        assert_eq!(tree.bytes_of(T_WIDGET), plain + plain + size_of::<SecBox>() + size_of::<SecText>() + size_of::<SecStyle>());
 
         // Writing defaults adds nothing.
         assert!(tree.update_ext(other, |e| e.alpha = 255));
-        assert_eq!(tree.ext(other).text_id, 0xFFFF);
+        assert_eq!(tree.ext(other).text_id, PTR_NONE);
 
         // Moving / compacting keeps everything.
         tree.compact();

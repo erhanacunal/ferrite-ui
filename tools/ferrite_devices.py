@@ -15,7 +15,9 @@ in sync by hand:
     BSP's lcd backend (ferrite-core/src/lcd.rs trait)
   - caps.audio / caps.video / caps.jpeg  <->  Platform::CAPS bits
     (ferrite-core/src/platform.rs); caps.jpeg also lets images use
-    "mode": "jpeg" (FI mode 3)
+    "mode": "jpeg" (FI mode 3); caps.multi_program <-> CAP_MULTI_PROGRAM
+    (ferrite-core `multi_program` feature: the task builtins). A missing
+    cap reads as false, so the fallback boards below leave it out.
 """
 
 import json

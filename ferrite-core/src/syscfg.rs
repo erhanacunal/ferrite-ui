@@ -15,9 +15,11 @@
 ///   2  u8   version (2)
 ///   3  u8   reserved
 ///   4  u32  arena_bytes     object pool arena (widgets, strings, arrays)
-///   8  u16  max_objects     object pool pointers (≤ pool::MAX_OBJECTS)
+///   8  u16  max_objects     object pool pointers, low half (≤ pool::MAX_OBJECTS)
 ///  10  u16  uart_rx_bytes   USART RX ring (rounded up to a power of two)
-///  12  ..   reserved (0)
+///  12  u16  max_objects_hi  high half of max_objects (0 below 64K; only
+///                           `wide_obj` firmware reaches past 0x3FFF)
+///  14  ..   reserved (0)
 ///  16  u8   eval_stack      VM evaluation stack depth
 ///  17  u8   call_stack      VM call stack depth
 ///  18  u8   cb_queue        VM callback queue length
@@ -43,7 +45,7 @@ const VERSION: u8 = 2;
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct SysCfg {
     pub arena_bytes: u32,
-    pub max_objects: u16,
+    pub max_objects: u32,
     pub uart_rx_bytes: u16,
     pub eval_stack: u8,
     pub call_stack: u8,
@@ -74,7 +76,7 @@ impl SysCfg {
         }
         Ok(Self {
             arena_bytes: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-            max_objects: u16_at(8),
+            max_objects: u16_at(8) as u32 | (u16_at(12) as u32) << 16,
             uart_rx_bytes: u16_at(10),
             eval_stack: b[16],
             call_stack: b[17],
@@ -144,6 +146,13 @@ mod tests {
                 anim_slots: 4,
             }
         );
+    }
+
+    #[test]
+    fn max_objects_high_half() {
+        let mut b = record();
+        b[12..14].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(SysCfg::parse(&b).ok().unwrap().max_objects, 3 << 16 | 96);
     }
 
     #[test]

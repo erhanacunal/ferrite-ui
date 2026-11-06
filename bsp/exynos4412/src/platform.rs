@@ -34,7 +34,7 @@ impl Platform for Exynos4412Platform {
     // WM8758 codec on I2S0 + pdma0 (audio.rs). JPEG → software decoder behind
     // `jpeg` later (no HW codec driver yet). Mirrored in
     // tools/devices/exynos4412.json (caps.*).
-    const CAPS: u32 = ferrite_core::platform::CAP_AUDIO;
+    const CAPS: u32 = ferrite_core::platform::CAP_AUDIO | ferrite_core::platform::CAP_MULTI_PROGRAM;
 
     const ANIM_SLOTS: usize = 64;
     // Glyph bitmaps in RAM at font load: text drawing then needs no
@@ -43,9 +43,10 @@ impl Platform for Exynos4412Platform {
 
     // 1 GB of DRAM (512 MB heap): pools far past the pool_large defaults
     // (2 MB / 8192), and the deepest VM stacks the u8 indices allow. A
-    // program's `"memory"` block still overrides each one.
+    // program's `"memory"` block still overrides each one. 256K object
+    // pointers (`wide_obj`): 1 MB table + 1 MB DFS cache.
     const DEFAULT_ARENA_BYTES: usize = 16 << 20;
-    const DEFAULT_MAX_OBJECTS: usize = ferrite_core::pool::MAX_OBJECTS;
+    const DEFAULT_MAX_OBJECTS: usize = 256 * 1024;
     const DEFAULT_EVAL_STACK: usize = 255;
     const DEFAULT_CALL_STACK: usize = 255;
     const DEFAULT_CB_QUEUE: usize = 64;

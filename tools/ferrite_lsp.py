@@ -556,6 +556,13 @@ BUILTIN_SIGNATURES = {
     'runProgram':  {'sig': 'runProgram(name, arg = 0) -> int', 'desc': 'Ends this program and starts program `name` from scratch (widgets, strings, arrays, callbacks and dialogs are dropped; EEPROM and files stay). Nothing after a successful call runs. Returns 0 only if there is no such program.'},
     'programArg':  {'sig': 'programArg() -> int', 'desc': 'The `arg` the program that started this one passed to `runProgram`; 0 for `main` at boot.'},
     'programName': {'sig': 'programName(index) -> string', 'desc': 'Name of program `index` (0-based, image order), "" past the last one. `programName(-1)` is this program's name.'},
+    'spawnProgram': {'sig': 'spawnProgram(name, arg = 0) -> int', 'desc': 'Start program `name` as a new task next to this one, on the same widget tree (it starts after this burst; `programArg()` gives it `arg`). Returns its task id, or -1 if there is no such program or all 16 task slots are taken. Its objects are freed when it ends. Boards with caps.multi_program only: elsewhere the build fails.'},
+    'killProgram': {'sig': 'killProgram(task) -> int', 'desc': 'End task `task` after this burst (its widgets, strings and arrays are freed); `killProgram(taskId())` ends this task at once. Returns 0 for main (task 0) or a task that is not running. Boards with caps.multi_program only: elsewhere the build fails.'},
+    'taskId':      {'sig': 'taskId() -> int', 'desc': 'This task's id (0 = main). Boards with caps.multi_program only: elsewhere the build fails.'},
+    'taskAlive':   {'sig': 'taskAlive(task) -> int', 'desc': '1 while task `task` is starting or running, else 0. Boards with caps.multi_program only: elsewhere the build fails.'},
+    'sendMessage': {'sig': 'sendMessage(task, a, b = 0) -> int', 'desc': 'Queue `on_task_message(from, a, b)` on task `task` (delivered after this burst). Returns 0 if it is not running or 64 messages are waiting. Boards with caps.multi_program only: elsewhere the build fails.'},
+    'setForeground': {'sig': 'setForeground(task) -> int', 'desc': 'Task `task` now gets the global input events (on_touch_down/move/up, on_swipe, on_long_press); widget events always go to the task that set the handler. 0 if it is not running. Boards with caps.multi_program only: elsewhere the build fails.'},
+    'foregroundTask': {'sig': 'foregroundTask() -> int', 'desc': 'The task that gets the global input events (0 = main). Boards with caps.multi_program only: elsewhere the build fails.'},
     'soundPlaying': {'sig': 'soundPlaying() -> int', 'desc': '1 while a sound is playing (until its last sample is output), else 0.'},
     'eepromSize':  {'sig': 'eepromSize() -> int', 'desc': 'EEPROM size in bytes (0 if the board has none).'},
     'eepromRead':  {'sig': 'eepromRead(addr) -> int', 'desc': 'Read one EEPROM byte (0..255). Bad address or bus error → VM fault 16.'},
@@ -638,6 +645,8 @@ CALLBACK_DOCS = {
     'on_touch_down': {'sig': 'fn on_touch_down(x, y)', 'desc': 'Called on touch press. Coordinates are packed.'},
     'on_touch_up': {'sig': 'fn on_touch_up()', 'desc': 'Called on touch release.'},
     'on_touch_move': {'sig': 'fn on_touch_move(x, y)', 'desc': 'Called on touch drag. Coordinates are packed.'},
+    'on_task_message': {'sig': 'fn on_task_message(from, a, b)', 'desc': 'Task `from` called sendMessage(this task, a, b).'},
+    'on_task_exit': {'sig': 'fn on_task_exit(task, code)', 'desc': 'A task this one spawned ended: code 0 = exited or killed, > 0 = VM fault code, -1 = could not start. Without this handler a fault opens the built-in "Program stopped" dialog.'},
 }
 
 # ============================================================

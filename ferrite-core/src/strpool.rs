@@ -9,10 +9,10 @@
 //!
 //! The formatting / parsing helpers below work on any `ObjPool`.
 
-use crate::pool::{ObjPool, T_STRING};
+use crate::pool::{ObjPool, ObjPtr, PTR_NONE, T_STRING};
 use crate::widget::WidgetId;
 
-pub const STR_NONE: u16 = 0xFFFF;
+pub const STR_NONE: ObjPtr = PTR_NONE;
 const FMT_BUF_SIZE: usize = 32;
 const INTERNED: u32 = 1 << 31;
 /// `str_sweep` mark bit (lengths never reach it: an object holds < 256 KB).
@@ -21,11 +21,11 @@ const LEN_MASK: u32 = KEEP - 1;
 
 impl ObjPool {
     /// Allocate a string. Returns its id, or None when the pool is full.
-    pub fn str_alloc(&mut self, data: &[u8]) -> Option<u16> {
+    pub fn str_alloc(&mut self, data: &[u8]) -> Option<ObjPtr> {
         self.str_new(data, false)
     }
 
-    fn str_new(&mut self, data: &[u8], interned: bool) -> Option<u16> {
+    fn str_new(&mut self, data: &[u8], interned: bool) -> Option<ObjPtr> {
         let p = self.alloc_obj(T_STRING, 1 + data.len().div_ceil(4))?;
         self.str_bytes_mut(p)[..data.len()].copy_from_slice(data);
         self.payload_mut(p, T_STRING)?[0] = data.len() as u32 | if interned { INTERNED } else { 0 };
@@ -33,7 +33,7 @@ impl ObjPool {
     }
 
     /// Writable byte area of string `p` (its whole payload capacity).
-    fn str_bytes_mut(&mut self, p: u16) -> &mut [u8] {
+    fn str_bytes_mut(&mut self, p: ObjPtr) -> &mut [u8] {
         match self.payload_mut(p, T_STRING) {
             // SAFETY: the words after the length word are plain storage;
             // viewing them as bytes is always valid.
@@ -44,7 +44,7 @@ impl ObjPool {
         }
     }
 
-    fn str_interned(&self, id: u16) -> bool {
+    fn str_interned(&self, id: ObjPtr) -> bool {
         self.payload(id, T_STRING).is_some_and(|w| w[0] & INTERNED != 0)
     }
 
@@ -53,14 +53,17 @@ impl ObjPool {
     /// took a new string, and a handler without `strClear()` filled the pool.
     /// The result may be shared: `str_free` ignores it and the byte edits
     /// work on a private copy.
-    pub fn str_intern(&mut self, data: &[u8]) -> Option<u16> {
-        let found = self.ptrs_of(T_STRING).find(|&p| self.str_interned(p) && self.str_get(p) == data);
+    pub fn str_intern(&mut self, data: &[u8]) -> Option<ObjPtr> {
+        // Only this task's literals: another task's copy dies with it.
+        let found = self
+            .ptrs_of(T_STRING)
+            .find(|&p| self.str_interned(p) && self.mine(p) && self.str_get(p) == data);
         found.or_else(|| self.str_new(data, true))
     }
 
     /// Id that can be edited in place: `id` itself, or a fresh private copy
     /// when `id` is an interned (possibly shared) literal.
-    fn str_unshare(&mut self, id: u16) -> Option<u16> {
+    fn str_unshare(&mut self, id: ObjPtr) -> Option<ObjPtr> {
         if self.str_interned(id) {
             // concat with "nothing" = copy into a fresh, non-interned string.
             self.str_concat(id, STR_NONE)
@@ -70,14 +73,14 @@ impl ObjPool {
     }
 
     /// Free a string. Interned literals may be shared, so they are left alone.
-    pub fn str_free(&mut self, id: u16) {
+    pub fn str_free(&mut self, id: ObjPtr) {
         if !self.str_interned(id) {
             self.free_obj(id, T_STRING);
         }
     }
 
     /// String bytes by id (empty when `id` names no string).
-    pub fn str_get(&self, id: u16) -> &[u8] {
+    pub fn str_get(&self, id: ObjPtr) -> &[u8] {
         match self.payload(id, T_STRING) {
             Some(w) => {
                 let len = (w[0] & LEN_MASK) as usize;
@@ -89,12 +92,12 @@ impl ObjPool {
     }
 
     /// String length by id (0 when `id` names no string).
-    pub fn str_len(&self, id: u16) -> u32 {
+    pub fn str_len(&self, id: ObjPtr) -> u32 {
         self.str_get(id).len() as u32
     }
 
     /// Compare two strings lexicographically. Returns -1, 0, or 1.
-    pub fn str_compare(&self, a: u16, b: u16) -> i32 {
+    pub fn str_compare(&self, a: ObjPtr, b: ObjPtr) -> i32 {
         match self.str_get(a).cmp(self.str_get(b)) {
             core::cmp::Ordering::Less => -1,
             core::cmp::Ordering::Equal => 0,
@@ -104,7 +107,7 @@ impl ObjPool {
 
     /// Concatenate two strings into a new one. An id that names no string
     /// (e.g. `0xFFFF` from `get(text)` on an emptied input) counts as empty.
-    pub fn str_concat(&mut self, a: u16, b: u16) -> Option<u16> {
+    pub fn str_concat(&mut self, a: ObjPtr, b: ObjPtr) -> Option<ObjPtr> {
         let (la, lb) = (self.str_get(a).len(), self.str_get(b).len());
         let p = self.alloc_obj(T_STRING, 1 + (la + lb).div_ceil(4))?;
         // Copy through a small buffer: the sources live in the same arena.
@@ -125,7 +128,7 @@ impl ObjPool {
     }
 
     /// Resize string `id` to `len` bytes, keeping the prefix.
-    fn str_resize(&mut self, id: u16, len: usize) -> bool {
+    fn str_resize(&mut self, id: ObjPtr, len: usize) -> bool {
         if !self.resize_obj(id, T_STRING, 1 + len.div_ceil(4)) {
             return false;
         }
@@ -136,7 +139,7 @@ impl ObjPool {
 
     /// Free every string.
     pub fn str_clear(&mut self) {
-        for p in 0..self.ptr_count() as u16 {
+        for p in 0..self.ptr_count() as ObjPtr {
             self.free_obj(p, T_STRING);
         }
     }
@@ -144,7 +147,7 @@ impl ObjPool {
     /// Insert a byte at `pos` in string `id`. Returns the id now holding the
     /// text — a new one when `id` was a shared literal, so the caller must
     /// store it — or None if nothing changed.
-    pub fn str_insert_byte(&mut self, id: u16, pos: usize, byte: u8, max_len: u8) -> Option<u16> {
+    pub fn str_insert_byte(&mut self, id: ObjPtr, pos: usize, byte: u8, max_len: u8) -> Option<ObjPtr> {
         self.payload(id, T_STRING)?;
         let old_len = self.str_get(id).len();
         // Enforce max_length (0 = no limit)
@@ -164,7 +167,7 @@ impl ObjPool {
 
     /// Delete the byte at `pos` in string `id`. Returns the id now holding
     /// the text (see `str_insert_byte`).
-    pub fn str_delete_byte(&mut self, id: u16, pos: usize) -> Option<u16> {
+    pub fn str_delete_byte(&mut self, id: ObjPtr, pos: usize) -> Option<ObjPtr> {
         let old_len = self.str_get(id).len();
         if pos >= old_len {
             return None;
@@ -176,10 +179,11 @@ impl ObjPool {
     }
 
     /// `strClear()`: free every string that no live widget shows. Widget text
-    /// that became empty is dropped too (the widget then has no text).
+    /// that became empty is dropped too (the widget then has no text). With
+    /// `multi_program` only the running task's strings are freed.
     pub fn str_sweep(&mut self) {
         // Pass 1: mark the strings live widgets show.
-        for p in 0..self.ptr_count() as u16 {
+        for p in 0..self.ptr_count() as ObjPtr {
             let w = WidgetId(p);
             if !self.is_live(w) {
                 continue;
@@ -196,11 +200,12 @@ impl ObjPool {
             }
         }
         // Pass 2: free the unmarked strings, unmark the kept ones.
-        for p in 0..self.ptr_count() as u16 {
+        for p in 0..self.ptr_count() as ObjPtr {
+            let mine = self.mine(p);
             match self.payload_mut(p, T_STRING) {
                 Some(w) if w[0] & KEEP != 0 => w[0] &= !KEEP,
-                Some(_) => self.free_obj(p, T_STRING),
-                None => {}
+                Some(_) if mine => self.free_obj(p, T_STRING),
+                _ => {}
             }
         }
     }
@@ -268,7 +273,7 @@ pub fn format_i32(val: i32, buf: &mut [u8]) -> usize {
 }
 
 /// Convert i32 to string in the pool. Returns string ID.
-pub fn itos(pool: &mut ObjPool, val: i32) -> Option<u16> {
+pub fn itos(pool: &mut ObjPool, val: i32) -> Option<ObjPtr> {
     let mut tmp = [0u8; FMT_BUF_SIZE];
     let len = format_i32(val, &mut tmp);
     pool.str_alloc(&tmp[..len])
@@ -336,7 +341,7 @@ pub fn format_f32(val: f32, buf: &mut [u8]) -> usize {
 }
 
 /// Convert f32 to string in the pool. Returns string ID.
-pub fn ftos(pool: &mut ObjPool, bits: u32) -> Option<u16> {
+pub fn ftos(pool: &mut ObjPool, bits: u32) -> Option<ObjPtr> {
     let val = f32::from_bits(bits);
     let mut tmp = [0u8; FMT_BUF_SIZE];
     let len = format_f32(val, &mut tmp);
@@ -346,7 +351,7 @@ pub fn ftos(pool: &mut ObjPool, bits: u32) -> Option<u16> {
 // === Parsing: string to number ===
 
 /// Parse a string (by ID) as i32. Returns 0 on failure.
-pub fn parse_int(pool: &ObjPool, id: u16) -> i32 {
+pub fn parse_int(pool: &ObjPool, id: ObjPtr) -> i32 {
     let data = pool.str_get(id);
     if data.is_empty() {
         return 0;
@@ -521,7 +526,7 @@ fn pad_write(digits: &[u8], width: u8, zero_pad: bool, out: &mut [u8]) -> usize 
 /// Format a string using printf-style specifiers.
 /// Supported: `%[0][width]d/i/u/x/X`, `%[.N]f`, `%s`, `%%`
 /// `%s` args are str_ids resolved from pool. Output is capped at 128 bytes.
-pub fn sprintf(pool: &mut ObjPool, fmt: &[u8], args: &[i32]) -> Option<u16> {
+pub fn sprintf(pool: &mut ObjPool, fmt: &[u8], args: &[i32]) -> Option<ObjPtr> {
     const OUT_SIZE: usize = 128;
     let mut out = [0u8; OUT_SIZE];
     let mut out_pos = 0;
@@ -612,7 +617,7 @@ pub fn sprintf(pool: &mut ObjPool, fmt: &[u8], args: &[i32]) -> Option<u16> {
             }
             b's' => {
                 if arg_idx < args.len() {
-                    let str_id = args[arg_idx] as u16;
+                    let str_id = args[arg_idx] as ObjPtr;
                     let mut tmp = [0u8; 64];
                     let copy_n = {
                         let s = pool.str_get(str_id);
@@ -639,7 +644,7 @@ pub fn sprintf(pool: &mut ObjPool, fmt: &[u8], args: &[i32]) -> Option<u16> {
 }
 
 /// Parse a string (by ID) as f32. Returns f32 bits. Returns 0.0 bits on failure.
-pub fn parse_float(pool: &ObjPool, id: u16) -> u32 {
+pub fn parse_float(pool: &ObjPool, id: ObjPtr) -> u32 {
     let data = pool.str_get(id);
     if data.is_empty() {
         return 0.0f32.to_bits();

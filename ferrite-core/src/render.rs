@@ -1078,7 +1078,7 @@ fn draw_line_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect,
 /// Polygon shape: points parsed from `text` ("x,y x,y …", relative to the
 /// widget's top-left), filled with `bg_color` and outlined in `border_color`.
 fn draw_polygon_shape<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
-    if ext.text_id == 0xFFFF {
+    if ext.text_id == crate::pool::PTR_NONE {
         return;
     }
     let text = ctx.objs.str_get(ext.text_id);
@@ -1201,7 +1201,7 @@ fn draw_label_text<P: Platform>(
     ext: &WidgetExt,
     bg: Option<Color>,
 ) {
-    if ext.text_id == 0xFFFF || ext.font_id == 0xFF {
+    if ext.text_id == crate::pool::PTR_NONE || ext.font_id == 0xFF {
         return;
     }
     let text = ctx.objs.str_get(ext.text_id);
@@ -1330,7 +1330,7 @@ fn draw_input_text<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: 
     let bg = if bg_color == 0 { None } else { Some(bg_color) };
 
     // Draw text if present
-    let has_text = ext.text_id != 0xFFFF && ext.font_id != 0xFF;
+    let has_text = ext.text_id != crate::pool::PTR_NONE && ext.font_id != 0xFF;
     if has_text {
         let text = ctx.objs.str_get(ext.text_id);
         if !text.is_empty() {
@@ -1398,7 +1398,7 @@ fn draw_dropdown<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &W
     let bg_color = effective_bg(&ctx.objs, widget, ext);
     let bg = if bg_color == 0 { None } else { Some(bg_color) };
 
-    if ext.text_id != 0xFFFF && text_w > 0 {
+    if ext.text_id != crate::pool::PTR_NONE && text_w > 0 {
         let text = ctx.objs.str_get(ext.text_id);
         if !text.is_empty() {
             font.draw_str(&ctx.lcd, &ctx.flash, text, cx, ty, ext.text_color, bg);
@@ -1698,7 +1698,7 @@ fn draw_graph<B: LcdBackend>(
         return;
     }
 
-    let arr_id = ext.value as u16;
+    let arr_id = ext.value as crate::pool::ObjPtr;
     let samples = match objs.arr(arr_id) {
         Some(s) if !s.is_empty() => s,
         _ => return,
@@ -2289,7 +2289,7 @@ mod tests {
         w.kind = KIND_GAUGE;
         w.border_color = 0x3186;
         let mut e = WidgetExt::DEFAULT;
-        e.value = value;
+        e.value = value as crate::widget::WValue;
         e.press_color = 0x05FF;
         e.text_color = 0xF800;
         let g = GaugeGeom::new(&GAUGE_BOX).unwrap();

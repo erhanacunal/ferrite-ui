@@ -155,6 +155,7 @@ fn main(_args: BootArgs) -> ! {
         eeprom: ferrite_core::eeprom::EepromImpl::none(),
         audio: ferrite_core::audio::AudioImpl::with_backend(audio),
         cursor_visible: false,
+        tasks: ferrite_core::task::TaskTable::new(),
     });
     let touch = TouchImpl::with_backend(touch::MxtTouch);
     embassy::run(move |spawner| {

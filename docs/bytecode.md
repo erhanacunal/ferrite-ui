@@ -69,6 +69,9 @@ Function kinds:
 | `9` | `on_touch_move` |
 | `10` | `on_swipe` |
 | `11` | `on_long_press` |
+| `12`–`14` | generated `on_click` / `on_tap` / `on_paint` dispatchers |
+| `15` | `on_task_message` (multi_program) |
+| `16` | `on_task_exit` (multi_program) |
 
 Older images are still parsed:
 
@@ -308,6 +311,20 @@ Trig, square root, and rounding. All operate on f32 bit patterns. Integer stack 
 | `0xD1` | `fatan2` | pop `x`, pop `y`; push `atan2(y, x)` in radians |
 | `0xD2` | `ffloor` | round toward −∞ |
 | `0xD3` | `fceil` | round toward +∞ |
+
+## Task Opcodes
+
+Only in firmware built with the ferrite-core `multi_program` feature (`caps.multi_program`, Exynos 4412); elsewhere they are bad opcodes (fault 2). Task ids: `0` = main, `1..15` = children.
+
+| Opcode | Name | Behavior |
+| --- | --- | --- |
+| `0xD4` | `spawnProgram` | pop `arg`, pop `str_id` (a `RES_PROGRAM` name); push the new task's id, or `-1` (no such program / no free slot). The task starts after the current burst |
+| `0xD5` | `killProgram` | pop `id`; push `1` if the task will end (at the end of the pass), else `0`. Killing the running task enters `Exit` with no next program |
+| `0xD6` | `taskId` | push the running task's id |
+| `0xD7` | `taskAlive` | pop `id`; push `1` while the task is starting or running |
+| `0xD8` | `sendMessage` | pop `b`, pop `a`, pop `id`; queue `on_task_message(from, a, b)` for that task; push `1`, or `0` (no such task / queue full) |
+| `0xD9` | `setForeground` | pop `id`; push `1` if that task now gets the global input events |
+| `0xDA` | `foregroundTask` | push the foreground task's id |
 
 ## Widget Properties
 

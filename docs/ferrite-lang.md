@@ -1001,6 +1001,39 @@ fn on_home(wid) {
 See `examples/exynos4412/launcher` (a launcher listing its apps with
 `programName`, and two apps).
 
+### Tasks: several programs at once
+
+On boards with `caps.multi_program` (Exynos 4412) programs can also run
+side by side, as tasks sharing the one widget tree. `main` is task `0`; it
+(or any task) starts children with `spawnProgram`. Every task has its own VM
+(variables, stacks, callbacks) and runs a burst each main-loop pass. Any task
+may read and change any widget; a widget belongs to the task that allocated
+it, and its `on_click` / `on_tap` / `on_paint` run in the task that set them.
+Global input callbacks (`on_touch_*`, `on_swipe`, `on_long_press`) go to the
+foreground task (main at first, see `setForeground`). `ferrite_build` rejects
+these builtins for other devices.
+
+| Builtin | Result | Description |
+|---------|--------|-------------|
+| `spawnProgram(name [, arg])` | int | Start program `name` as a new task (`programArg()` = `arg`); returns its id, or `-1` if there is no such program or all 15 child slots are taken. It runs `setup()` / `loop()` after the caller's burst |
+| `killProgram(task)` | int | End a task at the end of this pass (`1`), or `0` if it isn't running. `killProgram(taskId())` ends the caller now |
+| `taskId()` | int | The running task's id |
+| `taskAlive(task)` | int | `1` while the task is starting or running |
+| `sendMessage(task, a [, b])` | int | Queue `on_task_message(from, a, b)` for `task` (`b` defaults to `0`); `0` if it isn't running or the queue (64) is full |
+| `setForeground(task)` | int | Send the global input events to `task` |
+| `foregroundTask()` | int | The task that gets them |
+
+When a task ends (it was killed, it faulted, or it called `runProgram` from
+main) its widget subtrees are destroyed, its strings and arrays freed (those
+still shown by other tasks' widgets are handed to them). Its own children
+keep running; their exits are then reported to main. The parent's `on_task_exit(task, code)` runs; if the parent has none, a
+fault shows a dialog with the reason (OK closes it). `runProgram` in a child
+restarts that task with the other program; in main it ends every child and
+switches as before. A fault in main still shows the Code 6 screen.
+
+See `examples/exynos4412/multitask` (main with a ticker panel task and a
+messaging worker task).
+
 ### Sound: playSound / stopSound / setVolume / soundPlaying
 
 Play WAV files listed under `"sounds"` in `project.json` on boards with an
@@ -1595,6 +1628,8 @@ Define these functions to handle system events:
 | `fn on_swipe(dir, widget, delta)` | Swipe gesture (release after ≥40px travel) | direction (`SWIPE_*`), pressed widget id, signed dominant-axis delta |
 | `fn on_long_press(widget, x, y)` | Finger held still for ~1 s | pressed widget id, screen x, y |
 | `fn on_user_message(arr_id)` | USART message received | array of bytes |
+| `fn on_task_message(from, a, b)` | `sendMessage` from another task (multi_program boards) | sender task id, two ints |
+| `fn on_task_exit(task, code)` | A child task ended (multi_program boards) | task id; `0` ended / killed, `> 0` VM fault code, `-1` did not start |
 
 ```c
 fn on_touch_down(x, y) {
@@ -1924,7 +1959,7 @@ ext_count:      u8      (pre-allocation hint)
 opcodes...
 ```
 
-Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnPageChanging=4, OnPageChanged=5, OnUserMessage=6, OnTouchDown=7, OnTouchUp=8, OnTouchMove=9, OnSwipe=10, OnLongPress=11.
+Function kinds: Setup=0, Loop=1, UserFunction=2, OnProgramStart=3, OnPageChanging=4, OnPageChanged=5, OnUserMessage=6, OnTouchDown=7, OnTouchUp=8, OnTouchMove=9, OnSwipe=10, OnLongPress=11, OnTaskMessage=15, OnTaskExit=16 (12–14 are the generated widget-callback dispatchers).
 
 ## VM Limits
 

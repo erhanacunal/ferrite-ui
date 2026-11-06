@@ -50,6 +50,8 @@ pub mod sdboot;
 pub mod pool;
 pub mod strpool;
 pub mod syscfg;
+#[cfg(feature = "multi_program")]
+pub mod task;
 pub mod types;
 pub mod vm;
 pub mod widget;

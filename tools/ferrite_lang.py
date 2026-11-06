@@ -1735,6 +1735,8 @@ class CodeGen:
         'alloc', 'get', 'parseInt', 'strLen', 'strlen', 'strcmp',
         'millis', 'brightness', 'pinRead', 'eepromSize', 'eepromRead', 'strByte',
         'playSound', 'soundPlaying', 'runProgram', 'programArg',
+        'spawnProgram', 'killProgram', 'taskId', 'taskAlive', 'sendMessage',
+        'setForeground', 'foregroundTask',
         'arrFree', 'strFree', 'arrLen',
         'syscall',
     }
@@ -2956,6 +2958,47 @@ class CodeGen:
             self.asm.builtin(Builtin.PROGRAM_ARG)
             return
 
+        if name == 'spawnProgram':
+            # spawnProgram(name [, arg]) → task id of a new task running
+            # program `name` next to this one (it starts after this burst;
+            # programArg() gives it `arg`), or -1 (no such program / no slot)
+            if len(node.args) not in (1, 2):
+                raise CompileError("spawnProgram() takes 1-2 arguments: name [, arg]", node.line)
+            self._gen_expr(node.args[0])
+            if len(node.args) == 2:
+                self._gen_expr(node.args[1])
+            else:
+                self.asm.push(0)
+            self.asm.builtin(Builtin.TASK_SPAWN)
+            return
+
+        if name == 'sendMessage':
+            # sendMessage(task, a [, b]) → 1 if queued for the task's
+            # on_task_message(from, a, b), else 0
+            if len(node.args) not in (2, 3):
+                raise CompileError("sendMessage() takes 2-3 arguments: task, a [, b]", node.line)
+            for a in node.args:
+                self._gen_expr(a)
+            if len(node.args) == 2:
+                self.asm.push(0)
+            self.asm.builtin(Builtin.TASK_SEND)
+            return
+
+        if name in ('killProgram', 'taskAlive', 'setForeground'):
+            # killProgram(task) / taskAlive(task) / setForeground(task) → 1 / 0
+            if len(node.args) != 1:
+                raise CompileError(f"{name}() takes 1 argument: task", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin({'killProgram': Builtin.TASK_KILL, 'taskAlive': Builtin.TASK_ALIVE,
+                              'setForeground': Builtin.TASK_SET_FG}[name])
+            return
+
+        if name in ('taskId', 'foregroundTask'):
+            if len(node.args) != 0:
+                raise CompileError(f"{name}() takes no arguments", node.line)
+            self.asm.builtin(Builtin.TASK_ID if name == 'taskId' else Builtin.TASK_FG)
+            return
+
         if name == 'programName':
             # programName(i) → name of program i (image order), "" past the
             # last one; programName(-1) → this program's name
@@ -3622,6 +3665,8 @@ SYSTEM_CALLBACKS = {
     'on_touch_down':    2,
     'on_touch_up':      0,
     'on_touch_move':    2,
+    'on_task_message':  3,
+    'on_task_exit':     2,
     # Generated compile-time dispatchers injected by _generate_dispatchers()
     '__on_click_dispatch': 1,  # (widget_id)
     '__on_tap_dispatch':   2,  # (widget_id, packed_xy)

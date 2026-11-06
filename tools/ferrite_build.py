@@ -163,6 +163,10 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
 # Builtins whose opcodes exist only in firmware built with ferrite-core's
 # `audio` feature (caps.audio); elsewhere they fault with "bad opcode".
 AUDIO_BUILTINS = ("playSound", "stopSound", "setVolume", "soundPlaying")
+# Builtins whose opcodes exist only in firmware built with ferrite-core's
+# `multi_program` feature (caps.multi_program).
+TASK_BUILTINS = ("spawnProgram", "killProgram", "taskId", "taskAlive", "sendMessage",
+                 "setForeground", "foregroundTask")
 
 
 def used_builtins(source_path: str, include_dirs, names) -> set[str]:
@@ -206,13 +210,24 @@ SYSCFG_VERSION = 2
 # key -> (struct offset, struct format, max value)
 SYSCFG_FIELDS = {
     "arena_bytes": (4, "<I", 0xFFFFFFFF),
-    "max_objects": (8, "<H", 0x3FFF),
+    # Low half at 8, high half at 12 (wide_obj firmware; others clamp to 0x3FFF).
+    "max_objects": (8, "<I", 0x7FFFFFFE),
     "uart_rx_bytes": (10, "<H", 32 * 1024),
     "eval_stack": (16, "<B", 255),
     "call_stack": (17, "<B", 255),
     "cb_queue": (18, "<B", 255),
     "anim_slots": (19, "<B", 255),
 }
+
+
+def syscfg_value(rec: bytes, key: str) -> int:
+    """One field of a 32-byte RES_SYSCFG record."""
+    if key == "max_objects":
+        lo, = struct.unpack_from("<H", rec, 8)
+        hi, = struct.unpack_from("<H", rec, 12)
+        return lo | hi << 16
+    offset, fmt, _max = SYSCFG_FIELDS[key]
+    return struct.unpack_from(fmt, rec, offset)[0]
 
 
 def build_syscfg(memory: dict) -> bytes:
@@ -231,6 +246,10 @@ def build_syscfg(memory: dict) -> bytes:
             rounded = 1 << value.bit_length()
             print(f"warning: memory.uart_rx_bytes {value} is not a power of two — "
                   f"firmware rounds it up to {rounded}", file=sys.stderr)
+        if key == "max_objects":
+            struct.pack_into("<H", rec, 8, value & 0xFFFF)
+            struct.pack_into("<H", rec, 12, value >> 16)
+            continue
         struct.pack_into(fmt, rec, offset, value)
     return bytes(rec)
 
@@ -489,6 +508,14 @@ def build(project_path: str, output_path: str | None) -> dict:
                       f"the firmware has no sound opcodes",
                       file=sys.stderr)
                 sys.exit(1)
+        if device and not device["caps"].get("multi_program"):
+            used = used_builtins(str(source), include_dirs, TASK_BUILTINS)
+            if used:
+                print(f"Error: {prog['source']}: {', '.join(sorted(used))} need a "
+                      f"device that runs several programs at once "
+                      f"(caps.multi_program); the firmware has no task opcodes",
+                      file=sys.stderr)
+                sys.exit(1)
         image_data = compile_program(str(source), include_dirs=include_dirs,
                                      render_mode=render_mode,
                                      widget_page=prog.get("widget_page", widget_page),
@@ -652,9 +679,8 @@ def dump_fs(binary: bytes, symbols: dict | None = None) -> str:
             out.append(f"; {rate} Hz, {'stereo' if channels == 2 else 'mono'}, "
                        f"{frames} frames ({frames / max(rate, 1):.2f} s)")
         elif kind == RES_SYSCFG:
-            fields = [f"{key}={struct.unpack_from(fmt, blob, off)[0]}"
-                      for key, (off, fmt, _max) in SYSCFG_FIELDS.items()
-                      if off + struct.calcsize(fmt) <= len(blob)]
+            fields = [f"{key}={syscfg_value(blob, key)}"
+                      for key in SYSCFG_FIELDS if len(blob) >= 32]
             out.append("; " + ", ".join(fields) + "  (0 = firmware default)")
         else:
             head = " ".join(f"{b:02X}" for b in blob[:32])

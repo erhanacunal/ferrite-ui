@@ -161,6 +161,7 @@ _KIND_NAMES = {
     7: 'on_touch_down', 8: 'on_touch_up', 9: 'on_touch_move',
     10: 'on_swipe', 11: 'on_long_press',
     12: '__on_click_dispatch', 13: '__on_tap_dispatch', 14: '__on_paint_dispatch',
+    15: 'on_task_message', 16: 'on_task_exit',
 }
 
 

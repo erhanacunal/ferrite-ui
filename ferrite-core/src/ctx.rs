@@ -40,4 +40,7 @@ pub struct Ctx<P: Platform> {
     pub gpio: GpioImpl<P::GpioB>,
     pub eeprom: EepromImpl<P::EepromB>,
     pub cursor_visible: bool,
+    /// Task slots and the requests the VMs queue (`multi_program`).
+    #[cfg(feature = "multi_program")]
+    pub tasks: crate::task::TaskTable,
 }

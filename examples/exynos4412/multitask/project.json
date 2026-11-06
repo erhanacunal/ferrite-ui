@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "device": "exynos4412",
+  "screen": [1280, 800],
+  "render_mode": "dirty",
+  "include_dirs": ["../../../lib"],
+  "programs": [
+    {"name": "main", "source": "main.fl"},
+    {"name": "ticker", "source": "ticker.fl"},
+    {"name": "worker", "source": "worker.fl"}
+  ]
+}

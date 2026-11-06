@@ -17,12 +17,12 @@ use crate::proto::{
 };
 use crate::render;
 use crate::strpool;
-use crate::pool::ObjPool;
+use crate::pool::{ObjPool, ObjPtr, PTR_NONE};
 use crate::types::{Edges, Offset, Size};
 use crate::widget::{
     FLAG_CHECKED, FLAG_CLICKABLE, FLAG_CLIP_CHILDREN, FLAG_ENABLED, FLAG_HAS_ON_CLICK,
     FLAG_HAS_ON_PAINT, FLAG_HAS_ON_TAP, FLAG_MULTI_LINE, FLAG_VISIBLE, KIND_BUTTON_GROUP, KIND_RADIO,
-    WidgetId,
+    WValue, WidgetId,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -195,6 +195,11 @@ pub enum FunctionKind {
     OnTap = 13,
     /// Compile-time generated paint dispatcher. Arg: array_id of dirty widget ids (freed by generated body).
     OnPaint = 14,
+    /// `multi_program`: a `sendMessage` arrived. Args: from_task, a, b.
+    OnTaskMessage = 15,
+    /// `multi_program`: a task this one spawned ended. Args: task, code
+    /// (0 = exited or killed, > 0 = VM fault code, -1 = could not start).
+    OnTaskExit = 16,
 }
 
 impl FunctionKind {
@@ -215,6 +220,8 @@ impl FunctionKind {
             12 => Some(Self::OnClick),
             13 => Some(Self::OnTap),
             14 => Some(Self::OnPaint),
+            15 => Some(Self::OnTaskMessage),
+            16 => Some(Self::OnTaskExit),
             _ => None,
         }
     }
@@ -414,6 +421,22 @@ const OP_STR_BYTE: u8 = 0xB8; // pop index, pop str_id → push byte 0..255, or 
 const OP_RUN_PROGRAM: u8 = 0xBD; // pop arg, pop str_id (program name) → push 0 if missing; else exit, switch
 const OP_PROGRAM_ARG: u8 = 0xBE; // push the arg this program was started with (0 at boot)
 const OP_PROGRAM_NAME: u8 = 0xBF; // pop index → push str_id: nth program's name, "" past the end, -1 = own
+// Tasks (`multi_program`; elsewhere bad opcodes). Requests go to `Ctx::tasks`
+// and the runtime acts on them after the burst.
+#[cfg(feature = "multi_program")]
+const OP_TASK_SPAWN: u8 = 0xD4; // pop arg, pop str_id → push task id, -1 (no such program / no free slot)
+#[cfg(feature = "multi_program")]
+const OP_TASK_KILL: u8 = 0xD5; // pop id → push 1 if it will end, 0 (main / not running)
+#[cfg(feature = "multi_program")]
+const OP_TASK_ID: u8 = 0xD6; // push the running task's id (0 = main)
+#[cfg(feature = "multi_program")]
+const OP_TASK_ALIVE: u8 = 0xD7; // pop id → push 1 while starting / running, else 0
+#[cfg(feature = "multi_program")]
+const OP_TASK_SEND: u8 = 0xD8; // pop b, pop a, pop id → push 1 queued / 0
+#[cfg(feature = "multi_program")]
+const OP_TASK_SET_FG: u8 = 0xD9; // pop id → push 1 if it now gets the global input events
+#[cfg(feature = "multi_program")]
+const OP_TASK_FG: u8 = 0xDA; // push the foreground task's id
 // Sound opcodes exist only with the `audio` feature; elsewhere they are
 // bad opcodes.
 #[cfg(feature = "audio")]
@@ -545,6 +568,9 @@ pub struct ProgramRef {
 }
 
 impl ProgramRef {
+    /// No program (a free task slot).
+    pub const EMPTY: Self = Self { name: [0; crate::fs::NAME_LEN], len: 0, arg: 0 };
+
     /// `name` is cut to the 16 bytes a resource name can hold.
     pub fn new(name: &[u8], arg: i32) -> Self {
         let len = name.len().min(crate::fs::NAME_LEN);
@@ -1274,8 +1300,8 @@ impl Vm {
             return;
         }
 
-        let overlay = if (0..0xFFFF).contains(&overlay_raw) {
-            WidgetId(overlay_raw as u16)
+        let overlay = if overlay_raw >= 0 && (overlay_raw as i64) < PTR_NONE as i64 {
+            WidgetId(overlay_raw as ObjPtr)
         } else {
             WidgetId::NONE
         };
@@ -1792,7 +1818,7 @@ impl Vm {
             OP_ARR_FREE => {
                 let arr_id = self.pop();
                 if arr_id >= 0 {
-                    ctx.objs.arr_free(arr_id as u16);
+                    ctx.objs.arr_free(arr_id as ObjPtr);
                 }
             }
 
@@ -1917,10 +1943,10 @@ impl Vm {
                 // allocated widgets use W_TARGET_S, which takes a u16 id from
                 // the stack.
                 let wid = self.read_u8();
-                self.target = WidgetId(wid as u16);
+                self.target = WidgetId(wid as ObjPtr);
             }
             OP_W_TARGET_S => {
-                let wid = self.pop() as u16;
+                let wid = self.pop() as ObjPtr;
                 self.target = WidgetId(wid);
             }
             OP_W_SET => {
@@ -1941,12 +1967,12 @@ impl Vm {
                 // Static parent id (u8). Used for parent(0) and other literal
                 // widget references that fit in u8.
                 let parent = self.read_u8();
-                self.w_parent(ctx, parent as u16);
+                self.w_parent(ctx, parent as ObjPtr);
             }
             OP_W_PARENT_S => {
                 // Dynamic parent — id from stack. Used when the parent is a
                 // widget variable (its slot stores the runtime id from alloc).
-                let parent = self.pop() as u16;
+                let parent = self.pop() as ObjPtr;
                 self.w_parent(ctx, parent);
             }
             OP_W_LOAD => {
@@ -2151,37 +2177,37 @@ impl Vm {
             }
             OP_CONCAT => {
                 let (a, b) = self.pop2();
-                let (a, b) = (a as u16, b as u16);
+                let (a, b) = (a as ObjPtr, b as ObjPtr);
                 match ctx.objs.str_concat(a, b) {
                     Some(id) => self.push(id as i32),
                     None => self.fail(fault::STR_ALLOC),
                 }
             }
             OP_PARSE_INT => {
-                let id = self.pop() as u16;
+                let id = self.pop() as ObjPtr;
                 self.push(strpool::parse_int(&ctx.objs, id));
             }
             OP_PARSE_FLOAT => {
-                let id = self.pop() as u16;
+                let id = self.pop() as ObjPtr;
                 self.push(strpool::parse_float(&ctx.objs, id) as i32);
             }
             OP_STR_LEN => {
-                let id = self.pop() as u16;
+                let id = self.pop() as ObjPtr;
                 self.push(ctx.objs.str_len(id) as i32);
             }
             OP_STR_BYTE => {
                 let (id, idx) = self.pop2();
-                let bytes = ctx.objs.str_get(id as u16);
+                let bytes = ctx.objs.str_get(id as ObjPtr);
                 let b = usize::try_from(idx).ok().and_then(|i| bytes.get(i));
                 self.push(b.map_or(-1, |&b| b as i32));
             }
             OP_STR_CMP => {
                 let (a, b) = self.pop2();
-                let (a, b) = (a as u16, b as u16);
+                let (a, b) = (a as ObjPtr, b as ObjPtr);
                 self.push(ctx.objs.str_compare(a, b));
             }
             OP_SET_TEXT => {
-                let str_id = self.pop() as u16;
+                let str_id = self.pop() as ObjPtr;
                 if self.target.is_some() {
                     ctx.objs.update_ext(self.target, |ext| {
                         ext.text_id = str_id;
@@ -2193,7 +2219,7 @@ impl Vm {
             }
             OP_DRAW_STR => {
                 ctx.objs.screen_touched();
-                let str_id = self.pop() as u16;
+                let str_id = self.pop() as ObjPtr;
                 let (font_id, colors) = self.pop2();
                 let (fg, bg) = unpack_pair(colors);
                 let font_id = font_id as u8;
@@ -2206,7 +2232,7 @@ impl Vm {
             }
             OP_STR_CLEAR => ctx.objs.str_sweep(),
             OP_STR_FREE => {
-                let str_id = self.pop() as u16;
+                let str_id = self.pop() as ObjPtr;
                 ctx.objs.str_free(str_id);
             }
             OP_ROUNDED_RECT => {
@@ -2249,7 +2275,7 @@ impl Vm {
                 }
             }
             OP_SEND_USART => {
-                let arr_id = self.pop() as u16;
+                let arr_id = self.pop() as ObjPtr;
                 if let Some(arr) = ctx.objs.arr(arr_id) {
                     for &val in arr {
                         ctx.usart.write_byte(val as u8);
@@ -2257,7 +2283,7 @@ impl Vm {
                 }
             }
             OP_SEND_USART_STR => {
-                let str_id = self.pop() as u16;
+                let str_id = self.pop() as ObjPtr;
                 let bytes = ctx.objs.str_get(str_id);
                 ctx.usart.write(bytes);
             }
@@ -2376,7 +2402,7 @@ impl Vm {
             // --- Programs ---
             OP_RUN_PROGRAM => {
                 let (str_id, arg) = self.pop2();
-                let name = ctx.objs.str_get(str_id as u16);
+                let name = ctx.objs.str_get(str_id as ObjPtr);
                 let found = name.len() <= crate::fs::NAME_LEN
                     && ctx.fs.as_ref().is_some_and(|fs| {
                         fs.find_kind(&ctx.flash, name, crate::fs::RES_PROGRAM).is_some()
@@ -2391,6 +2417,8 @@ impl Vm {
                 }
             }
             OP_PROGRAM_ARG => self.push(self.program.arg),
+            #[cfg(feature = "multi_program")]
+            OP_TASK_SPAWN..=OP_TASK_FG => self.task_op(ctx, op),
             OP_PROGRAM_NAME => {
                 let index = self.pop();
                 let mut buf = [0u8; crate::fs::NAME_LEN];
@@ -2417,7 +2445,7 @@ impl Vm {
             #[cfg(feature = "audio")]
             OP_SOUND_PLAY => {
                 let (str_id, looping) = self.pop2();
-                let name = ctx.objs.str_get(str_id as u16);
+                let name = ctx.objs.str_get(str_id as ObjPtr);
                 let ok = match ctx.fs.as_ref() {
                     Some(fs) => ctx.audio.play(fs, &ctx.flash, name, looping != 0),
                     None => false,
@@ -2442,23 +2470,23 @@ impl Vm {
                 let duration = self.pop() as u16;
                 let to = self.pop();
                 let (widget, prop) = self.pop2();
-                let (widget, prop) = (WidgetId(widget as u16), prop as u8);
+                let (widget, prop) = (WidgetId(widget as ObjPtr), prop as u8);
                 let now = ctx.systick.millis();
                 self.start_anim(ctx, widget, prop, to, duration, ctrl, on_end, now);
             }
             OP_STOP_ANIM => {
-                let widget = WidgetId(self.pop() as u16);
+                let widget = WidgetId(self.pop() as ObjPtr);
                 self.stop_anim(widget);
             }
             OP_STOP_ANIM_PROP => {
                 let (widget, prop) = self.pop2();
-                let (widget, prop) = (WidgetId(widget as u16), prop as u8);
+                let (widget, prop) = (WidgetId(widget as ObjPtr), prop as u8);
                 self.stop_anim_prop(widget, prop);
             }
 
             // --- File ops (flash filesystem, read-only) ---
             OP_FILE_OPEN => {
-                let str_id = self.pop() as u16;
+                let str_id = self.pop() as ObjPtr;
                 let name = ctx.objs.str_get(str_id);
                 let result = self.file_open(ctx, name);
                 self.push(result);
@@ -2549,7 +2577,7 @@ impl Vm {
                 for i in (0..actual).rev() {
                     args[i] = self.pop();
                 }
-                let fmt_id = self.pop() as u16;
+                let fmt_id = self.pop() as ObjPtr;
                 let mut fmt_buf = [0u8; 128];
                 let fmt_len = {
                     let fmt = ctx.objs.str_get(fmt_id);
@@ -2668,6 +2696,69 @@ impl Vm {
         }
     }
 
+    /// The `multi_program` task opcodes (0xD4..=0xDA).
+    #[cfg(feature = "multi_program")]
+    #[inline(never)]
+    fn task_op<P: Platform>(&mut self, ctx: &mut Ctx<P>, op: u8) {
+        let me = ctx.objs.cur_task;
+        match op {
+            OP_TASK_SPAWN => {
+                let (str_id, arg) = self.pop2();
+                let name = ctx.objs.str_get(str_id as ObjPtr);
+                let found = !name.is_empty()
+                    && name.len() <= crate::fs::NAME_LEN
+                    && ctx.fs.as_ref().is_some_and(|fs| {
+                        fs.find_kind(&ctx.flash, name, crate::fs::RES_PROGRAM).is_some()
+                    });
+                let id = if found { ctx.tasks.spawn(ProgramRef::new(name, arg), me) } else { None };
+                self.push(id.map_or(-1, |i| i as i32));
+            }
+            OP_TASK_KILL => {
+                let id = self.pop();
+                if id == me as i32 && me != crate::task::TASK_MAIN {
+                    // Ending itself: nothing after this instruction runs.
+                    self.next_program = None;
+                    self.state = VmState::Exit;
+                    self.push(1);
+                } else {
+                    let ok = ctx.tasks.request_kill(id);
+                    self.push(ok as i32);
+                }
+            }
+            OP_TASK_ID => self.push(me as i32),
+            OP_TASK_ALIVE => {
+                let id = self.pop();
+                self.push(ctx.tasks.alive(id) as i32);
+            }
+            OP_TASK_SEND => {
+                let b = self.pop();
+                let (to, a) = self.pop2();
+                let ok = u8::try_from(to)
+                    .is_ok_and(|to| ctx.tasks.send(crate::task::Msg { to, from: me, a, b }));
+                self.push(ok as i32);
+            }
+            OP_TASK_SET_FG => {
+                let id = self.pop();
+                self.push(ctx.tasks.set_fg(id) as i32);
+            }
+            _ => self.push(ctx.tasks.fg as i32), // OP_TASK_FG
+        }
+    }
+
+    /// A fresh VM for another task, with this one's pool sizes and platform
+    /// hooks. None if the heap can't hold its stacks.
+    #[cfg(feature = "multi_program")]
+    pub fn sibling(&self) -> Option<Self> {
+        let mut vm = Self::new();
+        let (eval, call, cbq) = self.limits();
+        if !vm.configure(eval, call, cbq, self.anim_slots as usize) {
+            return None;
+        }
+        vm.syscall_fn = self.syscall_fn;
+        vm.forced_render_mode = self.forced_render_mode;
+        Some(vm)
+    }
+
     // --- Stack operations ---
 
     #[inline(never)]
@@ -2755,7 +2846,7 @@ impl Vm {
     }
 
     #[inline(never)]
-    fn w_parent<P: Platform>(&mut self, ctx: &mut Ctx<P>, parent: u16) {
+    fn w_parent<P: Platform>(&mut self, ctx: &mut Ctx<P>, parent: ObjPtr) {
         if self.target.is_some() {
             ctx.objs.add_child(WidgetId(parent), self.target);
         }
@@ -2859,9 +2950,9 @@ impl Vm {
                 PG_ALLTAR => self.w_alltar(ctx, arg),
                 PG_TARGET_ID..=PG_PARENT => {
                     let id = if op & 1 != 0 {
-                        self.var_get(self.resolve_slot(arg)) as u16
+                        self.var_get(self.resolve_slot(arg)) as ObjPtr
                     } else {
-                        arg as u16
+                        arg as ObjPtr
                     };
                     if op & 2 != 0 {
                         self.w_parent(ctx, id);
@@ -2914,6 +3005,11 @@ impl Vm {
                 return;
             }
             set_flag(&mut ctx.objs.get_mut(target).flags, flag, val != 0);
+            // The task that wires a handler gets the widget's events.
+            #[cfg(feature = "multi_program")]
+            if val != 0 && flag & (FLAG_HAS_ON_CLICK | FLAG_HAS_ON_TAP | FLAG_HAS_ON_PAINT) != 0 {
+                ctx.objs.take_handler(target);
+            }
             if flag & (FLAG_VISIBLE | FLAG_ENABLED) != 0 {
                 ctx.objs.mark_dirty(target);
             }
@@ -2984,10 +3080,10 @@ impl Vm {
                 PROP_PRESS_COLOR => ext.press_color = val as u16,
                 PROP_IMAGE_ID => ext.image_id = val as u8,
                 PROP_BORDER_RADIUS => ext.border_radius = val as u16,
-                PROP_VALUE => ext.value = val as i16,
+                PROP_VALUE => ext.value = val as WValue,
                 PROP_MAX_LENGTH => ext.max_length = val as u8,
-                PROP_CURSOR_POS => ext.value = val as i16,
-                PROP_SCROLL_Y => ext.value = val as i16,
+                PROP_CURSOR_POS => ext.value = val as WValue,
+                PROP_SCROLL_Y => ext.value = val as WValue,
                 PROP_GRADIENT_COLOR => ext.gradient_color = val as u16,
                 PROP_GRADIENT_DIR => ext.gradient_dir = val as u8,
                 PROP_ALPHA => ext.alpha = val as u8,
@@ -2997,7 +3093,7 @@ impl Vm {
                 PROP_FLEX_GROW => ext.flex_grow = val as u8,
                 // KIND_GRAPH props share storage with value/max_length/image_id;
                 // safe because a single widget kind is exclusive.
-                PROP_GRAPH_ARR => ext.value = val as i16,
+                PROP_GRAPH_ARR => ext.value = val as WValue,
                 PROP_GRAPH_COUNT => ext.max_length = val as u8,
                 PROP_GRAPH_FLAGS => ext.image_id = val as u8,
                 _ => {}
@@ -3082,7 +3178,7 @@ impl Vm {
             PROP_PADDING_R => e.padding.right as i32,
             PROP_PADDING_B => e.padding.bottom as i32,
             PROP_PADDING_L => e.padding.left as i32,
-            // String id of the widget's text (0xFFFF = none → reads as "").
+            // String id of the widget's text (PTR_NONE = none → reads as "").
             PROP_TEXT => e.text_id as i32,
             PROP_TEXT_COLOR => e.text_color as i32,
             PROP_FONT_ID => e.font_id as i32,
@@ -3330,7 +3426,7 @@ impl Vm {
         while done < count {
             let n = (count - done).min(buf.len());
             let at = addr + done as i32;
-            let data = &mut ctx.objs.arr_mut(arr_id as u16).unwrap()[done..done + n];
+            let data = &mut ctx.objs.arr_mut(arr_id as ObjPtr).unwrap()[done..done + n];
             let ok = if write {
                 for (b, &v) in buf.iter_mut().zip(data.iter()) {
                     *b = v as u8;
@@ -3355,7 +3451,7 @@ impl Vm {
         if arr_id < 0 {
             return None;
         }
-        ctx.objs.arr(arr_id as u16)
+        ctx.objs.arr(arr_id as ObjPtr)
     }
 
     fn arr_load<P: Platform>(&mut self, ctx: &Ctx<P>, arr_id: i32, idx: i32) {
@@ -3369,7 +3465,7 @@ impl Vm {
     }
 
     fn arr_store<P: Platform>(&mut self, ctx: &mut Ctx<P>, arr_id: i32, idx: i32, val: i32) {
-        let arr = if arr_id < 0 { None } else { ctx.objs.arr_mut(arr_id as u16) };
+        let arr = if arr_id < 0 { None } else { ctx.objs.arr_mut(arr_id as ObjPtr) };
         match arr {
             Some(arr) => match arr.get_mut(idx as usize) {
                 Some(v) if idx >= 0 => *v = val,
@@ -3671,6 +3767,8 @@ mod anim_tests {
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
             cursor_visible: false,
+            #[cfg(feature = "multi_program")]
+            tasks: crate::task::TaskTable::new(),
         }
     }
 
@@ -3695,9 +3793,9 @@ mod anim_tests {
         ctx.objs.str_sweep();
 
         let id = Vm::get_scalar_prop_on(&ctx, input, PROP_TEXT);
-        assert_eq!(ctx.objs.str_get(id as u16), b"erhan");
+        assert_eq!(ctx.objs.str_get(id as ObjPtr), b"erhan");
         let none = Vm::get_scalar_prop_on(&ctx, empty, PROP_TEXT);
-        assert_eq!(ctx.objs.str_get(none as u16), b"", "no text reads as empty");
+        assert_eq!(ctx.objs.str_get(none as ObjPtr), b"", "no text reads as empty");
     }
 
     #[test]
@@ -4099,7 +4197,7 @@ mod anim_tests {
         vm.program = ProgramRef::new(b"settings", 42);
         vm.tick(&mut ctx, 100);
         assert!(vm.state == VmState::Halted, "fault {}", vm.fault());
-        let s = |vm: &Vm, slot| ctx.objs.str_get(vm.var_get(slot) as u16).to_vec();
+        let s = |vm: &Vm, slot| ctx.objs.str_get(vm.var_get(slot) as ObjPtr).to_vec();
         assert_eq!(s(&vm, 0), b"main");
         assert_eq!(s(&vm, 1), b"settings", "only programs count, the image is skipped");
         assert_eq!(s(&vm, 2), b"", "past the last program");
@@ -4232,7 +4330,7 @@ mod anim_tests {
         vm.tick(&mut ctx, 100);
         assert!(vm.state == VmState::Halted, "fault {}", vm.fault());
         let want: Vec<i32> = (100..120).collect();
-        assert_eq!(ctx.objs.arr(vm.var_get(3) as u16), Some(&want[..]));
+        assert_eq!(ctx.objs.arr(vm.var_get(3) as ObjPtr), Some(&want[..]));
     }
 
     #[test]
@@ -4508,7 +4606,7 @@ mod anim_tests {
         vm.code = VmCode::Ram(code);
         vm.run(&mut ctx);
         assert!(vm.state == VmState::Halted);
-        let id = vm.stack[vm.sp as usize - 1] as u16;
+        let id = vm.stack[vm.sp as usize - 1] as ObjPtr;
         assert_eq!(ctx.objs.str_get(id), &text[..]);
     }
 
@@ -4527,7 +4625,7 @@ mod anim_tests {
         let mut ctx = mock_ctx();
         vm.run(&mut ctx);
         assert!(vm.state == VmState::Halted);
-        let id = vm.stack[vm.sp as usize - 1] as u16;
+        let id = vm.stack[vm.sp as usize - 1] as ObjPtr;
         assert_eq!(ctx.objs.str_get(id), &text[..]);
     }
 

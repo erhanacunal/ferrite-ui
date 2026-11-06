@@ -1,7 +1,7 @@
 //! Object pool: one compacting arena for every object a VM program can see —
 //! widgets, strings and arrays.
 //!
-//! Objects are named by a u16 *pointer* (`ObjPtr`). A pointer never changes
+//! Objects are named by a *pointer* (`ObjPtr`: u16, u32 with `wide_obj`). A pointer never changes
 //! while the object lives; it indexes the pointer table, which holds the
 //! object's current word offset in the arena:
 //!
@@ -10,6 +10,8 @@
 //! arena: [u32; arena_words]   blocks packed from 0 up to `top`
 //! block: header u32 = ptr (bits 0-13) | type (bits 14-15) | payload words (bits 16-31)
 //!        payload ...
+//! wide_obj: header u32 = type (bits 14-15) | payload words (bits 16-31), then ptr u32
+//! hole:  header u32 = T_FREE | (hole words - 1) -- always a single header word
 //! ```
 //!
 //! Allocation bumps `top`. Freeing marks the block `T_FREE` (or lowers `top`
@@ -39,8 +41,12 @@ use crate::syscfg::try_alloc_slice;
 use crate::widget::{Widget, WidgetId};
 
 /// Object pointer: table index. `PTR_NONE` = no object.
+#[cfg(not(feature = "wide_obj"))]
 pub type ObjPtr = u16;
-pub const PTR_NONE: ObjPtr = 0xFFFF;
+/// Object pointer: table index. `PTR_NONE` = no object.
+#[cfg(feature = "wide_obj")]
+pub type ObjPtr = u32;
+pub const PTR_NONE: ObjPtr = ObjPtr::MAX;
 
 /// Block types (header bits 14-15).
 pub const T_FREE: u8 = 0;
@@ -49,7 +55,12 @@ pub const T_STRING: u8 = 2;
 pub const T_ARRAY: u8 = 3;
 
 /// Largest pointer count: the block header stores the pointer in 14 bits.
+#[cfg(not(feature = "wide_obj"))]
 pub const MAX_OBJECTS: usize = 0x3FFF;
+/// Largest pointer count: the pointer has its own header word; the table
+/// entry's free tag (bit 31) caps it -- in practice the heap does first.
+#[cfg(feature = "wide_obj")]
+pub const MAX_OBJECTS: usize = 0x7FFF_FFFE;
 /// Largest payload of one object, in words (16-bit header field).
 pub const MAX_OBJ_WORDS: usize = 0xFFFF;
 
@@ -74,13 +85,50 @@ const FREE_TAG: Off = 1 << (Off::BITS - 1);
 /// Largest arena (words) a table entry can address.
 const MAX_ARENA_WORDS: usize = (FREE_TAG as usize) - 1;
 
+/// Header words of a live block (a hole always has one).
+#[cfg(not(feature = "wide_obj"))]
+pub(crate) const HDR: usize = 1;
+#[cfg(feature = "wide_obj")]
+pub(crate) const HDR: usize = 2;
+
+#[cfg(feature = "wide_obj")]
+const _: () = assert!(cfg!(feature = "pool_large"), "wide_obj needs pool_large (u32 table entries)");
+
+/// Write a live block header at `at`.
 #[inline]
-fn header(ptr: ObjPtr, ty: u8, words: usize) -> u32 {
-    (ptr as u32 & 0x3FFF) | ((ty as u32) << 14) | ((words as u32) << 16)
+fn put_header(arena: &mut [u32], at: usize, ptr: ObjPtr, ty: u8, words: usize) {
+    let h = ((ty as u32) << 14) | ((words as u32) << 16);
+    #[cfg(not(feature = "wide_obj"))]
+    {
+        arena[at] = h | (ptr as u32 & 0x3FFF);
+    }
+    #[cfg(feature = "wide_obj")]
+    {
+        arena[at] = h;
+        arena[at + 1] = ptr;
+    }
 }
+/// Header of a hole `len` words long (header included).
 #[inline]
-fn hdr_ptr(h: u32) -> ObjPtr {
-    (h & 0x3FFF) as ObjPtr
+fn hole(len: usize) -> u32 {
+    ((T_FREE as u32) << 14) | (((len - 1) as u32) << 16)
+}
+/// Pointer of the live block at `at`.
+#[inline]
+fn hdr_ptr(arena: &[u32], at: usize) -> ObjPtr {
+    #[cfg(not(feature = "wide_obj"))]
+    {
+        (arena[at] & 0x3FFF) as ObjPtr
+    }
+    #[cfg(feature = "wide_obj")]
+    {
+        arena[at + 1]
+    }
+}
+/// Words of the block with header `h`, header included.
+#[inline]
+fn blk_len(h: u32) -> usize {
+    (if hdr_type(h) == T_FREE { 1 } else { HDR }) + hdr_words(h)
 }
 #[inline]
 fn hdr_type(h: u32) -> u8 {
@@ -97,14 +145,26 @@ pub struct ObjPool {
     /// First unused arena word.
     top: usize,
     /// Pointers handed out so far (table entries `0..hwm` are initialised).
-    hwm: u16,
+    hwm: ObjPtr,
     /// FIFO of freed pointers, linked through the table.
     free_head: ObjPtr,
     free_tail: ObjPtr,
     /// Words held by freed blocks below `top` (what `compact` would reclaim).
     garbage: usize,
     /// Live objects per type (`[_, widgets, strings, arrays]`).
-    live: [u16; 4],
+    live: [u32; 4],
+    /// Task that allocated each object (`multi_program`): it is freed when
+    /// that task ends.
+    #[cfg(feature = "multi_program")]
+    pub(crate) owner: Box<[u8]>,
+    /// Task that handles each widget's events (`multi_program`): the one that
+    /// allocated it, or that set its last on_click / on_tap / on_paint.
+    #[cfg(feature = "multi_program")]
+    pub(crate) handler: Box<[u8]>,
+    /// Task the next allocations belong to (`multi_program`). The runtime sets
+    /// it around everything a task's VM runs; 0 (main) otherwise.
+    #[cfg(feature = "multi_program")]
+    pub cur_task: u8,
 
     // --- Widget tree state (see widget.rs) ---
     pub root: WidgetId,
@@ -139,6 +199,12 @@ impl ObjPool {
             free_tail: PTR_NONE,
             garbage: 0,
             live: [0; 4],
+            #[cfg(feature = "multi_program")]
+            owner: Box::new([]),
+            #[cfg(feature = "multi_program")]
+            handler: Box::new([]),
+            #[cfg(feature = "multi_program")]
+            cur_task: 0,
             root: WidgetId::NONE,
             dfs_cache: Vec::new(),
             dfs_valid: false,
@@ -181,6 +247,15 @@ impl ObjPool {
         ) else {
             return false;
         };
+        #[cfg(feature = "multi_program")]
+        {
+            let (Some(owner), Some(handler)) = (try_alloc_slice(objects, 0u8), try_alloc_slice(objects, 0u8))
+            else {
+                return false;
+            };
+            self.owner = owner;
+            self.handler = handler;
+        }
         self.arena = arena;
         self.table = table;
         self.dfs_cache = dfs;
@@ -195,6 +270,10 @@ impl ObjPool {
         self.free_tail = PTR_NONE;
         self.garbage = 0;
         self.live = [0; 4];
+        #[cfg(feature = "multi_program")]
+        {
+            self.cur_task = 0;
+        }
         self.root = WidgetId::NONE;
         self.dfs_cache.clear();
         self.dfs_valid = false;
@@ -233,18 +312,20 @@ impl ObjPool {
         while at < self.top {
             let h = self.arena[at];
             if hdr_type(h) == ty {
-                words += 1 + hdr_words(h);
+                words += blk_len(h);
             }
-            at += 1 + hdr_words(h);
+            at += blk_len(h);
         }
         words * 4
     }
     /// Heap bytes held by the pool (arena + table + DFS cache).
     pub fn heap_bytes(&self) -> usize {
         use core::mem::size_of;
+        let tasks = if cfg!(feature = "multi_program") { 2 * self.table.len() } else { 0 };
         self.arena.len() * 4
             + self.table.len() * size_of::<Off>()
             + self.dfs_cache.capacity() * size_of::<WidgetId>()
+            + tasks
     }
     /// Pointers handed out so far: every live pointer is below this. Used as
     /// the iteration bound and as a loop guard for tree walks.
@@ -270,14 +351,14 @@ impl ObjPool {
     pub(crate) fn payload(&self, ptr: ObjPtr, ty: u8) -> Option<&[u32]> {
         let at = self.block(ptr, ty)?;
         let n = hdr_words(self.arena[at]);
-        Some(&self.arena[at + 1..at + 1 + n])
+        Some(&self.arena[at + HDR..at + HDR + n])
     }
 
     #[inline]
     pub(crate) fn payload_mut(&mut self, ptr: ObjPtr, ty: u8) -> Option<&mut [u32]> {
         let at = self.block(ptr, ty)?;
         let n = hdr_words(self.arena[at]);
-        Some(&mut self.arena[at + 1..at + 1 + n])
+        Some(&mut self.arena[at + HDR..at + HDR + n])
     }
 
     /// Type of the object `ptr` names, or `T_FREE` for none.
@@ -333,14 +414,19 @@ impl ObjPool {
 
     /// Allocate an object with `words` zeroed payload words.
     pub(crate) fn alloc_obj(&mut self, ty: u8, words: usize) -> Option<ObjPtr> {
-        if words > MAX_OBJ_WORDS || !self.reserve_top(1 + words) {
+        if words > MAX_OBJ_WORDS || !self.reserve_top(HDR + words) {
             return None;
         }
         let p = self.take_ptr()?;
+        #[cfg(feature = "multi_program")]
+        {
+            self.owner[p as usize] = self.cur_task;
+            self.handler[p as usize] = self.cur_task;
+        }
         let at = self.top;
-        self.arena[at] = header(p, ty, words);
-        self.arena[at + 1..at + 1 + words].fill(0);
-        self.top += 1 + words;
+        put_header(&mut self.arena, at, p, ty, words);
+        self.arena[at + HDR..at + HDR + words].fill(0);
+        self.top += HDR + words;
         self.table[p as usize] = at as Off;
         self.live[ty as usize] += 1;
         Some(p)
@@ -351,20 +437,23 @@ impl ObjPool {
         let Some(at) = self.block(ptr, ty) else {
             return;
         };
-        let words = hdr_words(self.arena[at]);
-        self.release_block(at, words);
+        let len = blk_len(self.arena[at]);
+        self.release_block(at, len);
         self.live[ty as usize] -= 1;
         self.put_ptr(ptr);
     }
 
-    /// Turn the block at `at` (`words` payload) into a hole, or drop it when
-    /// it ends at `top`.
-    fn release_block(&mut self, at: usize, words: usize) {
-        if at + 1 + words == self.top {
+    /// Turn the `len` words at `at` into a hole, or drop them when they end
+    /// at `top`.
+    fn release_block(&mut self, at: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        if at + len == self.top {
             self.top = at;
         } else {
-            self.arena[at] = header(0, T_FREE, words);
-            self.garbage += 1 + words;
+            self.arena[at] = hole(len);
+            self.garbage += len;
         }
     }
 
@@ -383,38 +472,37 @@ impl ObjPool {
             return false;
         }
         if words < old {
-            self.arena[at] = header(ptr, ty, words);
-            let tail = at + 1 + words;
+            put_header(&mut self.arena, at, ptr, ty, words);
             // The cut-off words become a hole (a 1-word hole is just a header).
-            self.release_block(tail, old - words - 1);
+            self.release_block(at + HDR + words, old - words);
             return true;
         }
         // Last block: extend in place.
-        if at + 1 + old == self.top && self.top + (words - old) <= self.arena.len() {
-            self.arena[at + 1 + old..at + 1 + words].fill(0);
-            self.arena[at] = header(ptr, ty, words);
+        if at + HDR + old == self.top && self.top + (words - old) <= self.arena.len() {
+            self.arena[at + HDR + old..at + HDR + words].fill(0);
+            put_header(&mut self.arena, at, ptr, ty, words);
             self.top += words - old;
             return true;
         }
         // Move to top. Compaction may move the block (and may leave it last).
-        if !self.reserve_top(1 + words) {
+        if !self.reserve_top(HDR + words) {
             return false;
         }
         let at = self.table[ptr as usize] as usize;
-        if at + 1 + old == self.top {
-            self.arena[at + 1 + old..at + 1 + words].fill(0);
-            self.arena[at] = header(ptr, ty, words);
+        if at + HDR + old == self.top {
+            self.arena[at + HDR + old..at + HDR + words].fill(0);
+            put_header(&mut self.arena, at, ptr, ty, words);
             self.top += words - old;
             return true;
         }
         let dst = self.top;
-        self.arena.copy_within(at + 1..at + 1 + old, dst + 1);
-        self.arena[dst + 1 + old..dst + 1 + words].fill(0);
-        self.arena[dst] = header(ptr, ty, words);
-        self.top += 1 + words;
+        self.arena.copy_within(at + HDR..at + HDR + old, dst + HDR);
+        self.arena[dst + HDR + old..dst + HDR + words].fill(0);
+        put_header(&mut self.arena, dst, ptr, ty, words);
+        self.top += HDR + words;
         self.table[ptr as usize] = dst as Off;
-        self.arena[at] = header(0, T_FREE, old);
-        self.garbage += 1 + old;
+        self.arena[at] = hole(HDR + old);
+        self.garbage += HDR + old;
         true
     }
 
@@ -424,11 +512,12 @@ impl ObjPool {
         let mut write = 0;
         while read < self.top {
             let h = self.arena[read];
-            let n = 1 + hdr_words(h);
+            let n = blk_len(h);
             if hdr_type(h) != T_FREE {
                 if read != write {
                     self.arena.copy_within(read..read + n, write);
-                    self.table[hdr_ptr(h) as usize] = write as Off;
+                    let p = hdr_ptr(&self.arena, write);
+                    self.table[p as usize] = write as Off;
                 }
                 write += n;
             }
@@ -436,6 +525,34 @@ impl ObjPool {
         }
         self.top = write;
         self.garbage = 0;
+    }
+
+    /// True if `p` belongs to the running task: always without
+    /// `multi_program`. Scopes the string sweep and literal sharing.
+    #[inline]
+    pub(crate) fn mine(&self, p: ObjPtr) -> bool {
+        #[cfg(feature = "multi_program")]
+        {
+            self.owner.get(p as usize) == Some(&self.cur_task)
+        }
+        #[cfg(not(feature = "multi_program"))]
+        {
+            let _ = p;
+            true
+        }
+    }
+
+    /// Give object `obj` to the task that owns object `like` (a string the
+    /// runtime made for a task's widget, e.g. keyboard input). No-op without
+    /// `multi_program`.
+    #[inline]
+    pub(crate) fn adopt(&mut self, obj: ObjPtr, like: ObjPtr) {
+        #[cfg(feature = "multi_program")]
+        if let (Some(&o), true) = (self.owner.get(like as usize), (obj as usize) < self.owner.len()) {
+            self.owner[obj as usize] = o;
+        }
+        #[cfg(not(feature = "multi_program"))]
+        let _ = (obj, like);
     }
 
     /// Pointers of the live objects of type `ty`, in pointer order.
@@ -515,14 +632,15 @@ mod tests {
 
     #[test]
     fn compaction_keeps_pointers_and_contents() {
-        // 16 words: three 4-word blocks (header + 3) fill 12.
-        let mut p = pool(64, 8);
+        // Three (header + 3)-word blocks, one more block of room left.
+        let blk = HDR + 3;
+        let mut p = pool(4 * 4 * blk, 8);
         let a = p.arr_from(&[1, 2, 3]).unwrap();
         let b = p.arr_from(&[4, 5, 6]).unwrap();
         let c = p.arr_from(&[7, 8, 9]).unwrap();
         p.arr_free(b);
-        assert_eq!(p.garbage_bytes(), 16);
-        // 6 words don't fit at top (4 left) until the hole is reclaimed.
+        assert_eq!(p.garbage_bytes(), 4 * blk);
+        // header + 5 words don't fit at top (one block left) until the hole is reclaimed.
         let d = p.arr_from(&[10, 11, 12, 13, 14]).unwrap();
         assert_eq!(p.garbage_bytes(), 0);
         assert_eq!(p.arr(a), Some(&[1, 2, 3][..]));
@@ -538,7 +656,7 @@ mod tests {
         let a = p.arr_alloc(3).unwrap();
         let b = p.arr_alloc(3).unwrap();
         p.arr_free(b);
-        assert_eq!((p.used_bytes(), p.garbage_bytes()), (16, 0));
+        assert_eq!((p.used_bytes(), p.garbage_bytes()), (4 * (HDR + 3), 0));
         p.arr_free(a);
         assert_eq!(p.used_bytes(), 0);
     }
@@ -553,13 +671,31 @@ mod tests {
         assert!(p.resize_obj(a, T_ARRAY, 6), "moves past b");
         assert_eq!(p.arr(a), Some(&[1, 2, 0, 0, 0, 0][..]));
         assert_eq!(p.arr(b), Some(&[9][..]));
-        assert_eq!(p.garbage_bytes(), 20);
+        assert_eq!(p.garbage_bytes(), 4 * (HDR + 4));
         assert!(p.resize_obj(a, T_ARRAY, 1), "shrink");
         assert_eq!(p.arr(a), Some(&[1][..]));
         p.compact();
         assert_eq!(p.arr(b), Some(&[9][..]));
         assert_eq!(p.arr(a), Some(&[1][..]));
-        assert_eq!(p.used_bytes(), 16);
+        assert_eq!(p.used_bytes(), 4 * (2 * HDR + 2));
+    }
+
+    #[cfg(feature = "wide_obj")]
+    #[test]
+    fn wide_pointers_past_14_bits() {
+        let n = 0x4100usize;
+        let mut p = pool(n * 4 * (HDR + 1), n);
+        let ptrs: Vec<ObjPtr> = (0..n).map(|i| p.arr_from(&[i as i32]).unwrap()).collect();
+        assert_eq!(*ptrs.last().unwrap(), (n - 1) as ObjPtr);
+        // Free every other one, then compact: survivors keep id and value.
+        for &q in ptrs.iter().step_by(2) {
+            p.arr_free(q);
+        }
+        p.compact();
+        for (i, &q) in ptrs.iter().enumerate().skip(1).step_by(2) {
+            assert_eq!(p.arr(q), Some(&[i as i32][..]));
+        }
+        assert_eq!(p.live_objects(T_ARRAY), n / 2);
     }
 
     #[test]
