@@ -29,6 +29,15 @@
 //! (before it starts, or if it failed to) [`flush`] presents on CPU0, waiting
 //! for the switch.
 //!
+//! **G2D present on CPU0** (`g2d_present`, instead of the CPU2 presenter):
+//! [`flush`] cleans the caches (L1 by set/way, the PL310 by way: the G2D
+//! reads DRAM) and starts the G2D on the first 32-row band; the G2D interrupt
+//! (on CPU0) starts the next band and, after the last, switches the FIMD
+//! (`STATE` = FLIP). A later [`flush`] sees the switch at the scanned address
+//! and goes back to IDLE. [`fence`] keeps the same row rule, and while it
+//! waits it takes band ends itself (the interrupt may be masked). CPU2 is
+//! not started.
+//!
 //! Drawing on the scanned buffer directly showed every redraw's intermediate
 //! states (the erase before the paint), and in random 8-pixel pieces: dirty
 //! cache lines reach DRAM in eviction order, not drawing order. That looked
@@ -42,7 +51,10 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use exynos_4412_rs::drivers::display::{self, Fimd, Framebuffer, LTN101AL03, LVDS_SETTLE_MS, Timing};
-use exynos_4412_rs::{mmu, smp};
+use exynos_4412_rs::drivers::g2d::{self, Filter, Format, G2d, Surface};
+use exynos_4412_rs::drivers::gic::Gic;
+use exynos_4412_rs::drivers::l2c::L2c;
+use exynos_4412_rs::{cpu, mmu, smp, soc};
 use ferrite_core::fb;
 use ferrite_core::lcd::LcdBackend;
 
@@ -162,6 +174,54 @@ pub fn take_present_stats() -> (u32, u32, u32) {
     )
 }
 
+/// CPU0 presents with the G2D (`g2d_present`, [`start_presenter`]). Cleared
+/// for good if the G2D ever fails; CPU0 then copies itself.
+static G2D_ON: AtomicBool = AtomicBool::new(false);
+/// Rows per G2D copy: `COPY_LO` moves after each, so a primitive waits for
+/// at most one band (~70 µs at full width).
+const BAND: usize = 32;
+/// Polls of a band's end by [`wait_rows`] before giving up on the G2D (far
+/// more than a band takes).
+const G2D_POLLS: u32 = 5_000_000;
+/// After the switch (FLIP), how long [`flush`] waits for the FIMD to scan
+/// the new buffer before going on anyway (FIMD off).
+const FLIP_MS: u32 = 100;
+/// `systick::millis` at the switch.
+static FLIP_AT: AtomicU32 = AtomicU32::new(0);
+
+/// The G2D present in flight: CPU0 only, used by the task and by the G2D
+/// interrupt, so every user but the interrupt masks IRQs around it.
+struct G2dJob {
+    /// The box being copied (`prev ∪ req`).
+    r: Rect,
+    /// End of the band the G2D copies now (rows `COPY_LO..band_end`).
+    band_end: usize,
+    /// The back scan buffer: physical address (G2D) and non-cacheable alias
+    /// (CPU fallback).
+    back: usize,
+    nc: usize,
+    #[cfg(feature = "perf")]
+    t0: u32,
+}
+
+struct JobCell(UnsafeCell<G2dJob>);
+// SAFETY: see `G2dJob`.
+unsafe impl Sync for JobCell {}
+
+static JOB: JobCell = JobCell(UnsafeCell::new(G2dJob {
+    r: EMPTY,
+    band_end: 0,
+    back: 0,
+    nc: 0,
+    #[cfg(feature = "perf")]
+    t0: 0,
+}));
+
+fn job() -> &'static mut G2dJob {
+    // SAFETY: see `G2dJob`: IRQs are masked (or this is the interrupt).
+    unsafe { &mut *JOB.0.get() }
+}
+
 /// CPU2 runs the presenter ([`start_presenter`] succeeded).
 static PRESENTER: AtomicBool = AtomicBool::new(false);
 
@@ -231,11 +291,22 @@ fn wait_rows(y0: usize, y1: usize) {
     let t0 = crate::perf::cycles();
     // `lo` is read before `hi`: CPU2 only raises `lo` and lowers `hi` within
     // a copy, so the pair always covers what it may still read.
+    let mut polls = 0u32;
     while STATE.load(Ordering::Acquire) == COPY {
         let lo = COPY_LO.load(Ordering::Acquire);
         let hi = COPY_HI.load(Ordering::Acquire);
         if y1 <= lo || y0 >= hi {
             break;
+        }
+        // The G2D present (this core's): take band ends here, as the
+        // interrupt may be masked; a G2D that never finishes is given up.
+        if !PRESENTER.load(Ordering::Relaxed) {
+            polls += 1;
+            if polls < G2D_POLLS {
+                g2d_poll();
+            } else {
+                g2d_abort();
+            }
         }
         core::hint::spin_loop();
     }
@@ -245,17 +316,32 @@ fn wait_rows(y0: usize, y1: usize) {
 
 /// Shows what was drawn since the last flush. With the presenter on CPU2:
 /// hands the dirty box over and returns at once (or, if CPU2 is still busy,
-/// keeps it for a later flush). Without it: presents on this core.
+/// keeps it for a later flush). With the G2D: starts its copy and returns
+/// (or keeps the box while the last present is not on screen yet). Without
+/// either: presents on this core.
 pub fn flush() {
+    if !PRESENTER.load(Ordering::Acquire) {
+        match STATE.load(Ordering::Acquire) {
+            FLIP => g2d_flipped(),
+            COPY => return,
+            _ => {}
+        }
+    }
     let d = unsafe { &mut *(&raw mut DIRTY) };
     if is_empty(d) {
         return;
     }
     if !PRESENTER.load(Ordering::Acquire) {
-        let p = present_state();
-        p.req = *d;
-        *d = EMPTY;
-        present(p, |_, _| {}, || {});
+        match STATE.load(Ordering::Acquire) {
+            IDLE if G2D_ON.load(Ordering::Relaxed) => g2d_start(d),
+            IDLE => {
+                let p = present_state();
+                p.req = *d;
+                *d = EMPTY;
+                present(p, |_, _| {}, || {});
+            }
+            _ => {}
+        }
         return;
     }
     if STATE.load(Ordering::Acquire) != IDLE {
@@ -276,11 +362,155 @@ pub fn flush() {
 pub fn flush_wait() {
     flush();
     while unsafe { !is_empty(&*(&raw const DIRTY)) } || STATE.load(Ordering::Acquire) != IDLE {
-        if STATE.load(Ordering::Acquire) == IDLE {
-            flush();
+        match STATE.load(Ordering::Acquire) {
+            // The G2D present: drive it to its end.
+            COPY if !PRESENTER.load(Ordering::Acquire) => wait_rows(0, H),
+            COPY => {}
+            // IDLE: present; FLIP: on CPU0, `flush` looks for the switch.
+            _ => flush(),
         }
         core::hint::spin_loop();
     }
+}
+
+/// CPU0, IDLE, G2D on: starts the G2D present of `d` (+ the previous box).
+fn g2d_start(d: &mut Rect) {
+    let p = present_state();
+    let back_i = 1 - p.front;
+    let Some(back) = p.fb[back_i].as_ref().map(|fb| fb.address()) else {
+        G2D_ON.store(false, Ordering::Relaxed);
+        return;
+    };
+    p.req = *d;
+    *d = EMPTY;
+    let r = union(p.prev, p.req);
+    let nc = p.nc[back_i];
+    #[cfg(feature = "perf")]
+    let t0 = crate::perf::cycles();
+    // The G2D reads DRAM: what this core drew is still in its L1 and in the
+    // PL310. L1 by set/way is ~1000 operations, the PL310 by way one
+    // background operation for the whole cache.
+    mmu::clean_l1_all();
+    L2c::new().clean_all();
+    COPY_LO.store(r[1], Ordering::Relaxed);
+    COPY_HI.store(r[3], Ordering::Relaxed);
+    STATE.store(COPY, Ordering::Release);
+    let masked = cpu::mask_irq();
+    let j = job();
+    j.r = r;
+    j.band_end = r[1];
+    j.back = back;
+    j.nc = nc;
+    #[cfg(feature = "perf")]
+    {
+        j.t0 = t0;
+    }
+    g2d_next(j);
+    cpu::restore_irq(masked);
+}
+
+/// The G2D interrupt (CPU0): a band has ended.
+pub fn g2d_isr() {
+    g2d_step();
+}
+
+/// Takes a band end if there is one, IRQs masked around it.
+fn g2d_poll() {
+    let masked = cpu::mask_irq();
+    g2d_step();
+    cpu::restore_irq(masked);
+}
+
+/// IRQs masked: if the band in flight has ended, starts the next one (or
+/// switches the FIMD after the last).
+fn g2d_step() {
+    if STATE.load(Ordering::Acquire) == COPY && !PRESENTER.load(Ordering::Relaxed) && G2d::new().ack() {
+        g2d_next(job());
+    }
+}
+
+/// IRQs masked: rows below `band_end` are copied; starts the next band, or
+/// switches the FIMD. A G2D that refuses → CPU copy of the rest.
+fn g2d_next(j: &mut G2dJob) {
+    let y = j.band_end;
+    COPY_LO.store(y, Ordering::Release);
+    if y < j.r[3] {
+        let y1 = (y + BAND).min(j.r[3]);
+        if g2d_rows(j.back, j.r[0], y, y1, j.r[2] - j.r[0]) {
+            j.band_end = y1;
+            return;
+        }
+        G2D_ON.store(false, Ordering::Relaxed);
+        cpu_copy(j, y);
+    }
+    g2d_finish(j);
+}
+
+/// The G2D did not finish a band: give it up for good, copy the rest of the
+/// box on this core and switch.
+#[cold]
+fn g2d_abort() {
+    let masked = cpu::mask_irq();
+    if STATE.load(Ordering::Acquire) == COPY {
+        G2D_ON.store(false, Ordering::Relaxed);
+        exynos_4412_rs::println!("ferrite: G2D present timed out, CPU copy from now on");
+        let j = job();
+        // From the band in flight on (the G2D may still write it: the same
+        // pixels).
+        cpu_copy(j, COPY_LO.load(Ordering::Relaxed));
+        g2d_finish(j);
+    }
+    cpu::restore_irq(masked);
+}
+
+/// Copies rows `y..` of the job's box with the CPU.
+fn cpu_copy(j: &G2dJob, y: usize) {
+    let (src, dst) = (buf_ptr(SHADOW), j.nc as *mut u32);
+    let (x, w) = (j.r[0], j.r[2] - j.r[0]);
+    for row in y..j.r[3] {
+        let at = row * W + x;
+        // SAFETY: the box is clipped to the screen; `nc` is the back
+        // buffer's alias (G2D mode needs one).
+        unsafe { copy_row(src.add(at), dst.add(at), w) };
+        COPY_LO.store(row + 1, Ordering::Release);
+    }
+}
+
+/// IRQs masked: the copy is done; switch the FIMD to the back buffer
+/// (at the next vsync) and let CPU0 draw everywhere (FLIP).
+fn g2d_finish(j: &G2dJob) {
+    // The copy has reached DRAM before the FIMD may scan it.
+    // SAFETY: a barrier only.
+    unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+    #[cfg(feature = "perf")]
+    {
+        COPY_CYCLES.fetch_add(crate::perf::cycles().wrapping_sub(j.t0), Ordering::Relaxed);
+        COPY_COUNT.fetch_add(1, Ordering::Relaxed);
+        COPY_BYTES.fetch_add(((j.r[3] - j.r[1]) * (j.r[2] - j.r[0]) * 4) as u32, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "perf"))]
+    let _ = j;
+    let p = present_state();
+    if let Some(fb) = p.fb[1 - p.front].as_ref() {
+        let _ = Fimd::new().show(fb);
+    }
+    FLIP_AT.store(systick::millis(), Ordering::Relaxed);
+    STATE.store(FLIP, Ordering::Release);
+}
+
+/// FLIP, G2D present: once the FIMD scans the new buffer (or after
+/// `FLIP_MS`: FIMD off), it is the front and the next present may start.
+fn g2d_flipped() {
+    let p = present_state();
+    let back_i = 1 - p.front;
+    let want = p.fb[back_i].as_ref().map(|fb| fb.address() as u32);
+    let switched = want.is_none_or(|a| Fimd::new().scan_address() == a);
+    if !switched && systick::millis().wrapping_sub(FLIP_AT.load(Ordering::Relaxed)) < FLIP_MS {
+        return;
+    }
+    p.front = back_i;
+    p.prev = p.req;
+    STATE.store(IDLE, Ordering::Release);
 }
 
 /// One present: copy `prev ∪ req` from the shadow into the back buffer
@@ -299,8 +529,8 @@ fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) 
     let t0 = crate::perf::cycles();
     for y in r[1]..r[3] {
         let at = y * W + x;
-        // SAFETY: both boxes are clipped to the screen (`mark` callers); the
-        // shadow and the scan buffers are distinct.
+        // SAFETY: both boxes are clipped to the screen (`mark` callers);
+        // the shadow and the scan buffers are distinct.
         unsafe { copy_row(src.add(at), dst.add(at), w) };
         if nc == 0 {
             mmu::clean_dcache_range(dst as usize + at * 4, w * 4);
@@ -335,12 +565,43 @@ fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) 
     p.prev = p.req;
 }
 
-/// Starts the presenter on `cpu` (CPU0, after `Gic::init`). On failure
-/// presents stay on CPU0.
-pub fn start_presenter(cpu: usize) -> Result<(), smp::StartError> {
+/// Sets up how presents run (CPU0, after `Gic::init`, IRQs on): with the G2D
+/// driven by CPU0 (`g2d_present`), else the presenter on `cpu`. Returns
+/// which; on failure presents stay on CPU0 (CPU copy).
+pub fn start_presenter(cpu: usize) -> Result<&'static str, smp::StartError> {
+    // The G2D copy needs the L2 clean by way; erratum 727915 (a corrupting
+    // clean + invalidate by way) is r2p0's, this board's PL310 is r3p2. Its
+    // CPU fallback writes through the non-cacheable alias.
+    #[cfg(feature = "g2d_present")]
+    {
+        let l2 = L2c::new();
+        let p = present_state();
+        let buffers = p.nc.iter().all(|&a| a != 0) && p.fb.iter().all(Option::is_some);
+        if buffers && (!l2.is_enabled() || l2.revision() >= 0x05) {
+            let hz = G2d::new().power_on(g2d::DEFAULT_HZ);
+            let gic = Gic::new();
+            gic.set_target(soc::G2D_IRQ, 0);
+            gic.enable(soc::G2D_IRQ);
+            G2D_ON.store(true, Ordering::Release);
+            exynos_4412_rs::println!("ferrite: present copy by G2D at {} MHz", hz / 1_000_000);
+            return Ok("LCD presents by the G2D, driven by CPU0 (CPU2 not started)");
+        }
+    }
     smp::start_cpu(cpu, presenter)?;
     PRESENTER.store(true, Ordering::Release);
-    Ok(())
+    Ok("LCD presenter on CPU2")
+}
+
+/// Starts the G2D copy of rows `y0..y1`, columns `x..x + w`, from the shadow
+/// to the scan buffer at physical address `back` (its end: the interrupt or
+/// [`G2d::ack`]). False if it refused. The shadow must be in DRAM
+/// ([`g2d_start`]'s cleans).
+fn g2d_rows(back: usize, x: usize, y0: usize, y1: usize, w: usize) -> bool {
+    let shadow = Surface { address: buf_ptr(SHADOW) as usize, stride: W * 4, width: W, height: H, format: Format::Xrgb8888 };
+    let target = Surface { address: back, ..shadow };
+    let rect = g2d::Rect::new(x, y0, w, y1 - y0);
+    let g = G2d::new();
+    g.copy(&shadow, rect, &target, rect, Filter::Nearest).is_ok()
 }
 
 /// Copies `n` pixels from `src` (the cached shadow) to `dst`: NEON, 64 bytes

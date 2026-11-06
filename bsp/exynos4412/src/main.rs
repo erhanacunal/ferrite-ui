@@ -15,6 +15,8 @@
 //!   nothing CPU0 does can overrun the 16-byte FIFO.
 //! - CPU2: the LCD presenter (`lcd::start_presenter`), no executor: copies
 //!   the dirty box to the back scan buffer and switches the FIMD at vsync.
+//!   Not started with `g2d_present`: CPU0 drives the G2D copy instead (its
+//!   interrupt goes to CPU0).
 //! CPU3 stays parked. Audio is refilled from the `pdma0` interrupt (audio.rs).
 //!
 //! Build (from this directory): `cargo build --release`
@@ -33,7 +35,7 @@ use exynos_4412_rs::drivers::max77686::Max77686;
 use exynos_4412_rs::drivers::pl330::PDMA0_IRQ;
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::exceptions::ExceptionFrame;
-use exynos_4412_rs::{BootArgs, cpu, embassy, heap, mmu, println, smp};
+use exynos_4412_rs::{BootArgs, cpu, embassy, heap, mmu, println, smp, soc};
 
 use ferrite_core::backlight::BacklightImpl;
 use ferrite_core::ctx::Ctx;
@@ -74,6 +76,9 @@ extern "C" fn handle_irq(_frame: &mut ExceptionFrame) {
     // waits (and disable it).
     if irq.id() == PDMA0_IRQ {
         audio::dma_isr();
+    } else if irq.id() == soc::G2D_IRQ {
+        // A G2D present band has ended (lcd.rs, `g2d_present`).
+        lcd::g2d_isr();
     } else {
         // MCT (embassy time), UART2 RX (CPU1), …; the rest, e.g. the wake
         // SGI a secondary core gets at its start, is ignored.
@@ -144,11 +149,11 @@ fn main(_args: BootArgs) -> ! {
             true
         }
     };
-    // CPU2: the LCD presenter (copy to the back scan buffer + switch at
-    // vsync), so CPU0 never waits for the display. Not fatal: presents then
-    // run on CPU0.
+    // Presents: the G2D driven by CPU0 (`g2d_present`), else CPU2 as the LCD
+    // presenter (copy to the back scan buffer + switch at vsync), so CPU0
+    // never waits for the display. Not fatal: presents then run on CPU0.
     match lcd::start_presenter(2) {
-        Ok(()) => println!("ferrite: LCD presenter on CPU2"),
+        Ok(how) => println!("ferrite: {}", how),
         Err(e) => println!("ferrite: CPU2 ERROR {:?}, LCD presents on CPU0", e),
     }
     println!("ferrite: up, entering runtime");

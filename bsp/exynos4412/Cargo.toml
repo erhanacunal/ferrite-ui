@@ -9,9 +9,12 @@ name = "ferrite-ui"
 path = "src/main.rs"
 
 [features]
-default = ["perf"]
+default = ["perf", "g2d_present"]
 # Main-loop profiler: PMU cycle counter + `ferrite_cli.py perf` report.
 perf = ["ferrite-core/perf"]
+# The presenter (CPU2) copies the dirty box with the G2D instead of the CPU
+# (`lcd.rs`, "G2D present copy"). Off = the NEON copy.
+g2d_present = []
 
 [dependencies]
 ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "pool_large", "wide_code", "wide_obj", "multi_program", "audio", "fast_vm", "render_cache", "superops"] }
