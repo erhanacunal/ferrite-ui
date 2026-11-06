@@ -892,17 +892,24 @@ fn draw_widget_body<P: Platform>(
     // transparent one), confined to the clip: blending is not idempotent, so
     // a pixel outside the clip must not be blended twice. Without readback,
     // glyph cells are filled opaquely with the nearest solid background.
+    // The text is also confined to the label's box: glyphs taller
+    // than the box were drawn past it by a full redraw (`render_all` clips to
+    // the screen only), and no later redraw or restore, both clipped to the
+    // box, erased those pixels again.
     if widget.kind == KIND_LABEL {
         if ctx.lcd.has_alpha() {
             for cr in clip.iter() {
-                ctx.lcd.set_scissor(Some(*cr));
-                draw_label_text(ctx, widget, abs, ext, None);
+                if let Some(r) = cr.intersection(abs) {
+                    ctx.lcd.set_scissor(Some(r));
+                    draw_label_text(ctx, widget, abs, ext, None);
+                }
             }
-            ctx.lcd.set_scissor(None);
         } else {
             let bg = resolved_text_bg(&ctx.objs, widget, ext, P::DEFAULT_BG_COLOR);
+            ctx.lcd.set_scissor(Some(*abs));
             draw_label_text(ctx, widget, abs, ext, Some(bg));
         }
+        ctx.lcd.set_scissor(None);
     }
 
     // Progress bar / slider fill
@@ -939,11 +946,20 @@ fn draw_widget_body<P: Platform>(
         }
     }
 
-    // Spline graph (clip region already applied via screen-clipped fill calls
-    // below; pixel writes are cheap so we just bound to inner).
+    // Spline graph. Its curve and fill primitives take no clip: confine them
+    // to the clip region and the widget's box via the scissor. Without it a
+    // graph updated under a widget in front (a pull-down shade) drew over it,
+    // and the spline's overshoot past the top or bottom left lines outside
+    // the box, where no restore reaches.
     if widget.kind == KIND_GRAPH {
         let inner = inner_rect(abs, &b);
-        draw_graph(&ctx.lcd, &ctx.objs, widget, &inner, ext);
+        for cr in clip.iter() {
+            if let Some(r) = cr.intersection(abs) {
+                ctx.lcd.set_scissor(Some(r));
+                draw_graph(&ctx.lcd, &ctx.objs, widget, &inner, ext);
+            }
+        }
+        ctx.lcd.set_scissor(None);
     }
 
     // Image widget — draw image centered in content area
