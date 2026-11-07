@@ -109,6 +109,7 @@ impl Platform for EpaperPlatform {
     type SystickB = crate::systick::EpdSystick;
     type GpioB = crate::user_gpio::EpdGpio;
     type EepromB = ferrite_core::eeprom::NoEeprom;
+    type Renderer = ferrite_core::renderer::DefaultRenderer;
     // E-paper is white when idle; anti-aliased text on transparent labels
     // blends against this instead of the raster-board default (black).
     const DEFAULT_BG_COLOR: u16 = COLOR_WHITE;

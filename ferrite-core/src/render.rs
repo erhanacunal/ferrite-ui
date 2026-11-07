@@ -5,6 +5,7 @@ use crate::types::{Color, Edges, Offset, Rect};
 use crate::pool::ObjPool;
 use crate::lcd::{LcdBackend, LcdImpl, Underlay};
 use crate::platform::Platform;
+use crate::renderer::WidgetRenderer;
 use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
     FLAG_DIRTY_AB, FLAG_HAS_ON_PAINT, FLAG_PAINTED, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
@@ -15,7 +16,7 @@ use crate::widget::{
 /// Screen-bounds rect: the panel size from `LcdBackend::WIDTH`/`HEIGHT`,
 /// swapped in portrait mode (`LcdImpl::width`/`height`).
 #[inline]
-fn screen_rect<B: LcdBackend>(lcd: &LcdImpl<B>) -> Rect {
+pub fn screen_rect<B: LcdBackend>(lcd: &LcdImpl<B>) -> Rect {
     Rect::new(0, 0, lcd.width(), lcd.height())
 }
 
@@ -162,7 +163,7 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
         // Translucent widgets and transparent labels must not blend over
         // their own previous output in this buffer — restore what is behind
         // them first, unless this pass already repainted all of it.
-        if ctx.lcd.has_alpha() && shows_behind(&ctx.objs, id) && !behind_is_fresh(&ctx.objs, 0, i, &abs, false)
+        if ctx.lcd.has_alpha() && shows_behind_on::<P>(&ctx.objs, id) && !behind_is_fresh(&ctx.objs, 0, i, &abs, false)
         {
             redraw_behind(ctx, i, abs);
         }
@@ -515,7 +516,7 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
                 // they share its occluder list, so they were painted
                 // everywhere this widget's clip reaches.
                 if ctx.lcd.has_alpha()
-                    && shows_behind(&ctx.objs, sid)
+                    && shows_behind_on::<P>(&ctx.objs, sid)
                     && !behind_is_fresh(&ctx.objs, di, si, &sabs, moved_fresh && contains(&abs, &sabs))
                 {
                     redraw_behind_region(ctx, si, &clip, &sabs);
@@ -660,7 +661,7 @@ fn contains(outer: &Rect, inner: &Rect) -> bool {
 /// Does `draw_widget` paint every pixel of `rect` opaquely for `id` (whose
 /// absolute rect is `abs`)? True for a solid, square-cornered widget with a
 /// background: its border strips plus background fill tile its whole rect.
-fn covers_opaquely(tree: &ObjPool, id: WidgetId, abs: &Rect, rect: &Rect) -> bool {
+pub fn covers_opaquely(tree: &ObjPool, id: WidgetId, abs: &Rect, rect: &Rect) -> bool {
     let w = tree.get(id);
     let ext = &tree.ext(id);
     if is_freeform_shape(w.kind) || ext.border_radius != 0 || ext.alpha < 255 {
@@ -679,7 +680,14 @@ fn covers_opaquely(tree: &ObjPool, id: WidgetId, abs: &Rect, rect: &Rect) -> boo
 /// drawn straight over the content behind it on readback backends), or an
 /// anti-aliased outline — rounded corners and freeform shapes blend their
 /// edge pixels over what is behind (only asked on readback backends).
-fn shows_behind(tree: &ObjPool, id: WidgetId) -> bool {
+/// As the board's renderer reports it (`WidgetRenderer::shows_behind`), else
+/// the built-in rule ([`shows_behind`]).
+fn shows_behind_on<P: Platform>(tree: &ObjPool, id: WidgetId) -> bool {
+    P::Renderer::shows_behind(tree, id).unwrap_or_else(|| shows_behind(tree, id))
+}
+
+/// [`shows_behind_on`] for the built-in drawing.
+pub fn shows_behind(tree: &ObjPool, id: WidgetId) -> bool {
     if tree.alpha(id) < 255 {
         return true;
     }
@@ -703,7 +711,7 @@ fn shows_behind(tree: &ObjPool, id: WidgetId) -> bool {
 /// image without a background paints none): the pressed parent's fill, with
 /// its rounded corners, already shows through, and a filled copy would be a
 /// square box over it.
-fn effective_bg(tree: &ObjPool, widget: &Widget, ext: &WidgetExt) -> Color {
+pub fn effective_bg(tree: &ObjPool, widget: &Widget, ext: &WidgetExt) -> Color {
     // This widget is pressed (or a selected group button) and has a press_color
     if shows_press(widget) && ext.press_color != 0 {
         return ext.press_color;
@@ -788,9 +796,19 @@ fn resolved_text_bg(tree: &ObjPool, widget: &Widget, ext: &WidgetExt, fallback: 
 fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     #[cfg(feature = "perf")]
     let t0 = crate::perf::now();
-    draw_widget_body(ctx, id, abs, clip);
+    if !P::Renderer::draw(ctx, id, abs, clip) {
+        draw_widget_body(ctx, id, abs, clip);
+    }
     #[cfg(feature = "perf")]
     crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
+}
+
+/// Draw widget `id` the built-in way (what [`DefaultRenderer`] does), for a
+/// board renderer that adds to it or handles only some cases of a kind.
+///
+/// [`DefaultRenderer`]: crate::renderer::DefaultRenderer
+pub fn draw_default<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
+    draw_widget_body(ctx, id, abs, clip);
 }
 
 fn draw_widget_body<P: Platform>(
@@ -1081,7 +1099,7 @@ fn draw_widget_body<P: Platform>(
 /// Colour painted behind widget `w`: its nearest ancestor that paints a
 /// background (the `draw_bg` rule in `draw_widget`), else `fallback`. What
 /// anti-aliased edges mix against on write-only backends.
-fn backdrop(tree: &ObjPool, w: &Widget, fallback: Color) -> Color {
+pub fn backdrop(tree: &ObjPool, w: &Widget, fallback: Color) -> Color {
     let mut pid = w.parent;
     let mut depth = 0usize;
     while pid.is_some() {
@@ -1848,7 +1866,7 @@ fn gauge_key<P: Platform>(objs: &ObjPool, id: WidgetId, abs: &Rect) -> u32 {
 /// value is unchanged.
 fn gauge_changed_rects<P: Platform>(objs: &ObjPool, id: WidgetId, abs: &Rect) -> Option<([Rect; 2], usize)> {
     let w = objs.get(id);
-    if w.flags & FLAG_RENDERED == 0 {
+    if w.flags & FLAG_RENDERED == 0 || !P::Renderer::partial_redraw(objs, id) {
         return None;
     }
     let old = objs.drawn_value(id, gauge_key::<P>(objs, id, abs))?.clamp(0, 100) as i32;
@@ -2258,7 +2276,7 @@ fn erase_widget_area<B: LcdBackend>(tree: &ObjPool, lcd: &LcdImpl<B>, id: Widget
 }
 
 /// Compute inner area (background area) from border box.
-fn inner_rect(abs: &Rect, border: &Edges) -> Rect {
+pub fn inner_rect(abs: &Rect, border: &Edges) -> Rect {
     Rect::new(
         abs.x + border.left as i16,
         abs.y + border.top as i16,

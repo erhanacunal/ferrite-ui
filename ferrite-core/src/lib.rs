@@ -45,6 +45,7 @@ pub mod keyboard;
 pub mod proto;
 pub mod protocol;
 pub mod render;
+pub mod renderer;
 pub mod runtime;
 #[cfg(feature = "sdboot")]
 pub mod sdboot;

@@ -214,4 +214,5 @@ impl Platform for MockPlatform {
     type JpegB = crate::jpeg::NoJpeg;
     type GpioB = MockGpio;
     type EepromB = MockEeprom;
+    type Renderer = crate::renderer::DefaultRenderer;
 }

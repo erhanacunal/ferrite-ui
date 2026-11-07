@@ -36,6 +36,7 @@ impl Platform for N32903Platform {
     type JpegB = crate::jpeg::HwJpeg;
     type GpioB = crate::gpio::HeaderGpio;
     type EepromB = crate::eeprom::SpiNorEeprom;
+    type Renderer = ferrite_core::renderer::DefaultRenderer;
 
     // The "flash" is the SDRAM shadow of a NAND region (see flash/mod.rs), so
     // the default layout applies: config at 0x0000, resource FS from 0x1000.

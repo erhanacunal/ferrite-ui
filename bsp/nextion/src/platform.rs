@@ -42,6 +42,7 @@ impl Platform for NextionPlatform {
     type SystickB = crate::systick::Gd32Systick;
     type GpioB = crate::user_gpio::HeaderGpio;
     type EepromB = crate::eeprom::hw::At24c08;
+    type Renderer = ferrite_core::renderer::DefaultRenderer;
 }
 
 impl PlatformRuntime for NextionPlatform {

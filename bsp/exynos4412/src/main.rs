@@ -66,6 +66,7 @@ mod net;
 #[cfg(feature = "perf")]
 mod perf;
 mod platform;
+mod renderer;
 mod rtc;
 mod storage;
 mod systick;

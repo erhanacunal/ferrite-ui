@@ -87,6 +87,12 @@ pub struct Image {
 }
 
 impl Image {
+    /// Flash address of the pixel data: tells two loaded images apart
+    /// (caches keyed by what an image shows).
+    pub fn data_addr(&self) -> u32 {
+        self.data_addr
+    }
+
     /// Empty/invalid image sentinel (used for ImageList initialization).
     pub const fn empty() -> Self {
         Image {

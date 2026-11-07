@@ -37,6 +37,7 @@ impl Platform for SimPlatform {
     type JpegB = crate::jpeg::SoftJpeg;
     type GpioB = crate::gpio::SimGpio;
     type EepromB = crate::eeprom::SimEeprom;
+    type Renderer = ferrite_core::renderer::DefaultRenderer;
 
     // Software JPEG decoder (sim/src/jpeg.rs) + silent real-time audio
     // output (sim/src/audio.rs).

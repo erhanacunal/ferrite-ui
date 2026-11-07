@@ -14,6 +14,7 @@ use crate::gpio::GpioBackend;
 #[cfg(feature = "jpeg")]
 use crate::jpeg::JpegBackend;
 use crate::lcd::LcdBackend;
+use crate::renderer::WidgetRenderer;
 use crate::rtc::RtcBackend;
 use crate::systick::SystickBackend;
 use crate::touch::TouchBackend;
@@ -39,7 +40,8 @@ pub const CAP_MULTI_PROGRAM: u32 = 1 << 3;
 /// Board's VM runs superinstructions (`superops` feature, opcodes 0x45..=0x4D).
 pub const CAP_SUPEROPS: u32 = 1 << 4;
 
-pub trait Platform {
+// `Sized`: `Renderer` is generic over the platform itself.
+pub trait Platform: Sized {
     type LcdB: LcdBackend;
     // `Clone` so the VM can take its own flash handle for flash-execution cache
     // refills (backends are stateless MMIO drivers — see `flash::FlashBackend`).
@@ -62,6 +64,9 @@ pub trait Platform {
     // User-data EEPROM (`eepromRead`/`eepromWrite`/…); boards without one
     // use `ferrite_core::eeprom::NoEeprom`.
     type EepromB: EepromBackend;
+    // How widgets are drawn (`renderer`); boards without their own use
+    // `ferrite_core::renderer::DefaultRenderer`.
+    type Renderer: WidgetRenderer<Self>;
 
     // --- Flash layout (Rust's stand-in for C-style per-board `#define`s) ---
     //

@@ -43,6 +43,20 @@
 //! cache lines reach DRAM in eviction order, not drawing order. That looked
 //! like the static on an old TV screen.
 //!
+//! **Uncached shadow + G2D drawing** (`g2d_render`): the shadow is drawn
+//! through the non-cacheable alias too, so the G2D sees what the CPU drew
+//! without any cache maintenance: the present no longer cleans the caches
+//! (~1 ms per present), and large fills and translucent fills go to the G2D
+//! ([`g2d_fill`], [`g2d_blend_color`]), as do the board renderer's sprites
+//! ([`blit_sprite`], `renderer.rs`). The cost: CPU blends read DRAM
+//! uncached. A G2D operation runs synchronously, IRQs masked, after any
+//! present copy (which owns the G2D and reads the shadow) has ended.
+//!
+//! **Sprites** ([`begin_sprite`] .. [`end_sprite`]): the primitives draw into
+//! a caller's ARGB8888 buffer instead of the shadow, premultiplied: a fill
+//! is opaque, a blend composites "over" what the buffer holds (transparent
+//! at first), so the buffer can later be blended onto the screen.
+//!
 //! Buffered mode needs nothing more: the shadow already holds every frame, so
 //! `back_buf` is 1 for the renderer's per-buffer tracking and `end_frame` only
 //! flushes.
@@ -51,6 +65,8 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use exynos_4412_rs::drivers::display::{self, Fimd, Framebuffer, LTN101AL03, LVDS_SETTLE_MS, Timing};
+#[cfg(feature = "g2d_render")]
+use exynos_4412_rs::drivers::g2d::Alpha;
 use exynos_4412_rs::drivers::g2d::{self, Filter, Format, G2d, Surface};
 use exynos_4412_rs::drivers::gic::Gic;
 use exynos_4412_rs::drivers::l2c::L2c;
@@ -103,16 +119,106 @@ fn buf_ptr(index: usize) -> *mut u32 {
     unsafe { (BUFFERS.0.get() as *mut u32).add(index * PIXELS) }
 }
 
+/// Where the CPU reaches the shadow: its non-cacheable alias with
+/// `g2d_render` (set by [`init`]), else (null) its cached address.
+static mut SHADOW_PX: *mut u32 = core::ptr::null_mut();
+
 fn back() -> *mut u32 {
-    buf_ptr(SHADOW)
+    let p = unsafe { *(&raw const SHADOW_PX) };
+    if p.is_null() { buf_ptr(SHADOW) } else { p }
 }
 
-/// `w` pixels of row `y` from column `x`.
+/// The shadow is drawn uncached: the G2D may read it as it is.
+fn shadow_uncached() -> bool {
+    unsafe { !(*(&raw const SHADOW_PX)).is_null() }
+}
+
+/// Where the primitives draw: the shadow, or a sprite ([`begin_sprite`]).
+#[derive(Clone, Copy)]
+struct Target {
+    px: *mut u32,
+    stride: usize,
+    w: usize,
+    h: usize,
+    sprite: bool,
+}
+
+static mut SPRITE: Option<Target> = None;
+
+#[inline(always)]
+fn target() -> Target {
+    match unsafe { *(&raw const SPRITE) } {
+        Some(t) => t,
+        None => Target { px: back(), stride: W, w: W, h: H, sprite: false },
+    }
+}
+
+impl Target {
+    fn clip(&self, x: u16, y: u16, w: u16, h: u16) -> Option<(usize, usize, usize, usize)> {
+        let (x, y) = (x as usize, y as usize);
+        if w == 0 || h == 0 || x >= self.w || y >= self.h {
+            return None;
+        }
+        Some((x, y, (w as usize).min(self.w - x), (h as usize).min(self.h - y)))
+    }
+
+    /// `w` pixels of row `y` from column `x`.
+    ///
+    /// # Safety
+    /// Inside the target (`clip`), and no other live reference to them.
+    #[inline(always)]
+    unsafe fn row<'a>(&self, x: usize, y: usize, w: usize) -> &'a mut [u32] {
+        unsafe { core::slice::from_raw_parts_mut(self.px.add(y * self.stride + x), w) }
+    }
+
+    #[inline(always)]
+    fn fence(&self, y0: usize, y1: usize) {
+        if !self.sprite {
+            fence(y0, y1);
+        }
+    }
+
+    #[inline(always)]
+    fn mark(&self, x: usize, y: usize, w: usize, h: usize) {
+        if !self.sprite {
+            mark(x, y, w, h);
+        }
+    }
+
+    /// Opaque XRGB `src` blended over `d` with weight `a` (`fb::alpha8`).
+    #[inline(always)]
+    fn mix(&self, d: u32, src: u32, a: u32) -> u32 {
+        if self.sprite { over(d, src, a) } else { fb::blend_argb8888(d, src, a) }
+    }
+}
+
+/// Premultiplied "over" of opaque `src` (alpha byte 0xFF) with coverage `a`
+/// (0..=256) onto premultiplied `d`: every byte, alpha included, becomes
+/// `(s * a + d * (256 - a)) >> 8`.
+#[inline(always)]
+fn over(d: u32, src: u32, a: u32) -> u32 {
+    let na = 256 - a;
+    let rb = (((src & 0x00FF_00FF) * a + (d & 0x00FF_00FF) * na) >> 8) & 0x00FF_00FF;
+    let ag = ((((src >> 8) & 0x00FF_00FF) * a + ((d >> 8) & 0x00FF_00FF) * na) >> 8) & 0x00FF_00FF;
+    rb | ag << 8
+}
+
+/// From here to [`end_sprite`] the primitives draw into `px` (`w` × `h`
+/// ARGB8888, premultiplied, rows of `stride` pixels) at coordinates 0,0 ..
+/// w,h.
 ///
 /// # Safety
-/// `x + w <= W`, `y < H`, and no other live reference to those pixels.
-unsafe fn row<'a>(fb: *mut u32, x: usize, y: usize, w: usize) -> &'a mut [u32] {
-    unsafe { core::slice::from_raw_parts_mut(fb.add(y * W + x), w) }
+/// `px` holds `stride * h` words and nothing else references them until
+/// `end_sprite`; `w <= stride`, `w <= W`, `h <= H`.
+pub unsafe fn begin_sprite(px: *mut u32, w: usize, h: usize, stride: usize) {
+    unsafe { *(&raw mut SPRITE) = Some(Target { px, stride, w, h, sprite: true }) };
+}
+
+/// Back to the shadow. Cleans the sprite (`px`, `words` long) out of the
+/// caches, so the G2D reads what was drawn.
+pub fn end_sprite(px: *const u32, words: usize) {
+    unsafe { *(&raw mut SPRITE) = None };
+    mmu::clean_dcache_range(px as usize, words * 4);
 }
 
 fn mark(x: usize, y: usize, w: usize, h: usize) {
@@ -130,13 +236,6 @@ pub fn rgb565_to_xrgb(c: u16) -> u32 {
     0xFF00_0000 | display::rgb(r << 3 | r >> 2, g << 2 | g >> 4, b << 3 | b >> 2)
 }
 
-fn clip(x: u16, y: u16, w: u16, h: u16) -> Option<(usize, usize, usize, usize)> {
-    let (x, y) = (x as usize, y as usize);
-    if w == 0 || h == 0 || x >= W || y >= H {
-        return None;
-    }
-    Some((x, y, (w as usize).min(W - x), (h as usize).min(H - y)))
-}
 
 // ============================================================================
 //  Present
@@ -398,8 +497,15 @@ fn g2d_start(d: &mut Rect) {
     // The G2D reads DRAM: what this core drew is still in its L1 and in the
     // PL310. L1 by set/way is ~1000 operations, the PL310 by way one
     // background operation for the whole cache.
-    mmu::clean_l1_all();
-    L2c::new().clean_all();
+    if shadow_uncached() {
+        // Drawn through the alias: only this core's buffered stores must
+        // reach DRAM before the G2D reads them.
+        // SAFETY: a barrier only.
+        unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+    } else {
+        mmu::clean_l1_all();
+        L2c::new().clean_all();
+    }
     COPY_LO.store(r[1], Ordering::Relaxed);
     COPY_HI.store(r[3], Ordering::Relaxed);
     STATE.store(COPY, Ordering::Release);
@@ -432,8 +538,16 @@ fn g2d_poll() {
 /// IRQs masked: if the band in flight has ended, starts the next one (or
 /// switches the FIMD after the last).
 fn g2d_step() {
-    if STATE.load(Ordering::Acquire) == COPY && !PRESENTER.load(Ordering::Relaxed) && G2d::new().ack() {
-        g2d_next(job());
+    let g = G2d::new();
+    if STATE.load(Ordering::Acquire) == COPY && !PRESENTER.load(Ordering::Relaxed) {
+        if g.ack() {
+            g2d_next(job());
+        }
+    } else if g.is_done() && !g.ack() {
+        // Not a band's end, nor an operation waited for (drawing waits with
+        // this interrupt off at the GIC): one given up on that ended late.
+        // Its line stays asserted until cleared.
+        g2d_shutdown();
     }
 }
 
@@ -449,9 +563,22 @@ fn g2d_next(j: &mut G2dJob) {
             return;
         }
         G2D_ON.store(false, Ordering::Relaxed);
+        exynos_4412_rs::println!("ferrite: G2D refused a present band ({:?}), CPU copy from now on", G2d::new().status());
+        #[cfg(feature = "g2d_render")]
+        g2d_give_up();
+        g2d_shutdown();
         cpu_copy(j, y);
     }
     g2d_finish(j);
+}
+
+/// The G2D is given up for good (it did not finish, or refused): its
+/// interrupt off at the GIC, then re-initialised as at boot (`power_on`:
+/// interrupt disabled and cleared, nothing marked running), so a late end
+/// raises nothing and no later check waits for it.
+fn g2d_shutdown() {
+    Gic::new().disable(soc::G2D_IRQ);
+    G2d::new().power_on(g2d::DEFAULT_HZ);
 }
 
 /// The G2D did not finish a band: give it up for good, copy the rest of the
@@ -461,7 +588,10 @@ fn g2d_abort() {
     let masked = cpu::mask_irq();
     if STATE.load(Ordering::Acquire) == COPY {
         G2D_ON.store(false, Ordering::Relaxed);
-        exynos_4412_rs::println!("ferrite: G2D present timed out, CPU copy from now on");
+        exynos_4412_rs::println!("ferrite: G2D present timed out ({:?}), CPU copy from now on", G2d::new().status());
+        #[cfg(feature = "g2d_render")]
+        g2d_give_up();
+        g2d_shutdown();
         let j = job();
         // From the band in flight on (the G2D may still write it: the same
         // pixels).
@@ -473,7 +603,7 @@ fn g2d_abort() {
 
 /// Copies rows `y..` of the job's box with the CPU.
 fn cpu_copy(j: &G2dJob, y: usize) {
-    let (src, dst) = (buf_ptr(SHADOW), j.nc as *mut u32);
+    let (src, dst) = (back(), j.nc as *mut u32);
     let (x, w) = (j.r[0], j.r[2] - j.r[0]);
     for row in y..j.r[3] {
         let at = row * W + x;
@@ -529,7 +659,9 @@ fn g2d_flipped() {
 fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) {
     let back_i = 1 - p.front;
     let r = union(p.prev, p.req);
-    let src = buf_ptr(SHADOW);
+    // The alias with an uncached shadow: a cached read could hit lines from
+    // before CPU0's uncached writes.
+    let src = back();
     let (x, w) = (r[0], r[2] - r[0]);
     let nc = p.nc[back_i];
     let dst = if nc != 0 { nc as *mut u32 } else { buf_ptr(back_i) };
@@ -593,12 +725,21 @@ pub fn start_presenter(cpu: usize) -> Result<&'static str, smp::StartError> {
             gic.set_target(soc::G2D_IRQ, 0);
             gic.enable(soc::G2D_IRQ);
             G2D_ON.store(true, Ordering::Release);
+            #[cfg(feature = "g2d_render")]
+            enable_g2d_draw();
             exynos_4412_rs::println!("ferrite: present copy by G2D at {} MHz", hz / 1_000_000);
             return Ok("LCD presents by the G2D, driven by CPU0 (CPU2 not started)");
         }
     }
     smp::start_cpu(cpu, presenter)?;
     PRESENTER.store(true, Ordering::Release);
+    // The presenter copies with NEON; the G2D is free for drawing.
+    #[cfg(feature = "g2d_render")]
+    {
+        let hz = G2d::new().power_on(g2d::DEFAULT_HZ);
+        enable_g2d_draw();
+        exynos_4412_rs::println!("ferrite: G2D at {} MHz for drawing", hz / 1_000_000);
+    }
     Ok("LCD presenter on CPU2")
 }
 
@@ -742,6 +883,16 @@ fn presenter(_cpu: usize) -> ! {
 
 pub struct FimdLcd;
 
+/// Fills of at least this many pixels go to the G2D (`g2d_render`): it
+/// fills at ~3.2 GB/s, the CPU through the alias at ~1.8 GB/s, and each G2D
+/// operation costs a setup and a wait.
+#[cfg(feature = "g2d_render")]
+const G2D_FILL_MIN: usize = 64 * 1024;
+/// Translucent fills of at least this many pixels go to the G2D: the CPU
+/// would read every pixel back from DRAM uncached.
+#[cfg(feature = "g2d_render")]
+const G2D_BLEND_MIN: usize = 2048;
+
 impl LcdBackend for FimdLcd {
     const WIDTH: u16 = W as u16;
     const HEIGHT: u16 = H as u16;
@@ -764,25 +915,30 @@ impl LcdBackend for FimdLcd {
     }
 
     fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
-        let Some((x, y, w, h)) = clip(x, y, w, h) else { return };
-        fence(y, y + h);
+        let t = target();
+        let Some((x, y, w, h)) = t.clip(x, y, w, h) else { return };
+        let c = rgb565_to_xrgb(color);
+        #[cfg(feature = "g2d_render")]
+        if !t.sprite && w * h >= G2D_FILL_MIN && g2d_fill(x, y, w, h, c) {
+            return;
+        }
+        t.fence(y, y + h);
         timed!({
-            let c = rgb565_to_xrgb(color);
-            let fb = back();
             for r in y..y + h {
-                fb::fill_u32(unsafe { row(fb, x, r, w) }, c);
+                fb::fill_u32(unsafe { t.row(x, r, w) }, c);
             }
-            mark(x, y, w, h);
+            t.mark(x, y, w, h);
         })
     }
 
     fn draw_pixel(&self, x: u16, y: u16, color: u16) {
+        let t = target();
         let (x, y) = (x as usize, y as usize);
-        if x < W && y < H {
-            fence(y, y + 1);
+        if x < t.w && y < t.h {
+            t.fence(y, y + 1);
             timed!({
-                unsafe { *back().add(y * W + x) = rgb565_to_xrgb(color) };
-                mark(x, y, 1, 1);
+                unsafe { t.row(x, y, 1)[0] = rgb565_to_xrgb(color) };
+                t.mark(x, y, 1, 1);
             })
         }
     }
@@ -790,31 +946,33 @@ impl LcdBackend for FimdLcd {
     // The stream writes (write_pixel/s, write_run) belong to the stream
     // `begin_pixels` opened, within one primitive: its fence covers them.
     fn begin_pixels(&self, x: u16, y: u16, w: u16, h: u16) {
+        let t = target();
         // The stream writes only inside the clipped window.
-        let window = clip(x, y, w, h);
+        let window = t.clip(x, y, w, h);
         if let Some((_, wy, _, wh)) = window {
-            fence(wy, wy + wh);
+            t.fence(wy, wy + wh);
         }
         unsafe { (*(&raw mut CURSOR)).begin(x, y, w) };
         if let Some((x, y, w, h)) = window {
-            mark(x, y, w, h);
+            t.mark(x, y, w, h);
         }
     }
 
     fn write_pixel(&self, color: u16) {
+        let t = target();
         timed!({
-            if let Some((x, y)) = unsafe { (*(&raw mut CURSOR)).step(W, H) } {
-                unsafe { *back().add(y * W + x) = rgb565_to_xrgb(color) };
+            if let Some((x, y)) = unsafe { (*(&raw mut CURSOR)).step(t.w, t.h) } {
+                unsafe { t.row(x, y, 1)[0] = rgb565_to_xrgb(color) };
             }
         })
     }
 
     fn write_pixels(&self, colors: &[u16]) {
-        let fb = back();
+        let t = target();
         timed!({
             unsafe {
-                (*(&raw mut CURSOR)).advance(colors.len(), W, H, |x, y, len, skip| {
-                    for (d, &c) in row(fb, x, y, len).iter_mut().zip(&colors[skip..skip + len]) {
+                (*(&raw mut CURSOR)).advance(colors.len(), t.w, t.h, |x, y, len, skip| {
+                    for (d, &c) in t.row(x, y, len).iter_mut().zip(&colors[skip..skip + len]) {
                         *d = rgb565_to_xrgb(c);
                     }
                 });
@@ -823,10 +981,10 @@ impl LcdBackend for FimdLcd {
     }
 
     fn write_run(&self, color: u16, n: usize) {
-        let (fb, c) = (back(), rgb565_to_xrgb(color));
+        let (t, c) = (target(), rgb565_to_xrgb(color));
         timed!({
             unsafe {
-                (*(&raw mut CURSOR)).advance(n, W, H, |x, y, len, _| fb::fill_u32(row(fb, x, y, len), c));
+                (*(&raw mut CURSOR)).advance(n, t.w, t.h, |x, y, len, _| fb::fill_u32(t.row(x, y, len), c));
             }
         })
     }
@@ -838,68 +996,309 @@ impl LcdBackend for FimdLcd {
         if alpha == 255 {
             return self.fill_rect(x, y, w, h, color);
         }
-        let Some((x, y, w, h)) = clip(x, y, w, h) else { return };
+        let t = target();
+        let Some((x, y, w, h)) = t.clip(x, y, w, h) else { return };
         if alpha == 0 {
             return;
         }
-        fence(y, y + h);
+        let (src, a) = (rgb565_to_xrgb(color), fb::alpha8(alpha));
+        #[cfg(feature = "g2d_render")]
+        if !t.sprite && w * h >= G2D_BLEND_MIN && g2d_blend_color(x, y, w, h, src, alpha) {
+            return;
+        }
+        t.fence(y, y + h);
         timed!({
-            let (src, a, fb) = (rgb565_to_xrgb(color), fb::alpha8(alpha), back());
             for r in y..y + h {
-                // SAFETY: `row` is inside the shadow (clipped above).
-                unsafe { blend_fill(row(fb, x, r, w), src, a) };
+                let px = unsafe { t.row(x, r, w) };
+                if t.sprite {
+                    for p in px {
+                        *p = over(*p, src, a);
+                    }
+                } else {
+                    // SAFETY: `row` is inside the shadow (clipped above).
+                    unsafe { blend_fill(px, src, a) };
+                }
             }
-            mark(x, y, w, h);
+            t.mark(x, y, w, h);
         })
     }
 
     fn blend_pixel(&self, x: u16, y: u16, color: u16, alpha: u8) {
+        let t = target();
         let (x, y) = (x as usize, y as usize);
-        if alpha == 0 || x >= W || y >= H {
+        if alpha == 0 || x >= t.w || y >= t.h {
             return;
         }
-        fence(y, y + 1);
+        t.fence(y, y + 1);
         timed!({
-            let p = unsafe { &mut *back().add(y * W + x) };
+            let p = unsafe { &mut t.row(x, y, 1)[0] };
             let src = rgb565_to_xrgb(color);
-            *p = if alpha == 255 { src } else { fb::blend_argb8888(*p, src, fb::alpha8(alpha)) };
-            mark(x, y, 1, 1);
+            *p = if alpha == 255 { src } else { t.mix(*p, src, fb::alpha8(alpha)) };
+            t.mark(x, y, 1, 1);
         })
     }
 
     // Text and alpha images: one fence, timer and mark per row instead of
     // per pixel (each `blend_pixel` paid all three).
     fn blend_span(&self, x: u16, y: u16, color: u16, alphas: &[u8]) {
-        let Some((x, y, w, _)) = clip(x, y, alphas.len() as u16, 1) else { return };
-        fence(y, y + 1);
+        let t = target();
+        let Some((x, y, w, _)) = t.clip(x, y, alphas.len() as u16, 1) else { return };
+        t.fence(y, y + 1);
         timed!({
             let src = rgb565_to_xrgb(color);
-            for (p, &a) in unsafe { row(back(), x, y, w) }.iter_mut().zip(alphas) {
+            for (p, &a) in unsafe { t.row(x, y, w) }.iter_mut().zip(alphas) {
                 match a {
                     0 => {}
                     255 => *p = src,
-                    _ => *p = fb::blend_argb8888(*p, src, fb::alpha8(a)),
+                    _ => *p = t.mix(*p, src, fb::alpha8(a)),
                 }
             }
-            mark(x, y, w, 1);
+            t.mark(x, y, w, 1);
         })
     }
 
     fn blend_row(&self, x: u16, y: u16, colors: &[u16], alphas: &[u8]) {
+        let t = target();
         let n = colors.len().min(alphas.len());
-        let Some((x, y, w, _)) = clip(x, y, n as u16, 1) else { return };
-        fence(y, y + 1);
+        let Some((x, y, w, _)) = t.clip(x, y, n as u16, 1) else { return };
+        t.fence(y, y + 1);
         timed!({
-            let px = unsafe { row(back(), x, y, w) };
+            let px = unsafe { t.row(x, y, w) };
             for ((p, &c), &a) in px.iter_mut().zip(colors).zip(alphas) {
                 match a {
                     0 => {}
                     255 => *p = rgb565_to_xrgb(c),
-                    _ => *p = fb::blend_argb8888(*p, rgb565_to_xrgb(c), fb::alpha8(a)),
+                    _ => *p = t.mix(*p, rgb565_to_xrgb(c), fb::alpha8(a)),
                 }
             }
-            mark(x, y, w, 1);
+            t.mark(x, y, w, 1);
         })
+    }
+}
+
+// ============================================================================
+//  G2D drawing (`g2d_render`)
+// ============================================================================
+
+/// The G2D may draw on the shadow: it is powered, idle between presents,
+/// and the shadow is uncached. Cleared for good if an operation times out.
+#[cfg(feature = "g2d_render")]
+static G2D_DRAW: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "g2d_render")]
+fn enable_g2d_draw() {
+    if shadow_uncached() {
+        G2D_DRAW.store(true, Ordering::Release);
+    } else {
+        exynos_4412_rs::println!("ferrite: shadow outside the uncached alias, no G2D drawing");
+    }
+}
+
+/// G2D drawing is on ([`blit_sprite`] may be used).
+pub fn g2d_draw_ready() -> bool {
+    #[cfg(feature = "g2d_render")]
+    {
+        G2D_DRAW.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "g2d_render"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "g2d_render")]
+fn shadow_surface() -> Surface {
+    // The G2D takes physical addresses: the shadow's identity-mapped one.
+    Surface { address: buf_ptr(SHADOW) as usize, stride: W * 4, width: W, height: H, format: Format::Xrgb8888 }
+}
+
+/// How long one drawing operation may take: a full-screen blend takes
+/// ~3 ms.
+#[cfg(feature = "g2d_render")]
+const G2D_OP_MS: u32 = 50;
+
+/// G2D drawing is off for good: the CPU draws, into the cached shadow again
+/// (its reads are fast there, and a CPU present copy reads it). Safe at any
+/// time on CPU0: the shadow has no cached line (invalidated at `init`, only
+/// reached through the alias since), so cached reads fetch what DRAM holds.
+#[cfg(feature = "g2d_render")]
+fn g2d_give_up() {
+    G2D_DRAW.store(false, Ordering::Relaxed);
+    // SAFETY: a barrier only: the alias's stores are in DRAM first.
+    unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+    unsafe { *(&raw mut SHADOW_PX) = core::ptr::null_mut() };
+}
+
+/// Runs one G2D operation on the shadow and waits for its end. First waits
+/// for a present copy in flight (it reads the shadow, and the G2D present
+/// owns the G2D). Interrupts stay enabled (audio refills, the console); only
+/// the G2D's own is off at the GIC meanwhile, so `g2d_isr` does not take
+/// this operation's end. False if G2D drawing is off or the operation failed
+/// (then the caller draws with the CPU).
+#[cfg(feature = "g2d_render")]
+fn g2d_op(what: &str, op: impl FnOnce(&G2d) -> Result<(), g2d::Error>) -> bool {
+    if !G2D_DRAW.load(Ordering::Relaxed) {
+        return false;
+    }
+    if STATE.load(Ordering::Acquire) == COPY {
+        // Rows 0..H: until the copy has ended.
+        wait_rows(0, H);
+    }
+    timed!({
+        let gic = Gic::new();
+        let irq_on = gic.is_enabled(soc::G2D_IRQ);
+        if irq_on {
+            gic.disable(soc::G2D_IRQ);
+        }
+        // What this core wrote through the alias reaches DRAM before the
+        // G2D reads it (a blend reads the destination).
+        // SAFETY: a barrier only.
+        unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+        let g = G2d::new();
+        let result = op(&g);
+        let mut ok = result.is_ok();
+        if let Err(e) = result {
+            // Refused before starting (a bad rect): this one by the CPU.
+            exynos_4412_rs::println!("ferrite: G2D {} refused: {:?}", what, e);
+        } else {
+            let t0 = systick::millis();
+            while !g.ack() {
+                if systick::millis().wrapping_sub(t0) > G2D_OP_MS {
+                    ok = false;
+                    exynos_4412_rs::println!("ferrite: G2D {} timed out ({:?}), CPU drawing from now on", what, g.status());
+                    g2d_give_up();
+                    // The present cannot use it either.
+                    G2D_ON.store(false, Ordering::Relaxed);
+                    g2d_shutdown();
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        // SAFETY: a barrier only: the G2D's writes before this core's next
+        // reads of the shadow.
+        unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+        if irq_on && ok {
+            gic.enable(soc::G2D_IRQ);
+        }
+        ok
+    })
+}
+
+/// Fills a shadow rect (clipped to the screen) with XRGB `c` by the G2D.
+#[cfg(feature = "g2d_render")]
+fn g2d_fill(x: usize, y: usize, w: usize, h: usize, c: u32) -> bool {
+    let ok = g2d_op("fill", |g| g.fill(&shadow_surface(), g2d::Rect::new(x, y, w, h), c));
+    if ok {
+        mark(x, y, w, h);
+    }
+    ok
+}
+
+/// The source of [`g2d_blend_color`]: a screen-sized ARGB8888 surface only
+/// the G2D writes, holding `color` (premultiplied) in its top-left `w` × `h`.
+#[cfg(feature = "g2d_render")]
+struct Scratch {
+    /// Holds the surface at `base` (64-byte aligned, whole cache lines).
+    _px: alloc::vec::Vec<u32>,
+    base: usize,
+    color: u32,
+    w: usize,
+    h: usize,
+}
+
+#[cfg(feature = "g2d_render")]
+static mut SCRATCH: Option<Scratch> = None;
+
+/// The scratch surface, allocated at the first use. Its memory is cleaned
+/// and invalidated once: no cached line of it (the heap's earlier use) may
+/// be written back over the G2D's fills, and the CPU never touches it again.
+/// The heap gives no line alignment, so the surface starts on a 64-byte
+/// boundary inside a larger block: an invalidate must cover whole lines
+/// (the HAL refuses others, as they could hold a neighbour's data).
+#[cfg(feature = "g2d_render")]
+fn scratch() -> Option<&'static mut Scratch> {
+    // SAFETY: CPU0 only, outside interrupts.
+    let slot = unsafe { &mut *(&raw mut SCRATCH) };
+    if slot.is_none() {
+        const ALIGN: usize = 64;
+        let mut px = alloc::vec::Vec::new();
+        px.try_reserve_exact(PIXELS + ALIGN / 4).ok()?;
+        // SAFETY: u32 has no invalid values; the contents are never read
+        // by the CPU, only filled by the G2D.
+        unsafe { px.set_len(PIXELS + ALIGN / 4) };
+        let base = (px.as_ptr() as usize).next_multiple_of(ALIGN);
+        // PIXELS * 4 is a multiple of the line size: whole lines only.
+        mmu::clean_dcache_range(base, PIXELS * 4);
+        mmu::invalidate_dcache_range(base, PIXELS * 4);
+        *slot = Some(Scratch { _px: px, base, color: 0, w: 0, h: 0 });
+    }
+    slot.as_mut()
+}
+
+/// Blends XRGB `src` at `alpha` over a shadow rect (clipped) by the G2D.
+#[cfg(feature = "g2d_render")]
+fn g2d_blend_color(x: usize, y: usize, w: usize, h: usize, src: u32, alpha: u8) -> bool {
+    if !G2D_DRAW.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(sc) = scratch() else { return false };
+    let a = alpha as u32;
+    let pm = |shift: u32| (((src >> shift) & 0xFF) * a + 127) / 255;
+    let pixel = a << 24 | pm(16) << 16 | pm(8) << 8 | pm(0);
+    let surface = Surface { address: sc.base, stride: W * 4, width: W, height: H, format: Format::Argb8888 };
+    if sc.color != pixel || sc.w < w || sc.h < h {
+        // Fill what this blend and the last ones need.
+        let (fw, fh) = if sc.color == pixel { (sc.w.max(w), sc.h.max(h)) } else { (w, h) };
+        sc.w = 0;
+        if !g2d_op("scratch fill", |g| g.fill(&surface, g2d::Rect::new(0, 0, fw, fh), pixel)) {
+            return false;
+        }
+        (sc.color, sc.w, sc.h) = (pixel, fw, fh);
+    }
+    let ok = g2d_op("colour blend", |g| {
+        let (from, to) = (g2d::Rect::new(0, 0, w, h), g2d::Rect::new(x, y, w, h));
+        g.blend(&surface, from, Alpha::Premultiplied, &shadow_surface(), to, Filter::Nearest, 255)
+    });
+    if ok {
+        mark(x, y, w, h);
+    }
+    ok
+}
+
+/// Blends `w` × `h` pixels of a premultiplied ARGB8888 sprite (`px`, `sw` ×
+/// `sh`, rows of `stride` pixels, cleaned by [`end_sprite`]) from (`sx`,
+/// `sy`) over the shadow at (`dx`, `dy`). The rect must be inside both.
+/// False if the G2D did not draw it.
+#[allow(clippy::too_many_arguments)]
+pub fn blit_sprite(
+    px: *const u32,
+    sw: usize,
+    sh: usize,
+    stride: usize,
+    sx: usize,
+    sy: usize,
+    dx: usize,
+    dy: usize,
+    w: usize,
+    h: usize,
+) -> bool {
+    #[cfg(feature = "g2d_render")]
+    {
+        let sprite = Surface { address: px as usize, stride: stride * 4, width: sw, height: sh, format: Format::Argb8888 };
+        let ok = g2d_op("sprite blit", |g| {
+            let (from, to) = (g2d::Rect::new(sx, sy, w, h), g2d::Rect::new(dx, dy, w, h));
+            g.blend(&sprite, from, Alpha::Premultiplied, &shadow_surface(), to, Filter::Nearest, 255)
+        });
+        if ok {
+            mark(dx, dy, w, h);
+        }
+        ok
+    }
+    #[cfg(not(feature = "g2d_render"))]
+    {
+        let _ = (px, sw, sh, stride, sx, sy, dx, dy, w, h);
+        false
     }
 }
 
@@ -924,6 +1323,18 @@ pub fn init() -> Result<FimdLcd, display::Error> {
             p.nc[i] = nc;
         }
         p.fb[i] = Some(fb);
+    }
+    #[cfg(feature = "g2d_render")]
+    {
+        let shadow = buf_ptr(SHADOW) as usize;
+        if let (Some(nc), Some(_)) = (mmu::uncached(shadow), mmu::uncached(shadow + PIXELS * 4 - 1)) {
+            // As for the scan buffers: no cached line of it may be written
+            // back over the alias's stores later.
+            mmu::clean_dcache_range(shadow, PIXELS * 4);
+            mmu::invalidate_dcache_range(shadow, PIXELS * 4);
+            unsafe { *(&raw mut SHADOW_PX) = nc as *mut u32 };
+            exynos_4412_rs::println!("ferrite: LCD shadow via non-cacheable alias {:#x}", nc);
+        }
     }
     if p.nc.iter().all(|&a| a != 0) {
         exynos_4412_rs::println!("ferrite: LCD scan buffers via non-cacheable alias {:#x}, {:#x}", p.nc[0], p.nc[1]);

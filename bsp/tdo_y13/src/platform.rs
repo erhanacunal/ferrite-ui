@@ -31,6 +31,7 @@ impl Platform for TdoY13Platform {
     // caps.audio) when the audio milestone lands.
     type GpioB = ferrite_core::gpio::NoGpio;
     type EepromB = ferrite_core::eeprom::NoEeprom;
+    type Renderer = ferrite_core::renderer::DefaultRenderer;
 
     // The F1C100s BootROM loads firmware from offset 0 of the *same* SPI NOR
     // that holds the resources (BY25Q128AS, 128 Mbit = 16 MB), so the flash is
