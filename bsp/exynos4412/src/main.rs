@@ -107,6 +107,7 @@ fn main(_args: BootArgs) -> ! {
     usart::report_clock();
     let mct = Mct::new();
     mct.start();
+    systick::resync();
     mmu::enable();
     L2c::new().enable();
     #[cfg(feature = "perf")]

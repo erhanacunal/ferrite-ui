@@ -263,6 +263,8 @@ fn enter_standby(ctx: &mut Ctx<Exynos4412Platform>, button: &mut PowerButton) {
     }
     let pmic = Max77686::new(I2c::new(Bus::I2c0));
     let result = standby::enter(mct, Some(pmic), button);
+    // Asleep for possibly longer than the counter's low word wraps (~179 s).
+    crate::systick::resync();
     if shared_timer {
         gic.set_target(soc::MCT_G0_IRQ, 0);
     }

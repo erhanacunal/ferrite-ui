@@ -654,6 +654,70 @@ unsafe fn copy_row(mut src: *const u32, mut dst: *mut u32, n: usize) {
     }
 }
 
+/// Blends the opaque XRGB `src` over every pixel of `px` with weight `a`
+/// (`fb::alpha8`, 1..=255 here: alpha 255 is a fill): NEON, 8 pixels per
+/// step, bit-identical to `fb::blend_argb8888`. Each byte channel is
+/// `(s * a + d * (256 - a)) >> 8` in a u16 lane (at most 255 * 256, so
+/// nothing carries into the next channel), the X byte forced to 0xFF.
+///
+/// # Safety
+/// `px` is the cached shadow (read-modify-write; `pld` ahead).
+#[inline(always)]
+unsafe fn blend_fill(px: &mut [u32], src: u32, a: u32) {
+    debug_assert!((1..=255).contains(&a));
+    let n = px.len();
+    let mut p = px.as_mut_ptr();
+    let mut blocks = n / 8;
+    if blocks != 0 {
+        // s * a per byte channel, for the 2 pixels of a d register.
+        let sa: [u16; 8] = core::array::from_fn(|i| ((src >> (8 * (i % 4))) & 0xFF) as u16 * a as u16);
+        let na = 256 - a;
+        // SAFETY: reads and writes `blocks * 8` words from `p`, all inside
+        // `px`; q8-q11 and q13-q15 are clobbered, `sa` is only read.
+        unsafe {
+            core::arch::asm!(
+                "vld1.16 {{d28-d29}}, [{sa}]",
+                "vdup.8 d30, {na}",
+                "vmov.i32 q13, #0xFF000000",
+                "2:",
+                "pld [{p}, #192]",
+                "vld1.32 {{d0-d3}}, [{p}]",
+                "vmull.u8 q8, d0, d30",
+                "vmull.u8 q9, d1, d30",
+                "vmull.u8 q10, d2, d30",
+                "vmull.u8 q11, d3, d30",
+                "vadd.i16 q8, q8, q14",
+                "vadd.i16 q9, q9, q14",
+                "vadd.i16 q10, q10, q14",
+                "vadd.i16 q11, q11, q14",
+                "vshrn.i16 d0, q8, #8",
+                "vshrn.i16 d1, q9, #8",
+                "vshrn.i16 d2, q10, #8",
+                "vshrn.i16 d3, q11, #8",
+                "vorr q0, q0, q13",
+                "vorr q1, q1, q13",
+                "subs {b}, {b}, #1",
+                "vst1.32 {{d0-d3}}, [{p}]!",
+                "bne 2b",
+                p = inout(reg) p,
+                b = inout(reg) blocks,
+                sa = in(reg) sa.as_ptr(),
+                na = in(reg) na,
+                out("d0") _, out("d1") _, out("d2") _, out("d3") _,
+                out("d16") _, out("d17") _, out("d18") _, out("d19") _,
+                out("d20") _, out("d21") _, out("d22") _, out("d23") _,
+                out("d26") _, out("d27") _, out("d28") _, out("d29") _, out("d30") _,
+                options(nostack),
+            );
+        }
+    }
+    let _ = blocks;
+    for i in 0..n % 8 {
+        // SAFETY: the tail of `px`.
+        unsafe { *p.add(i) = fb::blend_argb8888(*p.add(i), src, a) };
+    }
+}
+
 /// The presenter core: waits for a hand-over, presents, repeats. No
 /// interrupts: `sev` from CPU0 wakes it.
 fn presenter(_cpu: usize) -> ! {
@@ -782,9 +846,8 @@ impl LcdBackend for FimdLcd {
         timed!({
             let (src, a, fb) = (rgb565_to_xrgb(color), fb::alpha8(alpha), back());
             for r in y..y + h {
-                for p in unsafe { row(fb, x, r, w) } {
-                    *p = fb::blend_argb8888(*p, src, a);
-                }
+                // SAFETY: `row` is inside the shadow (clipped above).
+                unsafe { blend_fill(row(fb, x, r, w), src, a) };
             }
             mark(x, y, w, h);
         })

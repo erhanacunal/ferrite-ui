@@ -45,8 +45,11 @@ pub mod phase {
     /// in parallel with the step: not part of the window's sum. Reported by
     /// the BSP (exynos4412: CPU2's copies).
     pub const PRESENT: u8 = 13;
+    /// Time reading the system timer (`systick::millis`), in any phase
+    /// (timed by the BSP; exynos4412: the MCT register read).
+    pub const TIMER: u8 = 14;
     /// Number of slots (ids 1..COUNT).
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 14;
 }
 
 /// Event counts, reported as plain numbers (ids from 0x80). Mirrored in
@@ -60,8 +63,10 @@ pub mod count {
     pub const PRESENTS: u8 = 0x83;
     /// KiB the presents copied.
     pub const PRESENT_KB: u8 = 0x84;
+    /// Timer reads (`phase::TIMER`).
+    pub const TIMER_READS: u8 = 0x85;
     /// Number of counts (ids 0x81..).
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 5;
 }
 
 /// A value only the runtime's own thread touches (the runtime and the
@@ -75,13 +80,13 @@ fn no_clock() -> u32 {
 }
 
 static CLOCK: Local<fn() -> u32> = Local(core::cell::UnsafeCell::new(no_clock));
-/// Number of sub-phases (`DRAW`, `PIXELS`, `PRESENT`).
-pub const SUBS: usize = 3;
+/// Number of sub-phases (`DRAW`, `PIXELS`, `PRESENT`, `TIMER`).
+pub const SUBS: usize = 4;
 
 type Sub = ([u64; SUBS], [u32; count::COUNT]);
 
 /// Cycles of the sub-phases (index id - `DRAW`) and the counts (index
-/// id - 0x81; a sub-phase call counts in the same index).
+/// id - 0x81; a sub-phase call counts in its count, `sub_count`).
 static SUB: Local<Sub> = Local(core::cell::UnsafeCell::new(([0; SUBS], [0; count::COUNT])));
 
 /// Sets the clock `now` reads (`PlatformRuntime::cycles`); the runtime does
@@ -97,7 +102,7 @@ pub fn now() -> u32 {
 }
 
 /// Adds one call of `cycles` to sub-phase `id` (`phase::DRAW` / `PIXELS` /
-/// `PRESENT`).
+/// `PRESENT` / `TIMER`).
 #[inline]
 pub fn add_sub(id: u8, cycles: u32) {
     add_sub_n(id, cycles as u64, 1);
@@ -109,7 +114,15 @@ pub fn add_sub_n(id: u8, cycles: u64, calls: u32) {
     let i = (id - phase::DRAW) as usize;
     let s = unsafe { &mut *SUB.0.get() };
     s.0[i] += cycles;
-    s.1[i] = s.1[i].wrapping_add(calls);
+    let c = &mut s.1[sub_count(i)];
+    *c = c.wrapping_add(calls);
+}
+
+/// Count index of sub-phase index `i`: `DRAW`/`PIXELS`/`PRESENT` count in
+/// 0x81..0x83, `TIMER` in 0x85 (0x84 is `PRESENT_KB`).
+#[inline]
+const fn sub_count(i: usize) -> usize {
+    if i < 3 { i } else { i + 1 }
 }
 
 /// Adds `n` to count `id` (`count::*`).

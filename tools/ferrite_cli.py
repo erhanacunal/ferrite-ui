@@ -232,13 +232,14 @@ PERF_PHASES = {
     11: "  widget draws",
     12: "  pixel writes",
     13: "present copy",
+    14: "  timer reads",
 }
 # Sub-phases: already inside the step phases above.
 # (13 runs on another core, in parallel with the step.)
-PERF_SUB_PHASES = (10, 11, 12, 13)
+PERF_SUB_PHASES = (10, 11, 12, 13, 14)
 # Event counts (plain numbers, not microseconds): perf::count in perf.rs.
 PERF_COUNTS = {0x81: "draw_widget calls", 0x82: "pixel primitive calls",
-               0x83: "presents", 0x84: "present KiB"}
+               0x83: "presents", 0x84: "present KiB", 0x85: "timer reads"}
 
 
 def _perf_length_ok(length: int) -> bool:

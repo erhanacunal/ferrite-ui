@@ -683,8 +683,19 @@ impl<B: LcdBackend> LcdImpl<B> {
         let r = (r as i32).min((w - 1) / 2).min((h - 1) / 2);
         let t = t as i32;
         let inner = t > 0 && w > 2 * t && h > 2 * t;
+        // Rows outside the scissor / screen draw nothing: skip their
+        // coverage math (a restore behind a small widget repaints a big
+        // rounded panel through a small scissor).
+        let (mut ry0, mut ry1) = (y.max(0), (y + h).min(self.height() as i32));
+        if let Some(sc) = self.scissor() {
+            ry0 = ry0.max(sc.y as i32);
+            ry1 = ry1.min(sc.bottom() as i32);
+        }
+        if ry0 >= ry1 {
+            return;
+        }
         if let (0, 0, Paint::Solid(color)) = (t, r, paint(y)) {
-            for row in y..y + h {
+            for row in ry0..ry1 {
                 self.aa_span(x, x + w - 1, row, color, alpha);
             }
             return;
@@ -695,7 +706,7 @@ impl<B: LcdBackend> LcdImpl<B> {
         let (cxli, cyti, cybi) = (xi + ri, yi + ri, yi + hi - 1 - ri);
         let s = 2 * x + w - 1;
 
-        for row in y..y + h {
+        for row in ry0..ry1 {
             let dy = (cyt - row).max(row - cyb).max(0);
             let ofull = cxl - ext_le(r, dy);
             // Inner box on this row: (dyi, first px with coverage, first full px).
@@ -1202,6 +1213,36 @@ mod tests {
                 }
             }
             assert_eq!(cov[(8 + h as usize / 2) * N + 8], 255, "rrect {w}x{h} r={r} t={t} edge");
+        }
+    }
+
+    /// Skipping the rows outside the scissor changes nothing inside it.
+    #[test]
+    fn scissored_round_rect_matches_the_full_draw() {
+        use crate::types::Rect;
+        for (w, h, r, t) in [(60u16, 40u16, 12u16, 0u16), (50, 50, 25, 3), (40, 30, 0, 2)] {
+            let shape = |l: &LcdImpl<AlphaGrid>| {
+                if t == 0 {
+                    l.fill_rounded_rect(8, 8, w, h, r, 1)
+                } else {
+                    l.stroke_rounded_rect(8, 8, w, h, r, t, 1)
+                }
+            };
+            let (full, _) = draw(shape);
+            for sc in [Rect::new(10, 9, 7, 5), Rect::new(30, 20, 20, 3), Rect::new(0, 40, 64, 30)] {
+                let (cut, _) = draw(|l| {
+                    l.set_scissor(Some(sc));
+                    shape(l)
+                });
+                for y in 0..N {
+                    for x in 0..N {
+                        let inside = (sc.x as usize..sc.right() as usize).contains(&x)
+                            && (sc.y as usize..sc.bottom() as usize).contains(&y);
+                        let want = if inside { full[y * N + x] } else { 0 };
+                        assert_eq!(cut[y * N + x], want, "rrect {w}x{h} r={r} t={t} at ({x},{y})");
+                    }
+                }
+            }
         }
     }
 

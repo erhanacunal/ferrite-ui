@@ -32,6 +32,7 @@ mod touch;
 mod usart;
 
 mod platform;
+mod prof;
 
 use lcd::sim::new_framebuffer;
 use lcd::{HEIGHT, WIDTH};
@@ -103,6 +104,9 @@ fn main() {
     });
 
     platform::install_host(window, fb.clone(), mouse.clone(), taps);
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    prof::start_from_args();
 
     ferrite_core::runtime::run::<SimPlatform>(ctx, touch)
 }
