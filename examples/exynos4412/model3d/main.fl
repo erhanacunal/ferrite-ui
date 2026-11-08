@@ -1,0 +1,156 @@
+// main.fl — 3D models on the Exynos 4412's Mali-400 GPU (lib/model3d.fl).
+//
+// Three model widgets turn at their own rates: a cube, a torus and a sphere.
+// Tap a model to change its colour, "Pause" to stop them. The top line shows,
+// once a second, the GPU frames run per second and the last frame's GPU
+// times (GP = vertex shading and binning, PPs = the four pixel processors).
+// The sim has no GPU: there the boxes show only their background.
+
+#include "core.fl"
+#include "color.fl"
+#include "sysinfo.fl"
+#include "model3d.fl"
+
+const BOX = 352;            // 22 x 22 tiles: under the GPU frame's 512
+const GAP = 40;
+const TOP = 200;
+
+var title_lbl;
+var stat_lbl;
+var pause_btn;
+var pause_lbl;
+var m0; var m1; var m2;
+var colors[6];
+var color_at[3];
+
+var paused = 0;
+var shown = 0;              // animation time (ms), stopped while paused
+var last = 0;
+var since = 0;
+var frames_at = 0;
+var shows_at = 0;
+
+fn model_box(i, shape) {
+    set(kind, KIND_MODEL3D);
+    set(location, GAP + i * (BOX + GAP) + 24, TOP);
+    set(size, BOX, BOX);
+    set(bg_color, 0x18E3);
+    set(border_radius, 0);
+    set(clickable, 1);
+    parent(0);
+}
+
+fn recolor(w, i) {
+    color_at[i] = (color_at[i] + 1) % 6;
+    model3dColor(w, colors[color_at[i]]);
+}
+
+fn on_m0(w) { recolor(m0, 0); }
+fn on_m1(w) { recolor(m1, 1); }
+fn on_m2(w) { recolor(m2, 2); }
+
+fn on_pause(w) {
+    paused = !paused;
+    target(pause_lbl);
+    set(text, paused ? "Run" : "Pause");
+    strClear();
+}
+
+fn setup() {
+    colors[0] = 0x4D7F; colors[1] = 0xFB08; colors[2] = 0x5FA9;
+    colors[3] = 0xFEA0; colors[4] = 0xC99F; colors[5] = 0xFFFF;
+
+    target(0);
+    set(bg_color, 0x0841);
+
+    title_lbl = alloc();
+    target(title_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 24, 20);
+    set(size, 900, 40);
+    set(text, "Mali-400 GPU: cube, torus, sphere (tap one to recolour)");
+    set(text_color, WHITE);
+    parent(0);
+
+    stat_lbl = alloc();
+    target(stat_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 24, 70);
+    set(size, 1000, 40);
+    set(text, "measuring...");
+    set(text_color, GREEN);
+    parent(0);
+
+    pause_btn = alloc();
+    target(pause_btn);
+    set(kind, KIND_BUTTON);
+    set(location, 1280 - 224, 20);
+    set(size, 200, 80);
+    set(bg_color, 0x2945);
+    set(press_color, 0x52AA);
+    set(border_radius, 12);
+    set(clickable, 1);
+    set(on_click, @on_pause);
+    parent(0);
+
+    pause_lbl = alloc();
+    target(pause_lbl);
+    set(kind, KIND_LABEL);
+    set(size, 200, 80);
+    set(text, "Pause");
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(pause_btn);
+
+    m0 = alloc(); target(m0); model_box(0, SHAPE_CUBE); set(on_click, @on_m0);
+    m1 = alloc(); target(m1); model_box(1, SHAPE_TORUS); set(on_click, @on_m1);
+    m2 = alloc(); target(m2); model_box(2, SHAPE_SPHERE); set(on_click, @on_m2);
+    model3dShape(m0, SHAPE_CUBE);
+    model3dShape(m1, SHAPE_TORUS);
+    model3dShape(m2, SHAPE_SPHERE);
+    color_at[0] = 0; color_at[1] = 1; color_at[2] = 2;
+    model3dColor(m0, colors[0]);
+    model3dColor(m1, colors[1]);
+    model3dColor(m2, colors[2]);
+
+    last = millis();
+    since = last;
+    frames_at = model3dStat(M3D_FRAMES);
+    shows_at = sysFrames();
+    return 0;
+}
+
+fn report() {
+    var now = millis();
+    var dt = now - since;
+    if (dt < 1000) {
+        return 0;
+    }
+    var f = model3dStat(M3D_FRAMES);
+    var s = sysFrames();
+    target(stat_lbl);
+    set(text, sprintf("GPU %d frames/s, screen %d fps | last frame: GP %d us, PPs %d us, total %d us, %d triangles | error %d",
+        (f - frames_at) * 1000 / dt, (s - shows_at) * 1000 / dt,
+        model3dStat(M3D_GP_US), model3dStat(M3D_PPS_US), model3dStat(M3D_TOTAL_US),
+        model3dStat(M3D_TRIANGLES), model3dStat(M3D_ERROR)));
+    strClear();
+    frames_at = f;
+    shows_at = s;
+    since = now;
+}
+
+fn loop() {
+    var now = millis();
+    if (!paused) {
+        shown = shown + (now - last);
+    }
+    last = now;
+    // Tenths of a degree: one turn in 6 s, 9 s, 7.5 s about the vertical
+    // axis, slower about the horizontal one.
+    var t = shown;
+    model3dTurn(m0, (t * 6 / 10) % 3600, (t * 4 / 10) % 3600, 0);
+    model3dTurn(m1, (t * 4 / 10) % 3600, 600 + (t * 3 / 10) % 3600, 0);
+    model3dTurn(m2, (t * 48 / 100) % 3600, 200, 0);
+    report();
+    delay(5);
+}

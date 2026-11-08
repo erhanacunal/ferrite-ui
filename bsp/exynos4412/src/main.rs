@@ -61,6 +61,7 @@ mod backlight;
 mod bridge;
 mod flash;
 mod lcd;
+mod model3d;
 #[cfg(feature = "wifi")]
 mod net;
 #[cfg(feature = "perf")]

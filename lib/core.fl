@@ -16,6 +16,7 @@ const KIND_GRAPH    = 10;
 const KIND_IMAGE    = 11;
 // 12-16: shape widgets (lib/shapes.fl)
 const KIND_BUTTON_GROUP = 17;  // exclusive toggle button: one selected per group_id
+const KIND_MODEL3D  = 18;  // 3D model view (exynos4412 GPU, lib/model3d.fl)
 
 // Text alignment
 const ALIGN_LEFT   = 0;

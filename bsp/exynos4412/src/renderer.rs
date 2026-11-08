@@ -72,6 +72,9 @@ impl WidgetRenderer<P> for ExynosRenderer {
         if !lcd::g2d_draw_ready() || ctx.lcd.is_portrait() {
             return false;
         }
+        if crate::model3d::draw(ctx, id, abs, clip) {
+            return true;
+        }
         if draw_picture(ctx, id, abs, clip) {
             return true;
         }

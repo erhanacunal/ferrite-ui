@@ -71,6 +71,10 @@ pub const KIND_ELLIPSE: u8 = 16;
 /// `group_id` form one group, and at most one of them is CHECKED (drawn with
 /// `press_color`). See `ObjPool::select_in_group`.
 pub const KIND_BUTTON_GROUP: u8 = 17;
+/// A 3D model view: the board's renderer draws it (exynos4412: the Mali GPU,
+/// `bsp/exynos4412/src/model3d.rs`); elsewhere only its background shows.
+/// What it shows is set through board syscalls (`lib/model3d.fl`).
+pub const KIND_MODEL3D: u8 = 18;
 
 // --- Text Alignment ---
 

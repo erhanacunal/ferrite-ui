@@ -181,15 +181,17 @@ KIND_LINE = 15
 KIND_ELLIPSE = 16
 # Exclusive toggle button: one CHECKED per group_id, drawn with press_color.
 KIND_BUTTON_GROUP = 17
+# 3D model view (drawn by the exynos4412 GPU; lib/model3d.fl).
+KIND_MODEL3D = 18
 
 # KIND_NAMES and KIND_VALUES are parallel (combo index ↔ kind value); keep
 # them in lockstep.
 KIND_NAMES = ["Base", "Label", "Button", "Progress", "Slider", "Checkbox", "Radio",
               "Button Group", "Dropdown", "Image", "Rectangle", "Circle", "Polygon", "Line",
-              "Ellipse"]
+              "Ellipse", "3D Model"]
 KIND_VALUES = [KIND_BASE, KIND_LABEL, KIND_BUTTON, KIND_PROGRESS, KIND_SLIDER, KIND_CHECKBOX,
                KIND_RADIO, KIND_BUTTON_GROUP, KIND_DROPDOWN, KIND_IMAGE, KIND_RECTANGLE,
-               KIND_CIRCLE, KIND_POLYGON, KIND_LINE, KIND_ELLIPSE]
+               KIND_CIRCLE, KIND_POLYGON, KIND_LINE, KIND_ELLIPSE, KIND_MODEL3D]
 KIND_PREFIXES = {
     KIND_BASE: "panel",
     KIND_LABEL: "lbl",
@@ -206,6 +208,7 @@ KIND_PREFIXES = {
     KIND_LINE: "line",
     KIND_ELLIPSE: "ellipse",
     KIND_BUTTON_GROUP: "btngrp",
+    KIND_MODEL3D: "model",
 }
 
 KIND_ICON_NAMES = {
@@ -224,6 +227,7 @@ KIND_ICON_NAMES = {
     KIND_LINE:     "fa5s.slash",
     KIND_ELLIPSE:  "fa5s.egg",
     KIND_BUTTON_GROUP: "fa5s.th-large",
+    KIND_MODEL3D: "fa5s.cube",
 }
 
 
