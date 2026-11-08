@@ -3203,6 +3203,11 @@ impl Vm {
                 ctx.images.find_or_load(val as u8, fs, &ctx.flash);
             }
         }
+        // An active layer root's position/visibility only places its surface.
+        #[cfg(feature = "layers")]
+        if matches!(prop_id, PROP_LOC_X | PROP_LOC_Y | PROP_VISIBLE) && ctx.objs.is_active_layer_root(self.target) {
+            return;
+        }
         // A property write that changes appearance schedules a redraw, so
         // `render()` repaints without an explicit `dirty(widget)` call.
         if prop_is_visual(prop_id) {
@@ -3215,6 +3220,10 @@ impl Vm {
     fn w_set_len<P: Platform>(&mut self, ctx: &mut Ctx<P>, prop_id: u8, data: &[u8]) {
         if self.target.is_some() {
             self.set_compound_prop(prop_id, data, ctx);
+            #[cfg(feature = "layers")]
+            if prop_id == PROP_LOCATION && ctx.objs.is_active_layer_root(self.target) {
+                return;
+            }
             if prop_is_visual(prop_id) {
                 ctx.objs.mark_dirty(self.target);
             }
@@ -3307,6 +3316,18 @@ impl Vm {
     /// so the animation engine can drive any widget without disturbing the
     /// VM's current `self.target`. Marks the widget dirty exactly as before.
     fn set_scalar_prop_on<P: Platform>(ctx: &mut Ctx<P>, target: WidgetId, prop_id: u8, val: i32) {
+        // Layer props live in the pool's layer table, not in the widget.
+        if matches!(prop_id, crate::proto::PROP_LAYER | crate::proto::PROP_LAYER_ALPHA) {
+            #[cfg(feature = "layers")]
+            if prop_id == crate::proto::PROP_LAYER {
+                ctx.objs.set_layer(target, val);
+            } else {
+                ctx.objs.set_layer_alpha(target, val);
+            }
+            #[cfg(not(feature = "layers"))]
+            let _ = (target, val);
+            return;
+        }
         // Boolean flag props: one table lookup + one set_flag instead of a
         // full match arm (and get_mut bounds check) per flag.
         let flag = match prop_id {
@@ -3340,6 +3361,11 @@ impl Vm {
             #[cfg(feature = "multi_program")]
             if val != 0 && flag & (FLAG_HAS_ON_CLICK | FLAG_HAS_ON_TAP | FLAG_HAS_ON_PAINT) != 0 {
                 ctx.objs.take_handler(target);
+            }
+            // Showing/hiding an active layer's root only shows/hides its surface.
+            #[cfg(feature = "layers")]
+            if flag == FLAG_VISIBLE && ctx.objs.layer_placement_changed(target) {
+                return;
             }
             if flag & (FLAG_VISIBLE | FLAG_ENABLED) != 0 {
                 ctx.objs.mark_dirty(target);
@@ -3454,6 +3480,14 @@ impl Vm {
         let e = &ctx.objs.ext(target);
         let link = |id: WidgetId| if id.is_none() { -1 } else { id.0 as i32 };
         match prop_id {
+            #[cfg(feature = "layers")]
+            crate::proto::PROP_LAYER => ctx.objs.layer_of(target),
+            #[cfg(feature = "layers")]
+            crate::proto::PROP_LAYER_ALPHA => ctx.objs.layer_alpha(target),
+            #[cfg(not(feature = "layers"))]
+            crate::proto::PROP_LAYER => 0,
+            #[cfg(not(feature = "layers"))]
+            crate::proto::PROP_LAYER_ALPHA => 255,
             // Base fields
             PROP_LOC_X => w.location.x as i32,
             PROP_LOC_Y => w.location.y as i32,
@@ -4039,6 +4073,9 @@ fn prop_is_visual(prop_id: u8) -> bool {
             | PROP_ON_CHANGE
             | PROP_MAX_LENGTH
             | PROP_CURSOR_POS
+            // Placements, not redraws (the setter marks what it needs).
+            | crate::proto::PROP_LAYER
+            | crate::proto::PROP_LAYER_ALPHA
     )
 }
 

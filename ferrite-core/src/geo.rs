@@ -123,6 +123,12 @@ impl ObjPool {
     pub fn abs_at(&self, i: usize) -> Rect {
         #[cfg(feature = "render_cache")]
         if let Some(g) = self.geo(i) {
+            #[cfg(feature = "layers")]
+            {
+                let o = self.layers.origin;
+                return Rect::new(g.abs.x.wrapping_sub(o.x), g.abs.y.wrapping_sub(o.y), g.abs.w, g.abs.h);
+            }
+            #[cfg(not(feature = "layers"))]
             return g.abs;
         }
         self.absolute_rect(self.dfs_at(i))
@@ -131,6 +137,11 @@ impl ObjPool {
     /// `is_tree_visible` of DFS entry `i`.
     #[inline]
     pub fn vis_at(&self, i: usize) -> bool {
+        // Outside the running pass's layer scope: as if hidden.
+        #[cfg(feature = "layers")]
+        if !self.in_scope(i) {
+            return false;
+        }
         #[cfg(feature = "render_cache")]
         if let Some(g) = self.geo(i) {
             return g.vis;

@@ -390,6 +390,8 @@ Scalar properties are used by `W_SET` and `W_GET`.
 | `0x33` | `FLEX` | `lib/flex.fl` container mode (u8): bits 0-1 direction, 2-4 justify, 5-6 align |
 | `0x34` | `FLEX_GAP` | `lib/flex.fl` gap between children, px (u8) |
 | `0x35` | `FLEX_GROW` | `lib/flex.fl` grow factor of a child (u8) |
+| `0x36` | `LAYER` | retained layer (1-4) a subtree root is drawn into, 0 = none (firmware `layers` feature; elsewhere ignored, reads 0) |
+| `0x37` | `LAYER_ALPHA` | a layer root's plane alpha, 0-255 (elsewhere ignored, reads 255) |
 
 Compound properties are used by `W_SET_LEN`:
 

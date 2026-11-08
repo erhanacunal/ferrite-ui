@@ -1,0 +1,169 @@
+// main.fl — retained layers demo (exynos4412 FIMD windows; the sim composites in software)
+//
+// A drawer slides in and out over a busy backdrop and a card fades in and out, both
+// forever. They are layers 1 and 2: their moves and fades change only where and how
+// the display shows their surfaces, so nothing is redrawn for them. "Layers on/off"
+// draws the same thing the normal way, for comparing the cost
+// (`ferrite_cli.py perf`, or the frame counter line on the screen).
+
+#include "core.fl"
+#include "color.fl"
+#include "anim.fl"
+#include "sysinfo.fl"
+
+const SCREEN_W = 1280;
+const SCREEN_H = 800;
+const COLS = 16;
+const ROWS = 10;
+
+var drawer;
+var drawer_lbl;
+var card;
+var card_lbl;
+var toggle;
+var toggle_lbl;
+var info_lbl;
+var layers_on = 1;
+var since = 0;
+var passes0 = 0;
+var frames0 = 0;
+
+fn set_layers() {
+    target(drawer);
+    set(layer, layers_on);
+    target(card);
+    set(layer, layers_on * 2);
+    target(toggle_lbl);
+    if (layers_on) {
+        set(text, "Layers on");
+    } else {
+        set(text, "Layers off");
+    }
+}
+
+fn on_toggle(wid) {
+    layers_on = 1 - layers_on;
+    set_layers();
+}
+
+fn setup() {
+    target(0);
+    set(bg_color, 0x10A2);
+
+    // Backdrop: rounded, partly translucent tiles (costly to redraw behind a moving panel).
+    var i = 0;
+    while (i < COLS * ROWS) {
+        var t = alloc();
+        target(t);
+        set(location, (i % COLS) * 80 + 4, (i / COLS) * 80 + 4);
+        set(size, 72, 72);
+        set(bg_color, (i * 40503 + 12345) & 0xFFFF);
+        set(border_radius, 14);
+        set(alpha, 120 + (i % 5) * 30);
+        parent(0);
+        i = i + 1;
+    }
+
+    info_lbl = alloc();
+    target(info_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 520, 740);
+    set(size, 500, 40);
+    set(bg_color, 0x0000);
+    set(text_color, WHITE);
+    parent(0);
+
+    toggle = alloc();
+    target(toggle);
+    set(kind, KIND_BUTTON);
+    set(location, SCREEN_W - 240, SCREEN_H - 100);
+    set(size, 220, 80);
+    set(bg_color, 0x2945);
+    set(press_color, 0x52AA);
+    set(border_radius, 12);
+    set(clickable, 1);
+    set(on_click, @on_toggle);
+    parent(0);
+
+    toggle_lbl = alloc();
+    target(toggle_lbl);
+    set(kind, KIND_LABEL);
+    set(size, 220, 80);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    parent(toggle);
+
+    // The drawer: last in the tree but for the card, so nothing is drawn over it.
+    drawer = alloc();
+    target(drawer);
+    set(location, -380, 40);
+    set(size, 420, 680);
+    set(bg_color, 0x31A6);
+    set(border_color, 0xFFE0);
+    set(border, 3, 3, 3, 3);
+    set(border_radius, 24);
+    parent(0);
+
+    drawer_lbl = alloc();
+    target(drawer_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 20, 20);
+    set(size, 370, 60);
+    set(text, "Drawer (layer 1)");
+    set(text_color, WHITE);
+    parent(drawer);
+
+    var j = 0;
+    while (j < 6) {
+        var row = alloc();
+        target(row);
+        set(location, 20, 100 + j * 90);
+        set(size, 370, 76);
+        set(bg_color, 0x4A69);
+        set(border_radius, 12);
+        set(alpha, 200);
+        parent(drawer);
+        j = j + 1;
+    }
+
+    card = alloc();
+    target(card);
+    set(location, 700, 120);
+    set(size, 460, 300);
+    set(bg_color, 0xFD20);
+    set(border_radius, 30);
+    set(alpha, 230);
+    parent(0);
+
+    card_lbl = alloc();
+    target(card_lbl);
+    set(kind, KIND_LABEL);
+    set(size, 460, 300);
+    set(text, "Card (layer 2, fading)");
+    set(text_color, BLACK);
+    set(text_align, ALIGN_CENTER);
+    parent(card);
+
+    set_layers();
+    animate(drawer, PROP_LOC_X, 20, 1200, EASE_IN_OUT | REPEAT_YOYO);
+    animate(card, PROP_LAYER_ALPHA, 0, 1500, EASE_IN_OUT | REPEAT_YOYO);
+    since = millis();
+    passes0 = sysPasses();
+    frames0 = sysFrames();
+    return 0;
+}
+
+fn loop() {
+    var now = millis();
+    var dt = now - since;
+    if (dt >= 1000) {
+        var p = sysPasses();
+        var f = sysFrames();
+        target(info_lbl);
+        set(text, sprintf("%d passes/s, %d frames/s", (p - passes0) * 1000 / dt, (f - frames0) * 1000 / dt));
+        strClear();
+        passes0 = p;
+        frames0 = f;
+        since = now;
+    }
+}

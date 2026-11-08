@@ -775,6 +775,23 @@ flexLayout(row);
 
 See `examples/nextion/flex_demo`.
 
+### Layers (`layer`, `layer_alpha`)
+
+A widget subtree can be drawn into its own retained surface, which the display composites over the screen (exynos4412: the FIMD's hardware windows; the sim does it in software). Moving such a subtree's root, hiding/showing it and fading it then redraw nothing: only where and how the surface is shown changes. Changes inside the subtree redraw only its surface.
+
+```c
+#include "anim.fl"
+
+drawer.layer = 1;                                        // layers 1..4, 0 = none
+animate(drawer, PROP_LOC_X, 0, 250, EASE_OUT);           // slides without redrawing
+animate(drawer, PROP_LAYER_ALPHA, 0, 300, EASE_IN);     // fades without redrawing
+```
+
+- The result looks the same as without `layer`: where a layer can't keep that, its subtree is drawn in the tree as usual, automatically. That is the case while a visible widget that comes later in the tree (drawn on top) overlaps the root's box, while the on-screen keyboard overlaps it, if the root is inside a scroll container, if any widget of the subtree has `on_paint`, in portrait mode and in the buffered render mode, and on boards without layers. Two overlapping layers must be numbered in tree order (the later one higher).
+- Content is clipped to the root's box (the surface is that size). Make the root the subtree's bounding box.
+- `layer_alpha` (0-255, default 255) fades the whole layer. It differs from `alpha`, which is the root's own background opacity. It only acts while the subtree is drawn as a layer: drawn in the tree (see above) it shows opaque, so hide the root at the end of a fade-out (`onAnimEnd`) instead of leaving it at 0.
+- A layer costs memory: width x height x 4 bytes (exynos4412: x 3).
+
 ### dirty() / render()
 
 `dirty()` marks the target widget subtree for redraw. `render()` redraws all dirty widgets.

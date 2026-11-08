@@ -31,6 +31,10 @@ external_alloc = []
 # arena offsets instead of the default 8 KB / 320 with u16. Enabled by BSPs like
 # `bsp-tdo-y13` (32 MB DRAM).
 pool_large = []
+# Retained layers (`layer.rs`): widget subtrees drawn into their own surfaces,
+# composited by the display (exynos4412 FIMD windows; sim in software). Moving
+# or fading a layer redraws nothing. Off = the code is not compiled.
+layers = []
 # 32-bit VM code addresses (`vm::CodeAddr = u32`): pc, call frames and callback
 # offsets widen so programs past 64 KB of bytecode run. Required to load images
 # with the wide-address header flag (32-bit jump/call targets). Costs ~4 B per

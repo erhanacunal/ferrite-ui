@@ -42,6 +42,8 @@ pub mod geo;
 pub mod heap;
 pub mod image;
 pub mod keyboard;
+#[cfg(feature = "layers")]
+pub mod layer;
 pub mod proto;
 pub mod protocol;
 pub mod render;

@@ -10,6 +10,7 @@
 //! | `POST /restart` | restarts the board |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
 //! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted |
+//! | `POST /api/overlay?mode=off\|still\|move\|fade\|full[&x=X&y=Y&alpha=A]` | FIMD window 1 test picture above the UI (`overlay_test.rs`) |
 //!
 //! `/flash` takes the same request as uart_boot's (`ferrite_cli bootflash
 //! --host` works against both): `Content-Length` required, `X-CRC32` (8 hex
@@ -244,6 +245,41 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
 " } else { "on=0|1 (now off)
 " }).await?;
                 }
+            }
+        }
+        (b"POST", b"/api/overlay") => {
+            use crate::overlay_test as ov;
+            use core::sync::atomic::Ordering;
+            let signed = |key: &[u8]| {
+                let v = query_param(query, key)?;
+                match v.split_first() {
+                    Some((b'-', rest)) => parse_decimal(rest).map(|n| -(n.min(4096) as i32)),
+                    _ => parse_decimal(v).map(|n| n.min(4096) as i32),
+                }
+            };
+            let mode = match query_param(query, b"mode") {
+                Some(b"off") => Some(ov::OFF),
+                Some(b"still") => Some(ov::STILL),
+                Some(b"move") => Some(ov::MOVE),
+                Some(b"fade") => Some(ov::FADE),
+                Some(b"full") => Some(ov::FULL),
+                _ => None,
+            };
+            match mode {
+                Some(mode) => {
+                    if let Some(x) = signed(b"x") {
+                        ov::X.store(x, Ordering::Relaxed);
+                    }
+                    if let Some(y) = signed(b"y") {
+                        ov::Y.store(y, Ordering::Relaxed);
+                    }
+                    if let Some(a) = query_param(query, b"alpha").and_then(parse_decimal) {
+                        ov::ALPHA.store(a.min(255) as u8, Ordering::Relaxed);
+                    }
+                    ov::MODE.store(mode, Ordering::Release);
+                    text(socket, "200 OK", "ok\n").await?;
+                }
+                None => text(socket, "400 Bad Request", "mode=off|still|move|fade|full [&x=X&y=Y&alpha=0..255]\n").await?,
             }
         }
         (b"POST", b"/restart") => {
@@ -536,6 +572,9 @@ fn status_json() -> String {
     }
     s.push('}');
     s.push('}');
+    // FIMD window 1 test: mode and the address it scans (0 = hidden).
+    let (mode, scan) = crate::overlay_test::status();
+    let _ = write!(s, ",\"overlay\":{{\"mode\":{},\"scan\":\"0x{:08x}\"}}", mode, scan);
     let now_ms = exynos_4412_rs::embassy::now() / 1000;
     let _ = write!(
         s,

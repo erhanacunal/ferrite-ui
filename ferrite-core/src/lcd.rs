@@ -134,6 +134,49 @@ pub trait LcdBackend {
             }
         }
     }
+
+    /// Retained layers the display composites over the screen (`layers`
+    /// feature, `layer.rs`): 0 = none, the renderer then never uses them.
+    /// Layer `n` is stacked above layers `0..n`.
+    #[cfg(feature = "layers")]
+    const LAYERS: usize = 0;
+
+    /// A surface for layer `n` (0-based), `w` x `h` pixels of premultiplied
+    /// ARGB, all transparent, hidden. Replaces any it had. False = can't.
+    #[cfg(feature = "layers")]
+    fn layer_alloc(&self, n: usize, w: u16, h: u16) -> bool {
+        let _ = (n, w, h);
+        false
+    }
+
+    /// Hide layer `n` and drop its surface.
+    #[cfg(feature = "layers")]
+    fn layer_free(&self, n: usize) {
+        let _ = n;
+    }
+
+    /// Every primitive (fills, blends, pixel streams) draws into layer `n`'s
+    /// surface, in its coordinates (0, 0 = its top-left; clipped to its
+    /// size), until `None`: the screen again. A blend composites "over" what
+    /// the surface holds. `move_rects` is not used meanwhile.
+    #[cfg(feature = "layers")]
+    fn layer_target(&self, n: Option<usize>) {
+        let _ = n;
+    }
+
+    /// Make a rect of the targeted surface transparent.
+    #[cfg(feature = "layers")]
+    fn layer_clear(&self, x: u16, y: u16, w: u16, h: u16) {
+        let _ = (x, y, w, h);
+    }
+
+    /// Show layer `n` from the next presented frame with its top-left at
+    /// screen (`x`, `y`) (off-screen parts cut off), every pixel's alpha
+    /// times `alpha`; or hide it (`visible` false).
+    #[cfg(feature = "layers")]
+    fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
+        let _ = (n, x, y, alpha, visible);
+    }
 }
 
 /// Generic LCD wrapper — backend-agnostic drawing primitives.
@@ -155,6 +198,13 @@ pub struct LcdImpl<B: LcdBackend> {
     /// Portrait `begin_pixels` stream: each logical row is one panel column,
     /// opened as its own 1 px wide window when the row starts.
     stream: Cell<RotStream>,
+    /// Layer surface the primitives draw into (`layers`): number and size,
+    /// which `width`/`height` report meanwhile.
+    #[cfg(feature = "layers")]
+    target: Cell<Option<(u8, u16, u16)>>,
+    /// Layers currently allocated (bit n).
+    #[cfg(feature = "layers")]
+    layers_alloc: Cell<u8>,
 }
 
 /// Portrait pixel-stream cursor (see `LcdImpl::stream`).
@@ -239,6 +289,74 @@ impl<B: LcdBackend> LcdImpl<B> {
             underlay: Cell::new(None),
             portrait: Cell::new(false),
             stream: Cell::new(RotStream::default()),
+            #[cfg(feature = "layers")]
+            target: Cell::new(None),
+            #[cfg(feature = "layers")]
+            layers_alloc: Cell::new(0),
+        }
+    }
+
+    /// Layers the backend composites (`LcdBackend::LAYERS`, at most
+    /// `layer::MAX_LAYERS`); 0 in portrait (not remapped).
+    #[cfg(feature = "layers")]
+    pub fn layer_count(&self) -> usize {
+        if self.portrait.get() { 0 } else { B::LAYERS.min(crate::layer::MAX_LAYERS) }
+    }
+
+    /// See `LcdBackend::layer_alloc`.
+    #[cfg(feature = "layers")]
+    pub fn layer_alloc(&self, n: usize, w: u16, h: u16) -> bool {
+        if n >= self.layer_count() || w == 0 || h == 0 || !self.be.layer_alloc(n, w, h) {
+            return false;
+        }
+        self.layers_alloc.set(self.layers_alloc.get() | 1 << n);
+        true
+    }
+
+    /// See `LcdBackend::layer_free`.
+    #[cfg(feature = "layers")]
+    pub fn layer_free(&self, n: usize) {
+        if self.layers_alloc.get() & 1 << n != 0 {
+            self.layers_alloc.set(self.layers_alloc.get() & !(1 << n));
+            self.be.layer_free(n);
+        }
+    }
+
+    /// Layers with a surface (bit n).
+    #[cfg(feature = "layers")]
+    pub fn layers_allocated(&self) -> u8 {
+        self.layers_alloc.get()
+    }
+
+    /// Hide and free every layer (error screens, buffered mode).
+    #[cfg(feature = "layers")]
+    pub fn layers_off(&self) {
+        for n in 0..crate::layer::MAX_LAYERS {
+            self.layer_free(n);
+        }
+    }
+
+    /// Draw into layer `n`'s `w` x `h` surface (`Some`), or the screen.
+    #[cfg(feature = "layers")]
+    pub fn layer_target(&self, t: Option<(usize, u16, u16)>) {
+        self.target.set(t.map(|(n, w, h)| (n as u8, w, h)));
+        self.be.layer_target(t.map(|(n, _, _)| n));
+    }
+
+    /// Make `r` of the targeted surface transparent (clipped to it).
+    #[cfg(feature = "layers")]
+    pub fn layer_clear(&self, r: &Rect) {
+        let Some((_, w, h)) = self.target.get() else { return };
+        if let Some(c) = r.intersection(&Rect::new(0, 0, w, h)) {
+            self.be.layer_clear(c.x as u16, c.y as u16, c.w, c.h);
+        }
+    }
+
+    /// See `LcdBackend::layer_place`.
+    #[cfg(feature = "layers")]
+    pub fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
+        if self.layers_alloc.get() & 1 << n != 0 {
+            self.be.layer_place(n, x, y, alpha, visible);
         }
     }
 
@@ -274,12 +392,20 @@ impl<B: LcdBackend> LcdImpl<B> {
     /// Logical screen width (the panel's height in portrait).
     #[inline]
     pub fn width(&self) -> u16 {
+        #[cfg(feature = "layers")]
+        if let Some((_, w, _)) = self.target.get() {
+            return w;
+        }
         if self.portrait.get() { B::HEIGHT } else { B::WIDTH }
     }
 
     /// Logical screen height (the panel's width in portrait).
     #[inline]
     pub fn height(&self) -> u16 {
+        #[cfg(feature = "layers")]
+        if let Some((_, _, h)) = self.target.get() {
+            return h;
+        }
         if self.portrait.get() { B::WIDTH } else { B::HEIGHT }
     }
 

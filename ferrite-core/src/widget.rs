@@ -832,6 +832,11 @@ impl ObjPool {
         if !self.is_live(id) || self.get(id).flags & FLAG_RENDERED == 0 {
             return;
         }
+        // An active layer's root only moves its surface.
+        #[cfg(feature = "layers")]
+        if self.is_active_layer_root(id) {
+            return;
+        }
         if !self.prev_rect(id, 0).is_empty() {
             return;
         }
@@ -934,6 +939,12 @@ impl ObjPool {
             pid = p.parent;
         }
 
+        // A layer pass draws in its surface's coordinates.
+        #[cfg(feature = "layers")]
+        {
+            x = x.wrapping_sub(self.layers.origin.x);
+            y = y.wrapping_sub(self.layers.origin.y);
+        }
         Rect::new(x, y, w.size.w, w.size.h)
     }
 
@@ -1153,6 +1164,10 @@ impl ObjPool {
     /// listed as changed, so the renderer may shift its pixels instead of
     /// redrawing it (`render::shift_moved`). Call `will_move` first.
     pub fn mark_moved(&mut self, id: WidgetId) {
+        #[cfg(feature = "layers")]
+        if self.layer_placement_changed(id) {
+            return;
+        }
         if self.is_live(id) {
             self.dirty_subtree(id);
         }

@@ -15,6 +15,6 @@ no-readback = []
 tablet = []
 
 [dependencies]
-ferrite-core = { path = "../../ferrite-core", features = ["host", "wide_code", "audio", "jpeg", "render_cache", "superops"] }
+ferrite-core = { path = "../../ferrite-core", features = ["host", "wide_code", "audio", "jpeg", "render_cache", "superops", "layers"] }
 jpeg-decoder = { version = "0.3", default-features = false }
 minifb = "0.27"

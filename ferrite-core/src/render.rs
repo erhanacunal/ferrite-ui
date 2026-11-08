@@ -106,6 +106,11 @@ pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
 pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
     let mut paint = PaintList::new();
     let buf = ctx.lcd.back_buf();
+    // Layers are a dirty-mode feature.
+    #[cfg(feature = "layers")]
+    if ctx.lcd.layers_allocated() != 0 {
+        layers_off(ctx);
+    }
     ctx.objs.ensure_dfs();
     ctx.objs.geo_begin();
     // The two buffers hold different frames: no incremental redraws.
@@ -261,6 +266,13 @@ fn redraw_behind_region<P: Platform>(
     clip: &ClipRegion,
     bounds: &Rect,
 ) {
+    // Behind a layer's root there is nothing: transparent.
+    #[cfg(feature = "layers")]
+    if ctx.objs.in_layer_pass() {
+        for r in clip.iter() {
+            ctx.lcd.layer_clear(r);
+        }
+    }
     for i in 0..target_idx {
         if !ctx.objs.vis_at(i) {
             continue;
@@ -281,22 +293,49 @@ fn redraw_behind_region<P: Platform>(
 /// Draw the entire widget tree from scratch (initial draw or full redraw).
 /// Iterative DFS using cached order — no recursion, no stack growth.
 pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
-    render_all_iterative(ctx);
+    ctx.objs.ensure_dfs();
+    ctx.objs.geo_begin();
+    #[cfg(feature = "layers")]
+    let active = {
+        let active = layers_sync(ctx);
+        for slot in ctx.objs.layers.slots.iter_mut() {
+            // The whole screen is drawn: nothing of a layer to restore on it.
+            slot.restore = Rect::new(0, 0, 0, 0);
+        }
+        if active != 0 {
+            ctx.objs.layers.scope = base_scope(&ctx.objs);
+        }
+        active
+    };
+    let n = ctx.objs.dfs_len();
+    render_all_iterative(ctx, 0, n);
+    #[cfg(feature = "layers")]
+    {
+        ctx.objs.layers.scope = crate::layer::Scope::All;
+        if active != 0 {
+            for s in 0..crate::layer::MAX_LAYERS {
+                if ctx.objs.layers.slots[s].active {
+                    layer_pass(ctx, s, true);
+                }
+            }
+        }
+        place_layers(ctx);
+    }
+    ctx.objs.geo_end();
     clear_all_dirty(ctx);
     // Everything shows what it last drew (see `render_dirty`'s `settled`).
     ctx.objs.settled_epoch = ctx.objs.draw_epoch;
 }
 
-/// Iterative full redraw: walk DFS order, skip invisible subtrees.
+/// Iterative full redraw of DFS entries `lo..hi` (`ensure_dfs` +
+/// `geo_begin` first): walk DFS order, skip invisible subtrees.
 /// Children of scroll containers are clipped to the viewport.
-fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>) {
-    ctx.objs.ensure_dfs();
-    ctx.objs.geo_begin();
+fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
     // Whole-screen clip for the full redraw — built once, reused for every
     // widget so we don't pay region setup in the per-widget loop.
     let full = ClipRegion::from_rect(screen_rect(&ctx.lcd));
-    let mut i = 0;
-    while i < ctx.objs.dfs_len() {
+    let mut i = lo;
+    while i < hi {
         let id = ctx.objs.dfs_at(i);
         if !ctx.objs.vis_at(i) {
             // Skip entire subtree of this invisible widget
@@ -332,14 +371,13 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>) {
     }
 
     // Draw scrollbars on top of all children
-    for i in 0..ctx.objs.dfs_len() {
+    for i in lo..hi {
         let id = ctx.objs.dfs_at(i);
         if ctx.objs.get(id).flags & FLAG_CLIP_CHILDREN != 0 && ctx.objs.vis_at(i) {
             let abs = ctx.objs.abs_at(i);
             draw_scrollbar(ctx, id, &abs);
         }
     }
-    ctx.objs.geo_end();
 }
 
 // --- Dirty render (painter's algorithm + clip) ---
@@ -365,7 +403,13 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
             break;
         }
     }
-    if !has_dirty {
+    // A layer moved, faded, was shown/hidden or (un)marked: placements and
+    // eligibility change even with nothing dirty.
+    #[cfg(feature = "layers")]
+    let placed = core::mem::take(&mut ctx.objs.layers.placed);
+    #[cfg(not(feature = "layers"))]
+    let placed = false;
+    if !has_dirty && !placed {
         // Dirty mode uses only the A bits: nothing left to draw until a
         // widget is marked again.
         ctx.objs.maybe_dirty = false;
@@ -374,16 +418,65 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     }
     ctx.objs.geo_begin();
 
+    #[cfg(feature = "layers")]
+    let active = layers_sync(ctx);
+    #[cfg(not(feature = "layers"))]
+    let active = 0usize;
+
     // A board that repaints whole areas (a GPU) takes the render over.
-    if <P::Renderer as WidgetRenderer<P>>::COMPOSES && compose_dirty(ctx) {
+    if active == 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && compose_dirty(ctx) {
         ctx.objs.geo_end();
         return;
     }
 
+    #[cfg(feature = "layers")]
+    if active != 0 {
+        ctx.objs.layers.scope = base_scope(&ctx.objs);
+    }
+    dirty_passes(ctx, settled, true);
+    #[cfg(feature = "layers")]
+    if active != 0 {
+        ctx.objs.layers.scope = crate::layer::Scope::All;
+        for s in 0..crate::layer::MAX_LAYERS {
+            if ctx.objs.layers.slots[s].active {
+                layer_pass(ctx, s, false);
+            }
+        }
+    }
+    #[cfg(feature = "layers")]
+    place_layers(ctx);
+    ctx.objs.geo_end();
+
+    clear_all_dirty(ctx);
+    ctx.objs.shifted.clear();
+    ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+}
+
+/// The passes of `render_dirty` over the running scope: the screen (`base`,
+/// with pixel shifts) or a layer's surface (`ctx.objs.layers`).
+fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
     let mut restores = Restores::new();
     // Pass 0: opaque panels that only moved get their pixels shifted.
-    if <P::LcdB as LcdBackend>::CAN_MOVE {
+    if base && <P::LcdB as LcdBackend>::CAN_MOVE {
         shift_moved(ctx, settled, &mut restores);
+    }
+    #[cfg(not(feature = "layers"))]
+    let _ = base;
+    // Layers that just moved into their surface: put back what the screen
+    // drew of them.
+    #[cfg(feature = "layers")]
+    if base {
+        for s in 0..crate::layer::MAX_LAYERS {
+            let slot = ctx.objs.layers.slots[s];
+            if !slot.active || slot.restore.is_empty() {
+                continue;
+            }
+            ctx.objs.layers.slots[s].restore = Rect::new(0, 0, 0, 0);
+            if let Some(ri) = ctx.objs.dfs_index(slot.root) {
+                restore_behind(ctx, ri, slot.restore);
+                restores.push(ri, slot.restore);
+            }
+        }
     }
     // Pass 1: erase dirty widgets that became invisible.
     // Only erase widgets that were actually drawn before (FLAG_RENDERED).
@@ -395,14 +488,25 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         if !ctx.objs.get(id).is_dirty() {
             continue;
         }
+        #[cfg(feature = "layers")]
+        if !ctx.objs.in_scope(di) {
+            continue;
+        }
         if !ctx.objs.vis_at(di) {
             if ctx.objs.get(id).flags & FLAG_RENDERED != 0 {
                 let abs = ctx.objs.abs_at(di);
                 if !abs.is_empty() {
                     // Restore what is behind it (ancestors and earlier
                     // siblings, not just the nearest ancestor's bg: a hidden
-                    // popup would otherwise leave a blank hole).
-                    erase_widget_area(&ctx.objs, &ctx.lcd, id, abs);
+                    // popup would otherwise leave a blank hole). In a layer
+                    // the restore starts from transparent instead.
+                    #[cfg(feature = "layers")]
+                    let erase = !ctx.objs.in_layer_pass();
+                    #[cfg(not(feature = "layers"))]
+                    let erase = true;
+                    if erase {
+                        erase_widget_area(&ctx.objs, &ctx.lcd, id, abs);
+                    }
                     restore_behind(ctx, di, abs);
                     restores.push(di, abs);
                 }
@@ -420,10 +524,20 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         if !w.is_dirty() {
             continue;
         }
+        #[cfg(feature = "layers")]
+        if !ctx.objs.in_scope(di) {
+            continue;
+        }
         let stale = buf_prev_rect(&ctx.objs, id, 0);
         if stale.is_empty() {
             continue;
         }
+        // Recorded on screen; a layer pass draws in its surface's coordinates.
+        #[cfg(feature = "layers")]
+        let stale = {
+            let o = ctx.objs.layers.origin;
+            Rect::new(stale.x.wrapping_sub(o.x), stale.y.wrapping_sub(o.y), stale.w, stale.h)
+        };
         let current = if ctx.objs.vis_at(di) {
             ctx.objs.abs_at(di)
         } else {
@@ -578,11 +692,149 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
             draw_scrollbar(ctx, id, &abs);
         }
     }
-    ctx.objs.geo_end();
+}
 
-    clear_all_dirty(ctx);
-    ctx.objs.shifted.clear();
-    ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+// --- Layers (`layer.rs`) ---
+
+/// Decides which layers are active this render (`ObjPool::layer_eligible`),
+/// (re)allocates their surfaces and hands the ones that stop back to the
+/// tree. Scope must be `All`, origin 0. Returns how many are active.
+#[cfg(feature = "layers")]
+fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
+    use crate::layer::{MAX_LAYERS, Slot};
+    let count = ctx.lcd.layer_count();
+    let mut active = 0;
+    for s in 0..MAX_LAYERS {
+        let mut slot: Slot = ctx.objs.layers.slots[s];
+        let live = slot.root.is_some() && ctx.objs.is_live(slot.root);
+        let range = if live { ctx.objs.dfs_index(slot.root).map(|ri| (ri, ctx.objs.sub_end_at(ri))) } else { None };
+        let mut want = s < count && range.is_some_and(|(ri, end)| ctx.objs.layer_eligible(s, ri, end));
+        if want {
+            let (ri, end) = range.unwrap_or((0, 0));
+            let size = ctx.objs.get(slot.root).size;
+            if !slot.active || (slot.w, slot.h) != (size.w, size.h) {
+                if ctx.lcd.layer_alloc(s, size.w, size.h) {
+                    if !slot.active {
+                        slot.restore = ctx.objs.layer_drawn_bounds(ri, end);
+                    }
+                    slot.active = true;
+                    slot.full = true;
+                    slot.w = size.w;
+                    slot.h = size.h;
+                } else {
+                    want = false;
+                }
+            }
+        }
+        if !want && slot.active {
+            // Drawn in the tree again.
+            slot.active = false;
+            slot.w = 0;
+            slot.h = 0;
+            if live {
+                ctx.objs.mark_dirty(slot.root);
+            }
+        }
+        if !slot.active {
+            // Also surfaces left over from a cleared pool.
+            ctx.lcd.layer_free(s);
+        }
+        if !live {
+            slot = Slot { root: WidgetId::NONE, alpha: 255, active: false, ..slot };
+        }
+        active += slot.active as usize;
+        ctx.objs.layers.slots[s] = slot;
+    }
+    active
+}
+
+/// The screen's scope: every DFS entry but the active layers' subtrees.
+#[cfg(feature = "layers")]
+fn base_scope(objs: &ObjPool) -> crate::layer::Scope {
+    let mut excl = [(0u32, 0u32); crate::layer::MAX_LAYERS];
+    let mut n = 0;
+    for slot in objs.layers.slots.iter().filter(|s| s.active) {
+        if let Some(ri) = objs.dfs_index(slot.root) {
+            excl[n] = (ri as u32, objs.sub_end_at(ri) as u32);
+            n += 1;
+        }
+    }
+    crate::layer::Scope::Base { excl, n: n as u8 }
+}
+
+/// Draws layer `s`'s dirty widgets into its surface (`all`: every widget,
+/// from a cleared surface). Scope must be `All` on entry and is again after.
+#[cfg(feature = "layers")]
+fn layer_pass<P: Platform>(ctx: &mut Ctx<P>, s: usize, all: bool) {
+    let slot = ctx.objs.layers.slots[s];
+    let Some(ri) = ctx.objs.dfs_index(slot.root) else { return };
+    let end = ctx.objs.sub_end_at(ri);
+    let abs = ctx.objs.abs_at(ri);
+    let mut full = slot.full || all;
+    if !ctx.objs.vis_at(ri) {
+        // Hidden: its surface keeps what it showed; anything that changed
+        // meanwhile is redrawn when it shows again.
+        if ctx.objs.layer_has_dirty(ri, end, false) {
+            ctx.objs.layers.slots[s].full = true;
+        }
+        return;
+    }
+    let at = Offset { x: abs.x, y: abs.y };
+    // Prev rects recorded since the root last moved are relative to a
+    // position the surface no longer has: no partial restore can be trusted.
+    if (at.x, at.y) != (slot.at.x, slot.at.y) && ctx.objs.layer_has_dirty(ri, end, true) {
+        full = true;
+    }
+    ctx.objs.layers.scope = crate::layer::Scope::Layer(ri as u32, end as u32);
+    ctx.objs.layers.origin = at;
+    ctx.lcd.layer_target(Some((s, slot.w, slot.h)));
+    if full {
+        ctx.lcd.layer_clear(&Rect::new(0, 0, slot.w, slot.h));
+        ctx.objs.layer_redraw_all(ri, end);
+    }
+    if all {
+        render_all_iterative(ctx, ri, end);
+    } else {
+        dirty_passes(ctx, false, false);
+    }
+    ctx.lcd.layer_target(None);
+    ctx.objs.layers.origin = Offset { x: 0, y: 0 };
+    ctx.objs.layers.scope = crate::layer::Scope::All;
+    let slot = &mut ctx.objs.layers.slots[s];
+    slot.at = at;
+    slot.full = false;
+}
+
+/// Shows every active layer where its root is (scope `All`, origin 0).
+#[cfg(feature = "layers")]
+fn place_layers<P: Platform>(ctx: &mut Ctx<P>) {
+    for s in 0..crate::layer::MAX_LAYERS {
+        let slot = ctx.objs.layers.slots[s];
+        if !slot.active {
+            continue;
+        }
+        if let Some(ri) = ctx.objs.dfs_index(slot.root) {
+            let abs = ctx.objs.abs_at(ri);
+            let vis = ctx.objs.vis_at(ri);
+            ctx.lcd.layer_place(s, abs.x as i32, abs.y as i32, slot.alpha, vis);
+        }
+    }
+}
+
+/// Hands every active layer back to the tree and frees the surfaces
+/// (buffered mode, which doesn't use layers).
+#[cfg(feature = "layers")]
+fn layers_off<P: Platform>(ctx: &mut Ctx<P>) {
+    for s in 0..crate::layer::MAX_LAYERS {
+        let slot = ctx.objs.layers.slots[s];
+        if slot.active {
+            ctx.objs.layers.slots[s].active = false;
+            ctx.objs.layers.slots[s].w = 0;
+            ctx.objs.layers.slots[s].h = 0;
+            ctx.objs.mark_dirty(slot.root);
+        }
+    }
+    ctx.lcd.layers_off();
 }
 
 /// Most areas one `WidgetRenderer::compose` call gets: more are merged.
@@ -759,6 +1011,11 @@ fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Rest
         }
         let Some(radius) = opaque_radius(&ctx.objs, id, &new) else { continue };
         let sub_end = ctx.objs.sub_end_at(di);
+        // A descendant that moved on its own (pending prev rect) would be
+        // carried along at its old place: redraw instead.
+        if (di + 1..sub_end).any(|j| !ctx.objs.prev_rect(ctx.objs.dfs_at(j), 0).is_empty()) {
+            continue;
+        }
         // A small box is cheaper to redraw than to move (a move costs a
         // fixed setup per rect on the exynos G2D: the Monitor stress test's
         // 51 tiles a frame were slower moved than redrawn).
@@ -3217,6 +3474,31 @@ mod shift_tests {
         }
         assert!(b.lcd.backend().moved.get() == 0);
         assert!(shifted_frames >= 6, "only {shifted_frames} frames shifted");
+    }
+
+    /// A panel and one of its children moving in the same frame: the
+    /// child's own move must not be carried along by the panel's shift (it
+    /// used to be: the panel was shifted whole, the child kept its old place
+    /// inside it).
+    #[test]
+    fn child_moving_inside_a_moving_panel() {
+        let mut a = ctx::<true>();
+        let mut b = ctx::<false>();
+        let (panel, _) = scene(&mut a);
+        let _ = scene(&mut b);
+        render_all(&mut a);
+        render_all(&mut b);
+        let child = a.objs.get(panel).first_child;
+        move_to(&mut a, child, 30, 22);
+        move_to(&mut a, panel, 26, 36);
+        move_to(&mut b, child, 30, 22);
+        move_to(&mut b, panel, 26, 36);
+        render_dirty(&mut a);
+        render_dirty(&mut b);
+        let (pa, pb) = (a.lcd.backend().px.borrow(), b.lcd.backend().px.borrow());
+        for i in 0..S * S {
+            assert!(pa[i] == pb[i], "pixel ({}, {}) {:04x} vs {:04x}", i % S, i / S, pa[i], pb[i]);
+        }
     }
 
     /// Two see-through widgets moving in the same frame (clock hands): the

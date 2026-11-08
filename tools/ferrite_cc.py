@@ -342,6 +342,9 @@ class Prop:
     FLEX = 0x33            # container: direction | justify | align bits
     FLEX_GAP = 0x34        # container: px between children
     FLEX_GROW = 0x35       # child: share of the leftover main-axis space
+    # Retained layers (firmware `layers` feature; ignored elsewhere)
+    LAYER = 0x36           # subtree root: layer 1..4 it is drawn into, 0 = none
+    LAYER_ALPHA = 0x37     # layer root: plane alpha 0-255 (fades without redrawing)
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -1214,6 +1217,7 @@ PROP_NAMES = {
     0x2D: 'GRAPH_ARR', 0x2E: 'GRAPH_COUNT', 0x2F: 'GRAPH_FLAGS',
     0x30: 'MULTI_LINE', 0x31: 'ALPHA', 0x32: 'GROUP_ID',
     0x33: 'FLEX', 0x34: 'FLEX_GAP', 0x35: 'FLEX_GROW',
+    0x36: 'LAYER', 0x37: 'LAYER_ALPHA',
     0x40: 'LOCATION', 0x41: 'SIZE',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -1558,6 +1562,8 @@ PROP_MAP = {
     'flex': (Prop.FLEX, False),
     'flex_gap': (Prop.FLEX_GAP, False),
     'flex_grow': (Prop.FLEX_GROW, False),
+    'layer': (Prop.LAYER, False),
+    'layer_alpha': (Prop.LAYER_ALPHA, False),
     # Tree links, read-only (get() only): widget id, or -1 = none
     'parent': (Prop.PARENT, False),
     'first_child': (Prop.FIRST_CHILD, False),

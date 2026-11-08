@@ -231,6 +231,9 @@ impl PlatformRuntime for Exynos4412Platform {
         // An FS image uploaded over HTTP, a restart request (net/).
         #[cfg(feature = "wifi")]
         crate::net::service();
+        // FIMD window 1 test picture (HTTP `POST /api/overlay`).
+        #[cfg(feature = "wifi")]
+        crate::overlay_test::service();
         // Power key: hold = off, + vol up = restart, + vol down = fastboot.
         if let Some(keys) = unsafe { (*(&raw mut KEYS)).as_mut() } {
             keys.service(Mct::new());

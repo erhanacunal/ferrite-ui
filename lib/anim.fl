@@ -49,3 +49,4 @@ const PROP_BORDER_RADIUS  = 0x23;
 const PROP_VALUE          = 0x24;
 const PROP_GRADIENT_COLOR = 0x2B;
 const PROP_ALPHA          = 0x31;
+const PROP_LAYER_ALPHA    = 0x37;  // a layer root's plane alpha: fades without redrawing

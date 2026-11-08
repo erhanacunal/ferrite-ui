@@ -207,6 +207,9 @@ pub struct ObjPool {
     /// the input handler: a board renderer that repaints whole areas
     /// (`WidgetRenderer::compose`) leaves areas that touch it to the built-in passes.
     pub overlay: Option<crate::types::Rect>,
+    /// Retained layers: roots, plane alphas, the running pass's scope (`layer.rs`).
+    #[cfg(feature = "layers")]
+    pub layers: crate::layer::Layers,
     /// Geometry by DFS index for the current render pass (`geo.rs`).
     #[cfg(feature = "render_cache")]
     pub(crate) geo: Vec<crate::geo::Geo>,
@@ -253,6 +256,8 @@ impl ObjPool {
             shifted: Vec::new(),
             overlay: None,
             shift_keep: Vec::new(),
+            #[cfg(feature = "layers")]
+            layers: crate::layer::Layers::new(),
             #[cfg(feature = "render_cache")]
             geo: Vec::new(),
             #[cfg(feature = "render_cache")]
@@ -330,6 +335,11 @@ impl ObjPool {
         self.changed_n = 0;
         self.settled_epoch = self.draw_epoch.wrapping_sub(1);
         self.shifted.clear();
+        #[cfg(feature = "layers")]
+        {
+            // The surfaces stay shown until the next render hides them.
+            self.layers = crate::layer::Layers::new();
+        }
         #[cfg(feature = "render_cache")]
         {
             self.geo_valid = false;

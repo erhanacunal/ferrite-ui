@@ -164,10 +164,10 @@ impl PlatformRuntime for SimPlatform {
             // Present the front (displayed) buffer (blocks to the target FPS
             // for pacing). In buffered mode this is whichever buffer the last
             // end_frame published; in dirty mode it is always buffer 0.
-            let buf = host.fb.front_buffer();
-            let _ = host
-                .window
-                .update_with_buffer(&buf, WIDTH as usize, HEIGHT as usize);
+            let window = &mut host.window;
+            host.fb.with_shown(|buf| {
+                let _ = window.update_with_buffer(buf, WIDTH as usize, HEIGHT as usize);
+            });
         });
     }
 }
