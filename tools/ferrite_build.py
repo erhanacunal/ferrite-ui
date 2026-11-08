@@ -38,6 +38,9 @@ JSON format:
     "sounds": [
       {"name": "beep", "source": "assets/beep.wav"}
     ],
+    "meshes": [
+      {"name": "knot", "source": "assets/knot.obj", "normals": "auto|smooth|flat"}
+    ],
     "memory": {
       "arena_bytes": 16384, "max_objects": 400, "uart_rx_bytes": 512,
       "eval_stack": 32, "call_stack": 12, "cb_queue": 16, "anim_slots": 8
@@ -47,6 +50,12 @@ JSON format:
   "sounds" are PCM WAV files (8/16/24/32-bit, mono or stereo, any rate),
   stored as 16-bit PCM and played with playSound(name) on boards with
   caps.audio.
+
+  "meshes" are Wavefront OBJ files (v / vn / f; polygons fanned into
+  triangles, other lines ignored), centred and scaled to radius 1 and stored
+  as RES_MESH for 3D model widgets (model3dMesh(w, name), lib/model3d.fl).
+  "normals": "auto" (default) keeps the file's vertex normals, or computes
+  smooth ones when it has none; "smooth" / "flat" always compute them.
 
   "widget_page": true moves static widget setup out of the program into a
   RES_PAGE resource with the program's name (see docs/bytecode.md). Set it
@@ -90,12 +99,13 @@ RES_PAGE = 3
 RES_FILE = 4
 RES_SYSCFG = 5
 RES_SOUND = 6
+RES_MESH = 7
 
 # Resource flags (stored in entry reserved[0], byte 28)
 RES_FLAG_FLASH_EXEC = 0x01
 
 KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE",
-              RES_FILE: "FILE", RES_SYSCFG: "SYSCFG", RES_SOUND: "SOUND"}
+              RES_FILE: "FILE", RES_SYSCFG: "SYSCFG", RES_SOUND: "SOUND", RES_MESH: "MESH"}
 
 # --- Image conversion (shared encoder in ferrite_img.py) ---
 
@@ -186,6 +196,105 @@ def used_builtins(source_path: str, include_dirs, names) -> set[str]:
 
 # RES_SYSCFG record — keep in sync with ferrite-core/src/syscfg.rs.
 SYSCFG_NAME = "sys"
+
+# RES_MESH (fs.rs RES_MESH): magic "MS", version 1, flags 0, triangle count
+# u32 LE, then 3 vertices a triangle: position x, y, z and normal x, y, z as
+# i16 LE (/ 32767), the model centred on its bounding box and scaled so its
+# farthest vertex is at 1.
+MESH_MAGIC = b"MS"
+MESH_VERSION = 1
+MESH_NORMALS = ("auto", "smooth", "flat")
+
+
+def _obj_index(token: str, count: int) -> int:
+    """An OBJ index (1-based, negative = from the end) → 0-based."""
+    i = int(token)
+    return i - 1 if i > 0 else count + i
+
+
+def parse_obj(text: str):
+    """OBJ text → (positions, normals, triangles); each triangle is three
+    (position index, normal index or None) corners. Polygons are fanned."""
+    positions, normals, tris = [], [], []
+    for line_no, line in enumerate(text.splitlines(), 1):
+        parts = line.split("#", 1)[0].split()
+        if not parts:
+            continue
+        tag = parts[0]
+        try:
+            if tag == "v":
+                positions.append(tuple(float(x) for x in parts[1:4]))
+            elif tag == "vn":
+                normals.append(tuple(float(x) for x in parts[1:4]))
+            elif tag == "f":
+                corners = []
+                for ref in parts[1:]:
+                    fields = ref.split("/")
+                    v = _obj_index(fields[0], len(positions))
+                    n = _obj_index(fields[2], len(normals)) if len(fields) > 2 and fields[2] else None
+                    if not 0 <= v < len(positions) or (n is not None and not 0 <= n < len(normals)):
+                        raise ValueError("index out of range")
+                    corners.append((v, n))
+                for k in range(1, len(corners) - 1):
+                    tris.append((corners[0], corners[k], corners[k + 1]))
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"line {line_no}: {e}: {line.strip()}")
+    return positions, normals, tris
+
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _unit(v):
+    length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5
+    return (v[0] / length, v[1] / length, v[2] / length) if length > 0 else (0.0, 0.0, 1.0)
+
+
+def convert_mesh(source_path: str, normals_mode: str = "auto") -> bytes:
+    """OBJ file → RES_MESH resource."""
+    if normals_mode not in MESH_NORMALS:
+        raise ValueError(f"normals must be one of {', '.join(MESH_NORMALS)}")
+    positions, file_normals, tris = parse_obj(Path(source_path).read_text(encoding="utf-8", errors="replace"))
+    if not tris:
+        raise ValueError("no faces")
+    use_file = normals_mode == "auto" and all(c[1] is not None for t in tris for c in t)
+    # Face normals (area-weighted: the cross product's length), and per
+    # position their sum for smooth shading.
+    face_n = [_cross(_sub(positions[t[1][0]], positions[t[0][0]]), _sub(positions[t[2][0]], positions[t[0][0]]))
+              for t in tris]
+    smooth = {}
+    if not use_file and normals_mode != "flat":
+        for t, n in zip(tris, face_n):
+            for v, _ in t:
+                s0 = smooth.get(v, (0.0, 0.0, 0.0))
+                smooth[v] = (s0[0] + n[0], s0[1] + n[1], s0[2] + n[2])
+    used = sorted({v for t in tris for v, _ in t})
+    lo = [min(positions[v][i] for v in used) for i in range(3)]
+    hi = [max(positions[v][i] for v in used) for i in range(3)]
+    centre = [(lo[i] + hi[i]) / 2 for i in range(3)]
+    radius = max(sum((positions[v][i] - centre[i]) ** 2 for i in range(3)) ** 0.5 for v in used) or 1.0
+
+    def q(x):
+        return max(-32767, min(32767, round(x * 32767)))
+
+    out = bytearray(MESH_MAGIC + bytes([MESH_VERSION, 0]) + struct.pack("<I", len(tris)))
+    for t, fn in zip(tris, face_n):
+        for v, ni in t:
+            p = [(positions[v][i] - centre[i]) / radius for i in range(3)]
+            if use_file:
+                n = _unit(file_normals[ni])
+            elif normals_mode == "flat":
+                n = _unit(fn)
+            else:
+                n = _unit(smooth[v])
+            out += struct.pack("<6h", *(q(x) for x in p), *(q(x) for x in n))
+    return bytes(out)
+
 
 # RES_SOUND header (audio.rs SOUND_HEADER): magic "SN", version, channels,
 # sample rate u32 LE; PCM16 LE samples (interleaved when stereo) follow.
@@ -570,6 +679,19 @@ def build(project_path: str, output_path: str | None) -> dict:
         data = convert_sound(str(project_dir / snd["source"]))
         resources.append((name, RES_SOUND, data, 0))
 
+    # 5c. Meshes — OBJ → RES_MESH, shown by 3D model widgets (model3dMesh).
+    for mesh in project.get("meshes", []):
+        name = mesh["name"]
+        if len(name.encode("ascii")) > 15:
+            print(f"Error: mesh name '{name}' exceeds 15 chars", file=sys.stderr)
+            sys.exit(1)
+        try:
+            data = convert_mesh(str(project_dir / mesh["source"]), mesh.get("normals", "auto"))
+        except (OSError, ValueError) as e:
+            print(f"Error: mesh '{name}' ({mesh['source']}): {e}", file=sys.stderr)
+            sys.exit(1)
+        resources.append((name, RES_MESH, data, 0))
+
     # 6. System configuration — optional "memory" block sizes the runtime pools.
     memory = project.get("memory")
     if memory is not None:
@@ -690,6 +812,8 @@ def dump_fs(binary: bytes, symbols: dict | None = None) -> str:
             frames = (len(blob) - 8) // (2 * max(channels, 1))
             out.append(f"; {rate} Hz, {'stereo' if channels == 2 else 'mono'}, "
                        f"{frames} frames ({frames / max(rate, 1):.2f} s)")
+        elif kind == RES_MESH and len(blob) >= 8:
+            out.append(f"; {struct.unpack_from('<I', blob, 4)[0]} triangles")
         elif kind == RES_SYSCFG:
             fields = [f"{key}={syscfg_value(blob, key)}"
                       for key in SYSCFG_FIELDS if len(blob) >= 32]
@@ -709,8 +833,9 @@ def show_info(project_path: str):
     programs = project.get("programs", [])
     files = project.get("files", [])
     sounds = project.get("sounds", [])
+    meshes = project.get("meshes", [])
 
-    total_res = len(fonts) + len(images) + len(programs) + len(files) + len(sounds)
+    total_res = len(fonts) + len(images) + len(programs) + len(files) + len(sounds) + len(meshes)
 
     print(f"Project: {project_path}")
     print(f"Screen:  {screen[0]}×{screen[1]}")
@@ -719,6 +844,7 @@ def show_info(project_path: str):
     print(f"Programs:{len(programs)}")
     print(f"Files:   {len(files)}")
     print(f"Sounds:  {len(sounds)}")
+    print(f"Meshes:  {len(meshes)}")
     print(f"Total:   {total_res} resources")
 
     if total_res > MAX_RESOURCES:

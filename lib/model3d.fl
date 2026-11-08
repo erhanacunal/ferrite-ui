@@ -3,8 +3,8 @@
 //
 // A model widget is a box (kind KIND_MODEL3D, bg_color = the backdrop behind
 // the model, at most 512 tiles of 16 x 16 once rounded up to 16: 512 x 256,
-// 352 x 352...) showing one built-in shape in one colour, lit from the upper
-// left. Set what it shows with the calls below after set(kind, KIND_MODEL3D);
+// 352 x 352...) showing one built-in shape or mesh resource in one colour,
+// lit from the upper left. Set what it shows with the calls below after set(kind, KIND_MODEL3D);
 // each marks the widget dirty when something changed.
 //
 // Ids are duplicated in bsp/exynos4412/src/model3d.rs and
@@ -15,6 +15,7 @@ const SYS_M3D_TURN  = 0x61;  // (w, yaw, pitch, roll) in tenths of a degree
 const SYS_M3D_COLOR = 0x62;  // (w, rgb565)
 const SYS_M3D_ZOOM  = 0x63;  // (w, percent)
 const SYS_M3D_STAT  = 0x64;  // (what) -> value
+const SYS_M3D_MESH  = 0x65;  // (w, name): a mesh resource ("meshes" in project.json)
 
 const SHAPE_CUBE   = 0;
 const SHAPE_TORUS  = 1;
@@ -25,7 +26,8 @@ const M3D_GP_US     = 1;  // last frame: vertex shading + binning, us
 const M3D_PPS_US    = 2;  // last frame: the four pixel processors, us
 const M3D_TOTAL_US  = 3;  // last frame: all of it, us
 const M3D_ERROR     = 4;  // last error: 0 none, 1 GPU start, 2 meshes,
-                          // 3 widget too big, 4 frame failed, 5 no G2D
+                          // 3 widget too big, 4 frame failed, 5 no G2D,
+                          // 6 mesh missing or bad
 const M3D_TRIANGLES = 5;  // triangles in the last frame
 
 fn model3dShape(w, s) { return syscall(SYS_M3D_SHAPE, w, s); }
@@ -33,3 +35,6 @@ fn model3dTurn(w, yaw, pitch, roll) { return syscall(SYS_M3D_TURN, w, yaw, pitch
 fn model3dColor(w, c) { return syscall(SYS_M3D_COLOR, w, c); }
 fn model3dZoom(w, percent) { return syscall(SYS_M3D_ZOOM, w, percent); }
 fn model3dStat(what) { return syscall(SYS_M3D_STAT, what); }
+// Show mesh resource `name` (an OBJ converted by ferrite_build) instead of a
+// built-in shape; model3dShape goes back to the shapes.
+fn model3dMesh(w, name: string) { return syscall(SYS_M3D_MESH, w, name); }

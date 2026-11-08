@@ -119,7 +119,7 @@ impl PlatformRuntime for SimPlatform {
             0x00 => Some(systick::millis() as i32), // SYS_UPTIME
             // 3D model syscalls (lib/model3d.fl, exynos4412 model3d.rs): the sim has no GPU,
             // so a model widget shows its background; setters succeed, stats are 0.
-            0x60..=0x63 => Some(1),
+            0x60..=0x63 | 0x65 => Some(1),
             0x64 => Some(0),
             // No heap figures on the host; frames = passes.
             _ => ferrite_core::sysinfo::syscall(id, args, objs, || {

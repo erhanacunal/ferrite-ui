@@ -1,6 +1,7 @@
 // main.fl — 3D models on the Exynos 4412's Mali-400 GPU (lib/model3d.fl).
 //
-// Three model widgets turn at their own rates: a cube, a torus and a sphere.
+// Three model widgets turn at their own rates: a cube, a trefoil knot (an OBJ
+// file, knot.obj from make_knot.py, "meshes" in project.json) and a torus.
 // Tap a model to change its colour, "Pause" to stop them. The top line shows,
 // once a second, the GPU frames run per second and the last frame's GPU
 // times (GP = vertex shading and binning, PPs = the four pixel processors).
@@ -68,7 +69,7 @@ fn setup() {
     set(kind, KIND_LABEL);
     set(location, 24, 20);
     set(size, 900, 40);
-    set(text, "Mali-400 GPU: cube, torus, sphere (tap one to recolour)");
+    set(text, "Mali-400 GPU: cube, knot (OBJ mesh), torus (tap one to recolour)");
     set(text_color, WHITE);
     parent(0);
 
@@ -103,11 +104,11 @@ fn setup() {
     parent(pause_btn);
 
     m0 = alloc(); target(m0); model_box(0, SHAPE_CUBE); set(on_click, @on_m0);
-    m1 = alloc(); target(m1); model_box(1, SHAPE_TORUS); set(on_click, @on_m1);
-    m2 = alloc(); target(m2); model_box(2, SHAPE_SPHERE); set(on_click, @on_m2);
+    m1 = alloc(); target(m1); model_box(1, 0); set(on_click, @on_m1);
+    m2 = alloc(); target(m2); model_box(2, SHAPE_TORUS); set(on_click, @on_m2);
     model3dShape(m0, SHAPE_CUBE);
-    model3dShape(m1, SHAPE_TORUS);
-    model3dShape(m2, SHAPE_SPHERE);
+    model3dMesh(m1, "knot");
+    model3dShape(m2, SHAPE_TORUS);
     color_at[0] = 0; color_at[1] = 1; color_at[2] = 2;
     model3dColor(m0, colors[0]);
     model3dColor(m1, colors[1]);

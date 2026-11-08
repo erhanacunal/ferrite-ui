@@ -11,8 +11,12 @@
 //! a restore behind something in front of it just copies the buffer again. One buffer is shared
 //! by every model widget, so two of them on the screen re-render each other's frames.
 //!
-//! A model is one of the built-in [`shape`]s in one colour, lit by a distant light from the
-//! upper left front (the `lit` shader of `gpu_cube_test`: per-vertex light, a quarter ambient).
+//! A model is one of the built-in [`shape`]s or a mesh resource (`RES_MESH`, from an OBJ file
+//! by `ferrite_build`) in one colour, lit by a distant light from the upper left front (the
+//! `lit` shader of `gpu_cube_test`: per-vertex light, a quarter ambient). A mesh is read from
+//! flash into the GPU's memory the first time it is drawn and kept until restart (the GPU's
+//! `LASTING_BYTES`, about 260 000 vertices in all); one that is missing or bad is remembered
+//! as such, and its widget shows only its background (error 6).
 //! Programs set it through syscalls ([`syscall`], `lib/model3d.fl`), which mark the widget dirty.
 //!
 //! Needs G2D drawing (`g2d_render`): without it the widget shows only its background.
@@ -27,6 +31,7 @@ use exynos_4412_rs::gpu::{self, Area, Gpu, Mat4, Mesh, Target, Texture, Vec3};
 use exynos_4412_rs::mmu;
 use ferrite_core::clip::ClipRegion;
 use ferrite_core::ctx::Ctx;
+use ferrite_core::fs::RES_MESH;
 use ferrite_core::pool::ObjPool;
 use ferrite_core::render;
 use ferrite_core::types::Rect;
@@ -44,6 +49,14 @@ const TARGET_W: usize = 512;
 const TARGET_H: usize = 512;
 /// Models kept (one per widget).
 const MAX_MODELS: usize = 16;
+/// Mesh resources kept in the GPU's memory (or remembered as unusable).
+const MAX_MESHES: usize = 16;
+/// A mesh resource's name: at most 15 bytes, as the FS table has it.
+const NAME_LEN: usize = 15;
+/// `RES_MESH` header: magic, version, flags, triangle count (fs.rs).
+const MESH_HEADER: usize = 8;
+/// Bytes of a mesh vertex: position and normal, three i16 each.
+const MESH_VERTEX: usize = 12;
 /// The camera: `2 atan(1 / 1.6)` from bottom to top.
 const FOV_Y: f32 = 1.117;
 const NEAR: f32 = 1.0;
@@ -61,6 +74,7 @@ pub const SYS_TURN: u8 = 0x61;
 pub const SYS_COLOR: u8 = 0x62;
 pub const SYS_ZOOM: u8 = 0x63;
 pub const SYS_STAT: u8 = 0x64;
+pub const SYS_MESH: u8 = 0x65;
 
 /// The built-in shapes, all about 1 from the centre to the edge.
 pub mod shape {
@@ -87,6 +101,7 @@ mod error {
     pub const TOO_BIG: i32 = 3;
     pub const FRAME: i32 = 4;
     pub const NO_G2D: i32 = 5;
+    pub const BAD_MESH: i32 = 6;
 }
 
 /// What a model widget shows.
@@ -102,12 +117,26 @@ struct Model {
     color: u16,
     /// Percent: 200 = twice as large.
     zoom: i32,
+    /// A mesh resource's name (`mesh_len` bytes), shown instead of `shape` when not empty.
+    mesh: [u8; NAME_LEN],
+    mesh_len: u8,
 }
 
 impl Model {
     fn new(id: WidgetId) -> Self {
-        Self { id, shape: shape::CUBE, yaw: 0, pitch: 0, roll: 0, color: 0x4D7F, zoom: 100 }
+        Self { id, shape: shape::CUBE, yaw: 0, pitch: 0, roll: 0, color: 0x4D7F, zoom: 100, mesh: [0; NAME_LEN], mesh_len: 0 }
     }
+
+    fn mesh_name(&self) -> &[u8] {
+        &self.mesh[..self.mesh_len as usize]
+    }
+}
+
+/// A mesh resource read into the GPU's memory, or None if it could not be.
+struct Loaded {
+    name: [u8; NAME_LEN],
+    len: u8,
+    mesh: Option<Mesh>,
 }
 
 /// What the buffer holds: the frame of this model at this size, over this background.
@@ -123,6 +152,7 @@ struct Gl {
     gpu: Gpu,
     target: usize,
     meshes: [Mesh; shape::COUNT],
+    loaded: Vec<Loaded>,
     texture: Texture,
     texture_color: Option<u16>,
 }
@@ -181,7 +211,11 @@ pub fn draw(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
     let want = Drawn { model, w: abs.w, h: abs.h, bg };
     if s.drawn != Some(want) {
         s.drawn = None;
-        if !s.render(&model, w16, h16, abs.w as usize, abs.h as usize, bg) {
+        let Some(mesh) = s.mesh_for(ctx, &model) else {
+            s.error = error::BAD_MESH;
+            return false;
+        };
+        if !s.render(&model, &mesh, w16, h16, abs.w as usize, abs.h as usize, bg) {
             return false;
         }
         s.drawn = Some(want);
@@ -245,20 +279,40 @@ impl State {
         };
         exynos_4412_rs::println!("ferrite: GPU started (offscreen {}x{})", TARGET_W, TARGET_H);
         self.failed = false;
-        self.gl = Some(Gl { gpu, target, meshes, texture, texture_color: None });
+        self.gl = Some(Gl { gpu, target, meshes, loaded: Vec::new(), texture, texture_color: None });
         true
     }
 
-    /// Runs a frame of `model` into the buffer's top left `w16` x `h16`, the model centred in
-    /// its top left `w` x `h` (the widget's box).
-    fn render(&mut self, model: &Model, w16: usize, h16: usize, w: usize, h: usize, bg: u32) -> bool {
+    /// The mesh `model` shows: a built-in shape, or its mesh resource, read the first time.
+    fn mesh_for(&mut self, ctx: &Ctx<P>, model: &Model) -> Option<Mesh> {
+        let gl = self.gl.as_mut()?;
+        let name = model.mesh_name();
+        if name.is_empty() {
+            return Some(gl.meshes[(model.shape as usize).min(shape::COUNT - 1)]);
+        }
+        if let Some(l) = gl.loaded.iter().find(|l| &l.name[..l.len as usize] == name) {
+            return l.mesh;
+        }
+        let mesh = load_mesh(&mut gl.gpu, ctx, name);
+        if mesh.is_none() {
+            exynos_4412_rs::println!("ferrite: mesh {:?} missing or bad", core::str::from_utf8(name).unwrap_or("?"));
+        }
+        if gl.loaded.len() < MAX_MESHES {
+            gl.loaded.push(Loaded { name: model.mesh, len: model.mesh_len, mesh });
+        }
+        mesh
+    }
+
+    /// Runs a frame of `mesh` as `model` shows it into the buffer's top left `w16` x `h16`, the
+    /// model centred in its top left `w` x `h` (the widget's box).
+    #[allow(clippy::too_many_arguments)]
+    fn render(&mut self, model: &Model, mesh: &Mesh, w16: usize, h16: usize, w: usize, h: usize, bg: u32) -> bool {
         let Some(gl) = self.gl.as_mut() else { return false };
         if gl.texture_color != Some(model.color) {
             let argb = lcd::rgb565_to_xrgb(model.color) | 0xFF00_0000;
             gl.gpu.write_texture(&gl.texture, |_, _| argb);
             gl.texture_color = Some(model.color);
         }
-        let mesh = gl.meshes[(model.shape as usize).min(shape::COUNT - 1)];
         // The perspective over the widget's box, then squeezed into its part of the frame:
         // scaled by w / w16, h / h16 and moved to the frame's top left (clip space, so the
         // move is in NDC: +1 is the frame's right and top edges).
@@ -275,7 +329,7 @@ impl State {
         let light = world.transform_direction_back(LIGHT);
         let mut frame = gl.gpu.frame(Area::new(0, 0, w16, h16), bg | 0xFF00_0000);
         frame
-            .draw(&mesh)
+            .draw(mesh)
             .uniform("mvp", &(projection * world))
             .uniform("light", &light)
             .texture("t", &gl.texture)
@@ -317,6 +371,8 @@ impl State {
 /// - `SYS_SHAPE (w, shape)`, `SYS_TURN (w, yaw, pitch, roll)` (tenths of a degree),
 ///   `SYS_COLOR (w, rgb565)`, `SYS_ZOOM (w, percent)`: 1, or 0 if `w` is not a model widget
 ///   (or too many are);
+/// - `SYS_MESH (w, name)`: the mesh resource `name` instead of a shape (1, or 0 for a bad
+///   name; a missing mesh shows when drawn, as error 6);
 /// - `SYS_STAT (what)`: frames run, the last frame's GP / PP / total microseconds, the last
 ///   error, the last mesh's triangles.
 pub fn syscall(id: u8, args: &[i32], objs: &mut ObjPool) -> Option<i32> {
@@ -334,7 +390,7 @@ pub fn syscall(id: u8, args: &[i32], objs: &mut ObjPool) -> Option<i32> {
             _ => 0,
         });
     }
-    if !matches!(id, SYS_SHAPE | SYS_TURN | SYS_COLOR | SYS_ZOOM) {
+    if !matches!(id, SYS_SHAPE | SYS_TURN | SYS_COLOR | SYS_ZOOM | SYS_MESH) {
         return None;
     }
     let w = WidgetId::from_vm(arg(0));
@@ -344,7 +400,22 @@ pub fn syscall(id: u8, args: &[i32], objs: &mut ObjPool) -> Option<i32> {
     let Some(m) = s.model(objs, w) else { return Some(0) };
     let before = *m;
     match id {
-        SYS_SHAPE => m.shape = (arg(1).clamp(0, shape::COUNT as i32 - 1)) as u8,
+        SYS_SHAPE => {
+            m.shape = (arg(1).clamp(0, shape::COUNT as i32 - 1)) as u8;
+            m.mesh_len = 0;
+        }
+        SYS_MESH => {
+            let name = match u32::try_from(arg(1)) {
+                Ok(p) => objs.str_get(p as _),
+                Err(_) => &[],
+            };
+            if name.is_empty() || name.len() > NAME_LEN {
+                return Some(0);
+            }
+            m.mesh = [0; NAME_LEN];
+            m.mesh[..name.len()].copy_from_slice(name);
+            m.mesh_len = name.len() as u8;
+        }
         SYS_TURN => (m.yaw, m.pitch, m.roll) = (arg(1).rem_euclid(3600), arg(2).rem_euclid(3600), arg(3).rem_euclid(3600)),
         SYS_COLOR => m.color = arg(1) as u16,
         _ => m.zoom = arg(1).clamp(10, 1000),
@@ -371,6 +442,34 @@ impl Tris {
         self.pos.push(p);
         self.normal.push(n);
     }
+}
+
+/// Mesh resource `name` into the GPU's memory; None if missing, malformed or too large.
+fn load_mesh(gpu: &mut Gpu, ctx: &Ctx<P>, name: &[u8]) -> Option<Mesh> {
+    let fs = ctx.fs.as_ref()?;
+    let entry = fs.find_kind(&ctx.flash, name, RES_MESH)?;
+    let mut head = [0u8; MESH_HEADER];
+    fs.read_resource(&ctx.flash, &entry, 0, &mut head);
+    let tris = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+    let vertices = tris.checked_mul(3)?;
+    let bytes = vertices.checked_mul(MESH_VERTEX)?;
+    if head[..3] != [b'M', b'S', 1] || tris == 0 || (entry.size as usize) < MESH_HEADER + bytes {
+        return None;
+    }
+    let mut raw: Vec<u8> = Vec::new();
+    raw.try_reserve_exact(bytes).ok()?;
+    raw.resize(bytes, 0);
+    fs.read_resource(&ctx.flash, &entry, MESH_HEADER as u32, &mut raw);
+    let mut t = Tris::new();
+    t.pos.try_reserve_exact(vertices).ok()?;
+    t.normal.try_reserve_exact(vertices).ok()?;
+    const ONE: f32 = 1.0 / 32767.0;
+    for v in raw.chunks_exact(MESH_VERTEX) {
+        let c = |i: usize| i16::from_le_bytes([v[i * 2], v[i * 2 + 1]]) as f32 * ONE;
+        t.vertex([c(0), c(1), c(2)], [c(3), c(4), c(5)]);
+    }
+    drop(raw);
+    build(gpu, t).ok()
 }
 
 fn build(gpu: &mut Gpu, t: Tris) -> Result<Mesh, gpu::Error> {

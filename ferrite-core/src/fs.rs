@@ -63,6 +63,12 @@ pub const RES_FILE: u8 = 4;
 pub const RES_SYSCFG: u8 = 5;
 /// PCM16 sound (header + samples) — see `audio::SOUND_HEADER` (`audio` feature).
 pub const RES_SOUND: u8 = 6;
+/// Triangle mesh for 3D model widgets (`ferrite_build.convert_mesh` from an
+/// OBJ file): header magic "MS", version 1, flags, triangle count u32 LE, then
+/// three vertices per triangle, each position x/y/z and normal x/y/z as i16 LE
+/// (/ 32767; the model centred and scaled to radius 1). Read by board renderers
+/// (exynos4412 `model3d.rs`).
+pub const RES_MESH: u8 = 7;
 /// `Fs::find_kind` wildcard.
 pub const RES_ANY: u8 = 0xFF;
 
