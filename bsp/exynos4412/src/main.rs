@@ -60,6 +60,10 @@ mod backlight;
 #[cfg_attr(not(feature = "wifi"), allow(dead_code))]
 mod bridge;
 mod flash;
+// The GPU compositor; with `gpu_compose` off only its shaders are used (`gpu::ui` skips them).
+#[cfg_attr(not(feature = "gpu_compose"), allow(dead_code))]
+mod compose;
+mod gpu;
 mod lcd;
 mod model3d;
 #[cfg(feature = "wifi")]

@@ -358,7 +358,7 @@ fn phase_name(id: u8) -> &'static str {
         12 => "pixel writes",
         13 => "present copy",
         14 => "timer reads",
-        15 => "G2D drawing",
+        15 => "G2D/GPU drawing",
         16 => "sprite drawing",
         0x81 => "draw_widget calls",
         0x82 => "pixel primitive calls",

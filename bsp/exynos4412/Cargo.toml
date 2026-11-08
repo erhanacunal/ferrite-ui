@@ -9,7 +9,7 @@ name = "ferrite-ui"
 path = "src/main.rs"
 
 [features]
-default = ["perf", "g2d_present", "g2d_render", "wifi"]
+default = ["perf", "g2d_present", "g2d_render", "gpu_compose", "wifi"]
 # Main-loop profiler: PMU cycle counter + `ferrite_cli.py perf` report.
 perf = ["ferrite-core/perf"]
 # The presenter (CPU2) copies the dirty box with the G2D instead of the CPU
@@ -19,6 +19,12 @@ g2d_present = []
 # translucent fills, and the renderer's cached sprites of translucent
 # shapes and images (`renderer.rs`). Off = CPU drawing into a cached shadow.
 g2d_render = []
+# The Mali-400 repaints the dirty areas whole (`compose.rs`): boxes, rounded
+# corners, gradients and pictures from shaders, other widgets from CPU-drawn
+# sprites. Needs g2d_render (the uncached shadow) and the compiled shaders in
+# src/compose/shaders.rs; without them, or if its self-test fails, the
+# built-in passes draw as before.
+gpu_compose = ["g2d_render"]
 # BCM4334 WiFi on CPU3 + an HTTP server and a TCP bridge to the USART
 # protocol (`net/`). Needs the chip firmware at build time
 # (`WIFI_FIRMWARE_DIR`, build.rs) or on CACHE, and FERRITE/WIFI.CFG.

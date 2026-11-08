@@ -233,7 +233,7 @@ PERF_PHASES = {
     12: "  pixel writes",
     13: "present copy",
     14: "  timer reads",
-    15: "  G2D drawing",
+    15: "  G2D/GPU drawing",
     16: "  sprite drawing",
 }
 # Sub-phases: already inside the step phases above.

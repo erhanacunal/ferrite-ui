@@ -1370,6 +1370,37 @@ pub fn blit_sprite(
     }
 }
 
+/// The shadow as a GPU target: physical address, stride in bytes, width,
+/// height. None unless G2D drawing is on: only then is the shadow drawn
+/// through the uncached alias, so the CPU sees what the GPU writes there.
+pub fn gpu_target() -> Option<(usize, usize, usize, usize)> {
+    g2d_draw_ready().then(|| (buf_ptr(SHADOW) as usize, W * 4, W, H))
+}
+
+/// Before the GPU writes the shadow: waits for a present copy in flight
+/// (it reads the shadow), and puts what this core wrote through the alias
+/// into DRAM first. False if the shadow is not the GPU's to write (G2D
+/// drawing is off: [`gpu_target`]).
+pub fn gpu_begin() -> bool {
+    if !g2d_draw_ready() {
+        return false;
+    }
+    if STATE.load(Ordering::Acquire) == COPY {
+        wait_rows(0, H);
+    }
+    // SAFETY: a barrier only.
+    unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+    true
+}
+
+/// The GPU wrote `w` × `h` shadow pixels at (`x`, `y`): the next present
+/// takes them.
+pub fn gpu_drew(x: usize, y: usize, w: usize, h: usize) {
+    // SAFETY: a barrier only: the GPU's writes before this core's next reads.
+    unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+    mark(x, y, w, h);
+}
+
 /// Copies `w` × `h` pixels of an opaque RGB565 picture (`addr`, a physical
 /// address, `sw` × `sh`, rows of `sw` pixels; whole cache lines cleaned by
 /// the caller) from (`sx`, `sy`) to the shadow at (`dx`, `dy`), by the G2D,

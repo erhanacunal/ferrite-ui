@@ -1812,6 +1812,7 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
 
     fn reset(&mut self, ctx: &mut Ctx<P>) {
         self.kb.visible = false;
+        ctx.objs.overlay = None;
         self.kb.focused = WidgetId::NONE;
         self.scroll_id = WidgetId::NONE;
         self.scroll_active = false;
@@ -2098,6 +2099,8 @@ impl FullInput {
         ctx.objs.mark_dirty(id);
         self.kb.set_screen(ctx.lcd.width(), ctx.lcd.height());
         self.kb.visible = true;
+        let top = self.kb.top();
+        ctx.objs.overlay = Some(crate::types::Rect::new(0, top as i16, ctx.lcd.width(), ctx.lcd.height().saturating_sub(top)));
         self.kb.dirty = true;
         let now = ctx.systick.millis();
         self.kb.reset_blink(now);
@@ -2111,6 +2114,7 @@ impl FullInput {
         }
         self.kb.focused = WidgetId::NONE;
         self.kb.visible = false;
+        ctx.objs.overlay = None;
         ctx.cursor_visible = false;
 
         // The widgets under the keyboard redraw in full, not incrementally.

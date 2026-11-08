@@ -203,6 +203,10 @@ pub struct ObjPool {
     pub(crate) shifted: Vec<(usize, crate::types::Rect)>,
     /// Scratch for pass 2: the part of a shifted subtree's box still to draw.
     pub(crate) shift_keep: Vec<crate::types::Rect>,
+    /// What is drawn over the widgets from outside the tree (the on-screen keyboard), set by
+    /// the input handler: a board renderer that repaints whole areas
+    /// (`WidgetRenderer::compose`) leaves areas that touch it to the built-in passes.
+    pub overlay: Option<crate::types::Rect>,
     /// Geometry by DFS index for the current render pass (`geo.rs`).
     #[cfg(feature = "render_cache")]
     pub(crate) geo: Vec<crate::geo::Geo>,
@@ -247,6 +251,7 @@ impl ObjPool {
             changed_n: 0,
             settled_epoch: u32::MAX,
             shifted: Vec::new(),
+            overlay: None,
             shift_keep: Vec::new(),
             #[cfg(feature = "render_cache")]
             geo: Vec::new(),

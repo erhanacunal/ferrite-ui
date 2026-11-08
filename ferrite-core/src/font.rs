@@ -97,6 +97,14 @@ unsafe impl Send for Font {}
 unsafe impl Sync for Font {}
 
 impl Font {
+    /// Where its glyph bitmaps are in flash: with `font_id` and `bpp`, what tells two loaded
+    /// fonts apart (a board renderer keying cached drawings by appearance).
+    pub fn bitmap_addr(&self) -> u32 {
+        self.bitmap_addr
+    }
+}
+
+impl Font {
     fn empty() -> Self {
         Font {
             font_id: 0xFF,

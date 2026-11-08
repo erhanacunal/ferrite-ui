@@ -374,6 +374,12 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     }
     ctx.objs.geo_begin();
 
+    // A board that repaints whole areas (a GPU) takes the render over.
+    if <P::Renderer as WidgetRenderer<P>>::COMPOSES && compose_dirty(ctx) {
+        ctx.objs.geo_end();
+        return;
+    }
+
     let mut restores = Restores::new();
     // Pass 0: opaque panels that only moved get their pixels shifted.
     if <P::LcdB as LcdBackend>::CAN_MOVE {
@@ -577,6 +583,124 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     clear_all_dirty(ctx);
     ctx.objs.shifted.clear();
     ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+}
+
+/// Most areas one `WidgetRenderer::compose` call gets: more are merged.
+pub const COMPOSE_AREAS: usize = 8;
+/// `WidgetRenderer::compose` areas start and end on multiples of this (or
+/// the screen's edge): the GPU's tiles.
+pub const COMPOSE_GRID: i16 = 16;
+
+/// The areas a dirty render changes, rounded out to [`COMPOSE_GRID`],
+/// merged until disjoint and at most [`COMPOSE_AREAS`].
+struct Areas {
+    list: [Rect; COMPOSE_AREAS],
+    n: usize,
+}
+
+impl Areas {
+    fn new() -> Self {
+        Self { list: [Rect::new(0, 0, 0, 0); COMPOSE_AREAS], n: 0 }
+    }
+
+    fn add(&mut self, r: Rect, screen: &Rect) {
+        if r.is_empty() {
+            return;
+        }
+        let g = COMPOSE_GRID as i32;
+        let x0 = (r.x as i32).div_euclid(g) * g;
+        let y0 = (r.y as i32).div_euclid(g) * g;
+        let x1 = (r.x as i32 + r.w as i32 + g - 1).div_euclid(g) * g;
+        let y1 = (r.y as i32 + r.h as i32 + g - 1).div_euclid(g) * g;
+        let Some(mut r) = rect_from(x0, y0, x1, y1).and_then(|r| r.intersection(screen)) else { return };
+        loop {
+            if let Some(i) = self.list[..self.n].iter().position(|a| a.intersects(&r)) {
+                r = bounds(&r, &self.list[i]);
+                self.remove(i);
+                continue;
+            }
+            if self.n < COMPOSE_AREAS {
+                break;
+            }
+            // Full: joined with the one it adds the least to.
+            let area = |r: &Rect| r.w as u32 * r.h as u32;
+            let i = (0..self.n)
+                .min_by_key(|&i| area(&bounds(&r, &self.list[i])) - area(&self.list[i]))
+                .unwrap_or(0);
+            r = bounds(&r, &self.list[i]);
+            self.remove(i);
+        }
+        self.list[self.n] = r;
+        self.n += 1;
+    }
+
+    fn remove(&mut self, i: usize) {
+        self.n -= 1;
+        self.list[i] = self.list[self.n];
+    }
+}
+
+fn rect_from(x0: i32, y0: i32, x1: i32, y1: i32) -> Option<Rect> {
+    let x0 = x0.clamp(i16::MIN as i32, i16::MAX as i32);
+    let y0 = y0.clamp(i16::MIN as i32, i16::MAX as i32);
+    let (w, h) = ((x1 - x0).clamp(0, u16::MAX as i32), (y1 - y0).clamp(0, u16::MAX as i32));
+    (w > 0 && h > 0).then(|| Rect::new(x0 as i16, y0 as i16, w as u16, h as u16))
+}
+
+/// The smallest rect holding both.
+fn bounds(a: &Rect, b: &Rect) -> Rect {
+    let x0 = (a.x as i32).min(b.x as i32);
+    let y0 = (a.y as i32).min(b.y as i32);
+    let x1 = (a.x as i32 + a.w as i32).max(b.x as i32 + b.w as i32);
+    let y1 = (a.y as i32 + a.h as i32).max(b.y as i32 + b.h as i32);
+    rect_from(x0, y0, x1, y1).unwrap_or(*a)
+}
+
+/// Dirty mode with a board that repaints whole areas
+/// (`WidgetRenderer::COMPOSES`): gathers what the render changes (each
+/// dirty widget's box where it is visible or was drawn, and where a moved
+/// one was drawn), offers it to `WidgetRenderer::compose`, and if taken does
+/// the bookkeeping the passes would. False = declined, nothing changed.
+#[inline(never)]
+fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
+    let screen = screen_rect(&ctx.lcd);
+    let mut areas = Areas::new();
+    for di in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(di);
+        let w = ctx.objs.get(id);
+        if !w.is_dirty() {
+            continue;
+        }
+        if ctx.objs.vis_at(di) || w.flags & FLAG_RENDERED != 0 {
+            areas.add(ctx.objs.abs_at(di), &screen);
+        }
+        areas.add(buf_prev_rect(&ctx.objs, id, 0), &screen);
+    }
+    if areas.n > 0 && !<P::Renderer as WidgetRenderer<P>>::compose(ctx, &areas.list[..areas.n]) {
+        return false;
+    }
+    for di in 0..ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(di);
+        if !ctx.objs.get(id).is_dirty() {
+            continue;
+        }
+        // Where a moved widget was drawn: repainted.
+        ctx.objs.set_prev_rect(id, 0, Rect::new(0, 0, 0, 0));
+        let vis = ctx.objs.vis_at(di);
+        let w = ctx.objs.get_mut(id);
+        if vis {
+            w.flags |= FLAG_RENDERED;
+        } else {
+            w.flags &= !FLAG_RENDERED;
+        }
+    }
+    // What gauges recorded of their last drawing is stale: the areas were
+    // drawn another way.
+    ctx.objs.draw_epoch = ctx.objs.draw_epoch.wrapping_add(1);
+    clear_all_dirty(ctx);
+    ctx.objs.shifted.clear();
+    ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+    true
 }
 
 /// Most rects one shift moves (they come from two clip regions).

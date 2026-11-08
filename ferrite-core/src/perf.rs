@@ -50,7 +50,9 @@ pub mod phase {
     pub const TIMER: u8 = 14;
     /// Time in G2D drawing operations (exynos4412 `g2d_render`: fills,
     /// colour blends, sprite blits; including the wait for a present copy in
-    /// flight), in any phase. Also counted in `PIXELS`.
+    /// flight), in any phase, and in the GPU compositor's frames
+    /// (`gpu_compose`: building and running them). Also counted in `PIXELS`
+    /// for the G2D's.
     pub const G2D: u8 = 15;
     /// Time drawing new sprites (exynos4412 renderer: a widget drawn into
     /// its sprite, plus the cache clean), inside `DRAW`.

@@ -1,15 +1,14 @@
 //! 3D model widgets (`KIND_MODEL3D`), drawn by the Mali-400 GPU.
 //!
-//! The GPU is started on the first model drawn (`Gpu::start_offscreen`): it renders into a
-//! 512 x 512 ARGB8888 buffer of ours ([`TARGET_W`] x [`TARGET_H`], on the heap, never touched by
-//! the CPU), and the G2D blends the widget's part of it onto the shadow once per clip rect, as
-//! the renderer does with sprites. A frame covers the widget's box rounded up to 16 pixels, at
-//! most `gpu::MAX_TILES` tiles of 16 x 16 (512 x 256, 352 x 352...): a bigger widget shows only
-//! its background.
+//! The GPU (`gpu.rs`, shared with the compositor) renders each model widget into an ARGB8888
+//! buffer of its own (on the heap, never touched by the CPU): its box rounded up to 16 pixels,
+//! at most `gpu::MAX_TILES` tiles of 16 x 16 (512 x 256, 352 x 352...); a bigger widget shows
+//! only its background. The G2D then blends the widget's part of it onto the shadow once per
+//! clip rect, as the renderer does with sprites, or the GPU compositor samples it
+//! ([`texture`]).
 //!
 //! A frame is run only when what the widget shows changed (its [`Model`], size or background):
-//! a restore behind something in front of it just copies the buffer again. One buffer is shared
-//! by every model widget, so two of them on the screen re-render each other's frames.
+//! a restore behind something in front of it just copies the buffer again.
 //!
 //! A model is one of the built-in [`shape`]s or a mesh resource (`RES_MESH`, from an OBJ file
 //! by `ferrite_build`) in one colour, lit by a distant light from the upper left front (the
@@ -26,7 +25,6 @@ use core::alloc::Layout;
 use core::f32::consts::TAU;
 
 use exynos_4412_rs::drivers::mali::Filter;
-use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::gpu::{self, Area, Gpu, Mat4, Mesh, Target, Texture, Vec3};
 use exynos_4412_rs::mmu;
 use ferrite_core::clip::ClipRegion;
@@ -44,9 +42,6 @@ mod shaders;
 
 use shaders::LIT;
 
-/// The GPU's buffer: the largest frame, 512 tiles, fits it in either direction.
-const TARGET_W: usize = 512;
-const TARGET_H: usize = 512;
 /// Models kept (one per widget).
 const MAX_MODELS: usize = 16;
 /// Mesh resources kept in the GPU's memory (or remembered as unusable).
@@ -139,7 +134,7 @@ struct Loaded {
     mesh: Option<Mesh>,
 }
 
-/// What the buffer holds: the frame of this model at this size, over this background.
+/// What a buffer holds: the frame of this model at this size, over this background.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Drawn {
     model: Model,
@@ -148,9 +143,46 @@ struct Drawn {
     bg: u32,
 }
 
+/// A model widget's buffer: `w16` x `h16` pixels at `addr` (64-byte aligned), lines `w16 * 4`
+/// bytes apart.
+struct Buffer {
+    id: WidgetId,
+    addr: usize,
+    w16: usize,
+    h16: usize,
+    drawn: Option<Drawn>,
+}
+
+impl Buffer {
+    fn layout(w16: usize, h16: usize) -> Option<Layout> {
+        Layout::from_size_align(w16 * h16 * 4, 64).ok()
+    }
+
+    /// A new buffer, out of the data cache (the GPU writes it past the caches: no line of it
+    /// may be written back later).
+    fn new(id: WidgetId, w16: usize, h16: usize) -> Option<Self> {
+        let layout = Self::layout(w16, h16)?;
+        // SAFETY: a non-zero size.
+        let addr = unsafe { alloc::alloc::alloc(layout) } as usize;
+        if addr == 0 {
+            return None;
+        }
+        mmu::discard_dcache_range(addr, layout.size());
+        Some(Self { id, addr, w16, h16, drawn: None })
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        if let Some(layout) = Self::layout(self.w16, self.h16) {
+            // SAFETY: allocated with this layout. The GPU only writes it during a frame into
+            // it, and none runs now.
+            unsafe { alloc::alloc::dealloc(self.addr as *mut u8, layout) };
+        }
+    }
+}
+
 struct Gl {
-    gpu: Gpu,
-    target: usize,
     meshes: [Mesh; shape::COUNT],
     loaded: Vec<Loaded>,
     texture: Texture,
@@ -159,10 +191,10 @@ struct Gl {
 
 struct State {
     gl: Option<Gl>,
-    /// The GPU would not start: not tried again.
+    /// The shapes would not build: not tried again.
     failed: bool,
     models: Vec<Model>,
-    drawn: Option<Drawn>,
+    buffers: Vec<Buffer>,
     frames: u32,
     times: gpu::Times,
     triangles: u32,
@@ -173,7 +205,7 @@ static mut STATE: State = State {
     gl: None,
     failed: false,
     models: Vec::new(),
-    drawn: None,
+    buffers: Vec::new(),
     frames: 0,
     times: gpu::Times { gp_us: 0, pps_us: 0, total_us: 0 },
     triangles: 0,
@@ -188,44 +220,19 @@ fn state() -> &'static mut State {
 /// Draws a `KIND_MODEL3D` widget; false for other kinds, or when it cannot (the built-in
 /// drawing then shows its background).
 pub fn draw(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
-    let w = ctx.objs.get(id);
-    if w.kind != KIND_MODEL3D {
+    if ctx.objs.get(id).kind != KIND_MODEL3D {
         return false;
     }
-    let s = state();
-    if !lcd::g2d_draw_ready() {
-        s.error = error::NO_G2D;
+    let Some(shared) = crate::gpu::get() else {
+        state().error = error::NO_G2D;
         return false;
-    }
-    let (w16, h16) = ((abs.w as usize).next_multiple_of(16), (abs.h as usize).next_multiple_of(16));
-    if w16 == 0 || h16 == 0 || w16 > TARGET_W || h16 > TARGET_H || (w16 / 16) * (h16 / 16) > gpu::MAX_TILES {
-        s.error = error::TOO_BIG;
-        return false;
-    }
-    if !s.start() {
-        return false;
-    }
-    let ext = ctx.objs.ext(id);
-    let bg = lcd::rgb565_to_xrgb(render::effective_bg(&ctx.objs, w, &ext));
-    let model = s.models.iter().find(|m| m.id == id).copied().unwrap_or(Model::new(id));
-    let want = Drawn { model, w: abs.w, h: abs.h, bg };
-    if s.drawn != Some(want) {
-        s.drawn = None;
-        let Some(mesh) = s.mesh_for(ctx, &model) else {
-            s.error = error::BAD_MESH;
-            return false;
-        };
-        if !s.render(&model, &mesh, w16, h16, abs.w as usize, abs.h as usize, bg) {
-            return false;
-        }
-        s.drawn = Some(want);
-    }
-    let target = s.gl.as_ref().map_or(0, |gl| gl.target) as *const u32;
+    };
+    let Some((addr, w16, h16)) = texture(ctx, id, abs, &mut shared.gpu) else { return false };
     let screen = Rect::new(0, 0, ctx.lcd.width(), ctx.lcd.height());
     for cr in clip.iter() {
         let Some(r) = cr.intersection(abs).and_then(|r| r.intersection(&screen)) else { continue };
         let (sx, sy) = ((r.x - abs.x) as usize, (r.y - abs.y) as usize);
-        if !lcd::blit_sprite(target, TARGET_W, TARGET_H, TARGET_W, sx, sy, r.x as usize, r.y as usize, r.w as usize, r.h as usize) {
+        if !lcd::blit_sprite(addr as *const u32, w16, h16, w16, sx, sy, r.x as usize, r.y as usize, r.w as usize, r.h as usize) {
             // The G2D gave up (it stays off): the background for this rect.
             render::draw_default(ctx, id, abs, &ClipRegion::from_rect(r));
         }
@@ -233,9 +240,51 @@ pub fn draw(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
     true
 }
 
+/// The buffer showing model widget `id` (box `abs`), its frame run first if what it shows
+/// changed: its address and size `w16` x `h16` (lines `w16 * 4` bytes apart), the widget in its
+/// top left, premultiplied (opaque: the widget's background under the model). None if `id` is
+/// not a model widget, or it cannot be shown (the reason in `SYS_STAT` error).
+pub fn texture(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, gpu: &mut Gpu) -> Option<(usize, usize, usize)> {
+    let w = ctx.objs.get(id);
+    if w.kind != KIND_MODEL3D {
+        return None;
+    }
+    let s = state();
+    if !lcd::g2d_draw_ready() {
+        s.error = error::NO_G2D;
+        return None;
+    }
+    let (w16, h16) = ((abs.w as usize).next_multiple_of(16), (abs.h as usize).next_multiple_of(16));
+    if w16 == 0 || h16 == 0 || (w16 / 16) * (h16 / 16) > gpu::MAX_TILES {
+        s.error = error::TOO_BIG;
+        return None;
+    }
+    if !s.start(gpu) {
+        return None;
+    }
+    let ext = ctx.objs.ext(id);
+    let bg = lcd::rgb565_to_xrgb(render::effective_bg(&ctx.objs, w, &ext));
+    let model = s.models.iter().find(|m| m.id == id).copied().unwrap_or(Model::new(id));
+    let want = Drawn { model, w: abs.w, h: abs.h, bg };
+    let at = s.buffer(&ctx.objs, id, w16, h16)?;
+    if s.buffers[at].drawn != Some(want) {
+        s.buffers[at].drawn = None;
+        let Some(mesh) = s.mesh_for(ctx, gpu, &model) else {
+            s.error = error::BAD_MESH;
+            return None;
+        };
+        if !s.render(gpu, at, &model, &mesh, abs.w as usize, abs.h as usize, bg) {
+            return None;
+        }
+        s.buffers[at].drawn = Some(want);
+    }
+    let b = &s.buffers[at];
+    Some((b.addr, b.w16, b.h16))
+}
+
 impl State {
-    /// The GPU, its buffer, the shapes and the colour texture, the first time.
-    fn start(&mut self) -> bool {
+    /// The shapes and the colour texture, the first time.
+    fn start(&mut self, gpu: &mut Gpu) -> bool {
         if self.gl.is_some() {
             return true;
         }
@@ -243,30 +292,9 @@ impl State {
             return false;
         }
         self.failed = true;
-        let bytes = TARGET_W * TARGET_H * 4;
-        let Ok(layout) = Layout::from_size_align(bytes, 64) else { return false };
-        // SAFETY: a non-zero size. Never freed: the GPU keeps the buffer mapped.
-        let target = unsafe { alloc::alloc::alloc(layout) } as usize;
-        if target == 0 {
-            self.error = error::START;
-            exynos_4412_rs::println!("ferrite: no memory for the GPU's buffer");
-            return false;
-        }
-        // The GPU writes it past the caches: no line of it may be written back later.
-        mmu::discard_dcache_range(target, bytes);
-        let t = Target { address: target, stride: TARGET_W * 4, width: TARGET_W, height: TARGET_H };
-        // SAFETY: the buffer is ours for good, and only the G2D reads it.
-        let mut gpu = match unsafe { Gpu::start_offscreen(Mct::new(), t) } {
-            Ok(gpu) => gpu,
-            Err(e) => {
-                self.error = error::START;
-                exynos_4412_rs::println!("ferrite: GPU start failed: {:?}", e);
-                return false;
-            }
-        };
         let made = (|| -> Result<_, gpu::Error> {
             let texture = gpu.texture_with(TEXTURE_SIDE, TEXTURE_SIDE, Filter::Nearest, |_, _| 0xFFFF_FFFF)?;
-            let meshes = [build(&mut gpu, cube())?, build(&mut gpu, torus(32, 16))?, build(&mut gpu, sphere(24, 16))?];
+            let meshes = [build(gpu, cube())?, build(gpu, torus(32, 16))?, build(gpu, sphere(24, 16))?];
             Ok((texture, meshes))
         })();
         let (texture, meshes) = match made {
@@ -277,14 +305,33 @@ impl State {
                 return false;
             }
         };
-        exynos_4412_rs::println!("ferrite: GPU started (offscreen {}x{})", TARGET_W, TARGET_H);
         self.failed = false;
-        self.gl = Some(Gl { gpu, target, meshes, loaded: Vec::new(), texture, texture_color: None });
+        self.gl = Some(Gl { meshes, loaded: Vec::new(), texture, texture_color: None });
         true
     }
 
+    /// The index of widget `id`'s buffer of `w16` x `h16`, made (or remade at a new size) if
+    /// needed; buffers of widgets that are no longer models go. None without the memory.
+    fn buffer(&mut self, objs: &ObjPool, id: WidgetId, w16: usize, h16: usize) -> Option<usize> {
+        if let Some(at) = self.buffers.iter().position(|b| b.id == id && b.w16 == w16 && b.h16 == h16) {
+            return Some(at);
+        }
+        self.buffers.retain(|b| b.id != id && objs.get(b.id).kind == KIND_MODEL3D);
+        if self.buffers.len() >= MAX_MODELS {
+            self.error = error::START;
+            return None;
+        }
+        let Some(b) = Buffer::new(id, w16, h16) else {
+            self.error = error::START;
+            exynos_4412_rs::println!("ferrite: no memory for a 3D model's buffer");
+            return None;
+        };
+        self.buffers.push(b);
+        Some(self.buffers.len() - 1)
+    }
+
     /// The mesh `model` shows: a built-in shape, or its mesh resource, read the first time.
-    fn mesh_for(&mut self, ctx: &Ctx<P>, model: &Model) -> Option<Mesh> {
+    fn mesh_for(&mut self, ctx: &Ctx<P>, gpu: &mut Gpu, model: &Model) -> Option<Mesh> {
         let gl = self.gl.as_mut()?;
         let name = model.mesh_name();
         if name.is_empty() {
@@ -293,7 +340,7 @@ impl State {
         if let Some(l) = gl.loaded.iter().find(|l| &l.name[..l.len as usize] == name) {
             return l.mesh;
         }
-        let mesh = load_mesh(&mut gl.gpu, ctx, name);
+        let mesh = load_mesh(gpu, ctx, name);
         if mesh.is_none() {
             exynos_4412_rs::println!("ferrite: mesh {:?} missing or bad", core::str::from_utf8(name).unwrap_or("?"));
         }
@@ -303,14 +350,24 @@ impl State {
         mesh
     }
 
-    /// Runs a frame of `mesh` as `model` shows it into the buffer's top left `w16` x `h16`, the
-    /// model centred in its top left `w` x `h` (the widget's box).
+    /// Runs a frame of `mesh` as `model` shows it into buffer `at`, the model centred in its top
+    /// left `w` x `h` (the widget's box).
     #[allow(clippy::too_many_arguments)]
-    fn render(&mut self, model: &Model, mesh: &Mesh, w16: usize, h16: usize, w: usize, h: usize, bg: u32) -> bool {
+    fn render(&mut self, gpu: &mut Gpu, at: usize, model: &Model, mesh: &Mesh, w: usize, h: usize, bg: u32) -> bool {
         let Some(gl) = self.gl.as_mut() else { return false };
+        let (addr, w16, h16) = (self.buffers[at].addr, self.buffers[at].w16, self.buffers[at].h16);
+        let target = Target { address: addr, stride: w16 * 4, width: w16, height: h16 };
+        // SAFETY: the widget's buffer, in the mapped heap, written only by the GPU.
+        if let Err(e) = unsafe { gpu.set_target(target) } {
+            if self.error != error::FRAME {
+                exynos_4412_rs::println!("ferrite: GPU target refused: {:?}", e);
+            }
+            self.error = error::FRAME;
+            return false;
+        }
         if gl.texture_color != Some(model.color) {
             let argb = lcd::rgb565_to_xrgb(model.color) | 0xFF00_0000;
-            gl.gpu.write_texture(&gl.texture, |_, _| argb);
+            gpu.write_texture(&gl.texture, |_, _| argb);
             gl.texture_color = Some(model.color);
         }
         // The perspective over the widget's box, then squeezed into its part of the frame:
@@ -327,7 +384,7 @@ impl State {
             * Mat4::rotation_y(angle(model.yaw))
             * Mat4::rotation_z(angle(model.roll));
         let light = world.transform_direction_back(LIGHT);
-        let mut frame = gl.gpu.frame(Area::new(0, 0, w16, h16), bg | 0xFF00_0000);
+        let mut frame = gpu.frame(Area::new(0, 0, w16, h16), bg | 0xFF00_0000);
         frame
             .draw(mesh)
             .uniform("mvp", &(projection * world))

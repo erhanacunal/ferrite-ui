@@ -35,6 +35,11 @@
 //! The G2D's blend rounds a little differently from the CPU's (at most 2 per
 //! channel, `g2d_test`), so sprite-drawn widgets are not bit-identical to the
 //! built-in drawing.
+//!
+//! **Whole areas (`gpu_compose`).** Dirty renders go to the GPU compositor
+//! first ([`WidgetRenderer::compose`], `compose.rs`), which draws widget
+//! kinds it has no shader for from these sprites; when it declines, the
+//! built-in passes run and [`ExynosRenderer::draw`] is asked as before.
 
 use alloc::vec::Vec;
 
@@ -45,8 +50,8 @@ use ferrite_core::render;
 use ferrite_core::renderer::WidgetRenderer;
 use ferrite_core::types::{Edges, Rect};
 use ferrite_core::widget::{
-    FLAG_CHECKED, FLAG_PRESSED, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_CIRCLE, KIND_ELLIPSE, KIND_IMAGE,
-    KIND_LINE, KIND_POLYGON, KIND_RECTANGLE, WidgetId,
+    FLAG_CHECKED, FLAG_MULTI_LINE, FLAG_PRESSED, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_CIRCLE, KIND_ELLIPSE,
+    KIND_IMAGE, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_RECTANGLE, WidgetId,
 };
 
 use crate::lcd;
@@ -68,6 +73,20 @@ const ROW_ALIGN: usize = 16;
 pub struct ExynosRenderer;
 
 impl WidgetRenderer<P> for ExynosRenderer {
+    const COMPOSES: bool = cfg!(feature = "gpu_compose");
+
+    fn compose(ctx: &Ctx<P>, areas: &[Rect]) -> bool {
+        #[cfg(feature = "gpu_compose")]
+        {
+            crate::compose::compose(ctx, areas)
+        }
+        #[cfg(not(feature = "gpu_compose"))]
+        {
+            let _ = (ctx, areas);
+            false
+        }
+    }
+
     fn draw(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
         if !lcd::g2d_draw_ready() || ctx.lcd.is_portrait() {
             return false;
@@ -86,7 +105,7 @@ impl WidgetRenderer<P> for ExynosRenderer {
         let at = match cache.find(key) {
             Some(at) => at,
             // Drawn once before: worth a sprite now.
-            None if cache.seen(key) => match cache.insert(ctx, id, abs, key) {
+            None if cache.seen(key) => match cache.insert(ctx, id, abs, key, None) {
                 Some(at) => at,
                 None => return false,
             },
@@ -160,7 +179,7 @@ static mut CLEANED_NEXT: usize = 0;
 /// from the data cache once per flash write generation (the G2D reads DRAM).
 /// None if the G2D cannot take it (outside the region, or not 4-byte
 /// aligned: an FS image from before `ferrite_build` aligned image pixels).
-fn picture_addr(addr: u32, len: usize) -> Option<usize> {
+pub(crate) fn picture_addr(addr: u32, len: usize) -> Option<usize> {
     let phys = crate::flash::phys(addr, len)?;
     if phys % 4 != 0 {
         return None;
@@ -200,9 +219,29 @@ fn wants_sprite(objs: &ObjPool, id: WidgetId, abs: &Rect) -> bool {
         && render::shows_behind(objs, id)
 }
 
+/// Whether [`appearance`] covers everything the built-in drawing of `kind`
+/// reads: the kinds [`wants_sprite`] takes, and labels. Others (gauges,
+/// sliders, inputs...) read more (a value, a cursor): the compositor draws
+/// them into a sprite of their own each time.
+pub(crate) fn appearance_complete(kind: u8) -> bool {
+    matches!(
+        kind,
+        KIND_BASE
+            | KIND_BUTTON
+            | KIND_BUTTON_GROUP
+            | KIND_IMAGE
+            | KIND_RECTANGLE
+            | KIND_CIRCLE
+            | KIND_ELLIPSE
+            | KIND_POLYGON
+            | KIND_LINE
+            | KIND_LABEL
+    )
+}
+
 /// 64-bit FNV-1a over everything the built-in drawing of these kinds reads,
 /// position excluded (the sprite is drawn at 0,0).
-fn appearance(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
+pub(crate) fn appearance(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
     let objs = &ctx.objs;
     let w = objs.get(id);
     let e = objs.ext(id);
@@ -231,6 +270,22 @@ fn appearance(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
             h.byte(byte);
         }
     }
+    if w.kind == KIND_LABEL {
+        h.u32(e.text_color as u32 | (e.text_align as u32) << 16 | ((w.flags & FLAG_MULTI_LINE != 0) as u32) << 24);
+        match ctx.fonts.resolve(e.font_id) {
+            Some(f) if e.font_id != 0xFF => {
+                h.u32(f.font_id as u32 | (f.bpp as u32) << 8);
+                h.u32(f.bitmap_addr());
+            }
+            // No text drawn.
+            _ => h.u32(0xFFFF_FFFF),
+        }
+        let text = objs.str_get(e.text_id);
+        h.u32(text.len() as u32);
+        for &byte in text {
+            h.byte(byte);
+        }
+    }
     h.0
 }
 
@@ -250,12 +305,12 @@ impl Fnv {
     }
 }
 
-struct Sprite {
+pub(crate) struct Sprite {
     key: u64,
-    w: usize,
-    h: usize,
+    pub(crate) w: usize,
+    pub(crate) h: usize,
     /// Pixels per row in `px` (`w` rounded up to `ROW_ALIGN`).
-    stride: usize,
+    pub(crate) stride: usize,
     /// The pixels start `start` words into `px` (64-byte aligned).
     px: Vec<u32>,
     start: usize,
@@ -264,12 +319,46 @@ struct Sprite {
 }
 
 impl Sprite {
-    fn pixels(&self) -> *const u32 {
+    pub(crate) fn pixels(&self) -> *const u32 {
         self.px[self.start..].as_ptr()
+    }
+
+    /// Widget `id` drawn the built-in way into a new sprite of its size,
+    /// premultiplied, cleaned for the G2D and the GPU. None if it cannot get
+    /// the memory or is larger than the panel.
+    pub(crate) fn draw(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, key: u64) -> Option<Self> {
+        let (w, h) = (abs.w as usize, abs.h as usize);
+        if w == 0 || h == 0 || w > lcd::PANEL.width || h > lcd::PANEL.height {
+            return None;
+        }
+        let stride = w.next_multiple_of(ROW_ALIGN);
+        let words = stride * h + ROW_ALIGN;
+        let mut px = Vec::new();
+        px.try_reserve_exact(words).ok()?;
+        // Transparent: the drawing composites onto it.
+        px.resize(words, 0);
+        let start = (px.as_ptr() as usize).next_multiple_of(ROW_ALIGN * 4) - px.as_ptr() as usize;
+        let start = start / 4;
+        let base = px[start..].as_mut_ptr();
+        #[cfg(feature = "perf")]
+        let t0 = crate::perf::cycles();
+        // SAFETY: `base` has stride * h words in `px`, and only the
+        // primitives touch them until `end_sprite`; w, h are within the panel.
+        unsafe { lcd::begin_sprite(base, w, h, stride) };
+        let local = Rect::new(0, 0, abs.w, abs.h);
+        render::draw_default(ctx, id, &local, &ClipRegion::from_rect(local));
+        lcd::end_sprite(base, stride * h);
+        #[cfg(feature = "perf")]
+        ferrite_core::perf::add_sub(ferrite_core::perf::phase::SPRITE, crate::perf::cycles().wrapping_sub(t0));
+        Some(Self { key, w, h, stride, px, start, used: 0 })
+    }
+
+    fn bytes(&self) -> usize {
+        self.px.len() * 4
     }
 }
 
-struct Cache {
+pub(crate) struct Cache {
     entries: Vec<Sprite>,
     bytes: usize,
     tick: u32,
@@ -285,7 +374,7 @@ impl Cache {
     /// widget pass 2 just drew, like a clock hand at a new angle) does not
     /// count: such an appearance may never come back, and its sprite was
     /// made for nothing (~5 ms for a clock hand's box).
-    fn seen(&mut self, key: u64) -> bool {
+    pub(crate) fn seen(&mut self, key: u64) -> bool {
         let frame = lcd::frames();
         if let Some(i) = self.seen.iter().position(|&(k, _)| k == key) {
             if self.seen[i].1 == frame {
@@ -299,57 +388,56 @@ impl Cache {
         false
     }
 
-    fn find(&mut self, key: u64) -> Option<usize> {
+    pub(crate) fn find(&mut self, key: u64) -> Option<usize> {
         let at = self.entries.iter().position(|s| s.key == key)?;
         self.tick = self.tick.wrapping_add(1);
         self.entries[at].used = self.tick;
         Some(at)
     }
 
-    /// Draws widget `id` into a new sprite, making room first. None if it
-    /// cannot get the memory.
-    fn insert(&mut self, ctx: &Ctx<P>, id: WidgetId, abs: &Rect, key: u64) -> Option<usize> {
+    /// The current use count: entries used after it are those used since.
+    pub(crate) fn tick(&self) -> u32 {
+        self.tick
+    }
+
+    pub(crate) fn entry(&self, at: usize) -> &Sprite {
+        &self.entries[at]
+    }
+
+    /// Draws widget `id` into a new sprite, making room first. Entries used
+    /// after `keep_after` (a [`tick`](Self::tick)) are not dropped for it:
+    /// a frame being composed still samples them. None if it cannot get the
+    /// memory.
+    pub(crate) fn insert(&mut self, ctx: &Ctx<P>, id: WidgetId, abs: &Rect, key: u64, keep_after: Option<u32>) -> Option<usize> {
         let (w, h) = (abs.w as usize, abs.h as usize);
-        let stride = w.next_multiple_of(ROW_ALIGN);
-        let words = stride * h + ROW_ALIGN;
-        let bytes = words * 4;
+        let bytes = (w.next_multiple_of(ROW_ALIGN) * h + ROW_ALIGN) * 4;
         if bytes > CACHE_BYTES {
             return None;
         }
-        while !self.entries.is_empty() && (self.bytes + bytes > CACHE_BYTES || self.entries.len() >= CACHE_ENTRIES) {
-            // The least recently used: the furthest back from `tick`.
-            let lru = (0..self.entries.len()).max_by_key(|&i| self.tick.wrapping_sub(self.entries[i].used))?;
+        while self.bytes + bytes > CACHE_BYTES || self.entries.len() >= CACHE_ENTRIES {
+            // The least recently used: the furthest back from `tick`, of
+            // those that may go.
+            let tick = self.tick;
+            let age = |s: &Sprite| tick.wrapping_sub(s.used);
+            let limit = keep_after.map_or(0, |k| tick.wrapping_sub(k));
+            let lru = (0..self.entries.len())
+                .filter(|&i| keep_after.is_none() || age(&self.entries[i]) > limit)
+                .max_by_key(|&i| age(&self.entries[i]))?;
             let old = self.entries.swap_remove(lru);
-            self.bytes -= old.px.len() * 4;
+            self.bytes -= old.bytes();
         }
-        let mut px = Vec::new();
-        px.try_reserve_exact(words).ok()?;
-        // Transparent: the drawing composites onto it.
-        px.resize(words, 0);
-        let start = (px.as_ptr() as usize).next_multiple_of(ROW_ALIGN * 4) - px.as_ptr() as usize;
-        let start = start / 4;
-        let base = px[start..].as_mut_ptr();
-        #[cfg(feature = "perf")]
-        let t0 = crate::perf::cycles();
-        // SAFETY: `base` has stride * h words in `px`, and only the
-        // primitives touch them until `end_sprite`; `wants_sprite` keeps w, h
-        // within the panel.
-        unsafe { lcd::begin_sprite(base, w, h, stride) };
-        let local = Rect::new(0, 0, abs.w, abs.h);
-        render::draw_default(ctx, id, &local, &ClipRegion::from_rect(local));
-        lcd::end_sprite(base, stride * h);
-        #[cfg(feature = "perf")]
-        ferrite_core::perf::add_sub(ferrite_core::perf::phase::SPRITE, crate::perf::cycles().wrapping_sub(t0));
+        let mut sprite = Sprite::draw(ctx, id, abs, key)?;
         self.tick = self.tick.wrapping_add(1);
-        self.bytes += bytes;
-        self.entries.push(Sprite { key, w, h, stride, px, start, used: self.tick });
+        sprite.used = self.tick;
+        self.bytes += sprite.bytes();
+        self.entries.push(sprite);
         Some(self.entries.len() - 1)
     }
 }
 
 static mut CACHE: Cache = Cache { entries: Vec::new(), bytes: 0, tick: 0, seen: [(0, 0); SEEN], seen_at: 0 };
 
-fn cache() -> &'static mut Cache {
+pub(crate) fn cache() -> &'static mut Cache {
     // SAFETY: the renderer runs on CPU0 only, never reentrantly (drawing a
     // sprite does not draw widgets through the renderer).
     unsafe { &mut *(&raw mut CACHE) }

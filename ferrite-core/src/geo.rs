@@ -120,7 +120,7 @@ impl ObjPool {
 
     /// `absolute_rect` of DFS entry `i`.
     #[inline]
-    pub(crate) fn abs_at(&self, i: usize) -> Rect {
+    pub fn abs_at(&self, i: usize) -> Rect {
         #[cfg(feature = "render_cache")]
         if let Some(g) = self.geo(i) {
             return g.abs;
@@ -130,7 +130,7 @@ impl ObjPool {
 
     /// `is_tree_visible` of DFS entry `i`.
     #[inline]
-    pub(crate) fn vis_at(&self, i: usize) -> bool {
+    pub fn vis_at(&self, i: usize) -> bool {
         #[cfg(feature = "render_cache")]
         if let Some(g) = self.geo(i) {
             return g.vis;
@@ -140,7 +140,7 @@ impl ObjPool {
 
     /// `scroll_parent` of DFS entry `i`.
     #[inline]
-    pub(crate) fn scroll_parent_at(&self, i: usize) -> WidgetId {
+    pub fn scroll_parent_at(&self, i: usize) -> WidgetId {
         #[cfg(feature = "render_cache")]
         if let Some(g) = self.geo(i) {
             return g.sp;
@@ -150,7 +150,7 @@ impl ObjPool {
 
     /// DFS index one past the subtree of entry `i` (its descendants follow
     /// it contiguously).
-    pub(crate) fn sub_end_at(&self, i: usize) -> usize {
+    pub fn sub_end_at(&self, i: usize) -> usize {
         #[cfg(feature = "render_cache")]
         if let Some(g) = self.geo(i) {
             return g.end as usize;
