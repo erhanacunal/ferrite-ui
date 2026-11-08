@@ -224,6 +224,8 @@ impl PlatformRuntime for Exynos4412Platform {
         }
         // Show what this pass drew (shadow -> scanned buffer, at a vsync).
         lcd::flush();
+        // The compositor switched on/off over HTTP: repaint everything.
+        crate::compose::service(ctx);
         // Config writes (touch calibration…): save once they settle.
         crate::flash::save_if_dirty(false);
         // An FS image uploaded over HTTP, a restart request (net/).

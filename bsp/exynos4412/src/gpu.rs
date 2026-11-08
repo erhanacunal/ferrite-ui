@@ -44,6 +44,34 @@ pub struct Shared {
 }
 
 static mut SHARED: Option<Shared> = None;
+
+/// What the GPU / compositor start said last (its console line without the prefix), for HTTP
+/// `/api/status` (read by CPU3).
+static STATUS: embassy_sync::blocking_mutex::CriticalSectionMutex<core::cell::RefCell<alloc::string::String>> =
+    embassy_sync::blocking_mutex::CriticalSectionMutex::new(core::cell::RefCell::new(alloc::string::String::new()));
+
+/// Where the self-test's corner check failed (for `status`).
+static CORNER_DETAIL: embassy_sync::blocking_mutex::CriticalSectionMutex<core::cell::RefCell<alloc::string::String>> =
+    embassy_sync::blocking_mutex::CriticalSectionMutex::new(core::cell::RefCell::new(alloc::string::String::new()));
+
+/// Prints `ferrite: <line>` and keeps it as [`status`].
+pub fn note(line: core::fmt::Arguments) {
+    let text = alloc::fmt::format(line);
+    exynos_4412_rs::println!("ferrite: {}", text);
+    STATUS.lock(|s| *s.borrow_mut() = text);
+}
+
+/// The last GPU / compositor start message ("" before the first widget render).
+pub fn status() -> alloc::string::String {
+    let mut s = STATUS.lock(|s| s.borrow().clone());
+    CORNER_DETAIL.lock(|d| {
+        if !d.borrow().is_empty() {
+            s.push_str(" -- ");
+            s.push_str(&d.borrow());
+        }
+    });
+    s
+}
 /// The GPU would not start: not tried again.
 static mut FAILED: bool = false;
 
@@ -68,7 +96,7 @@ fn start() -> Option<Shared> {
     let mut gpu = match unsafe { Gpu::start_offscreen(Mct::new(), target) } {
         Ok(gpu) => gpu,
         Err(e) => {
-            exynos_4412_rs::println!("ferrite: GPU start failed: {:?}", e);
+            note(format_args!("GPU start failed: {:?}", e));
             return None;
         }
     };
@@ -76,12 +104,40 @@ fn start() -> Option<Shared> {
     // SAFETY: the heap is plain memory; the GPU reads in it only textures the callers name,
     // and writes only the targets they set.
     if let Err(e) = unsafe { gpu.map(heap_start, heap_len) } {
-        exynos_4412_rs::println!("ferrite: GPU cannot map the heap: {:?}", e);
+        note(format_args!("GPU cannot map the heap: {:?}", e));
         return None;
     }
-    exynos_4412_rs::println!("ferrite: GPU started (offscreen, heap mapped)");
+    let hz = raise_clock();
+    note(format_args!("GPU started (offscreen, heap mapped, {} MHz)", hz / 1_000_000));
     let ui = ui(&mut gpu);
     Some(Shared { gpu, ui })
+}
+
+/// The GPU clock the compositor runs at: Linux's operating points (`exynos4412.dtsi`, the GPU's
+/// OPP table: 160 MHz 875 mV, 267 MHz 900 mV, 350 MHz 950 mV, 440 MHz 1025 mV) allow 440 MHz at
+/// 1.025 V; from the 800 MHz MPLL the divider gives 400 MHz. The HAL starts it at
+/// `mali::SAFE_HZ` (160 MHz).
+const FAST_HZ: u32 = 400_000_000;
+const FAST_MICROVOLTS: u32 = 1_025_000;
+
+/// Raises `vdd_g3d` (BUCK4, the DVS register the pins select) to [`FAST_MICROVOLTS`], waits for
+/// the ramp, then the clock to [`FAST_HZ`]. The GPU is idle (just started). Returns the clock;
+/// the safe one if the PMIC refused.
+fn raise_clock() -> u32 {
+    use exynos_4412_rs::drivers::i2c::{Bus, I2c};
+    use exynos_4412_rs::drivers::max77686::{self, Max77686};
+    let pmic = Max77686::new(I2c::new(Bus::I2c0));
+    if let Err(e) = pmic.set_dvs_microvolts(4, max77686::selected_dvs(), FAST_MICROVOLTS) {
+        exynos_4412_rs::println!("ferrite: GPU supply not raised ({:?}): staying at 160 MHz", e);
+        return exynos_4412_rs::drivers::mali::SAFE_HZ;
+    }
+    // 875 -> 1025 mV at 13.75 mV/us or faster: about 11 us; wait 200.
+    let mct = Mct::new();
+    let begin = mct.count();
+    while mct.count() - begin < 200 * 24 {
+        core::hint::spin_loop();
+    }
+    exynos_4412_rs::drivers::cmu::Cmu::new().set_g3d_clock(FAST_HZ)
 }
 
 /// The UI programs and the self-test; None (with the reason printed) if the compositor is off.
@@ -90,30 +146,30 @@ fn ui(gpu: &mut Gpu) -> Option<Ui> {
         return None;
     }
     if UI_FLAT.vertex.is_empty() || UI_ROUND.vertex.is_empty() {
-        exynos_4412_rs::println!("ferrite: GPU compositor off: compose/shaders.rs has no compiled shaders");
+        note(format_args!("GPU compositor off: compose/shaders.rs has no compiled shaders"));
         return None;
     }
     let loaded = gpu.shaders(&UI_FLAT).and_then(|flat| Ok((flat, gpu.shaders(&UI_ROUND)?)));
     let (flat, round) = match loaded {
         Ok(loaded) => loaded,
         Err(e) => {
-            exynos_4412_rs::println!("ferrite: GPU compositor off: shaders: {:?}", e);
+            note(format_args!("GPU compositor off: shaders: {:?}", e));
             return None;
         }
     };
     let ui = Ui { flat, round, argb: TexelFormat::BGRA_BYTES, rgb565: TexelFormat::RGB_565, any_565_stride: false };
     match self_test(gpu, ui) {
         Ok(ui) => {
-            exynos_4412_rs::println!(
-                "ferrite: GPU compositor on (ARGB swap {}, 565 swap {}, any 565 stride {})",
+            note(format_args!(
+                "GPU compositor on (ARGB swap {}, 565 swap {}, any 565 stride {})",
                 ui.argb.swap_rb,
                 ui.rgb565.swap_rb,
                 ui.any_565_stride
-            );
+            ));
             Some(ui)
         }
         Err(why) => {
-            exynos_4412_rs::println!("ferrite: GPU compositor off: self-test: {}", why);
+            note(format_args!("GPU compositor off: self-test: {}", why));
             None
         }
     }
@@ -168,6 +224,30 @@ const SIDE: usize = 16;
 /// 0 an ARGB texel (red), 2 an RGB565 texel (red), 4 texels 1264..1279 of a 1280-texel line,
 /// 6 half-transparent red blended over blue, 8 line 1 of an RGB565 texture of stride 48 bytes
 /// (green; line 0 is red). Returns `ui` with the swaps and the stride flag found.
+/// A rounded corner of the self-test: the piece at x0..x0+8, rows 10..16, of a circle centred
+/// at (cx, cy) with radius r and a border bw wide, crossing its edges inside the piece.
+struct Arc {
+    x0: f32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    bw: f32,
+}
+
+/// Newton's square root, for the self-test's expected values (`core` has none).
+fn sqrt(v: f32) -> f32 {
+    let mut x = v.max(1.0);
+    for _ in 0..24 {
+        x = 0.5 * (x + v / x);
+    }
+    x
+}
+
+const ARCS: [Arc; 2] = [
+    Arc { x0: 0.0, cx: 0.0, cy: 10.0, r: 6.0, bw: 2.0 },
+    Arc { x0: 8.0, cx: -62.0, cy: -60.0, r: 100.0, bw: 3.0 },
+];
+
 fn self_test(gpu: &mut Gpu, mut ui: Ui) -> Result<Ui, &'static str> {
     let target = Buffer::new(SIDE * SIDE).ok_or("no memory")?;
     let mut argb = Buffer::new(16).ok_or("no memory")?;
@@ -239,6 +319,7 @@ fn self_test(gpu: &mut Gpu, mut ui: Ui) -> Result<Ui, &'static str> {
             .mesh(&ui.round)
             .attribute("pos", &quad(0.0, 6.0, SIDE as f32, 8.0))
             .attribute("shape", &[[-256.0, -256.0, 0.0, 0.0]; 6])
+            .attribute("arc", &[[0.0f32; 4]; 6])
             .attribute("fill", &[fill; 6])
             .attribute("border", &[[0.0f32; 4]; 6])
             .build()
@@ -246,6 +327,28 @@ fn self_test(gpu: &mut Gpu, mut ui: Ui) -> Result<Ui, &'static str> {
             return Err("mesh");
         };
         frame.draw(&mesh).uniform("scale", &scale).blend(blend);
+    }
+    // Rows 10..16: two rounded corners, red fill and a green border, over black: a small one
+    // (left half) and a large one (right half), each piece past its corner circle's centre.
+    for arc in ARCS {
+        let (x0, x1) = (arc.x0, arc.x0 + 8.0);
+        let corners = quad(x0, 10.0, x1, 16.0);
+        let mut shape = [[0.0f32; 4]; 6];
+        for (s, [x, y]) in shape.iter_mut().zip(corners) {
+            *s = [x - arc.cx, y - arc.cy, arc.r, arc.bw];
+        }
+        let Ok(mesh) = frame
+            .mesh(&ui.round)
+            .attribute("pos", &corners)
+            .attribute("shape", &shape)
+            .attribute("arc", &[crate::compose::arc(arc.r, arc.bw); 6])
+            .attribute("fill", &[[1.0, 0.0, 0.0, 1.0]; 6])
+            .attribute("border", &[[0.0, 1.0, 0.0, 1.0]; 6])
+            .build()
+        else {
+            return Err("mesh");
+        };
+        frame.draw(&mesh).uniform("scale", &scale).blend(Blend::Premultiplied);
     }
     frame.show().map_err(|_| "frame")?;
     // Read what the GPU wrote: no stale line of it is cached (discarded above).
@@ -283,6 +386,56 @@ fn self_test(gpu: &mut Gpu, mut ui: Ui) -> Result<Ui, &'static str> {
         };
         if got != want {
             return Err("texel coordinates not exact across a 1280-texel line");
+        }
+    }
+    // The corners against their exact coverage (`ui_round`'s distance is an approximation
+    // within 1/(2r) of a pixel near the edge; a broken shader is off by a whole pixel's worth).
+    // Red and green are not swapped by the target (row 6 checked blue/red).
+    for arc in ARCS {
+        for y in 10..SIDE {
+            for x in arc.x0 as usize..arc.x0 as usize + 8 {
+                let (dx, dy) = (x as f32 + 0.5 - arc.cx, y as f32 + 0.5 - arc.cy);
+                let len = sqrt(dx * dx + dy * dy);
+                let outer = (0.5 - (len - arc.r)).clamp(0.0, 1.0);
+                let inner = (0.5 - (len - (arc.r - arc.bw))).clamp(0.0, 1.0);
+                let p = rgb_of(px(x, y));
+                let (r, g) = (((p >> 16) & 0xFF) as f32, ((p >> 8) & 0xFF) as f32);
+                if (r - inner * 255.0).abs() > 48.0 || (g - (outer - inner) * 255.0).abs() > 48.0 {
+                    let mut grid = alloc::string::String::new();
+                    for y in 10..SIDE {
+                        for x in 0..SIDE {
+                            let p = rgb_of(px(x, y));
+                            grid.push_str(&alloc::format!("{:02x}{:02x} ", (p >> 16) & 0xFF, (p >> 8) & 0xFF));
+                        }
+                        grid.push('|');
+                    }
+                    exynos_4412_rs::println!(
+                        "ferrite: self-test corner r {} at ({}, {}): red/green {} {}, want {} {}; rows 10..16 (red green): {}",
+                        arc.r,
+                        x,
+                        y,
+                        r as u32,
+                        g as u32,
+                        (inner * 255.0) as u32,
+                        ((outer - inner) * 255.0) as u32,
+                        grid
+                    );
+                    CORNER_DETAIL.lock(|d| {
+                        *d.borrow_mut() = alloc::format!(
+                            "r {} at ({}, {}): red/green {} {}, want {} {}; rows 10..16: {}",
+                            arc.r,
+                            x,
+                            y,
+                            r as u32,
+                            g as u32,
+                            (inner * 255.0) as u32,
+                            ((outer - inner) * 255.0) as u32,
+                            grid
+                        )
+                    });
+                    return Err("rounded corner coverage (ui_round)");
+                }
+            }
         }
     }
     // Line 1 of the 48-byte stride texture: green, whatever the swap.

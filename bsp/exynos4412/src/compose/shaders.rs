@@ -79,79 +79,117 @@ pub const UI_FLAT: Program = Program {
 /// // A corner of one piece of a box (ferrite's GPU compositor, compose.rs): its position in
 /// // pixels from the frame's top left; in `shape`, where it is against the box's nearest rounded
 /// // corner (xy, pixels, positive outwards past the corner circle's centre), the corner radius (z)
-/// // and the border width (w); the fill and the border colour, premultiplied.
+/// // and the border width (w); in `arc`, constants of the piece's corner for the fragment
+/// // shader (1/r, r/2, (r/ri)^2, ri/2 with ri = r - border, 0 = not rounded); the fill and the
+/// // border colour, premultiplied.
 /// uniform vec2 scale;
 /// attribute vec2 pos;
 /// attribute vec4 shape;
+/// attribute vec4 arc;
 /// attribute vec4 fill;
 /// attribute vec4 border;
 /// varying vec4 v_shape;
+/// varying vec4 v_arc;
 /// varying vec4 v_fill;
 /// varying vec4 v_border;
 ///
 /// void main() {
 ///     v_shape = shape;
+///     v_arc = arc;
 ///     v_fill = fill;
 ///     v_border = border;
 ///     gl_Position = vec4(pos.x * scale.x - 1.0, 1.0 - pos.y * scale.y, 0.0, 1.0);
 /// }
 /// // fragment
-/// // A rounded box's coverage at the pixel's centre from its signed distance (the rounded box
-/// // distance: length of the outside part, plus the inside part, minus the radius), anti-aliased
-/// // over one pixel: the fill inside the border's inner edge, the border between the two edges.
-/// // Pieces away from the corners have a large negative x or y: the distance is then the other's.
+/// // A rounded box's coverage at the pixel's centre, anti-aliased over one pixel: the fill inside
+/// // the border's inner edge, the border between the two edges.
+/// //
+/// // No length()/sqrt: on the board the PP's sqrt gave wrong coverage in scattered 2x2 quads.
+/// // Past a corner circle's centre (both q >= 0) the distance to a circle of radius r is
+/// // len - r ~ (len^2 / r^2 - 1) * r / 2, exact on the edge and within 1/(2r) pixels of it one
+/// // pixel away; the squares are taken in units of r, so mediump does not overflow. Elsewhere (and
+/// // for square corners) it is max(q.x, q.y) - r. Pieces away from the corners have a large
+/// // negative x or y.
 /// precision mediump float;
 /// varying vec4 v_shape;
+/// varying vec4 v_arc;
 /// varying vec4 v_fill;
 /// varying vec4 v_border;
 ///
 /// void main() {
 ///     vec2 q = v_shape.xy;
-///     float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - v_shape.z;
-///     float outer = clamp(0.5 - d, 0.0, 1.0);
-///     float inner = clamp(0.5 - d - v_shape.w, 0.0, 1.0);
+///     float lin = max(q.x, q.y) - v_shape.z;
+///     vec2 m = max(q, 0.0) * v_arc.x;
+///     float l2 = dot(m, m);
+///     float corner = step(0.0, min(q.x, q.y));
+///     float d_outer = mix(lin, (l2 - 1.0) * v_arc.y, corner * step(0.0001, v_arc.x));
+///     float d_inner = mix(lin + v_shape.w, (l2 * v_arc.z - 1.0) * v_arc.w, corner * step(0.0001, v_arc.w));
+///     float outer = clamp(0.5 - d_outer, 0.0, 1.0);
+///     float inner = clamp(0.5 - d_inner, 0.0, 1.0);
 ///     gl_FragColor = v_fill * inner + v_border * (outer - inner);
 /// }
 /// ```
 pub const UI_ROUND: Program = Program {
     name: "ui_round",
-    // 6 instructions; LIMA_DEBUG=dump disassembles them.
+    // 7 instructions; LIMA_DEBUG=dump disassembles them.
     vertex: &[
-        0xb08b_0ec0, 0x4f80_2ac1, 0x0007_ff80, 0x000a_d500,
-        0xb0cb_42d1, 0x4b80_2ad3, 0x8001_7f80, 0x0009_5509,
-        0xb416_01a1, 0x4380_2ad4, 0x4c00_f080, 0x0009_5509,
+        0xb00b_06c3, 0x5380_2ac2, 0x0007_ff80, 0x000a_d500,
+        0xb00b_0ac1, 0x4f80_2ac3, 0x0246_9f80, 0x0008_c90a,
+        0xb0cb_4ed8, 0x4b80_2ad1, 0xd241_7100, 0x000d_c909,
+        0xb416_01a1, 0x4380_2ad8, 0x4c00_f080, 0x000b_5509,
         0x64cb_3ac0, 0x4b80_c24d, 0x4a47_d100, 0x0000_8909,
         0xb006_41b1, 0x4780_6ac1, 0xc646_8400, 0x0001_0d08,
         0x64cb_3adb, 0x0380_81b2, 0x4002_6400, 0x000a_d508,
     ],
-    vertex_prefetch: 4,
+    vertex_prefetch: 5,
     // @     0: load.v $0 0, mov.pos.v1 $1.xy $0.xyxx
-    // @     4: mul.v0 $0.xy $1.xyxx $1.xyxx
-    // @     7: mul.s0 $1.x $1.x, add.s1 $0.z ^s0 $0.y, sqrt.s2 $0.w $0.z
-    // @    11: load.v $1 0, max.s1 $0.x $1.x $1.y
-    // @    15: min.s0 $0.x ^const0.x, add.s1 $0.x ^s0 $0.w, const0 0.000000 0.000000 0.000000 0.000000
-    // @    20: load.v $1 0, add.s1 $0.y $0.x -$1.z
-    // @    24: add.s1 $0.x ^const0.x -$0.y, const0 0.500000 0.000000 0.000000 0.000000
-    // @    28: load.v $1 0, add.sat.s1 $0.y $0.x -$1.w
-    // @    32: mov.sat.s0 $0.x, add.s1 $0.x ^s0 -$0.y
-    // @    35: load.v $1 2, mul.v0 $2 $1 $0.xxxx
-    // @    39: load.v $1 1, mul.v0 $1 $0.yyyy, add.v1 $3 ^v0 $2, stop
+    // @     4: load.v $0 1, mul.v0 $1.zw $1.xxxy $0.xxxx
+    // @     8: mul.v0 $0.xy $1.zwzz $1.zwzz
+    // @    11: mul.s0 $1.z $1.z, add.s1 $3.x ^s0 $0.y
+    // @    14: load.v $1 1, add.s1 $0.x $3.x ^const0.x, mul.s2 $0.z $0.x $1.xxyx, const0 -1.000000 0.000000 0.000000 0.000000
+    // @    20: load.v $1 1, ge.v0 $2.xy $1.wxzw ^const0.xxxx, const0 0.000100 0.000000 0.000000 0.000000
+    // @    26: load.v $1 0, min.s1 $0.x $1.x $1.y
+    // @    30: ge.s0 $0.x $0.x ^const0.x, const0 0.000000 0.000000 0.000000 0.000000
+    // @    34: mul.v0 $0.xy $0.xxzw $2
+    // @    37: load.v $1 0
+    // @    40: load.v $2 0, max.s0 $1.x $1.y, add.s1 $0.w ^s0 -$2.z
+    // @    44: mov.s0 $0.y, sel.s1 $0.z $0.z $0.w
+    // @    47: add.sat.s1 $3.z ^const0.x -$0.z, const0 0.500000 0.000000 0.000000 0.000000
+    // @    51: load.v $1 1
+    // @    54: load.v $2 1, mul.s0 $3.x $1.z, add.s1 $0.z ^s0 ^const0.x, mul.s2 $3.y $0.z $2.xwxx, const0 -1.000000 0.000000 0.000000 0.000000
+    // @    61: load.v $1 0, add.s1 $0.z $0.w $1.w
+    // @    65: mov.s0 $0.x, sel.s1 $0.x $3.y $0.z
+    // @    68: add.sat.s1 $0.x ^const0.x -$0.x, const0 0.500000 0.000000 0.000000 0.000000
+    // @    72: add.s1 $0.y $3.z -$0.x
+    // @    74: load.v $1 3, mul.v0 $2 $1 $0.yyyy
+    // @    78: load.v $1 2, mul.v0 $1 $0.xxxx, add.v1 $3 ^v0 $2, stop
     fragment: &[
-        0x0218_1084, 0xf000_3c60, 0x4000_0100, 0x0000_1f8c,
-        0x0220_0403, 0x0010_4041, 0x0000_0003, 0x0220_6804,
-        0x0000_0404, 0x1010_8040, 0x0060_4001, 0x0228_2084,
-        0xf100_3c60, 0x7900_1410, 0x0000_0000, 0x0222_2805,
-        0x2000_3000, 0x1010_00c0, 0x0000_0000, 0x0000_0000,
-        0x0220_2084, 0xf100_3c60, 0x0106_1800, 0x0000_0000,
-        0x0222_2004, 0x0040_8130, 0x0000_1c00, 0x0000_0000,
-        0x0218_2084, 0xf100_3c60, 0x0306_1c00, 0x0000_0000,
-        0x0220_2803, 0x3e80_0000, 0x1010_2040, 0x0228_0484,
-        0xf108_3c60, 0x8000_3904, 0x0000_003c, 0x0000_14a5,
-        0xf104_3c60, 0x0550_3904, 0x11c8_0000, 0x0101_e672,
+        0x0220_1084, 0xf000_3c60, 0x4000_0100, 0x0000_1f8c,
+        0x0218_0484, 0xf004_3c60, 0x4000_1004, 0x0000_0030,
+        0x0218_0403, 0x02b8_4ae1, 0x0000_0003, 0x0230_2803,
+        0x0000_0606, 0x1013_0040, 0x0232_6086, 0xf104_3c60,
+        0x0100_c030, 0x0200_0886, 0x0000_5e00, 0x0000_0000,
+        0x0222_0486, 0xf104_3c60, 0x800c_38c4, 0x00d1_ce0c,
+        0x0000_0000, 0x0000_0000, 0x0220_2084, 0xf100_3c60,
+        0x7100_1410, 0x0000_0000, 0x021a_0804, 0x1c40_3000,
+        0x0000_0000, 0x0000_0000, 0x0218_0403, 0x0390_8e00,
+        0x0000_0003, 0x0220_0083, 0xf100_3c60, 0x0000_0000,
+        0x0218_2884, 0xf200_3c60, 0x8800_1410, 0x4043_8a00,
+        0x0220_2803, 0xbe00_0001, 0x0b90_80c0, 0x021a_2004,
+        0x00ce_8230, 0x0000_1c00, 0x0000_0000, 0x0238_0083,
+        0xf104_3c60, 0x0000_0000, 0x0222_6887, 0xf204_3c60,
+        0x0000_1830, 0xc042_3000, 0x0641_0419, 0x0000_1780,
+        0x0000_0000, 0x0218_2084, 0xf100_3c60, 0x0108_1c0c,
+        0x0000_0000, 0x0220_2803, 0x7e00_0000, 0x0b90_0083,
+        0x0212_2004, 0x00c0_8030, 0x0000_1c00, 0x0000_0000,
+        0x0220_2002, 0x0041_800e, 0x0228_0484, 0xf10c_3c60,
+        0x8550_3904, 0x0000_003c, 0x0000_14a5, 0xf108_3c60,
+        0x0000_3904, 0x11c8_0000, 0x0101_e672,
     ],
     attributes: &[
         Attribute { name: "pos", components: 2 },
         Attribute { name: "shape", components: 4 },
+        Attribute { name: "arc", components: 4 },
         Attribute { name: "fill", components: 4 },
         Attribute { name: "border", components: 4 },
     ],
@@ -161,13 +199,13 @@ pub const UI_ROUND: Program = Program {
     vertex_uniform_floats: 4,
     vertex_constants: &[-1.0, 1.0, 1.0],
     fragment_uniform_halves: 0,
-    varyings: &[Varying { offset: 0, format: 0x3 }, Varying { offset: 16, format: 0x3 }, Varying { offset: 32, format: 0x3 }],
-    varying_stride: 48,
+    varyings: &[Varying { offset: 0, format: 0x3 }, Varying { offset: 16, format: 0x3 }, Varying { offset: 32, format: 0x3 }, Varying { offset: 48, format: 0x3 }],
+    varying_stride: 64,
     samplers: &[],
     render_state: [
         0x0000_0000, 0x0000_0000, 0xfc3b_1ad2, 0x0000_003e,
         0xffff_0000, 0xff00_0007, 0xff00_0007, 0x0000_ffff,
         0x3333_f807, 0x0000_0004, 0x0000_0000, 0x0000_0000,
-        0x0000_0000, 0x0000_1206, 0x0000_2000, 0x0000_0000,
+        0x0000_0000, 0x0000_1208, 0x0000_2000, 0x0000_0000,
     ],
 };

@@ -167,8 +167,8 @@ enum Prim {
     /// fill (inside the border) and the border colour.
     Round { rect: R, qx: (f32, f32), qy: (f32, f32), radius: f32, bw: f32, fill: Lin, border: [f32; 4] },
     /// `ui_flat`: `tex` over `rect`, texel coordinates `u.0 + u.1 * x` (and v likewise),
-    /// times `color`.
-    Flat { rect: R, u: (f32, f32), v: (f32, f32), color: [f32; 4], tex: Tex },
+    /// times `color` (solid colours: the white texel times it).
+    Flat { rect: R, u: (f32, f32), v: (f32, f32), color: Lin, tex: Tex },
 }
 
 impl Prim {
@@ -206,12 +206,16 @@ struct State {
     scratch: Vec<Sprite>,
     pos: Vec<[f32; 2]>,
     shape: Vec<[f32; 4]>,
+    arc: Vec<[f32; 4]>,
     fill: Vec<[f32; 4]>,
     border: Vec<[f32; 4]>,
     uv: Vec<[f32; 2]>,
     color: Vec<[f32; 4]>,
     /// A GPU error was printed: only the first is.
     told: bool,
+    /// One opaque white texel (heap, 64-byte aligned, cleaned): solid pieces are `ui_flat`
+    /// with it, times their colour. 0 until the first render.
+    white: usize,
 }
 
 static mut STATE: State = State {
@@ -220,11 +224,13 @@ static mut STATE: State = State {
     scratch: Vec::new(),
     pos: Vec::new(),
     shape: Vec::new(),
+    arc: Vec::new(),
     fill: Vec::new(),
     border: Vec::new(),
     uv: Vec::new(),
     color: Vec::new(),
     told: false,
+    white: 0,
 };
 
 fn state() -> &'static mut State {
@@ -232,32 +238,110 @@ fn state() -> &'static mut State {
     unsafe { &mut *(&raw mut STATE) }
 }
 
+/// Off = the passes draw everything. Starts off: on the board the compositor matched the
+/// passes on page slides and was 2x slower on the Monitor stress test (many small areas,
+/// ~0.3 ms fixed cost per GPU frame). HTTP `POST /api/compose?on=1|0` switches it, for A/B
+/// runs and screenshots of the same scene both ways.
+pub static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// [`ENABLED`] changed: the whole screen is repainted the new way ([`service`]).
+pub static REPAINT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Why renders were composed or declined, counted since boot (HTTP `/api/status`): the
+/// names of [`COUNTS`]' slots.
+pub const COUNT_NAMES: [&str; 9] =
+    ["composed", "switched_off", "portrait", "keyboard", "no_gpu", "no_shaders", "clip_or_on_paint", "widget", "gpu_error"];
+const TAKEN: usize = 0;
+const OFF: usize = 1;
+const PORTRAIT: usize = 2;
+const KEYBOARD: usize = 3;
+const NO_GPU: usize = 4;
+const NO_UI: usize = 5;
+const CLIP: usize = 6;
+const WIDGET: usize = 7;
+const GPU_ERROR: usize = 8;
+pub static COUNTS: [core::sync::atomic::AtomicU32; 9] = [const { core::sync::atomic::AtomicU32::new(0) }; 9];
+
+/// Where the compositor's time goes, summed since boot (HTTP `/api/status`): the names of
+/// [`TIMES`]' slots. GPU frames, their draws, pieces and pixels; the HAL's GP / PP / whole-frame
+/// times (resets and L2 clear included in the last); CPU time building and running the frames,
+/// and in whole `compose` calls (gathering the pieces and drawing sprites included).
+pub const TIME_NAMES: [&str; 9] = ["frames", "draws", "pieces", "kpx", "gp_us", "pp_us", "frame_hw_us", "frame_us", "compose_us"];
+const T_FRAMES: usize = 0;
+const T_DRAWS: usize = 1;
+const T_PIECES: usize = 2;
+const T_KPX: usize = 3;
+const T_GP: usize = 4;
+const T_PP: usize = 5;
+const T_HW: usize = 6;
+const T_FRAME: usize = 7;
+const T_COMPOSE: usize = 8;
+pub static TIMES: [core::sync::atomic::AtomicU64; 9] = [const { core::sync::atomic::AtomicU64::new(0) }; 9];
+
+fn add_time(slot: usize, n: u64) {
+    TIMES[slot].fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Microseconds on the MCT (24 MHz).
+fn now_us() -> u64 {
+    exynos_4412_rs::drivers::timer::Mct::new().count() / 24
+}
+
+fn count(slot: usize) -> bool {
+    COUNTS[slot].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    slot == TAKEN
+}
+
+/// CPU0, once per pass (`frame_end`): repaints everything after [`ENABLED`] changed.
+pub fn service(ctx: &mut Ctx<P>) {
+    use core::sync::atomic::Ordering;
+    if REPAINT.swap(false, Ordering::AcqRel) {
+        let root = ctx.objs.root;
+        ctx.objs.mark_dirty(root);
+    }
+}
+
 /// Repaints `areas` (see the module's documentation); false = declined, nothing drawn.
 pub fn compose(ctx: &Ctx<P>, areas: &[Rect]) -> bool {
+    if !ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        return count(OFF);
+    }
     if ctx.lcd.is_portrait() {
-        return false;
+        return count(PORTRAIT);
     }
     if let Some(o) = ctx.objs.overlay {
         if areas.iter().any(|a| a.intersects(&o)) {
-            return false;
+            return count(KEYBOARD);
         }
     }
-    let Some(shared) = crate::gpu::get() else { return false };
-    let Some(ui) = shared.ui else { return false };
+    let Some(shared) = crate::gpu::get() else { return count(NO_GPU) };
+    let Some(ui) = shared.ui else { return count(NO_UI) };
     let gpu = &mut shared.gpu;
+    let t0 = now_us();
     let s = state();
+    if s.white == 0 {
+        match white_texel() {
+            Some(addr) => s.white = addr,
+            None => return count(WIDGET),
+        }
+    }
     s.prims.clear();
     s.items.clear();
     s.scratch.clear();
-    let ok = s.collect(ctx, &ui, gpu, areas) && s.draw(&ui, gpu, areas);
+    let result = match s.collect(ctx, &ui, gpu, areas) {
+        Err(slot) => slot,
+        Ok(()) if s.draw(&ui, gpu, areas) => TAKEN,
+        Ok(()) => GPU_ERROR,
+    };
     // The sprites drawn for this render only go (the frames are over).
     s.scratch.clear();
-    ok
+    add_time(T_COMPOSE, now_us() - t0);
+    count(result)
 }
 
 impl State {
-    /// Every visible widget that touches `areas`, in DFS order, as pieces. False to decline.
-    fn collect(&mut self, ctx: &Ctx<P>, ui: &Ui, gpu: &mut Gpu, areas: &[Rect]) -> bool {
+    /// Every visible widget that touches `areas`, in DFS order, as pieces. Err(the reason's
+    /// [`COUNTS`] slot) to decline.
+    fn collect(&mut self, ctx: &Ctx<P>, ui: &Ui, gpu: &mut Gpu, areas: &[Rect]) -> Result<(), usize> {
         let objs = &ctx.objs;
         let areas: Vec<R> = areas.iter().map(R::of).collect();
         let keep_after = renderer::cache().tick();
@@ -286,14 +370,14 @@ impl State {
             }
             let w = objs.get(id);
             if w.flags & (FLAG_CLIP_CHILDREN | FLAG_HAS_ON_PAINT) != 0 {
-                return false;
+                return Err(CLIP);
             }
             let start = self.prims.len();
-            let Some(opaque) = self.widget(ctx, ui, gpu, id, &abs, keep_after) else { return false };
+            let Some(opaque) = self.widget(ctx, ui, gpu, id, &abs, keep_after) else { return Err(WIDGET) };
             self.items.push(Item { start, opaque });
             i += 1;
         }
-        true
+        Ok(())
     }
 
     /// Widget `id`'s pieces; the rect it paints opaquely, if any. None to decline.
@@ -416,14 +500,19 @@ impl State {
         }
     }
 
+    /// `fill` over `rect`: the white texel times it (`ui_flat`, two instructions a pixel,
+    /// against `ui_round`'s dozen).
     fn solid(&mut self, rect: R, fill: Lin) {
         if !rect.is_empty() {
-            self.prims.push(Prim::Round { rect, qx: (FAR, 0.0), qy: (FAR, 0.0), radius: 0.0, bw: 0.0, fill, border: [0.0; 4] });
+            self.prims.push(solid_prim(rect, fill, self.white));
         }
     }
 
     /// A rounded box: nine pieces, the corners `k` square (the radius, or the border if wider,
-    /// at most half the box), each knowing where it is from its corner circle's centre.
+    /// at most half the box), each knowing where it is from its corner circle's centre. Only
+    /// the corners need `ui_round`; the straight pieces' edges lie on pixel boundaries, so they
+    /// are solids (border band + fill), which `ui_round` would draw the same, at a fraction of
+    /// the shader cost. Solids first, then the corners: no piece overlaps another.
     fn rounded(&mut self, r: &R, radius: i32, bw: i32, fill: Lin, border: [f32; 4]) {
         let radius = radius.min(r.w() / 2).min(r.h() / 2).max(0);
         let kx = radius.max(bw).min(r.w() / 2);
@@ -434,8 +523,28 @@ impl State {
         // Outwards from the left corners' centre (x0 + radius), the right ones' (x1 - radius).
         let qx = [(r.x0 as f32 + rad, -1.0), (FAR, 0.0), (-(r.x1 as f32 - rad), 1.0)];
         let qy = [(r.y0 as f32 + rad, -1.0), (FAR, 0.0), (-(r.y1 as f32 - rad), 1.0)];
-        for row in 0..3 {
-            for col in 0..3 {
+        let band = Lin::flat(border);
+        let bw = bw.max(0);
+        // Middle column (top, middle, bottom pieces) and middle row (left, right pieces).
+        let (mx0, mx1) = (cols[1], cols[2]);
+        let (my0, my1) = (rows[1], rows[2]);
+        let top_band = (r.y0 + bw).min(my0);
+        let bottom_band = (r.y1 - bw).max(my1);
+        let left_band = (r.x0 + bw).min(mx0);
+        let right_band = (r.x1 - bw).max(mx1);
+        // Top piece: border band, then fill; bottom likewise upwards.
+        self.solid(R { x0: mx0, y0: r.y0, x1: mx1, y1: top_band }, band);
+        self.solid(R { x0: mx0, y0: top_band, x1: mx1, y1: my0 }, fill);
+        self.solid(R { x0: mx0, y0: bottom_band, x1: mx1, y1: r.y1 }, band);
+        self.solid(R { x0: mx0, y0: my1, x1: mx1, y1: bottom_band }, fill);
+        // Left and right pieces, and the middle.
+        self.solid(R { x0: r.x0, y0: my0, x1: left_band, y1: my1 }, band);
+        self.solid(R { x0: left_band, y0: my0, x1: mx0, y1: my1 }, fill);
+        self.solid(R { x0: right_band, y0: my0, x1: r.x1, y1: my1 }, band);
+        self.solid(R { x0: mx1, y0: my0, x1: right_band, y1: my1 }, fill);
+        self.solid(R { x0: mx0, y0: my0, x1: mx1, y1: my1 }, fill);
+        for row in [0, 2] {
+            for col in [0, 2] {
                 let rect = R { x0: cols[col], y0: rows[row], x1: cols[col + 1], y1: rows[row + 1] };
                 if !rect.is_empty() {
                     self.prims.push(Prim::Round { rect, qx: qx[col], qy: qy[row], radius: rad, bw: bw as f32, fill, border });
@@ -450,7 +559,7 @@ impl State {
         let (tw, th) = (tex.w as f32, tex.h as f32);
         let u = ((shift as f32 - x as f32) / tw, 1.0 / tw);
         let v = (-(y as f32) / th, 1.0 / th);
-        self.prims.push(Prim::Flat { rect, u, v, color: [1.0; 4], tex });
+        self.prims.push(Prim::Flat { rect, u, v, color: Lin::flat([1.0; 4]), tex });
     }
 
     /// Widget `id` from a sprite: cached by appearance when it is complete and was seen
@@ -523,6 +632,7 @@ impl State {
     fn frame(&mut self, ui: &Ui, gpu: &mut Gpu, c: &R) -> Result<(), gpu::Error> {
         #[cfg(feature = "perf")]
         let t0 = crate::perf::cycles();
+        let started = now_us();
         let first = self.items.iter().rposition(|it| it.opaque.is_some_and(|o| o.contains(c))).unwrap_or(0);
         let from = self.items.get(first).map_or(self.prims.len(), |it| it.start);
         let mut frame = gpu.frame(Area::new(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize), 0xFF00_0000);
@@ -544,6 +654,7 @@ impl State {
                 batch = Some(b);
             }
             self.push(&p, &rect, c);
+            add_time(T_PIECES, 1);
         }
         if let Some(done) = batch {
             self.flush(ui, &mut frame, done, scale)?;
@@ -551,10 +662,19 @@ impl State {
         }
         if !drew {
             // Nothing there: black, as an empty frame would leave the area as it was.
-            self.push(&Prim::Round { rect: *c, qx: (FAR, 0.0), qy: (FAR, 0.0), radius: 0.0, bw: 0.0, fill: Lin::flat([0.0, 0.0, 0.0, 1.0]), border: [0.0; 4] }, c, c);
-            self.flush(ui, &mut frame, Batch::Round, scale)?;
+            let black = solid_prim(*c, Lin::flat([0.0, 0.0, 0.0, 1.0]), self.white);
+            self.push(&black, c, c);
+            self.flush(ui, &mut frame, black.batch(), scale)?;
         }
         let shown = frame.show();
+        add_time(T_FRAMES, 1);
+        add_time(T_KPX, (c.w() * c.h()) as u64 / 1000);
+        if let Ok(t) = &shown {
+            add_time(T_GP, t.gp_us);
+            add_time(T_PP, t.pps_us);
+            add_time(T_HW, t.total_us);
+        }
+        add_time(T_FRAME, now_us() - started);
         #[cfg(feature = "perf")]
         ferrite_core::perf::add_sub(ferrite_core::perf::phase::G2D, crate::perf::cycles().wrapping_sub(t0));
         shown.map(|_| ())
@@ -569,12 +689,13 @@ impl State {
             match *p {
                 Prim::Round { qx, qy, radius, bw, fill, border, .. } => {
                     self.shape.push([qx.0 + qx.1 * fx, qy.0 + qy.1 * fy, radius, bw]);
+                    self.arc.push(arc(radius, bw));
                     self.fill.push(fill.at(fx, fy));
                     self.border.push(border);
                 }
                 Prim::Flat { u, v, color, .. } => {
                     self.uv.push([u.0 + u.1 * fx, v.0 + v.1 * fy]);
-                    self.color.push(color);
+                    self.color.push(color.at(fx, fy));
                 }
             }
         }
@@ -582,11 +703,13 @@ impl State {
 
     /// The batch's vertices as one mesh of the frame, and its draw.
     fn flush(&mut self, ui: &Ui, frame: &mut Frame<'_>, batch: Batch, scale: [f32; 2]) -> Result<(), gpu::Error> {
+        add_time(T_DRAWS, 1);
         let result = match batch {
             Batch::Round => frame
                 .mesh(&ui.round)
                 .attribute("pos", &self.pos)
                 .attribute("shape", &self.shape)
+                .attribute("arc", &self.arc)
                 .attribute("fill", &self.fill)
                 .attribute("border", &self.border)
                 .build()
@@ -616,12 +739,49 @@ impl State {
         };
         self.pos.clear();
         self.shape.clear();
+        self.arc.clear();
         self.fill.clear();
         self.border.clear();
         self.uv.clear();
         self.color.clear();
         result
     }
+}
+
+/// The `arc` attribute of `ui_round` for a corner of `radius` with a border `bw` wide:
+/// 1/r, r/2, (r/ri)^2, ri/2 with ri = r - bw; zeros where that circle is under a pixel (the
+/// corner, or the border's inner corner, is then square).
+pub fn arc(radius: f32, bw: f32) -> [f32; 4] {
+    if radius < 1.0 {
+        return [0.0; 4];
+    }
+    let ri = radius - bw;
+    if ri < 1.0 {
+        return [1.0 / radius, radius / 2.0, 0.0, 0.0];
+    }
+    let k = radius / ri;
+    [1.0 / radius, radius / 2.0, k * k, ri / 2.0]
+}
+
+/// `fill` over `rect` as the white texel at `white` times it.
+fn solid_prim(rect: R, fill: Lin, white: usize) -> Prim {
+    let tex = Tex { addr: white, w: 1, h: 1, stride: 64, fmt: Fmt::Argb };
+    Prim::Flat { rect, u: (0.5, 0.0), v: (0.5, 0.0), color: fill, tex }
+}
+
+/// One opaque white texel for [`solid_prim`]: a 64-byte heap block, kept for good, cleaned out
+/// of the caches for the GPU. None if the heap has no room.
+fn white_texel() -> Option<usize> {
+    let layout = core::alloc::Layout::from_size_align(64, 64).ok()?;
+    // SAFETY: a non-zero size; the block is never freed.
+    let p = unsafe { alloc::alloc::alloc(layout) } as *mut u32;
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: 16 words in the block.
+    unsafe { core::slice::from_raw_parts_mut(p, 16).fill(0xFFFF_FFFF) };
+    exynos_4412_rs::mmu::clean_dcache_range(p as usize, 64);
+    Some(p as usize)
 }
 
 /// A label that paints nothing: no background, border, image or text.

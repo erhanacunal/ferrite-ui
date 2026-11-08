@@ -1377,6 +1377,17 @@ pub fn gpu_target() -> Option<(usize, usize, usize, usize)> {
     g2d_draw_ready().then(|| (buf_ptr(SHADOW) as usize, W * 4, W, H))
 }
 
+/// A copy of the shadow (XRGB8888, `PANEL` size, rows top to bottom), for
+/// screenshots (HTTP `GET /api/screen`). CPU0, between passes. None if the
+/// heap has no room.
+pub fn grab() -> Option<alloc::vec::Vec<u32>> {
+    let mut copy = alloc::vec::Vec::new();
+    copy.try_reserve_exact(PIXELS).ok()?;
+    // SAFETY: the shadow holds PIXELS words; nothing draws while CPU0 is here.
+    copy.extend_from_slice(unsafe { core::slice::from_raw_parts(back() as *const u32, PIXELS) });
+    Some(copy)
+}
+
 /// Before the GPU writes the shadow: waits for a present copy in flight
 /// (it reads the shadow), and puts what this core wrote through the alias
 /// into DRAM first. False if the shadow is not the GPU's to write (G2D

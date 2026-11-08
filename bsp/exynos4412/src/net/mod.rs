@@ -661,9 +661,37 @@ fn install(image: Vec<u8>) -> u8 {
     if crate::storage::save(&full) { FLASH_SAVED } else { FLASH_SAVE_FAILED }
 }
 
+/// Screenshot mailbox (HTTP `GET /api/screen`): CPU3 raises [`SCREEN_WANTED`], CPU0 copies the
+/// shadow between passes into [`SCREEN`] (None = no memory) and raises [`SCREEN_READY`].
+static SCREEN_WANTED: AtomicBool = AtomicBool::new(false);
+static SCREEN_READY: AtomicBool = AtomicBool::new(false);
+static SCREEN: CriticalSectionMutex<RefCell<Option<Vec<u32>>>> = CriticalSectionMutex::new(RefCell::new(None));
+
+/// CPU3: the screen as CPU0 holds it between passes (XRGB8888, rows top to bottom), or None
+/// (no memory, or CPU0 did not answer within 3 s).
+pub async fn screenshot() -> Option<Vec<u32>> {
+    SCREEN_READY.store(false, Ordering::Release);
+    SCREEN.lock(|s| *s.borrow_mut() = None);
+    SCREEN_WANTED.store(true, Ordering::Release);
+    let start = Instant::now();
+    while !SCREEN_READY.load(Ordering::Acquire) {
+        if start.elapsed() > Duration::from_secs(3) {
+            SCREEN_WANTED.store(false, Ordering::Release);
+            return None;
+        }
+        Timer::after(Duration::from_millis(2)).await;
+    }
+    SCREEN.lock(|s| s.borrow_mut().take())
+}
+
 /// CPU0, once per main-loop pass (`frame_end`): cheap unless the network
 /// asked for something.
 pub fn service() {
+    if SCREEN_WANTED.swap(false, Ordering::AcqRel) {
+        let shot = crate::lcd::grab();
+        SCREEN.lock(|s| *s.borrow_mut() = shot);
+        SCREEN_READY.store(true, Ordering::Release);
+    }
     if FLASH_STATUS.load(Ordering::Acquire) == FLASH_PENDING
         && let Some(image) = UPLOAD.lock(|u| u.borrow_mut().take())
     {

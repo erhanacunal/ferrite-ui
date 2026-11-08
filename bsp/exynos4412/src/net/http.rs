@@ -8,6 +8,8 @@
 //! | `GET /api/perf?ms=N` | JSON: the main-loop profile over N ms (default 1000, `perf` feature) |
 //! | `POST /flash` (or `/fs`, or `PUT`) | an FS image (or a whole `FLASH.BIN`): checked, saved as `FERRITE/FLASH.BIN`, then a restart |
 //! | `POST /restart` | restarts the board |
+//! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
+//! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted |
 //!
 //! `/flash` takes the same request as uart_boot's (`ferrite_cli bootflash
 //! --host` works against both): `Content-Length` required, `X-CRC32` (8 hex
@@ -128,6 +130,41 @@ async fn answer(socket: &mut TcpSocket<'_>, status: &str, kind: &str, body: &[u8
     socket.flush().await
 }
 
+/// `px` (the panel's XRGB8888 pixels, rows top to bottom) as a 32-bit BMP, top-down (negative
+/// height): its rows are the pixels' bytes as they are (B, G, R, X).
+async fn screen_bmp(socket: &mut TcpSocket<'_>, px: &[u32]) -> TcpResult<()> {
+    let (w, h) = (crate::lcd::PANEL.width as u32, crate::lcd::PANEL.height as u32);
+    let data = w * h * 4;
+    let mut bmp = [0u8; 54];
+    bmp[0..2].copy_from_slice(b"BM");
+    bmp[2..6].copy_from_slice(&(54 + data).to_le_bytes());
+    bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+    bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+    bmp[18..22].copy_from_slice(&w.to_le_bytes());
+    bmp[22..26].copy_from_slice(&(-(h as i32)).to_le_bytes());
+    bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bmp[28..30].copy_from_slice(&32u16.to_le_bytes());
+    bmp[34..38].copy_from_slice(&data.to_le_bytes());
+    let mut head = String::new();
+    let _ = write!(
+        head,
+        "HTTP/1.1 200 OK
+Content-Type: image/bmp
+Content-Length: {}
+Cache-Control: no-store
+Connection: close
+
+",
+        54 + data
+    );
+    write_all(socket, head.as_bytes()).await?;
+    write_all(socket, &bmp).await?;
+    // SAFETY: plain words viewed as their bytes.
+    let bytes = unsafe { core::slice::from_raw_parts(px.as_ptr() as *const u8, px.len() * 4) };
+    write_all(socket, bytes).await?;
+    socket.flush().await
+}
+
 async fn text(socket: &mut TcpSocket<'_>, status: &str, body: &str) -> TcpResult<()> {
     answer(socket, status, "text/plain", body.as_bytes()).await
 }
@@ -184,6 +221,30 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             let expect = header(head, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
             let early = &request[head_end..filled];
             upload(socket, length, want, expect, early).await?;
+        }
+        (b"GET", b"/api/screen") => match super::screenshot().await {
+            Some(px) => screen_bmp(socket, &px).await?,
+            None => text(socket, "503 Service Unavailable", "No screenshot (no memory or no answer)
+").await?,
+        },
+        (b"POST", b"/api/compose") => {
+            use core::sync::atomic::Ordering;
+            match query_param(query, b"on") {
+                Some(b"0") | Some(b"1") => {
+                    let on = query_param(query, b"on") == Some(b"1");
+                    crate::compose::ENABLED.store(on, Ordering::Relaxed);
+                    crate::compose::REPAINT.store(true, Ordering::Release);
+                    text(socket, "200 OK", if on { "GPU compositor on
+" } else { "GPU compositor off
+" }).await?;
+                }
+                _ => {
+                    let on = crate::compose::ENABLED.load(Ordering::Relaxed);
+                    text(socket, "400 Bad Request", if on { "on=0|1 (now on)
+" } else { "on=0|1 (now off)
+" }).await?;
+                }
+            }
         }
         (b"POST", b"/restart") => {
             text(socket, "200 OK", "Restarting\n").await?;
@@ -458,6 +519,23 @@ fn status_json() -> String {
             _ => "free",
         }
     );
+    // The GPU compositor: its start message (with the self-test's failing corner), whether it
+    // is switched on, and why renders were composed or declined.
+    let _ = write!(
+        s,
+        ",\"compositor\":{{\"enabled\":{},\"status\":\"{}\"",
+        crate::compose::ENABLED.load(core::sync::atomic::Ordering::Relaxed),
+        crate::gpu::status().replace('"', "'")
+    );
+    for (name, n) in crate::compose::COUNT_NAMES.iter().zip(&crate::compose::COUNTS) {
+        let _ = write!(s, ",\"{}\":{}", name, n.load(core::sync::atomic::Ordering::Relaxed));
+    }
+    s.push_str(",\"time\":{");
+    for (i, (name, n)) in crate::compose::TIME_NAMES.iter().zip(&crate::compose::TIMES).enumerate() {
+        let _ = write!(s, "{}\"{}\":{}", if i == 0 { "" } else { "," }, name, n.load(core::sync::atomic::Ordering::Relaxed));
+    }
+    s.push('}');
+    s.push('}');
     let now_ms = exynos_4412_rs::embassy::now() / 1000;
     let _ = write!(
         s,

@@ -51,7 +51,7 @@ use ferrite_core::renderer::WidgetRenderer;
 use ferrite_core::types::{Edges, Rect};
 use ferrite_core::widget::{
     FLAG_CHECKED, FLAG_MULTI_LINE, FLAG_PRESSED, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_CIRCLE, KIND_ELLIPSE,
-    KIND_IMAGE, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_RECTANGLE, WidgetId,
+    KIND_GRAPH, KIND_IMAGE, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_RECTANGLE, WidgetId,
 };
 
 use crate::lcd;
@@ -236,6 +236,7 @@ pub(crate) fn appearance_complete(kind: u8) -> bool {
             | KIND_POLYGON
             | KIND_LINE
             | KIND_LABEL
+            | KIND_GRAPH
     )
 }
 
@@ -268,6 +269,20 @@ pub(crate) fn appearance(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> u64 {
         // The points.
         for &byte in objs.str_get(e.text_id) {
             h.byte(byte);
+        }
+    }
+    if w.kind == KIND_GRAPH {
+        // `render::draw_graph`: the samples (array id in `value`), the count cap, the line
+        // colour; flags (`image_id`) and the fill colour (`gradient_color`) are hashed above.
+        h.u32(e.max_length as u32 | (e.text_color as u32) << 16);
+        match objs.arr(e.value as ferrite_core::pool::ObjPtr) {
+            Some(samples) => {
+                h.u32(samples.len() as u32);
+                for &v in samples {
+                    h.u32(v as u32);
+                }
+            }
+            None => h.u32(0xFFFF_FFFF),
         }
     }
     if w.kind == KIND_LABEL {
