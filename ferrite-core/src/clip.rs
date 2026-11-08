@@ -74,6 +74,8 @@ impl ClipRegion {
     ///
     /// Each subtraction can produce up to 4 new rects (top, bottom, left, right strips).
     /// When the pool is full, the original rect is preserved (overdraw, no tearing).
+    /// Returns false then: the region is larger than the exact difference (a
+    /// caller that copies pixels by it must not trust it).
     ///
     /// ```text
     /// +------------------+
@@ -84,10 +86,11 @@ impl ClipRegion {
     /// |   bottom strip   |
     /// +------------------+
     /// ```
-    pub fn subtract(&mut self, cut: &Rect) {
+    pub fn subtract(&mut self, cut: &Rect) -> bool {
         if cut.is_empty() {
-            return;
+            return true;
         }
+        let mut exact = true;
 
         let mut temp = [Rect::new(0, 0, 0, 0); MAX_CLIP_RECTS];
         let mut new_count: usize = 0;
@@ -108,6 +111,7 @@ impl ClipRegion {
             if new_count + pieces > MAX_CLIP_RECTS {
                 temp[new_count] = r;
                 new_count += 1;
+                exact = false;
                 continue;
             }
 
@@ -151,6 +155,7 @@ impl ClipRegion {
 
         self.rects[..new_count].copy_from_slice(&temp[..new_count]);
         self.count = new_count;
+        exact
     }
 
     fn count_pieces(r: &Rect, cut: &Rect) -> usize {

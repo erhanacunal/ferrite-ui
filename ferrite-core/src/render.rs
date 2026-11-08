@@ -283,6 +283,8 @@ fn redraw_behind_region<P: Platform>(
 pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
     render_all_iterative(ctx);
     clear_all_dirty(ctx);
+    // Everything shows what it last drew (see `render_dirty`'s `settled`).
+    ctx.objs.settled_epoch = ctx.objs.draw_epoch;
 }
 
 /// Iterative full redraw: walk DFS order, skip invisible subtrees.
@@ -351,6 +353,9 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     if !ctx.objs.maybe_dirty {
         return;
     }
+    // Every widget still shows what it last drew: nothing drew over the
+    // screen since the last render, and the tree kept its shape.
+    let settled = ctx.objs.draw_epoch == ctx.objs.settled_epoch && ctx.objs.dfs_valid;
     ctx.objs.ensure_dfs();
 
     let mut has_dirty = false;
@@ -364,11 +369,16 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         // Dirty mode uses only the A bits: nothing left to draw until a
         // widget is marked again.
         ctx.objs.maybe_dirty = false;
+        ctx.objs.clear_changed();
         return;
     }
     ctx.objs.geo_begin();
 
     let mut restores = Restores::new();
+    // Pass 0: opaque panels that only moved get their pixels shifted.
+    if <P::LcdB as LcdBackend>::CAN_MOVE {
+        shift_moved(ctx, settled, &mut restores);
+    }
     // Pass 1: erase dirty widgets that became invisible.
     // Only erase widgets that were actually drawn before (FLAG_RENDERED).
     // Without this gate, an animated widget on a hidden page (e.g. a progress
@@ -422,6 +432,15 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         restores.push(di, stale);
     }
 
+    // A restore after the shift that drew over shifted pixels (a widget
+    // behind the panel restored there): the panel is drawn there again.
+    if !ctx.objs.shifted.is_empty() {
+        let shifted = &mut ctx.objs.shifted;
+        shifted.retain(|&(sdi, r)| {
+            !restores.full && !restores.list[..restores.n].iter().any(|&(i, a)| i != sdi && a.intersects(&r))
+        });
+    }
+
     // Pass 2: draw dirty visible widgets with clipping. A dirty widget is
     // drawn together with its whole subtree, after which the loop resumes past
     // that subtree: `mark_dirty` marks every descendant too, so visiting them
@@ -457,7 +476,14 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
 
         // Pass 1b put back what is behind this subtree (it moved): its
         // see-through widgets inside the root's box need not restore it again.
-        let moved_fresh = restores.fresh_behind(di, abs);
+        // Not if a widget before it was drawn in this pass over its box: that
+        // one left the box out of its clip (every later widget is an
+        // occluder), counting on this subtree to restore behind itself.
+        let moved_fresh = restores.fresh_behind(di, abs) && !painted_before(&ctx.objs, di, &abs);
+
+        // Its pixels were shifted (pass 0): draw only what came into view
+        // (`shift_keep`, kept in `ctx.objs.shift_keep`).
+        let keep = !ctx.objs.shifted.is_empty() && shift_keep(ctx, di, &abs);
 
         // Flat iteration over dirty widget + its descendants
         for si in di..sub_end {
@@ -470,6 +496,10 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
 
             let mut clip = ClipRegion::from_rect(sabs);
             clip.clip_to_bounds(&screen_rect(&ctx.lcd));
+            if keep {
+                // One rect cut by at most MAX_CLIP_RECTS disjoint ones: fits.
+                clip.restrict(&ctx.objs.shift_keep);
+            }
 
             // Viewport clipping for children of scroll containers
             let sp = ctx.objs.scroll_parent_at(si);
@@ -545,6 +575,212 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     ctx.objs.geo_end();
 
     clear_all_dirty(ctx);
+    ctx.objs.shifted.clear();
+    ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+}
+
+/// Most rects one shift moves (they come from two clip regions).
+const SHIFT_MAX: usize = crate::clip::MAX_CLIP_RECTS;
+
+/// Dirty mode, pass 0 (before the restores): a widget that only moved since
+/// the last render, and paints its box opaquely, still shows its last
+/// drawing at the old place. Instead of putting back what is behind the old
+/// box and drawing the whole subtree at the new one, its pixels are moved
+/// there (`LcdImpl::move_rects`); only the part of the old box it left is
+/// restored, and pass 2 draws only the part of the new box that came into
+/// view (`ObjPool::shifted`). A sliding drawer then costs two strips a frame.
+///
+/// Taken only when the result is the same as the full redraw:
+/// - `settled`: nothing drew over the screen since the last render, and the
+///   tree kept its shape (every widget shows what it last drew);
+/// - the root moved (`will_move` recorded where it was drawn), kept its
+///   size, its parent is not dirty, and nothing in its subtree changed
+///   (`ObjPool::changed_within`; location writes use `mark_moved`);
+/// - it paints its box opaquely (`opaque_radius`) apart from its rounded
+///   corners, which are left out (what is behind them shows through), and
+///   it is not inside a scroll container (viewport clipping);
+/// - pixels of widgets in front of it (where they are or were, drawn or
+///   hidden) are neither moved nor overwritten;
+/// - every clip region involved is exact (no overflow).
+///
+/// Several shifts in one render must not touch each other's boxes (one's
+/// restore would overwrite the other's source).
+#[inline(never)]
+fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Restores) {
+    ctx.objs.shifted.clear();
+    if !settled || ctx.lcd.is_portrait() {
+        return;
+    }
+    let screen = screen_rect(&ctx.lcd);
+    let n = ctx.objs.dfs_len();
+    let mut touched: Option<Rect> = None;
+    for di in 0..n {
+        let id = ctx.objs.dfs_at(di);
+        let w = ctx.objs.get(id);
+        if !w.is_dirty() || w.flags & FLAG_RENDERED == 0 || !ctx.objs.vis_at(di) {
+            continue;
+        }
+        let old = ctx.objs.prev_rect(id, 0);
+        let new = ctx.objs.abs_at(di);
+        if old.is_empty() || old == new || old.w != new.w || old.h != new.h {
+            continue;
+        }
+        let parent = w.parent;
+        if parent.is_none() || ctx.objs.get(parent).is_dirty() || ctx.objs.scroll_parent_at(di).is_some() {
+            continue;
+        }
+        let span = old.union(&new);
+        if touched.is_some_and(|t| t.intersects(&span)) || ctx.objs.changed_within(id) {
+            continue;
+        }
+        let Some(radius) = opaque_radius(&ctx.objs, id, &new) else { continue };
+        let sub_end = ctx.objs.sub_end_at(di);
+        // A small box is cheaper to redraw than to move (a move costs a
+        // fixed setup per rect on the exynos G2D: the Monitor stress test's
+        // 51 tiles a frame were slower moved than redrawn).
+        if (old.w as u32) * (old.h as u32) < <P::LcdB as LcdBackend>::MOVE_MIN_PX {
+            continue;
+        }
+        let Some(moves) = plan_moves(&ctx.objs, &old, &new, radius, sub_end, &screen) else { continue };
+        let (dx, dy) = (new.x - old.x, new.y - old.y);
+        let dest = |m: &Rect| Rect::new(m.x + dx, m.y + dy, m.w, m.h);
+        // What it leaves behind: the old box but where it moves to.
+        let mut behind = ClipRegion::from_rect(old);
+        behind.clip_to_bounds(&screen);
+        let mut exact = true;
+        for m in &moves {
+            exact &= behind.subtract(&dest(m));
+        }
+        if !exact || moves.is_empty() || !ctx.lcd.move_rects(&moves, dx, dy) {
+            continue;
+        }
+        #[cfg(feature = "perf")]
+        {
+            use crate::perf::{add_count, count};
+            add_count(count::SHIFTS, 1);
+            let px: u32 = moves.iter().map(|m| m.w as u32 * m.h as u32).sum();
+            add_count(count::SHIFT_KPX, (px + 512) >> 10);
+        }
+        // From here on as `restore_behind`, over `behind` only.
+        ctx.objs.screen_touched();
+        if !behind.is_empty() {
+            redraw_behind_region(ctx, di, &behind, &old);
+            for j in sub_end..n {
+                if !ctx.objs.vis_at(j) {
+                    continue;
+                }
+                let a = ctx.objs.abs_at(j);
+                if behind.iter().iter().any(|r| r.intersects(&a)) {
+                    let jid = ctx.objs.dfs_at(j);
+                    if !ctx.objs.get(jid).is_dirty() {
+                        ctx.objs.mark_dirty(jid);
+                    }
+                }
+            }
+        }
+        // Pass 1b must not restore the old box again.
+        ctx.objs.set_prev_rect(id, 0, Rect::new(0, 0, 0, 0));
+        restores.push(di, old);
+        for m in &moves {
+            ctx.objs.shifted.push((di, dest(m)));
+        }
+        touched = Some(touched.map_or(span, |t| t.union(&span)));
+    }
+}
+
+/// The corner radius of widget `id` (at `abs`) if it paints its whole box
+/// opaquely except, when rounded, the four `radius` x `radius` corners;
+/// None if anything behind it may show through elsewhere (or it paints by
+/// script, `on_paint`).
+fn opaque_radius(tree: &ObjPool, id: WidgetId, abs: &Rect) -> Option<u16> {
+    let w = tree.get(id);
+    let ext = &tree.ext(id);
+    if is_freeform_shape(w.kind) || ext.alpha < 255 || w.flags & FLAG_HAS_ON_PAINT != 0 {
+        return None;
+    }
+    // Same condition as `draw_bg` in `draw_widget`.
+    let bg = effective_bg(tree, w, ext);
+    if bg == 0 && (w.kind == KIND_LABEL || w.kind == KIND_IMAGE) {
+        return None;
+    }
+    Some(ext.border_radius.min(abs.w / 2).min(abs.h / 2))
+}
+
+/// The rects (at the old place) whose pixels move from `old` to `new`: the
+/// box at both places on screen, without the rounded corners (`radius`) and
+/// without what any widget from DFS index `front` on covers or covered
+/// there. None if a region overflowed (it would be too large) or there are
+/// too many pieces.
+fn plan_moves(tree: &ObjPool, old: &Rect, new: &Rect, radius: u16, front: usize, screen: &Rect) -> Option<alloc::vec::Vec<Rect>> {
+    let (dx, dy) = (new.x - old.x, new.y - old.y);
+    let mut src = ClipRegion::from_rect(*old);
+    src.clip_to_bounds(screen);
+    let mut dst = ClipRegion::from_rect(*new);
+    dst.clip_to_bounds(screen);
+    let mut exact = true;
+    if radius > 0 {
+        for (region, b) in [(&mut src, old), (&mut dst, new)] {
+            let r = radius;
+            let (x1, y1) = (b.right() - r as i16, b.bottom() - r as i16);
+            for (x, y) in [(b.x, b.y), (x1, b.y), (b.x, y1), (x1, y1)] {
+                exact &= region.subtract(&Rect::new(x, y, r, r));
+            }
+        }
+    }
+    let span = old.union(new);
+    for j in front..tree.dfs_len() {
+        let jid = tree.dfs_at(j);
+        // Drawn now or before (a hidden one still shows until pass 1).
+        if !tree.vis_at(j) && tree.get(jid).flags & FLAG_RENDERED == 0 {
+            continue;
+        }
+        for r in [tree.abs_at(j), tree.prev_rect(jid, 0)] {
+            if r.intersects(&span) {
+                exact &= src.subtract(&r);
+                exact &= dst.subtract(&r);
+            }
+        }
+    }
+    if !exact {
+        return None;
+    }
+    let mut out = alloc::vec::Vec::new();
+    for s in src.iter() {
+        for d in dst.iter() {
+            if let Some(i) = s.intersection(&Rect::new(d.x - dx, d.y - dy, d.w, d.h)) {
+                if out.len() == SHIFT_MAX {
+                    return None;
+                }
+                out.push(i);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// For the dirty subtree at DFS index `di` (root at `abs`): if pass 0 moved
+/// its pixels, put in `ctx.objs.shift_keep` the part of its box still to be
+/// drawn (on screen, minus the moved rects) and return true. False = draw
+/// it whole (nothing moved, or the region overflowed).
+#[inline(never)]
+fn shift_keep<P: Platform>(ctx: &mut Ctx<P>, di: usize, abs: &Rect) -> bool {
+    if !ctx.objs.shifted.iter().any(|&(i, _)| i == di) {
+        return false;
+    }
+    let mut keep = ClipRegion::from_rect(*abs);
+    keep.clip_to_bounds(&screen_rect(&ctx.lcd));
+    let mut exact = true;
+    for &(i, r) in &ctx.objs.shifted {
+        if i == di {
+            exact &= keep.subtract(&r);
+        }
+    }
+    if !exact {
+        return false;
+    }
+    ctx.objs.shift_keep.clear();
+    ctx.objs.shift_keep.extend_from_slice(keep.iter());
+    true
 }
 
 /// After a complete drawing of widget `id` at `abs`: remember what an
@@ -598,6 +834,14 @@ impl Restores {
             .iter()
             .any(|&(i, r)| i > di && (r.intersects(&old) || r.intersects(&current)))
     }
+}
+
+/// A visible widget before DFS position `idx` was drawn in this pass
+/// (`FLAG_PAINTED`) and touches `rect`.
+fn painted_before(tree: &ObjPool, idx: usize, rect: &Rect) -> bool {
+    (0..idx).any(|k| {
+        tree.vis_at(k) && tree.get(tree.dfs_at(k)).flags & FLAG_PAINTED != 0 && tree.abs_at(k).intersects(rect)
+    })
 }
 
 /// A widget that draws no pixel: a label without text, background, border
@@ -864,8 +1108,17 @@ fn draw_widget_body<P: Platform>(
                 // soft inner edge blends over the background rather than over
                 // what is behind the widget (without readback: mixes with the
                 // fill colour, its outer edge with the backdrop).
-                let Some(outer) = abs.intersection(&screen_rect(&ctx.lcd)) else {
-                    continue;
+                //
+                // Readback backends draw the whole box, partly off the screen
+                // or not (see `fill_rounded_rect_screen`); write-only backends
+                // keep the box cut to the screen.
+                let outer = if <P::LcdB as LcdBackend>::HAS_ALPHA {
+                    *abs
+                } else {
+                    let Some(outer) = abs.intersection(&screen_rect(&ctx.lcd)) else {
+                        continue;
+                    };
+                    outer
                 };
                 if draw_bg {
                     let inset = (bw / 2) as u16;
@@ -1012,26 +1265,27 @@ fn draw_widget_body<P: Platform>(
         ctx.lcd.set_scissor(None);
     }
 
-    // Progress bar / slider fill
-    if widget.kind == KIND_PROGRESS || widget.kind == KIND_SLIDER {
+    // Value fill (progress / slider), check indicator, input and dropdown
+    // contents. Their primitives take no clip: confine them to the clip
+    // region and the box via the scissor. Without it a clipped redraw drew
+    // them over widgets in front, and over pixels it was not to touch (a
+    // shifted subtree's: the AA ends of a fill were blended twice).
+    if matches!(
+        widget.kind,
+        KIND_PROGRESS | KIND_SLIDER | KIND_CHECKBOX | KIND_RADIO | KIND_INPUT | KIND_DROPDOWN
+    ) {
         let inner = inner_rect(abs, &b);
-        draw_value_fill(&ctx.lcd, widget, &inner, ext);
-    }
-
-    // Checkbox / radio indicator
-    if widget.kind == KIND_CHECKBOX || widget.kind == KIND_RADIO {
-        let inner = inner_rect(abs, &b);
-        draw_check_indicator(&ctx.lcd, widget, &inner, ext);
-    }
-
-    // Input text + cursor
-    if widget.kind == KIND_INPUT {
-        draw_input_text(ctx, widget, abs, ext);
-    }
-
-    // Dropdown selected text + arrow
-    if widget.kind == KIND_DROPDOWN {
-        draw_dropdown(ctx, widget, abs, ext);
+        for cr in clip.iter() {
+            let Some(r) = cr.intersection(abs) else { continue };
+            ctx.lcd.set_scissor(Some(r));
+            match widget.kind {
+                KIND_PROGRESS | KIND_SLIDER => draw_value_fill(&ctx.lcd, widget, &inner, ext),
+                KIND_CHECKBOX | KIND_RADIO => draw_check_indicator(&ctx.lcd, widget, &inner, ext),
+                KIND_INPUT => draw_input_text(ctx, widget, abs, ext),
+                _ => draw_dropdown(ctx, widget, abs, ext),
+            }
+        }
+        ctx.lcd.set_scissor(None);
     }
 
     // Gauge arc. Like the shapes below, its primitives take no clip: confine
@@ -2203,7 +2457,14 @@ fn fill_gradient_rect_screen<B: LcdBackend>(
     }
 }
 
-/// Fill gradient rounded rect clipped to screen bounds.
+// The rounded helpers below draw the whole `rect` on readback backends,
+// partly off the screen or not, and let the scissor / screen cut it: the
+// corners stay where they are. Write-only backends cut the rect to the screen
+// first and round the cut rect (a corner appears at the screen edge), as
+// they always did. A widget sliding onto the screen is drawn partly off it,
+// and the renderer may later move those pixels on screen (`shift_moved`).
+
+/// Fill gradient rounded rect, clipped to the screen.
 fn fill_gradient_rounded_rect_screen<B: LcdBackend>(
     lcd: &LcdImpl<B>,
     rect: Rect,
@@ -2212,26 +2473,25 @@ fn fill_gradient_rounded_rect_screen<B: LcdBackend>(
     c2: Color,
     dir: u8,
 ) {
-    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
-        lcd.fill_gradient_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, c1, c2, dir);
-    }
+    lcd.fill_gradient_rounded_rect_at(rect.x, rect.y, rect.w, rect.h, radius, c1, c2, dir);
 }
 
-/// Draw rounded rect outline clipped to screen bounds.
+/// Draw rounded rect outline, clipped to the screen.
 fn rounded_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, radius: u16, color: Color) {
-    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
+    if B::HAS_ALPHA && radius > 0 {
+        // The same anti-aliased 1 px ring as `draw_rounded_rect`.
+        lcd.stroke_rounded_rect(rect.x, rect.y, rect.w, rect.h, radius, 1, color);
+    } else if let Some(r) = rect.intersection(&screen_rect(lcd)) {
         lcd.draw_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, color);
     }
 }
 
-/// Fill rounded rect clipped to screen bounds.
+/// Fill rounded rect, clipped to the screen.
 fn fill_rounded_rect_screen<B: LcdBackend>(lcd: &LcdImpl<B>, rect: Rect, radius: u16, color: Color) {
-    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
-        lcd.fill_rounded_rect(r.x as u16, r.y as u16, r.w, r.h, radius, color);
-    }
+    lcd.fill_rounded_rect_at(rect.x, rect.y, rect.w, rect.h, radius, color, 255);
 }
 
-/// Blend rounded rect clipped to screen bounds.
+/// Blend rounded rect, clipped to the screen.
 fn fill_rounded_rect_blend_screen<B: LcdBackend>(
     lcd: &LcdImpl<B>,
     rect: Rect,
@@ -2239,9 +2499,7 @@ fn fill_rounded_rect_blend_screen<B: LcdBackend>(
     color: Color,
     alpha: u8,
 ) {
-    if let Some(r) = rect.intersection(&screen_rect(lcd)) {
-        lcd.fill_rounded_rect_blend(r.x as u16, r.y as u16, r.w, r.h, radius, color, alpha);
-    }
+    lcd.fill_rounded_rect_at(rect.x, rect.y, rect.w, rect.h, radius, color, alpha);
 }
 
 /// Erase the area of a widget that is becoming invisible by repainting the
@@ -2433,6 +2691,7 @@ fn clear_all_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         let id = ctx.objs.dfs_at(i);
         ctx.objs.get_mut(id).clear_dirty();
     }
+    ctx.objs.clear_changed();
 }
 
 #[cfg(all(test, feature = "mock"))]
@@ -2619,5 +2878,304 @@ mod tests {
         tree.add_child(button, inner);
         let ext = &tree.ext(inner);
         assert_eq!(effective_bg(&tree, tree.get(inner), ext), 0x2C9F);
+    }
+}
+
+/// `render_dirty`'s pass 0 (`shift_moved`): the same scene animated on a
+/// backend that moves pixels and on one that cannot must give the same
+/// screen after every frame.
+#[cfg(all(test, feature = "mock"))]
+mod shift_tests {
+    use super::*;
+    use crate::backlight::BacklightImpl;
+    use crate::flash::FlashImpl;
+    use crate::font::FontList;
+    use crate::gpio::GpioImpl;
+    use crate::image::ImageList;
+    use crate::mock::*;
+    use crate::rtc::RtcImpl;
+    use crate::systick::SystickImpl;
+    use crate::types::Size;
+    use crate::usart::UsartImpl;
+    use crate::widget::KIND_BASE;
+    use alloc::vec;
+    use core::cell::{Cell, RefCell};
+
+    const S: usize = 128;
+
+    /// 128×128 RGB565 readback frame buffer; `MOVE` = it can move pixels.
+    struct Fb<const MOVE: bool> {
+        px: RefCell<Vec<u16>>,
+        /// Pixels moved so far.
+        moved: Cell<usize>,
+    }
+
+    impl<const MOVE: bool> LcdBackend for Fb<MOVE> {
+        const WIDTH: u16 = S as u16;
+        const HEIGHT: u16 = S as u16;
+        const HAS_ALPHA: bool = true;
+        const CAN_MOVE: bool = MOVE;
+        fn begin_frame(&mut self) {}
+        fn end_frame(&mut self) {}
+        fn back_buf(&self) -> u8 {
+            0
+        }
+        fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, c: u16) {
+            self.blend_rect(x, y, w, h, c, 255);
+        }
+        fn blend_rect(&self, x: u16, y: u16, w: u16, h: u16, c: u16, a: u8) {
+            let mut px = self.px.borrow_mut();
+            for yy in y as usize..(y as usize + h as usize).min(S) {
+                for xx in x as usize..(x as usize + w as usize).min(S) {
+                    let p = &mut px[yy * S + xx];
+                    *p = lcd::lerp_rgb565(*p, c, a as u16, 255);
+                }
+            }
+        }
+        fn blend_pixel(&self, x: u16, y: u16, c: u16, a: u8) {
+            self.blend_rect(x, y, 1, 1, c, a);
+        }
+        fn begin_pixels(&self, _: u16, _: u16, _: u16, _: u16) {}
+        fn write_pixel(&self, _: u16) {}
+        fn send_command(&self, _: u16) {}
+        fn send_data(&self, _: u16) {}
+        fn move_rects(&self, rects: &[Rect], dx: i16, dy: i16) -> bool {
+            let before = self.px.borrow().clone();
+            let mut px = self.px.borrow_mut();
+            for r in rects {
+                for y in r.y..r.bottom() {
+                    for x in r.x..r.right() {
+                        px[(y + dy) as usize * S + (x + dx) as usize] = before[y as usize * S + x as usize];
+                    }
+                }
+                self.moved.set(self.moved.get() + r.w as usize * r.h as usize);
+            }
+            true
+        }
+    }
+
+    struct Plat<const MOVE: bool>;
+    impl<const MOVE: bool> Platform for Plat<MOVE> {
+        type LcdB = Fb<MOVE>;
+        type FlashB = MockFlash;
+        type TouchB = MockTouch;
+        type BacklightB = MockBacklight;
+        type RtcB = MockRtc;
+        type UsartB = MockUsart;
+        type SystickB = MockSystick;
+        #[cfg(feature = "audio")]
+        type AudioB = crate::audio::NoAudio;
+        #[cfg(feature = "jpeg")]
+        type JpegB = crate::jpeg::NoJpeg;
+        type GpioB = MockGpio;
+        type EepromB = MockEeprom;
+        type Renderer = crate::renderer::DefaultRenderer;
+    }
+
+    fn ctx<const MOVE: bool>() -> Ctx<Plat<MOVE>> {
+        Ctx {
+            lcd: LcdImpl::with_backend(Fb { px: RefCell::new(vec![0; S * S]), moved: Cell::new(0) }),
+            flash: FlashImpl::with_backend(MockFlash),
+            fonts: FontList::new(),
+            images: ImageList::new(),
+            objs: ObjPool::new(),
+            fs: None,
+            backlight: BacklightImpl::with_backend(MockBacklight),
+            rtc: RtcImpl::with_backend(MockRtc),
+            usart: UsartImpl::with_backend(MockUsart),
+            systick: SystickImpl::init(),
+            #[cfg(feature = "audio")]
+            audio: crate::audio::AudioImpl::none(),
+            #[cfg(feature = "jpeg")]
+            jpeg: crate::jpeg::JpegImpl::none(),
+            gpio: GpioImpl::with_backend(MockGpio::default()),
+            eeprom: crate::eeprom::EepromImpl::with_backend(MockEeprom::default()),
+            cursor_visible: false,
+            #[cfg(feature = "multi_program")]
+            tasks: crate::task::TaskTable::new(),
+        }
+    }
+
+    fn rect(objs: &mut ObjPool, parent: WidgetId, r: Rect, bg: u16, radius: u16, alpha: u8) -> WidgetId {
+        let id = objs.alloc_widget().unwrap();
+        objs.add_child(parent, id);
+        let w = objs.get_mut(id);
+        w.kind = KIND_BASE;
+        w.location = Offset { x: r.x, y: r.y };
+        w.size = Size { w: r.w, h: r.h };
+        w.background_color = bg;
+        objs.update_ext(id, |e| {
+            e.border_radius = radius;
+            e.alpha = alpha;
+        });
+        id
+    }
+
+    /// Wallpaper-ish backdrop, a rounded opaque panel with an outline and
+    /// see-through contents, and two widgets in front of its path. Returns
+    /// (panel, front).
+    fn scene<const MOVE: bool>(ctx: &mut Ctx<Plat<MOVE>>) -> (WidgetId, WidgetId) {
+        let o = &mut ctx.objs;
+        let root = o.alloc_widget().unwrap();
+        o.root = root;
+        o.get_mut(root).size = Size { w: S as u16, h: S as u16 };
+        o.get_mut(root).background_color = 0x1082;
+        rect(o, root, Rect::new(-10, 40, 90, 90), 0xF81F, 45, 90);
+        rect(o, root, Rect::new(70, -20, 70, 60), 0x07E0, 20, 60);
+        let panel = rect(o, root, Rect::new(20, 30, 60, 40), 0x39E7, 8, 255);
+        o.update_ext(panel, |e| e.border = Edges { top: 2, right: 2, bottom: 2, left: 2 });
+        o.get_mut(panel).border_color = 0xFFE0;
+        rect(o, panel, Rect::new(5, 5, 20, 10), 0x001F, 0, 255);
+        rect(o, panel, Rect::new(30, 4, 22, 22), 0xF800, 6, 128);
+        rect(o, panel, Rect::new(8, 20, 40, 12), 0x07FF, 5, 200);
+        // A rounded value fill (drawn by `draw_value_fill`).
+        let bar = rect(o, panel, Rect::new(3, 31, 50, 6), 0x2104, 3, 255);
+        o.get_mut(bar).kind = crate::widget::KIND_PROGRESS;
+        o.update_ext(bar, |e| {
+            e.press_color = 0x8DBF;
+            e.value = 60;
+        });
+        let front = rect(o, root, Rect::new(55, 60, 20, 18), 0xFFFF, 0, 255);
+        rect(o, root, Rect::new(0, 100, 40, 20), 0x8410, 7, 150);
+        (panel, front)
+    }
+
+    fn move_to<const MOVE: bool>(ctx: &mut Ctx<Plat<MOVE>>, id: WidgetId, x: i16, y: i16) {
+        ctx.objs.will_move(id);
+        ctx.objs.get_mut(id).location = Offset { x, y };
+        ctx.objs.mark_moved(id);
+    }
+
+    #[test]
+    fn shifted_panel_matches_redrawn_panel() {
+        let mut a = ctx::<true>();
+        let mut b = ctx::<false>();
+        let (panel, front) = scene(&mut a);
+        let _ = scene(&mut b);
+        render_all(&mut a);
+        render_all(&mut b);
+        // Down, right, diagonally, partly off each edge, under the widget in
+        // front, then back.
+        let path = [(20, 34), (26, 34), (14, 22), (-25, 22), (-25, -15), (80, 100), (90, 70), (40, 50), (20, 30)];
+        let mut last_moved = 0;
+        let mut shifted_frames = 0;
+        for (step, &(x, y)) in path.iter().enumerate() {
+            move_to(&mut a, panel, x, y);
+            move_to(&mut b, panel, x, y);
+            if step == 6 {
+                // A frame where the panel also changes: drawn the full way.
+                for c in [&mut a.objs, &mut b.objs] {
+                    c.get_mut(panel).background_color = 0x2945;
+                    c.mark_dirty(panel);
+                }
+            }
+            if step == 7 {
+                // Something in front changes in the same frame.
+                for c in [&mut a.objs, &mut b.objs] {
+                    c.get_mut(front).background_color = 0xFD20;
+                    c.mark_dirty(front);
+                }
+            }
+            render_dirty(&mut a);
+            render_dirty(&mut b);
+            let (pa, pb) = (a.lcd.backend().px.borrow(), b.lcd.backend().px.borrow());
+            for i in 0..S * S {
+                assert!(pa[i] == pb[i], "step {step} ({x}, {y}): pixel ({}, {}) {:04x} vs {:04x}", i % S, i / S, pa[i], pb[i]);
+            }
+            let moved = a.lcd.backend().moved.get();
+            if step == 6 {
+                assert_eq!(moved, last_moved, "a changed panel must not be shifted");
+            }
+            if moved > last_moved {
+                shifted_frames += 1;
+            }
+            last_moved = moved;
+        }
+        assert!(b.lcd.backend().moved.get() == 0);
+        assert!(shifted_frames >= 6, "only {shifted_frames} frames shifted");
+    }
+
+    /// Two see-through widgets moving in the same frame (clock hands): the
+    /// earlier one leaves the later one's box out of its clip, so the later
+    /// one must restore behind its new box even though pass 1b put back what
+    /// was behind its old box. It used to skip that, and the earlier widget
+    /// was missing where the later one's new box left its old one.
+    #[test]
+    fn overlapping_see_through_widgets_moving_together() {
+        let build = |a: Rect, b: Rect| {
+            let mut c = ctx::<false>();
+            let o = &mut c.objs;
+            let root = o.alloc_widget().unwrap();
+            o.root = root;
+            o.get_mut(root).size = Size { w: S as u16, h: S as u16 };
+            o.get_mut(root).background_color = 0x1082;
+            let wa = rect(o, root, a, 0xFFFF, 0, 200);
+            let wb = rect(o, root, b, 0xF800, 0, 200);
+            (c, wa, wb)
+        };
+        let (a0, b0) = (Rect::new(20, 20, 40, 60), Rect::new(10, 44, 80, 6));
+        let (a1, b1) = (Rect::new(21, 20, 40, 60), Rect::new(10, 36, 80, 14));
+        let (mut c, wa, wb) = build(a0, b0);
+        render_all(&mut c);
+        for (id, r) in [(wa, a1), (wb, b1)] {
+            c.objs.will_move(id);
+            let w = c.objs.get_mut(id);
+            w.location = Offset { x: r.x, y: r.y };
+            w.size = Size { w: r.w, h: r.h };
+            c.objs.mark_dirty(id);
+        }
+        render_dirty(&mut c);
+        let (mut want, _, _) = build(a1, b1);
+        render_all(&mut want);
+        let (got, want) = (c.lcd.backend().px.borrow(), want.lcd.backend().px.borrow());
+        for i in 0..S * S {
+            assert!(got[i] == want[i], "pixel ({}, {}) {:04x} vs {:04x}", i % S, i / S, got[i], want[i]);
+        }
+    }
+
+    #[test]
+    fn rounded_box_partly_off_screen_keeps_its_shape() {
+        // A rounded, bordered, gradient-filled box over a plain background,
+        // drawn whole and with its left 30 px off the screen.
+        let draw = |x: i16| {
+            let mut c = ctx::<false>();
+            let o = &mut c.objs;
+            let root = o.alloc_widget().unwrap();
+            o.root = root;
+            o.get_mut(root).size = Size { w: S as u16, h: S as u16 };
+            o.get_mut(root).background_color = 0x1082;
+            let b = rect(o, root, Rect::new(x, 20, 70, 50), 0x39E7, 12, 255);
+            o.update_ext(b, |e| {
+                e.border = Edges { top: 3, right: 3, bottom: 3, left: 3 };
+                e.gradient_color = 0xF800;
+                e.gradient_dir = 1;
+            });
+            o.get_mut(b).border_color = 0xFFE0;
+            render_all(&mut c);
+            c.lcd.backend().px.borrow().clone()
+        };
+        let (whole, cut) = (draw(40), draw(-30));
+        for y in 0..S {
+            for lx in 30..70 {
+                let (a, b) = (whole[y * S + 40 + lx], cut[y * S + lx - 30]);
+                assert!(a == b, "box column {lx}, row {y}: {a:04x} vs {b:04x}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_shifted_after_drawing_outside_the_renderer() {
+        let mut a = ctx::<true>();
+        let (panel, _) = scene(&mut a);
+        render_all(&mut a);
+        // A VM drawing builtin drew over the screen.
+        a.objs.screen_touched();
+        move_to(&mut a, panel, 24, 30);
+        render_dirty(&mut a);
+        assert_eq!(a.lcd.backend().moved.get(), 0);
+        // The next frame may shift again.
+        move_to(&mut a, panel, 28, 30);
+        render_dirty(&mut a);
+        assert!(a.lcd.backend().moved.get() > 0);
     }
 }

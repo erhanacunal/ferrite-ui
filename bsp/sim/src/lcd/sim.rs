@@ -4,6 +4,7 @@ use std::vec;
 use std::vec::Vec;
 
 use super::{HEIGHT, LcdBackend, WIDTH};
+use ferrite_core::types::Rect;
 
 /// Two 32-bit ARGB (0xAARRGGBB) framebuffers with hardware-style front/back
 /// indices, so the double-buffered ("buffered") render mode runs on the host
@@ -133,6 +134,37 @@ impl LcdBackend for SimLcd {
     // the Nextion instead (no blending; underlay anti-aliasing).
     const HAS_ALPHA: bool = !cfg!(feature = "no-readback");
     const AA_UNDERLAY: bool = cfg!(feature = "no-readback");
+    // Moving pixels needs readback too.
+    const CAN_MOVE: bool = !cfg!(feature = "no-readback");
+
+    fn move_rects(&self, rects: &[Rect], dx: i16, dy: i16) -> bool {
+        // `FERRITE_SIM_NO_MOVE=1`: redraw instead (A/B against the shift).
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("FERRITE_SIM_NO_MOVE").is_some()) {
+            return false;
+        }
+        let mut fb = self.fb.draw();
+        let stride = WIDTH as usize;
+        // All read before any is written: a destination may overlap any
+        // source.
+        let mut saved = Vec::new();
+        for r in rects {
+            for y in r.y..r.bottom() {
+                let row = y as usize * stride;
+                saved.extend_from_slice(&fb[row + r.x as usize..row + r.right() as usize]);
+            }
+        }
+        let mut at = 0;
+        for r in rects {
+            for y in r.y..r.bottom() {
+                let row = (y + dy) as usize * stride + (r.x + dx) as usize;
+                fb[row..row + r.w as usize].copy_from_slice(&saved[at..at + r.w as usize]);
+                at += r.w as usize;
+            }
+        }
+        true
+    }
+
     fn begin_frame(&mut self) {
         self.fb.begin();
     }

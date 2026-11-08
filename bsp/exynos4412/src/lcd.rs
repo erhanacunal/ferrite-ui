@@ -73,6 +73,7 @@ use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::{cpu, mmu, smp, soc};
 use ferrite_core::fb;
 use ferrite_core::lcd::LcdBackend;
+use ferrite_core::types::Rect as UiRect;
 
 use crate::systick;
 
@@ -371,6 +372,17 @@ const POLL_LIMIT: u32 = 10_000_000;
 
 /// Times a pixel primitive for the profiler (`perf`: the `PIXELS` row),
 /// after its `fence`, so display waits stay in their own row.
+/// Counts `px` pixels the CPU blended on the screen (not into a sprite) for
+/// the profiler (`CPU_BLEND_KPX`).
+macro_rules! cpu_blend {
+    ($t:expr, $px:expr) => {{
+        #[cfg(feature = "perf")]
+        if !$t.sprite {
+            crate::perf::add_px(ferrite_core::perf::count::CPU_BLEND_KPX, $px);
+        }
+    }};
+}
+
 macro_rules! timed {
     ($body:block) => {{
         #[cfg(feature = "perf")]
@@ -419,6 +431,16 @@ fn wait_rows(y0: usize, y1: usize) {
     }
     #[cfg(feature = "perf")]
     crate::perf::add_wait(crate::perf::cycles().wrapping_sub(t0));
+}
+
+/// Whether drawing now would reach the screen any sooner
+/// (`PlatformRuntime::render_due`): false while something drawn since the
+/// last present is waiting for a present still in flight (copying, or
+/// copied and waiting for the scan-out switch). `flush` hands it over once
+/// that present is done; drawing more meanwhile is wasted.
+pub fn render_due() -> bool {
+    let nothing_waits = unsafe { is_empty(&*(&raw const DIRTY)) };
+    nothing_waits || STATE.load(Ordering::Acquire) == IDLE
 }
 
 /// Shows what was drawn since the last flush. With the presenter on CPU2:
@@ -899,6 +921,11 @@ impl LcdBackend for FimdLcd {
     // DRAM framebuffer: read-modify-write blending (full anti-aliasing).
     // Mirror in tools/devices/exynos4412.json caps.alpha.
     const HAS_ALPHA: bool = true;
+    // `move_rects`: the G2D through the scratch surface, else the CPU.
+    const CAN_MOVE: bool = true;
+    // Each moved rect costs two G2D copies (~5 µs setup each): small boxes
+    // are redrawn instead.
+    const MOVE_MIN_PX: u32 = 128 * 128;
 
     fn begin_frame(&mut self) {
         unsafe { IN_FRAME = true };
@@ -992,6 +1019,28 @@ impl LcdBackend for FimdLcd {
     fn send_command(&self, _cmd: u16) {}
     fn send_data(&self, _data: u16) {}
 
+    fn move_rects(&self, rects: &[UiRect], dx: i16, dy: i16) -> bool {
+        // The caller (`LcdImpl::move_rects`) checked that every source and
+        // destination is inside the screen.
+        if unsafe { (*(&raw const SPRITE)).is_some() } || rects.is_empty() {
+            return false;
+        }
+        let rs = rects.iter().map(|r| (r.x as usize, r.y as usize, r.w as usize, r.h as usize));
+        let (dx, dy) = (dx as isize, dy as isize);
+        let to = |x: usize, y: usize| (x.wrapping_add_signed(dx), y.wrapping_add_signed(dy));
+        #[cfg(feature = "g2d_render")]
+        for way in [Moved::Bands, Moved::Buffered] {
+            match g2d_move(way, rects, dx as i16, dy as i16) {
+                Moved::Done => return true,
+                // Sources may be overwritten already: no other way can
+                // finish it (the caller redraws instead).
+                Moved::Partly => return false,
+                _ => {}
+            }
+        }
+        cpu_move(rs, to)
+    }
+
     fn blend_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16, alpha: u8) {
         if alpha == 255 {
             return self.fill_rect(x, y, w, h, color);
@@ -1007,6 +1056,7 @@ impl LcdBackend for FimdLcd {
             return;
         }
         t.fence(y, y + h);
+        cpu_blend!(t, w * h);
         timed!({
             for r in y..y + h {
                 let px = unsafe { t.row(x, r, w) };
@@ -1030,6 +1080,7 @@ impl LcdBackend for FimdLcd {
             return;
         }
         t.fence(y, y + 1);
+        cpu_blend!(t, 1);
         timed!({
             let p = unsafe { &mut t.row(x, y, 1)[0] };
             let src = rgb565_to_xrgb(color);
@@ -1044,6 +1095,7 @@ impl LcdBackend for FimdLcd {
         let t = target();
         let Some((x, y, w, _)) = t.clip(x, y, alphas.len() as u16, 1) else { return };
         t.fence(y, y + 1);
+        cpu_blend!(t, w);
         timed!({
             let src = rgb565_to_xrgb(color);
             for (p, &a) in unsafe { t.row(x, y, w) }.iter_mut().zip(alphas) {
@@ -1062,6 +1114,7 @@ impl LcdBackend for FimdLcd {
         let n = colors.len().min(alphas.len());
         let Some((x, y, w, _)) = t.clip(x, y, n as u16, 1) else { return };
         t.fence(y, y + 1);
+        cpu_blend!(t, w);
         timed!({
             let px = unsafe { t.row(x, y, w) };
             for ((p, &c), &a) in px.iter_mut().zip(colors).zip(alphas) {
@@ -1136,10 +1189,25 @@ fn g2d_give_up() {
 /// this operation's end. False if G2D drawing is off or the operation failed
 /// (then the caller draws with the CPU).
 #[cfg(feature = "g2d_render")]
-fn g2d_op(what: &str, op: impl FnOnce(&G2d) -> Result<(), g2d::Error>) -> bool {
+fn g2d_op(what: &str, px: usize, op: impl FnOnce(&G2d) -> Result<(), g2d::Error>) -> bool {
     if !G2D_DRAW.load(Ordering::Relaxed) {
         return false;
     }
+    #[cfg(feature = "perf")]
+    let t0 = crate::perf::cycles();
+    let ok = g2d_op_inner(what, op);
+    #[cfg(feature = "perf")]
+    {
+        ferrite_core::perf::add_sub(ferrite_core::perf::phase::G2D, crate::perf::cycles().wrapping_sub(t0));
+        crate::perf::add_px(ferrite_core::perf::count::G2D_KPX, px);
+    }
+    #[cfg(not(feature = "perf"))]
+    let _ = px;
+    ok
+}
+
+#[cfg(feature = "g2d_render")]
+fn g2d_op_inner(what: &str, op: impl FnOnce(&G2d) -> Result<(), g2d::Error>) -> bool {
     if STATE.load(Ordering::Acquire) == COPY {
         // Rows 0..H: until the copy has ended.
         wait_rows(0, H);
@@ -1188,7 +1256,7 @@ fn g2d_op(what: &str, op: impl FnOnce(&G2d) -> Result<(), g2d::Error>) -> bool {
 /// Fills a shadow rect (clipped to the screen) with XRGB `c` by the G2D.
 #[cfg(feature = "g2d_render")]
 fn g2d_fill(x: usize, y: usize, w: usize, h: usize, c: u32) -> bool {
-    let ok = g2d_op("fill", |g| g.fill(&shadow_surface(), g2d::Rect::new(x, y, w, h), c));
+    let ok = g2d_op("fill", w * h, |g| g.fill(&shadow_surface(), g2d::Rect::new(x, y, w, h), c));
     if ok {
         mark(x, y, w, h);
     }
@@ -1251,12 +1319,12 @@ fn g2d_blend_color(x: usize, y: usize, w: usize, h: usize, src: u32, alpha: u8) 
         // Fill what this blend and the last ones need.
         let (fw, fh) = if sc.color == pixel { (sc.w.max(w), sc.h.max(h)) } else { (w, h) };
         sc.w = 0;
-        if !g2d_op("scratch fill", |g| g.fill(&surface, g2d::Rect::new(0, 0, fw, fh), pixel)) {
+        if !g2d_op("scratch fill", fw * fh, |g| g.fill(&surface, g2d::Rect::new(0, 0, fw, fh), pixel)) {
             return false;
         }
         (sc.color, sc.w, sc.h) = (pixel, fw, fh);
     }
-    let ok = g2d_op("colour blend", |g| {
+    let ok = g2d_op("colour blend", w * h, |g| {
         let (from, to) = (g2d::Rect::new(0, 0, w, h), g2d::Rect::new(x, y, w, h));
         g.blend(&surface, from, Alpha::Premultiplied, &shadow_surface(), to, Filter::Nearest, 255)
     });
@@ -1286,7 +1354,7 @@ pub fn blit_sprite(
     #[cfg(feature = "g2d_render")]
     {
         let sprite = Surface { address: px as usize, stride: stride * 4, width: sw, height: sh, format: Format::Argb8888 };
-        let ok = g2d_op("sprite blit", |g| {
+        let ok = g2d_op("sprite blit", w * h, |g| {
             let (from, to) = (g2d::Rect::new(sx, sy, w, h), g2d::Rect::new(dx, dy, w, h));
             g.blend(&sprite, from, Alpha::Premultiplied, &shadow_surface(), to, Filter::Nearest, 255)
         });
@@ -1300,6 +1368,220 @@ pub fn blit_sprite(
         let _ = (px, sw, sh, stride, sx, sy, dx, dy, w, h);
         false
     }
+}
+
+/// Copies `w` × `h` pixels of an opaque RGB565 picture (`addr`, a physical
+/// address, `sw` × `sh`, rows of `sw` pixels; whole cache lines cleaned by
+/// the caller) from (`sx`, `sy`) to the shadow at (`dx`, `dy`), by the G2D,
+/// expanding to XRGB8888 like [`rgb565_to_xrgb`]. The rect must be inside
+/// both. False if the G2D did not draw it (off, or it expands 565
+/// differently: [`g2d_565_matches`]).
+#[allow(clippy::too_many_arguments)]
+pub fn copy_rgb565(addr: usize, sw: usize, sh: usize, sx: usize, sy: usize, dx: usize, dy: usize, w: usize, h: usize) -> bool {
+    #[cfg(feature = "g2d_render")]
+    {
+        if !g2d_565_matches() {
+            return false;
+        }
+        let picture = Surface { address: addr, stride: sw * 2, width: sw, height: sh, format: Format::Rgb565 };
+        let ok = g2d_op("picture copy", w * h, |g| {
+            let (from, to) = (g2d::Rect::new(sx, sy, w, h), g2d::Rect::new(dx, dy, w, h));
+            g.copy(&picture, from, &shadow_surface(), to, Filter::Nearest)
+        });
+        if ok {
+            mark(dx, dy, w, h);
+            #[cfg(feature = "perf")]
+            ferrite_core::perf::add_count(ferrite_core::perf::count::PICTURE_COPIES, 1);
+        }
+        ok
+    }
+    #[cfg(not(feature = "g2d_render"))]
+    {
+        let _ = (addr, sw, sh, sx, sy, dx, dy, w, h);
+        false
+    }
+}
+
+/// Most pieces a banded [`g2d_move`] copies one by one (each costs a G2D
+/// setup of ~5 µs; a move by a few pixels goes through the scratch surface
+/// instead).
+#[cfg(feature = "g2d_render")]
+const MOVE_BANDS_MAX: usize = 64;
+
+/// How [`g2d_move`] moves (`Bands`, `Buffered`) and how it went.
+#[cfg(feature = "g2d_render")]
+#[derive(Clone, Copy, PartialEq)]
+enum Moved {
+    /// Straight from source to destination, in bands that never overwrite a
+    /// source not copied yet ([`ferrite_core::lcd::move_bands`]): half the
+    /// pixel traffic of `Buffered`.
+    Bands,
+    /// Every source into the scratch surface (at its own position; the
+    /// rects don't overlap), then every one from there to its destination.
+    Buffered,
+    /// Done.
+    Done,
+    /// Not tried (G2D drawing off, too many bands, no scratch surface):
+    /// nothing written.
+    NotTried,
+    /// An operation failed after a destination was written: some sources
+    /// may be overwritten.
+    Partly,
+}
+
+/// Moves shadow rects by (`dx`, `dy`) by the G2D, the `way` way.
+#[cfg(feature = "g2d_render")]
+fn g2d_move(way: Moved, rects: &[UiRect], dx: i16, dy: i16) -> Moved {
+    if !G2D_DRAW.load(Ordering::Relaxed) {
+        return Moved::NotTried;
+    }
+    let shadow = shadow_surface();
+    // One G2D copy of `r` from `src` to `dst` at (`tx`, `ty`).
+    let copy = |what: &str, src: &Surface, r: &UiRect, dst: &Surface, tx: usize, ty: usize| {
+        let (x, y, w, h) = (r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+        #[cfg(feature = "perf")]
+        ferrite_core::perf::add_count(ferrite_core::perf::count::MOVE_OPS, 1);
+        let (from, to) = (g2d::Rect::new(x, y, w, h), g2d::Rect::new(tx, ty, w, h));
+        g2d_op(what, w * h, |g| g.copy(src, from, dst, to, Filter::Nearest))
+    };
+    let dest = |r: &UiRect| ((r.x + dx) as usize, (r.y + dy) as usize);
+    match way {
+        Moved::Bands => {
+            let Some(bands) = ferrite_core::lcd::move_bands(rects, dx, dy, MOVE_BANDS_MAX) else {
+                return Moved::NotTried;
+            };
+            for (i, b) in bands.iter().enumerate() {
+                let (tx, ty) = dest(b);
+                // The first band's destination covers no source (it is the
+                // furthest along the move): failing there loses nothing.
+                if !copy("move", &shadow, b, &shadow, tx, ty) {
+                    return if i == 0 { Moved::NotTried } else { Moved::Partly };
+                }
+                mark(tx, ty, b.w as usize, b.h as usize);
+            }
+            Moved::Done
+        }
+        _ => {
+            let Some(sc) = scratch() else { return Moved::NotTried };
+            // Its colour is overwritten: the next colour blend fills it again.
+            sc.w = 0;
+            let tmp = Surface { address: sc.base, stride: W * 4, width: W, height: H, format: Format::Xrgb8888 };
+            for r in rects {
+                if !copy("move read", &shadow, r, &tmp, r.x as usize, r.y as usize) {
+                    return Moved::NotTried;
+                }
+            }
+            for r in rects {
+                let (tx, ty) = dest(r);
+                // Even the first write may cover another rect's source (a
+                // failed or timed-out copy may have written part of it):
+                // the CPU must not read the shadow after it.
+                if !copy("move write", &tmp, r, &shadow, tx, ty) {
+                    return Moved::Partly;
+                }
+                mark(tx, ty, r.w as usize, r.h as usize);
+            }
+            Moved::Done
+        }
+    }
+}
+
+/// Source pixels of [`cpu_move`], kept between frames (a drawer slide moves
+/// up to a screen per frame).
+static mut MOVE_BUF: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+
+/// [`FimdLcd::move_rects`] by the CPU: every source row into `MOVE_BUF`,
+/// then out to the destinations. False if the buffer can't be allocated.
+fn cpu_move(
+    rects: impl Iterator<Item = (usize, usize, usize, usize)> + Clone,
+    to: impl Fn(usize, usize) -> (usize, usize),
+) -> bool {
+    // SAFETY: CPU0 only, outside interrupts.
+    let buf = unsafe { &mut *(&raw mut MOVE_BUF) };
+    let total: usize = rects.clone().map(|(_, _, w, h)| w * h).sum();
+    buf.clear();
+    if buf.try_reserve(total).is_err() {
+        return false;
+    }
+    let px = back();
+    timed!({
+        for (x, y, w, h) in rects.clone() {
+            for r in y..y + h {
+                // SAFETY: inside the shadow (checked by the caller).
+                buf.extend_from_slice(unsafe { core::slice::from_raw_parts(px.add(r * W + x), w) });
+            }
+        }
+        let mut at = 0;
+        for (x, y, w, h) in rects {
+            let (tx, ty) = to(x, y);
+            fence(ty, ty + h);
+            for r in 0..h {
+                // SAFETY: the destination is inside the shadow; `buf` is
+                // not part of it.
+                unsafe { copy_row(buf.as_ptr().add(at), px.add((ty + r) * W + tx), w) };
+                at += w;
+            }
+            mark(tx, ty, w, h);
+        }
+    });
+    true
+}
+
+/// 0 = not checked yet, 1 = the G2D's RGB565 expansion matches the CPU's,
+/// 2 = it does not (pictures are drawn by the CPU).
+#[cfg(feature = "g2d_render")]
+static G2D_565: AtomicU8 = AtomicU8::new(0);
+
+/// Whether a G2D copy from RGB565 gives exactly [`rgb565_to_xrgb`]'s
+/// pixels, checked once on every level of each channel: a picture is drawn
+/// partly by the G2D and partly by the CPU (when it is off), and the two
+/// must not show a seam.
+#[cfg(feature = "g2d_render")]
+fn g2d_565_matches() -> bool {
+    match G2D_565.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    #[repr(C, align(64))]
+    struct Lines<T>(T);
+    const N: usize = 64;
+    // Every red and blue level (5 bits) with every green level (6 bits),
+    // and the extremes.
+    static mut SRC: Lines<[u16; N]> = Lines([0; N]);
+    static mut DST: Lines<[u32; N]> = Lines([0; N]);
+    // SAFETY: CPU0 only, never reentrant; the G2D is the only other user,
+    // inside `g2d_op` below.
+    let (src, dst) = unsafe { (&mut (*(&raw mut SRC)).0, &mut (*(&raw mut DST)).0) };
+    for (i, p) in src.iter_mut().enumerate() {
+        let (r, g, b) = ((i % 32) as u16, i as u16, (31 - i % 32) as u16);
+        *p = r << 11 | g << 5 | b;
+    }
+    dst.fill(0);
+    mmu::clean_dcache_range(src.as_ptr() as usize, N * 2);
+    mmu::clean_dcache_range(dst.as_ptr() as usize, N * 4);
+    mmu::invalidate_dcache_range(dst.as_ptr() as usize, N * 4);
+    let from = Surface { address: src.as_ptr() as usize, stride: N * 2, width: N, height: 1, format: Format::Rgb565 };
+    let to = Surface { address: dst.as_ptr() as usize, stride: N * 4, width: N, height: 1, format: Format::Xrgb8888 };
+    let ok = g2d_op("565 check", N, |g| g.copy(&from, g2d::Rect::all(&from), &to, g2d::Rect::all(&to), Filter::Nearest));
+    if !ok {
+        // G2D drawing went off: nothing decided about the expansion.
+        return false;
+    }
+    mmu::invalidate_dcache_range(dst.as_ptr() as usize, N * 4);
+    // SAFETY: read after the G2D's writes (the op waited for its end).
+    let got = |i: usize| unsafe { core::ptr::read_volatile(dst.as_ptr().add(i)) };
+    let bad = (0..N).find(|&i| got(i) != rgb565_to_xrgb(src[i]));
+    if let Some(i) = bad {
+        exynos_4412_rs::println!(
+            "ferrite: G2D RGB565 expansion differs ({:04x} -> {:08x}, CPU {:08x}): pictures drawn by the CPU",
+            src[i],
+            got(i),
+            rgb565_to_xrgb(src[i])
+        );
+    }
+    G2D_565.store(if bad.is_none() { 1 } else { 2 }, Ordering::Relaxed);
+    bad.is_none()
 }
 
 /// Powers the FIMD, starts it on scan buffer A and turns on LVDS + backlight.

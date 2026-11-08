@@ -760,9 +760,23 @@ impl<B: LcdBackend> LcdImpl<B> {
         let reach = (main.ra.max(main.ra + main.dr) + 128 + 255) >> 8;
         let (ax, ay) = (main.ax, main.ay);
         let (bx, by) = (ax + main.ux, ay + main.uy);
-        let (x0, x1) = (ax.min(bx) - reach, ax.max(bx) + reach);
-        let (y0, y1) = (ay.min(by) - reach, ay.max(by) + reach);
+        let (mut x0, mut x1) = (ax.min(bx) - reach, ax.max(bx) + reach);
+        let (mut y0, mut y1) = (ay.min(by) - reach, ay.max(by) + reach);
         let ys = if ax * 256 - main.ra <= bx * 256 - (main.ra + main.dr) { ay } else { by };
+        // Each pixel's coverage and owner depend only on the pixel: rows and
+        // columns outside the scissor draw nothing, so they are not
+        // evaluated (a restore repaints a clock hand's outline through small
+        // clip rects). Skipped rows only leave `xs` further left: still a
+        // valid start.
+        if let Some(sc) = self.scissor() {
+            x0 = x0.max(sc.x as i32);
+            x1 = x1.min(sc.right() as i32 - 1);
+            y0 = y0.max(sc.y as i32);
+            y1 = y1.min(sc.bottom() as i32 - 1);
+            if x1 < x0 || y1 < y0 {
+                return;
+            }
+        }
         let owned = |px: i32, py: i32, c: i32| {
             nbrs.iter().all(|(n, before)| {
                 let cn = n.cov(px, py);
@@ -805,11 +819,11 @@ impl<B: LcdBackend> LcdImpl<B> {
             }
         };
         let mut xs = x0;
-        for py in ys..=y1 {
+        for py in ys.max(y0)..=y1 {
             scan(py, &mut xs);
         }
         let mut xs = x0;
-        for py in (y0..ys).rev() {
+        for py in (y0..ys.min(y1 + 1)).rev() {
             scan(py, &mut xs);
         }
     }
@@ -923,7 +937,8 @@ impl Stroke {
 /// the edge sweeps in it; a running sum along the row then yields the
 /// covered fraction of every pixel. Contributions left of `left` fold into
 /// index 0 (exact for a prefix sum); those right of the row are dropped.
-fn accumulate_edge(acc: &mut [f32], left: i32, y: f32, p0: (f32, f32), p1: (f32, f32)) {
+/// Widens `touched` (inclusive index range) to the entries it changed.
+fn accumulate_edge(acc: &mut [f32], left: i32, y: f32, p0: (f32, f32), p1: (f32, f32), touched: &mut (usize, usize)) {
     let (p0, p1, dir) = if p0.1 < p1.1 { (p0, p1, 1.0) } else { (p1, p0, -1.0) };
     let top = p0.1.max(y);
     let bot = p1.1.min(y + 1.0);
@@ -939,6 +954,8 @@ fn accumulate_edge(acc: &mut [f32], left: i32, y: f32, p0: (f32, f32), p1: (f32,
         let i = (xi - left).max(0) as usize;
         if i < acc.len() {
             acc[i] += v;
+            touched.0 = touched.0.min(i);
+            touched.1 = touched.1.max(i);
         }
     };
     let x0f = libm::floorf(x0);
@@ -989,9 +1006,21 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
         // Rows/columns limited to the screen; edges left of it still count.
         let left = x_min.max(0);
-        let right = x_max.min(self.width() as i32 - 1);
-        let (top, bottom) = (y_min.max(0), y_max.min(self.height() as i32 - 1));
-        if right < left || bottom < top {
+        let mut right = x_max.min(self.width() as i32 - 1);
+        let (mut top, mut bottom) = (y_min.max(0), y_max.min(self.height() as i32 - 1));
+        // Rows outside the scissor and columns right of it draw nothing:
+        // skip them (a restore repaints a clock hand through small clip
+        // rects; each used to rasterize the whole hand). Columns left of it
+        // still accumulate (the coverage sum runs from the left) but are not
+        // evaluated.
+        let mut first = left;
+        if let Some(sc) = self.scissor() {
+            top = top.max(sc.y as i32);
+            bottom = bottom.min(sc.bottom() as i32 - 1);
+            right = right.min(sc.right() as i32 - 1);
+            first = first.max(sc.x as i32);
+        }
+        if right < left || bottom < top || right < first {
             return true;
         }
         let len = (right - left + 1) as usize;
@@ -1002,30 +1031,61 @@ impl<B: LcdBackend> LcdImpl<B> {
         acc.resize(len, 0.0);
         let at = |i: usize| (points[i].x as f32 + 0.5, points[i].y as f32 + 0.5);
 
+        // Only the entries an edge touched are non-zero (the buffer is
+        // cleared as it is read): between them the coverage stays the same,
+        // so it is only re-evaluated where an edge added something. A thin
+        // diagonal clock hand used to cost its whole bounding box per row.
         for y in top..=bottom {
-            acc.fill(0.0);
+            let mut touched = (usize::MAX, 0usize);
             for i in 0..points.len() {
                 let j = if i + 1 == points.len() { 0 } else { i + 1 };
-                accumulate_edge(&mut acc, left, y as f32, at(i), at(j));
+                accumulate_edge(&mut acc, left, y as f32, at(i), at(j), &mut touched);
+            }
+            if touched.0 > touched.1 {
+                continue;
             }
             let mut sum = 0.0f32;
+            let mut a = 0i32;
             let mut run: Option<i32> = None;
-            for (i, v) in acc.iter().enumerate() {
-                sum += v;
-                // Even-odd: winding w → coverage |w| folded into 0..1..0.
-                let w = libm::fabsf(sum) % 2.0;
-                let c = if w > 1.0 { 2.0 - w } else { w };
-                let a = (c * 255.0 + 0.5) as i32;
-                let x = left + i as i32;
+            let put = |x: i32, a: i32, run: &mut Option<i32>| {
                 if a >= 255 {
                     run.get_or_insert(x);
-                    continue;
+                    return;
                 }
                 if let Some(r) = run.take() {
                     self.aa_span(r, x - 1, y, color, 255);
                 }
                 if a > 0 {
                     self.aa_px(x, y, color, a as u8);
+                }
+            };
+            for i in touched.0..=touched.1 {
+                let v = acc[i];
+                if v != 0.0 {
+                    acc[i] = 0.0;
+                    sum += v;
+                    // Even-odd: winding w → coverage |w| folded into 0..1..0.
+                    // (`%` is a libm call: only when it changes anything.)
+                    let w = libm::fabsf(sum);
+                    let w = if w < 2.0 { w } else { w % 2.0 };
+                    let c = if w > 1.0 { 2.0 - w } else { w };
+                    a = (c * 255.0 + 0.5) as i32;
+                }
+                let x = left + i as i32;
+                if x >= first {
+                    put(x, a, &mut run);
+                }
+            }
+            // Past the last touched entry the coverage stays `a` (0 unless
+            // edges right of the buffer were dropped).
+            let tail = (left + touched.1 as i32 + 1).max(first);
+            if a >= 255 {
+                if tail <= right {
+                    run.get_or_insert(tail);
+                }
+            } else if a > 0 {
+                for x in tail..=right {
+                    put(x, a, &mut run);
                 }
             }
             if let Some(r) = run {
@@ -1367,6 +1427,93 @@ mod tests {
                     if filled == 0 {
                         assert_eq!(c, 0, "{poly:?}: exterior ({x},{y}) = {c}");
                     }
+                }
+            }
+        }
+    }
+
+    /// Lines, wedges and polygon outlines: skipping what is outside the
+    /// scissor changes nothing inside it.
+    #[test]
+    fn scissored_strokes_match_the_full_draw() {
+        use crate::types::Rect;
+        let tri = pts(&[(10, 5), (90, 20), (40, 85)]);
+        let shapes: [&dyn Fn(&LcdImpl<AlphaGrid>); 4] = [
+            &|l| l.draw_line_thick(5, 5, 90, 40, 1, 3),
+            &|l| l.draw_line_thick(90, 5, 5, 90, 1, 1),
+            &|l| l.draw_wedge(10, 80, 80, 12, 6 * 256, 256, 1),
+            &|l| l.draw_polyline(&tri, 1, true, 2),
+        ];
+        for (k, shape) in shapes.iter().enumerate() {
+            let (full, _) = draw(|l| shape(l));
+            for sc in [Rect::new(30, 20, 9, 6), Rect::new(0, 40, 50, 30), Rect::new(60, 0, 30, 90), Rect::new(70, 70, 25, 25)] {
+                let (cut, _) = draw(|l| {
+                    l.set_scissor(Some(sc));
+                    shape(l)
+                });
+                for y in 0..N {
+                    for x in 0..N {
+                        let inside = (sc.x as usize..sc.right() as usize).contains(&x)
+                            && (sc.y as usize..sc.bottom() as usize).contains(&y);
+                        let want = if inside { full[y * N + x] } else { 0 };
+                        assert_eq!(cut[y * N + x], want, "stroke {k} at ({x},{y})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Skipping what is outside the scissor changes nothing inside it.
+    #[test]
+    fn scissored_polygon_matches_the_full_draw() {
+        use crate::types::Rect;
+        for shape in [&[(10i16, 5i16), (90, 20), (40, 85)][..], &[(5, 5), (80, 10), (20, 30), (85, 60), (8, 88)][..]] {
+            let poly = pts(shape);
+            let (full, _) = draw(|l| l.fill_polygon(&poly, 1));
+            for sc in [Rect::new(30, 20, 9, 6), Rect::new(0, 40, 50, 30), Rect::new(60, 0, 30, 90), Rect::new(70, 70, 25, 25)] {
+                let (cut, _) = draw(|l| {
+                    l.set_scissor(Some(sc));
+                    l.fill_polygon(&poly, 1)
+                });
+                for y in 0..N {
+                    for x in 0..N {
+                        let inside = (sc.x as usize..sc.right() as usize).contains(&x)
+                            && (sc.y as usize..sc.bottom() as usize).contains(&y);
+                        let want = if inside { full[y * N + x] } else { 0 };
+                        assert_eq!(cut[y * N + x], want, "polygon at ({x},{y})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The touched-columns walk gives exactly what evaluating every column
+    /// of the bounding box (the previous algorithm) gives.
+    #[test]
+    fn polygon_matches_full_width_reference() {
+        let hand = [(48i16, 48i16), (88, 10), (86, 8), (46, 46)];
+        let off_left = [(-30i16, 10i16), (60, 20), (10, 80)];
+        let off_right = [(40i16, 10i16), (130, 40), (50, 90)];
+        let extra: [&[(i16, i16)]; 3] = [&hand, &off_left, &off_right];
+        for poly in POLYS.iter().copied().chain(extra) {
+            let p = pts(poly);
+            let (cov, _) = draw(|l| l.fill_polygon(&p, 1));
+            // Reference: accumulate over the full screen width, evaluate all.
+            let at = |i: usize| (p[i].x as f32 + 0.5, p[i].y as f32 + 0.5);
+            for y in 0..N {
+                let mut acc = [0f32; N];
+                let mut t = (usize::MAX, 0);
+                for i in 0..p.len() {
+                    accumulate_edge(&mut acc, 0, y as f32, at(i), at((i + 1) % p.len()), &mut t);
+                }
+                let mut sum = 0f32;
+                for x in 0..N {
+                    sum += acc[x];
+                    let w = libm::fabsf(sum);
+                    let w = if w < 2.0 { w } else { w % 2.0 };
+                    let c = if w > 1.0 { 2.0 - w } else { w };
+                    let want = ((c * 255.0 + 0.5) as i32).clamp(0, 255) as u8;
+                    assert_eq!(cov[y * N + x], want, "{poly:?} at ({x},{y})");
                 }
             }
         }

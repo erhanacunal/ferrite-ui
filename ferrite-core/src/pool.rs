@@ -48,6 +48,9 @@ pub type ObjPtr = u16;
 pub type ObjPtr = u32;
 pub const PTR_NONE: ObjPtr = ObjPtr::MAX;
 
+/// Changed widgets `ObjPool` lists per frame (see `ObjPool::changed`).
+pub(crate) const CHANGED_MAX: usize = 8;
+
 /// Block types (header bits 14-15).
 pub const T_FREE: u8 = 0;
 pub const T_WIDGET: u8 = 1;
@@ -183,6 +186,23 @@ pub struct ObjPool {
     /// found no dirty widget. While it is down the render passes skip their
     /// DFS scans, so an idle main-loop pass doesn't walk the tree.
     pub(crate) maybe_dirty: bool,
+    /// Widgets `mark_dirty` was called on since the last render (the roots
+    /// of what changed; a move, `mark_moved`, is not listed). `changed_n`
+    /// past `CHANGED_MAX` = more than fit: anything may have changed. A
+    /// moved subtree with nothing listed in it only moved, so its pixels can
+    /// be shifted instead of redrawn (`render::shift_moved`).
+    pub(crate) changed: [WidgetId; CHANGED_MAX],
+    pub(crate) changed_n: u8,
+    /// `draw_epoch` when the last dirty render ended: equal at the start of
+    /// the next one = nothing drew over the screen between them, so every
+    /// widget still shows what it last drew.
+    pub(crate) settled_epoch: u32,
+    /// This render's shifted pixels: (DFS index of the moved subtree root,
+    /// destination rect). Pass 2 leaves them alone. Empty on boards that
+    /// cannot move pixels (never allocated there).
+    pub(crate) shifted: Vec<(usize, crate::types::Rect)>,
+    /// Scratch for pass 2: the part of a shifted subtree's box still to draw.
+    pub(crate) shift_keep: Vec<crate::types::Rect>,
     /// Geometry by DFS index for the current render pass (`geo.rs`).
     #[cfg(feature = "render_cache")]
     pub(crate) geo: Vec<crate::geo::Geo>,
@@ -223,6 +243,11 @@ impl ObjPool {
             dead: Widget::DEAD,
             draw_epoch: 0,
             maybe_dirty: false,
+            changed: [WidgetId::NONE; CHANGED_MAX],
+            changed_n: 0,
+            settled_epoch: u32::MAX,
+            shifted: Vec::new(),
+            shift_keep: Vec::new(),
             #[cfg(feature = "render_cache")]
             geo: Vec::new(),
             #[cfg(feature = "render_cache")]
@@ -297,6 +322,9 @@ impl ObjPool {
         self.dfs_cache.clear();
         self.dfs_valid = false;
         self.maybe_dirty = false;
+        self.changed_n = 0;
+        self.settled_epoch = self.draw_epoch.wrapping_sub(1);
+        self.shifted.clear();
         #[cfg(feature = "render_cache")]
         {
             self.geo_valid = false;

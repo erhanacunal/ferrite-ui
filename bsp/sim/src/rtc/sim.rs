@@ -10,10 +10,21 @@ pub struct SystemRtc {
 }
 
 impl SystemRtc {
+    /// `FERRITE_SIM_CLOCK=HH:MM[:SS]` starts the clock at that time of day
+    /// (today, UTC) instead of the host time, e.g. to reproduce a clock face.
     pub fn new() -> Self {
-        Self {
+        let rtc = Self {
             offset_secs: Cell::new(0),
+        };
+        if let Ok(v) = std::env::var("FERRITE_SIM_CLOCK") {
+            let f: Vec<i64> = v.split(':').filter_map(|p| p.trim().parse().ok()).collect();
+            if f.len() >= 2 {
+                let want = f[0] * 3600 + f[1] * 60 + f.get(2).copied().unwrap_or(0);
+                let now = rtc.current_unix_secs() as i64;
+                rtc.offset_secs.set(want - now.rem_euclid(86400));
+            }
         }
+        rtc
     }
 
     fn current_unix_secs(&self) -> u64 {

@@ -269,6 +269,80 @@ def make_gallery():
 
 
 # ---------------------------------------------------------------------------
+# Wallpapers
+# ---------------------------------------------------------------------------
+# The home screen's background: the vertical gradient plus three translucent
+# blobs, pre-composited into one opaque picture. As widgets (a gradient root
+# and three alpha circles) every restore behind a sliding page re-blended up
+# to 1.5 screens of blob pixels; as a picture it is one copy.
+SW, SH = 1280, 800
+# (top, bottom) RGB565, as WALL_TOP/WALL_BOT and WALL2_TOP/WALL2_BOT in ui.fl.
+WALLS = [("wall1", 0x08A6, 0x38CA), ("wall2", 0x0965, 0x1209)]
+# (x, y, size, radius, RGB565, alpha 0..255): BLOB1..3 in ui.fl, the boxes
+# build_wallpaper() used to place. As widgets their boxes were cut to the
+# screen before the corners were rounded (radius at most half the cut box's
+# shorter side), so blobs crossing the edge were rounded rects, not circles:
+# `rounded_box` draws them that way, to look as before.
+BLOBS = [(-260, 300, 760, 380, 0x4A3C, 70), (860, -260, 640, 320, 0xEA53, 52), (700, 560, 420, 210, 0x15D4, 40)]
+
+
+def expand565(c):
+    """RGB565 -> 8-bit channels, as the exynos framebuffer expands them."""
+    r, g, b = (c >> 11) & 0x1F, (c >> 5) & 0x3F, c & 0x1F
+    return (r << 3 | r >> 2, g << 2 | g >> 4, b << 3 | b >> 2)
+
+
+def lerp565(c1, c2, t, n):
+    """`lerp_rgb565` (ferrite-core lcd.rs): the gradient's row colours."""
+    t8 = min(t, n) * 256 // n if n else 0
+    out = 0
+    for shift, mask in ((11, 0x1F), (5, 0x3F), (0, 0x1F)):
+        a, b = (c1 >> shift) & mask, (c2 >> shift) & mask
+        out |= ((a * (256 - t8) + b * t8) >> 8) << shift
+    return out
+
+
+def make_wallpaper(top, bottom):
+    import numpy as np
+    rows = np.array([expand565(lerp565(top, bottom, y, SH - 1)) for y in range(SH)], dtype=np.float64)
+    img = np.repeat(rows[:, None, :], SW, axis=1)
+    ys, xs = np.mgrid[0:SH, 0:SW]
+    for x, y, size, radius, color, alpha in BLOBS:
+        x0, y0, x1, y1 = max(x, 0), max(y, 0), min(x + size, SW), min(y + size, SH)
+        r = min(radius, (x1 - x0) / 2, (y1 - y0) / 2)
+        # Signed distance to the rounded rect, coverage over one pixel.
+        cx, cy, hw, hh = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+        qx = np.abs(xs + 0.5 - cx) - (hw - r)
+        qy = np.abs(ys + 0.5 - cy) - (hh - r)
+        dist = np.hypot(np.maximum(qx, 0), np.maximum(qy, 0)) + np.minimum(np.maximum(qx, qy), 0) - r
+        a = (np.clip(0.5 - dist, 0, 1) * alpha / 255)[..., None]
+        img = img * (1 - a) + np.array(expand565(color), dtype=np.float64) * a
+    # To RGB565 with a 4x4 ordered dither (the blobs' blends fall between
+    # 565 steps), stored as 8-bit values that ferrite_img truncates back to
+    # exactly these 565 values.
+    bayer = (np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]) + 0.5) / 16
+    dither = np.tile(bayer, (SH // 4 + 1, SW // 4 + 1))[:SH, :SW]
+    out = np.empty((SH, SW, 3), dtype=np.uint8)
+    for ch, bits in enumerate((5, 6, 5)):
+        levels = np.arange(1 << bits)
+        steps = (levels << (8 - bits)) | (levels >> (2 * bits - 8))
+        v = img[..., ch]
+        # The step at or below v, then up one by the fraction past it: a value
+        # that is already a step (the plain gradient rows) stays exact.
+        q = np.clip(np.searchsorted(steps, v, side="right") - 1, 0, len(steps) - 2)
+        frac = (v - steps[q]) / (steps[q + 1] - steps[q])
+        q = q + (frac > dither)
+        out[..., ch] = steps[q]
+    return Image.fromarray(out, "RGB")
+
+
+def make_wallpapers():
+    for name, top, bottom in WALLS:
+        make_wallpaper(top, bottom).save(OUT / f"{name}.png")
+    print(f"wallpapers: {len(WALLS)}")
+
+
+# ---------------------------------------------------------------------------
 # Sounds
 # ---------------------------------------------------------------------------
 RATE = 11025
@@ -372,6 +446,7 @@ def main():
     make_icons(Path(args.icons))
     make_fonts()
     make_gallery()
+    make_wallpapers()
     make_sounds()
 
 

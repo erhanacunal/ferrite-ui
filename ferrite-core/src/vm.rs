@@ -3391,7 +3391,12 @@ impl Vm {
         }
 
         if dirty {
-            ctx.objs.mark_dirty(target);
+            if matches!(prop_id, PROP_LOC_X | PROP_LOC_Y) {
+                // Only moved: its pixels may be shifted (`render::shift_moved`).
+                ctx.objs.mark_moved(target);
+            } else {
+                ctx.objs.mark_dirty(target);
+            }
         }
         if prop_set {
             return;
@@ -3642,7 +3647,10 @@ impl Vm {
             };
             if val != Self::get_scalar_prop_on(ctx, a.target, a.prop_id) {
                 Self::set_scalar_prop_on(ctx, a.target, a.prop_id, val);
-                if prop_is_visual(a.prop_id) {
+                // The setter marked a location change as a move
+                // (`mark_moved`); `mark_dirty` would list it as changed and
+                // keep its pixels from being shifted.
+                if prop_is_visual(a.prop_id) && !matches!(a.prop_id, PROP_LOC_X | PROP_LOC_Y) {
                     ctx.objs.mark_dirty(a.target);
                 }
             }
@@ -3701,7 +3709,7 @@ impl Vm {
                     x: vals[0] as i16,
                     y: vals[1] as i16,
                 };
-                ctx.objs.mark_dirty(self.target);
+                ctx.objs.mark_moved(self.target);
                 return;
             }
             PROP_SIZE if count >= 2 => {

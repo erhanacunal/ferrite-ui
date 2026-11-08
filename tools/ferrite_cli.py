@@ -233,13 +233,22 @@ PERF_PHASES = {
     12: "  pixel writes",
     13: "present copy",
     14: "  timer reads",
+    15: "  G2D drawing",
+    16: "  sprite drawing",
 }
 # Sub-phases: already inside the step phases above.
 # (13 runs on another core, in parallel with the step.)
-PERF_SUB_PHASES = (10, 11, 12, 13, 14)
+PERF_SUB_PHASES = (10, 11, 12, 13, 14, 15, 16)
 # Event counts (plain numbers, not microseconds): perf::count in perf.rs.
 PERF_COUNTS = {0x81: "draw_widget calls", 0x82: "pixel primitive calls",
-               0x83: "presents", 0x84: "present KiB", 0x85: "timer reads"}
+               0x83: "presents", 0x84: "present KiB", 0x85: "timer reads",
+               0x86: "G2D draw ops", 0x87: "G2D draw kpx", 0x88: "sprites made",
+               0x89: "sprite blits", 0x8A: "sprite-eligible drawn by CPU (first sighting)",
+               0x8B: "CPU blended kpx", 0x8C: "subtrees shifted", 0x8D: "shifted kpx",
+               0x8E: "G2D picture copies", 0x8F: "G2D move copies"}
+# Longest pass breakdown: id = PERF_MAX_BASE + phase id, microseconds
+# (perf::MAX_PASS in perf.rs).
+PERF_MAX_BASE = 0x40
 
 
 def _perf_length_ok(length: int) -> bool:
@@ -580,7 +589,12 @@ def format_perf(p: dict) -> list[str]:
     in_step = 0
     times = {}
     counts = []
+    longest = []
     for pid, us in p["phases"]:
+        if PERF_MAX_BASE < pid < 0x80:
+            if us:
+                longest.append((PERF_PHASES.get(pid - PERF_MAX_BASE, f"phase {pid - PERF_MAX_BASE}").strip(), us))
+            continue
         if pid in PERF_COUNTS:
             counts.append((PERF_COUNTS[pid], us))
             times[pid] = us
@@ -608,6 +622,18 @@ def format_perf(p: dict) -> list[str]:
         rate = times[0x84] * 1024 / times[13] / 1000  # bytes/us = MB/s -> GB/s
         per = times[13] / max(times.get(0x83, 0), 1)
         lines.append(f"present copy rate: {rate:.2f} GB/s ({per:.0f} us per present)")
+    presents = max(times.get(0x83, 0), 1)
+    if times.get(0x86) or times.get(0x8B):
+        lines.append(f"per present: G2D {times.get(15, 0) / presents:.0f} us / {times.get(0x86, 0) / presents:.1f} ops"
+                     f" / {times.get(0x87, 0) / presents:.0f} kpx, CPU blends {times.get(0x8B, 0) / presents:.0f} kpx,"
+                     f" sprites {times.get(0x89, 0) / presents:.1f} blits + {times.get(0x88, 0) / presents:.2f} made"
+                     f" ({times.get(16, 0) / presents:.0f} us)")
+    if times.get(0x8C) or times.get(0x8E) or times.get(0x8F):
+        lines.append(f"per present: {times.get(0x8C, 0) / presents:.1f} shifts / {times.get(0x8D, 0) / presents:.0f} kpx,"
+                     f" G2D {times.get(0x8E, 0) / presents:.1f} picture copies + {times.get(0x8F, 0) / presents:.1f} move copies")
+    if longest:
+        lines.append(f"longest pass ({p['max_pass_us']} us): "
+                     + ", ".join(f"{name} {us}" for name, us in sorted(longest, key=lambda e: -e[1])))
     return lines
 
 

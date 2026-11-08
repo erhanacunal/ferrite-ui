@@ -11,6 +11,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use ferrite_core::flash::FlashBackend;
 
 use crate::{storage, systick};
@@ -51,7 +52,26 @@ pub fn init() {
     unsafe { USED = n };
 }
 
+/// Bumped by every write or erase: data handed to a device by address
+/// (`phys`) and cleaned from the cache for it must be cleaned again after.
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// The current write generation (see `GENERATION`).
+pub fn generation() -> u32 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
+/// The physical address of region bytes `addr .. addr + len` (identity
+/// mapped), for a device that reads them directly (the G2D). None past the
+/// region. The caller cleans them from the data cache first.
+pub fn phys(addr: u32, len: usize) -> Option<usize> {
+    let s = shadow();
+    let end = (addr as usize).checked_add(len)?;
+    (end <= s.len()).then(|| s.as_ptr() as usize + addr as usize)
+}
+
 fn touch(end: usize) {
+    GENERATION.fetch_add(1, Ordering::Relaxed);
     unsafe {
         USED = USED.max(end);
         DIRTY = true;
@@ -119,6 +139,7 @@ impl FlashBackend for RamFlash {
         let base = (addr as usize & !(SECTOR - 1)).min(s.len());
         let end = (base + SECTOR).min(s.len());
         s[base..end].fill(0xFF);
+        GENERATION.fetch_add(1, Ordering::Relaxed);
         // An erase inside the saved part changes it; past it, nothing to save.
         if base < unsafe { USED } {
             touch(0);

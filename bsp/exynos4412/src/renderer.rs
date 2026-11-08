@@ -15,7 +15,7 @@
 //! clip rect (`lcd::blit_sprite`). The tablet's wallpaper circles, restored
 //! behind every sliding page, are the case this is for.
 //!
-//! A sprite is made the second time an appearance is drawn ([`Cache::seen`]):
+//! A sprite is made the second time an appearance is drawn, in a later frame ([`Cache::seen`]):
 //! a widget whose size or colour animates gets a new appearance every frame,
 //! and drawing each into a fresh sprite (draw, cache clean, allocation) cost
 //! far more than drawing it directly.
@@ -24,6 +24,13 @@
 //! widget that moves keeps its sprite, two equal widgets share one, and a
 //! program switch needs no invalidation. The least recently used go first
 //! when the cache is over [`CACHE_BYTES`] or [`CACHE_ENTRIES`].
+//!
+//! **Pictures (`g2d_render`).** A widget that is only an opaque raw picture
+//! of exactly its size (a full-screen wallpaper as the root's background
+//! image) is copied by the G2D from the flash shadow, RGB565 to XRGB8888,
+//! per clip rect ([`draw_picture`]): restoring behind a sliding page is then
+//! one engine copy instead of a CPU loop reading the picture 128 bytes at a
+//! time. The background colour under it is skipped (the picture covers it).
 //!
 //! The G2D's blend rounds a little differently from the CPU's (at most 2 per
 //! channel, `g2d_test`), so sprite-drawn widgets are not bit-identical to the
@@ -36,7 +43,7 @@ use ferrite_core::ctx::Ctx;
 use ferrite_core::pool::ObjPool;
 use ferrite_core::render;
 use ferrite_core::renderer::WidgetRenderer;
-use ferrite_core::types::Rect;
+use ferrite_core::types::{Edges, Rect};
 use ferrite_core::widget::{
     FLAG_CHECKED, FLAG_PRESSED, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_CIRCLE, KIND_ELLIPSE, KIND_IMAGE,
     KIND_LINE, KIND_POLYGON, KIND_RECTANGLE, WidgetId,
@@ -62,7 +69,13 @@ pub struct ExynosRenderer;
 
 impl WidgetRenderer<P> for ExynosRenderer {
     fn draw(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
-        if !lcd::g2d_draw_ready() || ctx.lcd.is_portrait() || !wants_sprite(&ctx.objs, id, abs) {
+        if !lcd::g2d_draw_ready() || ctx.lcd.is_portrait() {
+            return false;
+        }
+        if draw_picture(ctx, id, abs, clip) {
+            return true;
+        }
+        if !wants_sprite(&ctx.objs, id, abs) {
             return false;
         }
         let key = appearance(ctx, id, abs);
@@ -74,7 +87,12 @@ impl WidgetRenderer<P> for ExynosRenderer {
                 Some(at) => at,
                 None => return false,
             },
-            None => return false,
+            None => {
+                // First sighting: drawn by the CPU this time.
+                #[cfg(feature = "perf")]
+                ferrite_core::perf::add_count(ferrite_core::perf::count::SPRITE_FIRST, 1);
+                return false;
+            }
         };
         let sprite = &cache.entries[at];
         let screen = Rect::new(0, 0, ctx.lcd.width(), ctx.lcd.height());
@@ -85,6 +103,8 @@ impl WidgetRenderer<P> for ExynosRenderer {
             let (sx, sy) = ((r.x - abs.x) as usize, (r.y - abs.y) as usize);
             let (dx, dy) = (r.x as usize, r.y as usize);
             let px = sprite.pixels();
+            #[cfg(feature = "perf")]
+            ferrite_core::perf::add_count(ferrite_core::perf::count::SPRITE_BLITS, 1);
             if !lcd::blit_sprite(px, sprite.w, sprite.h, sprite.stride, sx, sy, dx, dy, r.w as usize, r.h as usize) {
                 // The G2D gave up (it stays off): this rect by the CPU.
                 render::draw_default(ctx, id, abs, &ClipRegion::from_rect(r));
@@ -92,6 +112,65 @@ impl WidgetRenderer<P> for ExynosRenderer {
         }
         true
     }
+}
+
+/// Draws widget `id` if it is only an opaque picture of exactly its size: a
+/// base or image widget, no border, square, opaque, whose (background)
+/// image is raw RGB565 without alpha and `abs`'s size. Everything else such
+/// a widget draws (its background) is under the picture. False = not such a
+/// widget, nothing drawn.
+fn draw_picture(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
+    let w = ctx.objs.get(id);
+    if !matches!(w.kind, KIND_BASE | KIND_IMAGE) {
+        return false;
+    }
+    let e = ctx.objs.ext(id);
+    if e.image_id == 0 || e.border != Edges::ZERO || e.border_radius != 0 || e.alpha != 255 {
+        return false;
+    }
+    let Some(img) = ctx.images.find(e.image_id) else { return false };
+    if !img.is_raw_opaque() || img.width != abs.w || img.height != abs.h {
+        return false;
+    }
+    let (pw, ph) = (img.width as usize, img.height as usize);
+    let Some(addr) = picture_addr(img.data_addr(), pw * ph * 2) else { return false };
+    let screen = Rect::new(0, 0, ctx.lcd.width(), ctx.lcd.height());
+    for cr in clip.iter() {
+        let Some(r) = cr.intersection(abs).and_then(|r| r.intersection(&screen)) else { continue };
+        let (sx, sy) = ((r.x - abs.x) as usize, (r.y - abs.y) as usize);
+        let (dx, dy) = (r.x as usize, r.y as usize);
+        if !lcd::copy_rgb565(addr, pw, ph, sx, sy, dx, dy, r.w as usize, r.h as usize) {
+            // The G2D gave up or expands 565 differently: this rect by the CPU.
+            render::draw_default(ctx, id, abs, &ClipRegion::from_rect(r));
+        }
+    }
+    true
+}
+
+/// Pictures whose pixels were cleaned from the data cache, with the flash
+/// write generation at the time (`flash::generation`).
+const CLEANED: usize = 8;
+static mut CLEANED_AT: [Option<(u32, u32)>; CLEANED] = [None; CLEANED];
+static mut CLEANED_NEXT: usize = 0;
+
+/// The physical address of the `len` picture bytes at flash `addr`, cleaned
+/// from the data cache once per flash write generation (the G2D reads DRAM).
+/// None if the G2D cannot take it (outside the region, or not 4-byte
+/// aligned: an FS image from before `ferrite_build` aligned image pixels).
+fn picture_addr(addr: u32, len: usize) -> Option<usize> {
+    let phys = crate::flash::phys(addr, len)?;
+    if phys % 4 != 0 {
+        return None;
+    }
+    let generation = crate::flash::generation();
+    // SAFETY: CPU0 only, never reentrant (see `cache`).
+    let (seen, next) = unsafe { (&mut *(&raw mut CLEANED_AT), &mut *(&raw mut CLEANED_NEXT)) };
+    if !seen.contains(&Some((addr, generation))) {
+        exynos_4412_rs::mmu::clean_dcache_range(phys, len);
+        seen[*next] = Some((addr, generation));
+        *next = (*next + 1) % CLEANED;
+    }
+    Some(phys)
 }
 
 /// A widget worth a sprite: one of the kinds whose whole drawing depends
@@ -191,19 +270,28 @@ struct Cache {
     entries: Vec<Sprite>,
     bytes: usize,
     tick: u32,
-    /// Appearances drawn once (ring).
-    seen: [u64; SEEN],
+    /// Appearances drawn once (ring), with the frame (`lcd::frames`) they
+    /// were drawn in.
+    seen: [(u64, u32); SEEN],
     seen_at: usize,
 }
 
 impl Cache {
-    /// Whether `key` was drawn once already; else remembers it.
+    /// Whether `key` was drawn already in an earlier frame; else remembers
+    /// it. A second drawing in the same frame (a restore repainting a
+    /// widget pass 2 just drew, like a clock hand at a new angle) does not
+    /// count: such an appearance may never come back, and its sprite was
+    /// made for nothing (~5 ms for a clock hand's box).
     fn seen(&mut self, key: u64) -> bool {
-        if let Some(i) = self.seen.iter().position(|&k| k == key) {
-            self.seen[i] = 0;
+        let frame = lcd::frames();
+        if let Some(i) = self.seen.iter().position(|&(k, _)| k == key) {
+            if self.seen[i].1 == frame {
+                return false;
+            }
+            self.seen[i] = (0, 0);
             return true;
         }
-        self.seen[self.seen_at] = key;
+        self.seen[self.seen_at] = (key, frame);
         self.seen_at = (self.seen_at + 1) % SEEN;
         false
     }
@@ -238,6 +326,8 @@ impl Cache {
         let start = (px.as_ptr() as usize).next_multiple_of(ROW_ALIGN * 4) - px.as_ptr() as usize;
         let start = start / 4;
         let base = px[start..].as_mut_ptr();
+        #[cfg(feature = "perf")]
+        let t0 = crate::perf::cycles();
         // SAFETY: `base` has stride * h words in `px`, and only the
         // primitives touch them until `end_sprite`; `wants_sprite` keeps w, h
         // within the panel.
@@ -245,6 +335,8 @@ impl Cache {
         let local = Rect::new(0, 0, abs.w, abs.h);
         render::draw_default(ctx, id, &local, &ClipRegion::from_rect(local));
         lcd::end_sprite(base, stride * h);
+        #[cfg(feature = "perf")]
+        ferrite_core::perf::add_sub(ferrite_core::perf::phase::SPRITE, crate::perf::cycles().wrapping_sub(t0));
         self.tick = self.tick.wrapping_add(1);
         self.bytes += bytes;
         self.entries.push(Sprite { key, w, h, stride, px, start, used: self.tick });
@@ -252,7 +344,7 @@ impl Cache {
     }
 }
 
-static mut CACHE: Cache = Cache { entries: Vec::new(), bytes: 0, tick: 0, seen: [0; SEEN], seen_at: 0 };
+static mut CACHE: Cache = Cache { entries: Vec::new(), bytes: 0, tick: 0, seen: [(0, 0); SEEN], seen_at: 0 };
 
 fn cache() -> &'static mut Cache {
     // SAFETY: the renderer runs on CPU0 only, never reentrantly (drawing a

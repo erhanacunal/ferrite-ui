@@ -63,6 +63,26 @@ pub trait LcdBackend {
     /// Optional: flush dirty region (e-paper panels).
     fn flush_dirty(&self) {}
 
+    /// The backend can move pixels on screen ([`move_rects`]). Lets the
+    /// renderer skip working out what to move on boards that can't.
+    ///
+    /// [`move_rects`]: LcdBackend::move_rects
+    const CAN_MOVE: bool = false;
+    /// Smallest box (pixels) the renderer moves with `move_rects` instead
+    /// of redrawing it.
+    const MOVE_MIN_PX: u32 = 0;
+
+    /// Moves the pixels of every rect in `rects` by (`dx`, `dy`), as if all
+    /// were read first and then written: a destination may overlap any
+    /// source. Every source and destination lies inside the screen. False =
+    /// not done (nothing changed); the caller then draws instead. Readback
+    /// backends only; the renderer uses it to shift a moved opaque panel's
+    /// pixels and draw only the strip that comes into view.
+    fn move_rects(&self, rects: &[Rect], dx: i16, dy: i16) -> bool {
+        let _ = (rects, dx, dy);
+        false
+    }
+
     /// Optional hook fired before a full redraw. E-paper panels override this to
     /// ghost-erase (drive all pixels white) so prior dark content does not bleed
     /// through. No-op on framebuffer panels.
@@ -170,6 +190,47 @@ impl Underlay {
     }
 }
 
+/// Splits a move of `rects` by (`dx`, `dy`) (`LcdBackend::move_rects`:
+/// every source read before any destination written) into pieces a plain
+/// copier (which may not handle overlap) can copy one by one, in the
+/// returned order, straight from source to destination: bands no taller
+/// than `|dy|` (no wider than `|dx|` for a horizontal move), the ones
+/// furthest along the move first. A piece's destination then only covers
+/// source pixels of pieces copied before it. None if more than `max`
+/// pieces would be needed (a short move: copy through a buffer instead).
+pub fn move_bands(rects: &[Rect], dx: i16, dy: i16, max: usize) -> Option<alloc::vec::Vec<Rect>> {
+    let mut out = alloc::vec::Vec::new();
+    let vertical = dy != 0;
+    let step = if vertical { dy.unsigned_abs() } else { dx.unsigned_abs() };
+    if step == 0 {
+        return Some(out);
+    }
+    for r in rects {
+        let len = if vertical { r.h } else { r.w };
+        let mut at = 0u16;
+        while at < len {
+            let n = step.min(len - at);
+            if out.len() == max {
+                return None;
+            }
+            out.push(if vertical {
+                Rect::new(r.x, r.y + at as i16, r.w, n)
+            } else {
+                Rect::new(r.x + at as i16, r.y, n, r.h)
+            });
+            at += n;
+        }
+    }
+    let ahead = if vertical { dy > 0 } else { dx > 0 };
+    let key = |b: &Rect| if vertical { b.y } else { b.x };
+    if ahead {
+        out.sort_unstable_by_key(|b| core::cmp::Reverse(key(b)));
+    } else {
+        out.sort_unstable_by_key(key);
+    }
+    Some(out)
+}
+
 impl<B: LcdBackend> LcdImpl<B> {
     pub fn with_backend(be: B) -> Self {
         Self {
@@ -191,6 +252,23 @@ impl<B: LcdBackend> LcdImpl<B> {
     #[inline]
     pub fn is_portrait(&self) -> bool {
         self.portrait.get()
+    }
+
+    /// Moves the pixels of `rects` (logical coordinates, all inside the
+    /// screen, destinations too) by (`dx`, `dy`): see
+    /// [`LcdBackend::move_rects`]. False if not done (portrait: not
+    /// remapped).
+    pub fn move_rects(&self, rects: &[Rect], dx: i16, dy: i16) -> bool {
+        if !B::CAN_MOVE || self.portrait.get() {
+            return false;
+        }
+        let screen = Rect::new(0, 0, B::WIDTH, B::HEIGHT);
+        let inside = |r: &Rect| r.intersection(&screen) == Some(*r);
+        let moved = |r: &Rect| Rect::new(r.x + dx, r.y + dy, r.w, r.h);
+        if !rects.iter().all(|r| !r.is_empty() && inside(r) && inside(&moved(r))) {
+            return false;
+        }
+        self.be.move_rects(rects, dx, dy)
     }
 
     /// Logical screen width (the panel's height in portrait).
@@ -1041,6 +1119,37 @@ impl<B: LcdBackend> LcdImpl<B> {
         }
     }
 
+    /// Anti-aliased rounded-rect fill at signed coordinates (partly off the
+    /// screen), at `alpha`, readback backends only (`HAS_ALPHA`): the shape is
+    /// that of the whole rect, the scissor / screen only cut it. Elsewhere
+    /// the rect is cut to the screen first and the cut rect is rounded (the
+    /// unsigned primitives' behaviour).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_rounded_rect_at(&self, x: i16, y: i16, w: u16, h: u16, r: u16, color: u16, alpha: u8) {
+        if B::HAS_ALPHA && r > 0 {
+            self.smooth_round_rect(x, y, w, h, r, 0, color, alpha);
+            return;
+        }
+        let Some(c) = Rect::new(x, y, w, h).intersection(&Rect::new(0, 0, self.width(), self.height())) else { return };
+        if alpha == 255 {
+            self.fill_rounded_rect(c.x as u16, c.y as u16, c.w, c.h, r, color);
+        } else {
+            self.fill_rounded_rect_blend(c.x as u16, c.y as u16, c.w, c.h, r, color, alpha);
+        }
+    }
+
+    /// `fill_gradient_rounded_rect` at signed coordinates: see
+    /// [`fill_rounded_rect_at`](Self::fill_rounded_rect_at).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_gradient_rounded_rect_at(&self, x: i16, y: i16, w: u16, h: u16, r: u16, c1: u16, c2: u16, dir: u8) {
+        if B::HAS_ALPHA && r > 0 {
+            self.smooth_gradient_round_rect(x, y, w, h, r, c1, c2, dir);
+            return;
+        }
+        let Some(c) = Rect::new(x, y, w, h).intersection(&Rect::new(0, 0, self.width(), self.height())) else { return };
+        self.fill_gradient_rounded_rect(c.x as u16, c.y as u16, c.w, c.h, r, c1, c2, dir);
+    }
+
     pub fn fill_rounded_rect(&self, x: u16, y: u16, w: u16, h: u16, r: u16, color: u16) {
         if w == 0 || h == 0 {
             return;
@@ -1643,6 +1752,51 @@ mod tests {
     use std::vec::Vec;
 
     const N: usize = 64;
+
+    /// Copying `move_bands`' pieces one by one, straight, gives what reading
+    /// every source first gives.
+    #[test]
+    fn move_bands_match_a_buffered_move() {
+        // A panel's region: a body plus side strips (corners cut), as
+        // `plan_moves` makes them.
+        let shapes: [&[Rect]; 3] = [
+            &[Rect::new(10, 12, 30, 20)],
+            &[Rect::new(14, 10, 22, 4), Rect::new(10, 14, 30, 16), Rect::new(14, 30, 22, 4)],
+            &[Rect::new(5, 5, 8, 40), Rect::new(20, 5, 8, 40), Rect::new(13, 20, 7, 6)],
+        ];
+        let moves = [(0i16, 7i16), (0, -3), (5, 0), (-9, 0), (4, 6), (-6, -11), (3, 1), (0, 25), (-2, 30)];
+        for rects in shapes {
+            for &(dx, dy) in &moves {
+                let fits = |r: &Rect| r.x + dx >= 0 && r.y + dy >= 0 && r.right() + dx <= N as i16 && r.bottom() + dy <= N as i16;
+                if !rects.iter().all(fits) {
+                    continue;
+                }
+                let start: Vec<u16> = (0..N * N).map(|i| i as u16).collect();
+                let mut want = start.clone();
+                for r in rects {
+                    for y in r.y..r.bottom() {
+                        for x in r.x..r.right() {
+                            want[(y + dy) as usize * N + (x + dx) as usize] = start[y as usize * N + x as usize];
+                        }
+                    }
+                }
+                let bands = move_bands(rects, dx, dy, 1000).unwrap();
+                let area = |v: &[Rect]| v.iter().map(|r| r.w as u32 * r.h as u32).sum::<u32>();
+                assert_eq!(area(&bands), area(rects));
+                let mut got = start.clone();
+                for b in &bands {
+                    for y in b.y..b.bottom() {
+                        for x in b.x..b.right() {
+                            got[(y + dy) as usize * N + (x + dx) as usize] = got[y as usize * N + x as usize];
+                        }
+                    }
+                }
+                assert!(got == want, "shape {} by ({dx}, {dy})", rects.len());
+            }
+        }
+        // Too many pieces for a short move.
+        assert!(move_bands(&[Rect::new(0, 0, 10, 40)], 0, 1, 16).is_none());
+    }
 
     /// Records which pixels `fill_rect` touched (N×N grid).
     struct Grid(RefCell<Vec<u8>>);

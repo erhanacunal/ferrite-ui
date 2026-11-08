@@ -82,6 +82,9 @@ MAX_RESOURCES = 1000
 
 RES_FONT = 0
 RES_IMAGE = 1
+# Bytes before an image resource's pixels: the FI header + the image id
+# (`HEADER_SIZE` in ferrite-core image.rs).
+IMAGE_HEADER = 9
 RES_PROGRAM = 2
 RES_PAGE = 3
 RES_FILE = 4
@@ -281,6 +284,13 @@ def build_fs(project: dict, resources: list[tuple[str, int, bytes, int]],
         # Name: 16 byte null-padded ASCII
         name_bytes = name.encode("ascii")[:15]
         name_padded = name_bytes + b'\x00' * (16 - len(name_bytes))
+
+        # An image's pixel data (after its 9-byte header: FI's 8 + the image
+        # id) starts 8-byte aligned: a board that hands raw pixels straight
+        # to a graphics engine (exynos4412's G2D) needs them aligned. The gap
+        # is zeros, covered by the checksum like the rest of the data.
+        if kind == RES_IMAGE:
+            data_blob.extend(bytes(-(fs_base + data_base_rel + len(data_blob) + IMAGE_HEADER) % 8))
 
         # Offset: absolute flash address (FS image is written at fs_base)
         offset = fs_base + data_base_rel + len(data_blob)

@@ -188,6 +188,10 @@ impl PlatformRuntime for Exynos4412Platform {
         crate::perf::hz()
     }
 
+    fn render_due() -> bool {
+        lcd::render_due()
+    }
+
     #[cfg(feature = "perf")]
     fn perf_take_wait() -> u64 {
         crate::perf::take_wait()

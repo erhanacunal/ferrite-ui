@@ -200,6 +200,17 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
     fn perf_take_wait() -> u64 {
         0
     }
+
+    /// Dirty mode: whether a render now would reach the screen any sooner.
+    /// A BSP whose present runs in the background answers false while what
+    /// was drawn since the last present is still waiting for it: drawing
+    /// again then only moves pixels that are never shown. The dirty flags
+    /// stay set, and the next due render draws the latest state once
+    /// (property animations tick every pass, each changing a widget a
+    /// little: the exynos pull-down shade was moved ~7 times per present).
+    fn render_due() -> bool {
+        true
+    }
 }
 
 /// Per-frame input handling. Owns whatever cross-frame state the strategy needs
@@ -643,12 +654,17 @@ impl<P: PlatformRuntime> Runtime<P> {
             self.perf.add_cycles(phase::DRAW + i as u8, c);
         }
         let p = &self.perf;
-        let mut rows = [(0u8, 0u32); phase::COUNT + count::COUNT];
+        const MAXN: usize = crate::perf::MAX_PASS_PHASES.len();
+        let mut rows = [(0u8, 0u32); phase::COUNT + count::COUNT + MAXN];
         for (i, row) in rows.iter_mut().take(phase::COUNT).enumerate() {
             *row = (i as u8 + 1, to_us(p.phase[i], hz));
         }
         for (i, &n) in counts.iter().enumerate() {
             rows[phase::COUNT + i] = (count::DRAWS + i as u8, n);
+        }
+        // Where the longest pass went.
+        for (i, &id) in crate::perf::MAX_PASS_PHASES.iter().enumerate() {
+            rows[phase::COUNT + count::COUNT + i] = (crate::perf::MAX_PASS + id, to_us(p.max_phase(id) as u64, hz));
         }
         let header = protocol::PerfHeader {
             cycle_hz: hz,
@@ -1369,6 +1385,9 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, input: 
             }
         }
         RenderMode::Dirty => {
+            if !P::render_due() {
+                return;
+            }
             let mut paint = render::PaintList::new();
             render::collect_dirty_paint(ctx, &mut paint);
             render::render_dirty(ctx);

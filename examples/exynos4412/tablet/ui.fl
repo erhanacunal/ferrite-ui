@@ -32,6 +32,8 @@ const F120 = 6;   // digits, ':' and '.' only
 // Palette (RGB565)
 const WHITE      = 0xFFFF;
 const BLACK      = 0x0000;
+// WALL_*/WALL2_* and BLOB1-3 are baked into the wallpaper pictures by
+// make_assets.py (WALLS, BLOBS): keep in sync.
 const WALL_TOP   = 0x08A6;  // 14,22,52
 const WALL_BOT   = 0x38CA;  // 58,26,80
 const WALL2_TOP  = 0x0965;  // 8,44,40
@@ -106,6 +108,8 @@ const IMG_LEFT         = 29;
 const IMG_RIGHT        = 30;
 const IMG_PIC0         = 31;   // 6 pictures, 960x560
 const IMG_THUMB0       = 37;   // 6 thumbnails, 288x168
+const IMG_WALL1        = 43;   // home wallpapers, 1280x800, opaque raw
+const IMG_WALL2        = 44;
 
 // --- Shared state (programArg) ---
 var ui_volume = 70;

@@ -1,7 +1,10 @@
 // clock.fl — analog clock, digital time and a stopwatch with laps.
 //
-// The hands are polygon widgets the size of the face: each second their
-// point lists are rebuilt from sin/cos. The face dots are small circles.
+// The hands are polygon widgets sized to their own bounding box: each second
+// their points are recomputed from sin/cos, and a hand whose rounded points
+// didn't change is left alone (a hand box repaint restores what is behind it,
+// so a face-sized box redrew the whole face every second). The face dots are
+// small circles.
 #include "ui.fl"
 #include "shapes.fl"
 
@@ -17,16 +20,20 @@ var sw_lbl; var sw_start; var sw_start_t; var sw_lap; var sw_lap_t;
 var lap_lbl[5];
 
 var last_sec = -1;
+var last_min = -1;
+var last_day = -1;
+var hp[24];               // last placed hand points (face coords), 8 per hand
 var sw_run = 0;
 var sw_base = 0;          // millis() at start minus time already counted
 var sw_ms = 0;            // shown time while stopped
 var lap_n = 0;
 var lap_prev = 0;
 
-// A hand polygon: angle `a` (radians, clockwise from 12), length `len`,
-// tail `tail`, half width `hw` at the hub. Points are relative to the face
-// box. Returns the point list.
-fn hand_points(a: float, len, tail, hw) -> string {
+// Place hand `k` (0 hour, 1 minute, 2 second) as a polygon: angle `a`
+// (radians, clockwise from 12), length `len`, tail `tail`, half width `hw` at
+// the hub. The widget box is the points' bounding box plus a margin for the
+// anti-aliased outline. Returns 1 if the hand changed.
+fn place_hand(w: widget, k, a: float, len, tail, hw) {
     var dx = sin(a);
     var dy = 0.0 - cos(a);
     var c = itof(FACE / 2);
@@ -37,11 +44,37 @@ fn hand_points(a: float, len, tail, hw) -> string {
     // Perpendicular: (-dy, dx).
     var px = (0.0 - dy) * itof(hw);
     var py = dx * itof(hw);
-    return sprintf("%d,%d %d,%d %d,%d %d,%d",
-        ftoi(bx + px), ftoi(by + py),
-        ftoi(tx + px * 0.25), ftoi(ty + py * 0.25),
-        ftoi(tx - px * 0.25), ftoi(ty - py * 0.25),
-        ftoi(bx - px), ftoi(by - py));
+    var x0 = ftoi(bx + px);
+    var y0 = ftoi(by + py);
+    var x1 = ftoi(tx + px * 0.25);
+    var y1 = ftoi(ty + py * 0.25);
+    var x2 = ftoi(tx - px * 0.25);
+    var y2 = ftoi(ty - py * 0.25);
+    var x3 = ftoi(bx - px);
+    var y3 = ftoi(by - py);
+    var b = k * 8;
+    if (hp[b] == x0 && hp[b + 1] == y0 && hp[b + 2] == x1 && hp[b + 3] == y1
+        && hp[b + 4] == x2 && hp[b + 5] == y2 && hp[b + 6] == x3 && hp[b + 7] == y3) {
+        return 0;
+    }
+    hp[b] = x0; hp[b + 1] = y0; hp[b + 2] = x1; hp[b + 3] = y1;
+    hp[b + 4] = x2; hp[b + 5] = y2; hp[b + 6] = x3; hp[b + 7] = y3;
+    var lx = x0; var hx = x0; var ly = y0; var hy = y0;
+    if (x1 < lx) { lx = x1; } if (x1 > hx) { hx = x1; }
+    if (x2 < lx) { lx = x2; } if (x2 > hx) { hx = x2; }
+    if (x3 < lx) { lx = x3; } if (x3 > hx) { hx = x3; }
+    if (y1 < ly) { ly = y1; } if (y1 > hy) { hy = y1; }
+    if (y2 < ly) { ly = y2; } if (y2 > hy) { hy = y2; }
+    if (y3 < ly) { ly = y3; } if (y3 > hy) { hy = y3; }
+    var m = 3;
+    lx = lx - m; ly = ly - m;
+    target(w);
+    set(location, CX - FACE / 2 + lx, CY - FACE / 2 + ly);
+    set(size, hx - lx + m + 1, hy - ly + m + 1);
+    set(text, sprintf("%d,%d %d,%d %d,%d %d,%d",
+        x0 - lx, y0 - ly, x1 - lx, y1 - ly, x2 - lx, y2 - ly, x3 - lx, y3 - ly));
+    dirty();
+    return 1;
 }
 
 fn style_hand(color) {
@@ -165,14 +198,22 @@ fn show_time() {
     var as = itof(s) * 0.1047198;
     var am = (itof(m) + itof(s) / 60.0) * 0.1047198;
     var ah = (itof(h % 12) + itof(m) / 60.0) * 0.5235988;
-    target(hand_h); set(text, hand_points(ah, 150, 26, 11)); dirty();
-    target(hand_m); set(text, hand_points(am, 222, 30, 8)); dirty();
-    target(hand_s); set(text, hand_points(as, 238, 50, 3)); dirty();
-    target(hub); dirty();
+    var moved = place_hand(hand_h, 0, ah, 150, 26, 11);
+    moved = place_hand(hand_m, 1, am, 222, 30, 8) | moved;
+    moved = place_hand(hand_s, 2, as, 238, 50, 3) | moved;
+    if (moved) {
+        target(hub); dirty();
+    }
 
-    target(dig_time); set(text, sprintf("%d:%02d", h, m)); dirty();
+    if (m != last_min) {
+        last_min = m;
+        target(dig_time); set(text, sprintf("%d:%02d", h, m)); dirty();
+    }
     target(dig_sec); set(text, sprintf("%02d", s)); dirty();
-    target(dig_date); set(text, sprintf("%s, %d %s", day_name(wd), dd, month_name(mo))); dirty();
+    if (dd != last_day) {
+        last_day = dd;
+        target(dig_date); set(text, sprintf("%s, %d %s", day_name(wd), dd, month_name(mo))); dirty();
+    }
     strClear();
 }
 

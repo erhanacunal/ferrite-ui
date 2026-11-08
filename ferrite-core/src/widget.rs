@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use crate::pool::{ObjPool, ObjPtr, PTR_NONE, T_WIDGET};
+use crate::pool::{CHANGED_MAX, ObjPool, ObjPtr, PTR_NONE, T_WIDGET};
 use crate::render::SCROLLBAR_W;
 use crate::types::{Color, Edges, Offset, Rect, Size};
 use alloc::vec::Vec;
@@ -555,6 +555,7 @@ impl ObjPool {
         self.dfs_valid = false;
         // A new widget starts dirty (Widget::NEW).
         self.maybe_dirty = true;
+        self.note_changed(WidgetId(p));
         Some(WidgetId(p))
     }
 
@@ -1134,18 +1135,71 @@ impl ObjPool {
     }
 
     /// Mark widget and all descendants as dirty in both buffers. The only
-    /// way (with `alloc_widget`) to set a dirty bit: it raises `maybe_dirty`.
+    /// way (with `alloc_widget` and `mark_moved`) to set a dirty bit: it
+    /// raises `maybe_dirty`. `id` is listed as changed (see `changed`).
     pub fn mark_dirty(&mut self, id: WidgetId) {
         if !self.is_live(id) {
             return;
         }
+        self.note_changed(id);
+        self.dirty_subtree(id);
+    }
+
+    /// `mark_dirty` for a widget whose location changed and nothing else: not
+    /// listed as changed, so the renderer may shift its pixels instead of
+    /// redrawing it (`render::shift_moved`). Call `will_move` first.
+    pub fn mark_moved(&mut self, id: WidgetId) {
+        if self.is_live(id) {
+            self.dirty_subtree(id);
+        }
+    }
+
+    fn dirty_subtree(&mut self, id: WidgetId) {
         self.maybe_dirty = true;
         self.get_mut(id).flags |= FLAG_DIRTY_AB;
         let mut child = self.get(id).first_child;
         while child.is_some() {
-            self.mark_dirty(child);
+            self.dirty_subtree(child);
             child = self.get(child).next_sibling;
         }
+    }
+
+    fn note_changed(&mut self, id: WidgetId) {
+        let n = self.changed_n as usize;
+        if n < CHANGED_MAX {
+            if !self.changed[..n].contains(&id) {
+                self.changed[n] = id;
+                self.changed_n += 1;
+            }
+        } else {
+            self.changed_n = CHANGED_MAX as u8 + 1;
+        }
+    }
+
+    /// Whether anything in `root`'s subtree was listed as changed since the
+    /// last render (or more than the list holds changed).
+    pub(crate) fn changed_within(&self, root: WidgetId) -> bool {
+        let n = self.changed_n as usize;
+        if n > CHANGED_MAX {
+            return true;
+        }
+        self.changed[..n].iter().any(|&c| {
+            let mut w = c;
+            let mut depth = 0;
+            while w.is_some() && depth <= self.count() {
+                if w == root {
+                    return true;
+                }
+                w = self.get(w).parent;
+                depth += 1;
+            }
+            false
+        })
+    }
+
+    /// Forget the changed list (a render consumed it).
+    pub(crate) fn clear_changed(&mut self) {
+        self.changed_n = 0;
     }
 
     /// Rebuild DFS cache if invalidated.

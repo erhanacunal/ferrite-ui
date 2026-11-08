@@ -93,6 +93,13 @@ impl Image {
         self.data_addr
     }
 
+    /// Stored as plain RGB565 rows without alpha (`width * height` u16 LE
+    /// from `data_addr`): opaque, and readable by address, so a board can
+    /// hand it to a graphics engine.
+    pub fn is_raw_opaque(&self) -> bool {
+        self.mode == MODE_RAW && !self.has_alpha
+    }
+
     /// Empty/invalid image sentinel (used for ImageList initialization).
     pub const fn empty() -> Self {
         Image {

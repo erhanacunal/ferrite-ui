@@ -264,6 +264,18 @@
       "image_id": 42,
       "source": "assets/th_city.png",
       "max_colors": 256
+    },
+    {
+      "name": "wall1",
+      "image_id": 43,
+      "source": "assets/wall1.png",
+      "mode": "raw"
+    },
+    {
+      "name": "wall2",
+      "image_id": 44,
+      "source": "assets/wall2.png",
+      "mode": "raw"
     }
   ],
   "sounds": [

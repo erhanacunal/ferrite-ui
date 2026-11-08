@@ -102,28 +102,14 @@ fn style_group(x, y, w, h) {
     set(size, w, h);
 }
 
+// The gradient and its three translucent blobs are one opaque picture
+// (make_assets.py `make_wallpapers`): restoring behind a sliding page copies
+// it instead of re-blending the blobs. The root's colour stays what
+// anti-aliased edges and see-through widgets assume is behind them.
 fn build_wallpaper() {
     target(0);
-    if (ui_flags & 2) {
-        set(bg_color, WALL2_TOP);
-        set(gradient_color, WALL2_BOT);
-    } else {
-        set(bg_color, WALL_TOP);
-        set(gradient_color, WALL_BOT);
-    }
-    set(gradient_dir, 2);
-    var b1 = alloc();
-    style_box(-260, 300, 760, 760, BLOB1, 380);
-    set(alpha, 70);
-    parent(0);
-    var b2 = alloc();
-    style_box(860, -260, 640, 640, BLOB2, 320);
-    set(alpha, 52);
-    parent(0);
-    var b3 = alloc();
-    style_box(700, 560, 420, 420, BLOB3, 210);
-    set(alpha, 40);
-    parent(0);
+    set(bg_color, (ui_flags & 2) ? WALL2_TOP : WALL_TOP);
+    set(image_id, (ui_flags & 2) ? IMG_WALL2 : IMG_WALL1);
 }
 
 fn build_page0(pg: widget) {
@@ -203,10 +189,13 @@ fn build_dock() {
     dk3 = alloc(); make_icon(dk3, dock, APP_SETTINGS, 460, 60, DOCK_D, 0, 2); target(dk3); set(on_click, @on_icon);
 }
 
+// The drawer and the shade are opaque: a panel that only slides keeps its
+// pixels, which the renderer then moves instead of redrawing them (only the
+// strip coming into view is drawn). A translucent one would show the
+// wallpaper moving with it, so it is redrawn whole every frame.
 fn build_drawer() {
     drawer = alloc();
     style_box(0, SCREEN_H, SCREEN_W, SCREEN_H - STATUS_H, APP_BG, 32);
-    set(alpha, 238);
     parent(0);
     drawer_handle = alloc();
     target(drawer_handle);
@@ -256,7 +245,6 @@ fn build_shade() {
 
     shade = alloc();
     style_box(0, -SHADE_H - 32, SCREEN_W, SHADE_H + 32, SURFACE, 32);
-    set(alpha, 245);
     parent(0);
     // Content sits 32 px down: the top corners stay off screen.
     shade_time = alloc();
@@ -598,9 +586,7 @@ fn on_tile(w) {
     }
     if (w == tile_wall) {
         ui_flags = toggle(ui_flags, 2);
-        target(0);
-        set(bg_color, (ui_flags & 2) ? WALL2_TOP : WALL_TOP);
-        set(gradient_color, (ui_flags & 2) ? WALL2_BOT : WALL_BOT);
+        build_wallpaper();
         dirty();
     }
     if (w == tile_chime) {

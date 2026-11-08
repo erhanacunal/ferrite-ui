@@ -79,3 +79,18 @@ pub fn take_wait() -> u64 {
     }
     unsafe { core::mem::replace(&mut *(&raw mut WAIT), 0) }
 }
+
+/// Pixel counts (`count::G2D_KPX`, `count::CPU_BLEND_KPX`) are reported in
+/// kilopixels: the remainders carry over (CPU0 only).
+static mut PX_REM: [u32; 2] = [0; 2];
+
+/// Adds `px` pixels to kilopixel count `id` (`G2D_KPX` or `CPU_BLEND_KPX`).
+pub fn add_px(id: u8, px: usize) {
+    let slot = if id == ferrite_core::perf::count::G2D_KPX { 0 } else { 1 };
+    let rem = unsafe { &mut (*(&raw mut PX_REM))[slot] };
+    let total = *rem as usize + px;
+    *rem = (total & 1023) as u32;
+    if total >= 1024 {
+        ferrite_core::perf::add_count(id, (total >> 10) as u32);
+    }
+}
