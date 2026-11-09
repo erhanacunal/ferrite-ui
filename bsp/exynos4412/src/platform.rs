@@ -32,6 +32,9 @@ pub fn passes() -> u32 {
     PASSES.load(Ordering::Relaxed)
 }
 
+/// Backlight at boot, in percent.
+const BOOT_BRIGHTNESS: u8 = 50;
+
 pub struct Exynos4412Platform;
 
 impl Platform for Exynos4412Platform {
@@ -161,10 +164,7 @@ impl PlatformRuntime for Exynos4412Platform {
                     frames: lcd::frames(),
                     heap_used: heap.used,
                     heap_total: heap.size,
-                    #[cfg(feature = "perf")]
-                    cpu_mhz: crate::perf::hz() / 1_000_000,
-                    #[cfg(not(feature = "perf"))]
-                    cpu_mhz: 0,
+                    cpu_mhz: crate::cpuclock::mhz(),
                 }
             }),
         }
@@ -204,9 +204,11 @@ impl PlatformRuntime for Exynos4412Platform {
         unsafe { *(&raw mut BUTTON) = Some(PowerButton::new()) };
 
         ctx.lcd.fill_rect(0, 0, PANEL.width as u16, PANEL.height as u16, COLOR_BLACK);
-        // Black on screen before the backlight comes up.
+        // Black on screen before the backlight comes up. Half brightness, like the HAL's
+        // `DEFAULT_BRIGHTNESS`: full drains the battery and heats the panel; programs set
+        // their own with `setBrightness`.
         lcd::flush_wait();
-        ctx.backlight.set_brightness(100);
+        ctx.backlight.set_brightness(BOOT_BRIGHTNESS);
 
         // Nothing saved on CACHE yet (or storage off): recovery, so the host
         // can writefs.
