@@ -2,7 +2,7 @@
 /// Hardware backends implement this trait; the framework uses LcdImpl<B> for all drawing.
 use core::cell::Cell;
 
-use crate::types::{Offset, Rect};
+use crate::types::{Offset, Rect, Size};
 
 /// Anti-aliased variants of the shape primitives, used on blend-capable
 /// backends (`LcdBackend::HAS_ALPHA`).
@@ -176,6 +176,23 @@ pub trait LcdBackend {
     #[cfg(feature = "layers")]
     fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
         let _ = (n, x, y, alpha, visible);
+    }
+
+    /// [`layer_compose`](Self::layer_compose) works: a layer something is
+    /// drawn over keeps its surface and is blended into the screen
+    /// (`layer.rs`, composed layers). False = such a layer is drawn in the
+    /// tree.
+    #[cfg(feature = "layers")]
+    const LAYER_COMPOSE: bool = false;
+
+    /// Blends rect (`sx`, `sy`, `w`, `h`) of layer `n`'s surface over the
+    /// screen at (`dx`, `dy`), every pixel's alpha times `alpha`
+    /// (premultiplied "over"). Only while the screen is targeted; the rect is
+    /// inside both.
+    #[cfg(feature = "layers")]
+    #[allow(clippy::too_many_arguments)]
+    fn layer_compose(&self, n: usize, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16, alpha: u8) {
+        let _ = (n, sx, sy, w, h, dx, dy, alpha);
     }
 }
 
@@ -358,6 +375,35 @@ impl<B: LcdBackend> LcdImpl<B> {
         if self.layers_alloc.get() & 1 << n != 0 {
             self.be.layer_place(n, x, y, alpha, visible);
         }
+    }
+
+    /// See `LcdBackend::LAYER_COMPOSE`.
+    #[cfg(feature = "layers")]
+    pub fn can_compose(&self) -> bool {
+        B::LAYER_COMPOSE
+    }
+
+    /// Blends layer `n`'s surface, shown with its top-left at `at` (screen,
+    /// signed), over the screen inside `r` (cut to the surface, the screen
+    /// and the scissor). Screen targeted only.
+    #[cfg(feature = "layers")]
+    pub fn layer_compose(&self, n: usize, at: Offset, size: Size, r: &Rect, alpha: u8) {
+        if self.layers_alloc.get() & 1 << n == 0 || self.target.get().is_some() || alpha == 0 {
+            return;
+        }
+        let surface = Rect::new(at.x, at.y, size.w, size.h);
+        let mut c = match r.intersection(&surface).and_then(|c| c.intersection(&Rect::new(0, 0, B::WIDTH, B::HEIGHT))) {
+            Some(c) => c,
+            None => return,
+        };
+        if let Some(s) = self.scissor.get() {
+            c = match c.intersection(&s) {
+                Some(c) => c,
+                None => return,
+            };
+        }
+        let (sx, sy) = ((c.x as i32 - at.x as i32) as u16, (c.y as i32 - at.y as i32) as u16);
+        self.be.layer_compose(n, sx, sy, c.w, c.h, c.x as u16, c.y as u16, alpha);
     }
 
     /// Switch between landscape (panel orientation) and portrait (rotated

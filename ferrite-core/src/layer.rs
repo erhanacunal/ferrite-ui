@@ -12,12 +12,24 @@
 //! is redrawn. Changes inside the subtree redraw only its surface.
 //!
 //! A layer is active only when the result looks the same as drawing it in the
-//! tree (`ObjPool::layer_eligible`): the backend has that many layers, the
-//! screen is not in portrait, the root is not inside a scroll container, no
-//! widget of the subtree has `on_paint` (VM drawing goes to the screen), the
-//! on-screen keyboard does not overlap it, and no visible widget after the
-//! subtree in DFS order (one that would be drawn over it) overlaps its box. A
-//! layer that stops being eligible is drawn in the tree again, and one that
+//! tree (`ObjPool::layer_fit`): the backend has that many layers, the screen
+//! is not in portrait, the root is not inside a scroll container and no
+//! widget of the subtree has `on_paint` (VM drawing goes to the screen). An
+//! active layer is shown in its display window when nothing is drawn over it:
+//! the on-screen keyboard does not overlap it, and no visible widget after the
+//! subtree in DFS order (nor a lower-numbered layer) overlaps its box.
+//! Otherwise it is *composed* (`Slot::composed`, backends with
+//! `LcdBackend::LAYER_COMPOSE`): its window is hidden and the screen's passes
+//! draw the root as one see-through widget, its surface blended over what is
+//! behind it (`LcdBackend::layer_compose`), so the widgets after it are drawn
+//! over it as in the tree. The surface is kept, as SurfaceFlinger keeps a
+//! buffer it composites with GL when the hardware composer can't show it in an
+//! overlay: a plain widget sliding over a layer costs blends of the kept
+//! surface, not a new surface and a full redraw when the layer comes back. A
+//! composed layer whose content or placement changes recomposites its whole
+//! on-screen box.
+//!
+//! A layer that stops being eligible is drawn in the tree again, and one that
 //! becomes eligible moves into its surface: what the screen drew of it is
 //! restored first. Only the dirty render mode uses layers; the buffered mode
 //! turns them off.
@@ -52,6 +64,16 @@ pub struct Slot {
     pub full: bool,
     /// Just became active: what the screen drew of the subtree, to restore.
     pub restore: Rect,
+    /// Active, but drawn into the screen by the screen's passes (its surface
+    /// blended over what is behind) instead of shown in its window.
+    pub composed: bool,
+    /// Composed: where the screen shows the surface (empty = nowhere) and
+    /// with which plane alpha.
+    pub shown: Rect,
+    pub shown_alpha: u8,
+    /// Composed: the root is drawn again on the screen this render (after its
+    /// surface's pass).
+    pub recompose: bool,
 }
 
 impl Slot {
@@ -64,7 +86,22 @@ impl Slot {
         at: Offset { x: 0, y: 0 },
         full: false,
         restore: Rect { x: 0, y: 0, w: 0, h: 0 },
+        composed: false,
+        shown: Rect { x: 0, y: 0, w: 0, h: 0 },
+        shown_alpha: 255,
+        recompose: false,
     };
+}
+
+/// How a layer can be drawn this render (`ObjPool::layer_fit`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fit {
+    /// In the tree.
+    Tree,
+    /// In its surface, composed into the screen (something is drawn over it).
+    Compose,
+    /// In its surface, shown in its window.
+    Window,
 }
 
 /// Which DFS entries a render pass draws.
@@ -89,6 +126,8 @@ pub struct Layers {
     /// Subtracted from every absolute rect during a layer pass (the root's
     /// screen position): geometry is then surface coordinates.
     pub origin: Offset,
+    /// Slots that are composed (bit n), for the drawing's quick check.
+    pub composed: u8,
 }
 
 impl Layers {
@@ -98,6 +137,7 @@ impl Layers {
             placed: false,
             scope: Scope::All,
             origin: Offset { x: 0, y: 0 },
+            composed: 0,
         }
     }
 }
@@ -124,6 +164,13 @@ impl ObjPool {
                 // Leaves this slot (or is pushed out of it): drawn in the tree.
                 let root = slot.root;
                 self.layers.slots[s] = Slot { root: WidgetId::NONE, ..Slot::EMPTY };
+                self.layers.composed &= !(1 << s);
+                if slot.composed && !slot.shown.is_empty() && self.is_live(root) {
+                    // The screen shows its surface there (the root may have
+                    // moved since): put back as the root's previous place.
+                    self.set_prev_rect(root, 0, slot.shown);
+                    self.get_mut(root).flags |= FLAG_RENDERED;
+                }
                 if slot.active {
                     self.layer_drop_flags(root);
                 }
@@ -196,27 +243,38 @@ impl ObjPool {
         matches!(self.layers.scope, Scope::Layer(..))
     }
 
-    /// Where the subtree of DFS entry `ri` (a layer root) may be drawn as a
-    /// layer: see the module docs. `overlay` = the keyboard's rect.
-    pub(crate) fn layer_eligible(&self, me: usize, ri: usize, end: usize) -> bool {
+    /// `id` is the root of a composed layer and the screen is being drawn:
+    /// drawing it blends its surface (slot returned), and it counts as a
+    /// see-through widget (never opaque, restored behind before drawing).
+    #[inline]
+    pub fn composed_root(&self, id: WidgetId) -> Option<usize> {
+        if self.layers.composed == 0 || self.in_layer_pass() || id.is_none() {
+            return None;
+        }
+        self.layers.slots.iter().position(|s| s.composed && s.root == id)
+    }
+
+    /// How the subtree of DFS entry `ri` (layer `me`'s root) may be drawn:
+    /// see the module docs.
+    pub(crate) fn layer_fit(&self, me: usize, ri: usize, end: usize) -> Fit {
         if self.scroll_parent_at(ri).is_some() {
-            return false;
+            return Fit::Tree;
         }
         let root = self.abs_at(ri);
         if root.is_empty() {
-            return false;
+            return Fit::Tree;
         }
         for i in ri..end {
             if self.get(self.dfs_at(i)).flags & FLAG_HAS_ON_PAINT != 0 {
-                return false;
+                return Fit::Tree;
             }
         }
         if !self.vis_at(ri) {
             // Hidden: nothing shows, nothing to check against.
-            return true;
+            return Fit::Window;
         }
         if self.overlay.is_some_and(|k| k.intersects(&root)) {
-            return false;
+            return Fit::Compose;
         }
         let mut j = end;
         while j < self.dfs_len() {
@@ -225,17 +283,17 @@ impl ObjPool {
             let id = self.dfs_at(j);
             if let Some(other) = self.layers.slots.iter().position(|s| s.root.is_some() && s.root == id) {
                 if other < me && self.vis_at(j) && self.abs_at(j).intersects(&root) {
-                    return false;
+                    return Fit::Compose;
                 }
                 j = self.sub_end_at(j);
                 continue;
             }
             if self.vis_at(j) && self.abs_at(j).intersects(&root) {
-                return false;
+                return Fit::Compose;
             }
             j += 1;
         }
-        true
+        Fit::Window
     }
 
     /// The box the screen last drew the subtree `[ri, end)` in (for when it
@@ -482,22 +540,53 @@ impl SoftLayers {
                     if x < 0 || x >= w as i32 {
                         continue;
                     }
-                    let p = s.px[sy * s.w as usize + sx];
-                    if p == 0 {
-                        continue;
-                    }
                     let d = &mut dst[y as usize * w + x as usize];
-                    let pa = ((p >> 24) * plane + 127) / 255;
-                    let na = 255 - pa;
-                    let ch = |sh: u32| {
-                        let sc = (((p >> sh) & 0xFF) * plane + 127) / 255;
-                        (sc + (((*d >> sh) & 0xFF) * na + 127) / 255).min(255)
-                    };
-                    *d = 0xFF00_0000 | ch(16) << 16 | ch(8) << 8 | ch(0);
+                    *d = over_plane(*d, s.px[sy * s.w as usize + sx], plane);
                 }
             }
         }
     }
+
+    /// `LcdBackend::layer_compose` for a software screen: blends rect
+    /// `src` (x, y, w, h) of surface `n` over `dst` (0x__RRGGBB pixels, rows
+    /// of `stride`) at `at`, times `alpha`. The rect must be inside both.
+    /// False if `n` has no surface.
+    pub fn compose_onto(
+        &self,
+        n: usize,
+        src: (usize, usize, usize, usize),
+        dst: &mut [u32],
+        stride: usize,
+        at: (usize, usize),
+        alpha: u8,
+    ) -> bool {
+        let (sx, sy, w, h) = src;
+        let surfaces = self.surfaces.borrow();
+        let Some(s) = surfaces.get(n).and_then(Option::as_ref) else { return false };
+        for row in 0..h {
+            let from = &s.px[(sy + row) * s.w as usize + sx..][..w];
+            let out = &mut dst[(at.1 + row) * stride + at.0..][..w];
+            for (d, &p) in out.iter_mut().zip(from) {
+                *d = over_plane(*d, p, alpha as u32);
+            }
+        }
+        true
+    }
+}
+
+/// Premultiplied `p` times plane alpha `plane` over opaque `d` (the top byte
+/// is written 0xFF).
+fn over_plane(d: u32, p: u32, plane: u32) -> u32 {
+    if p == 0 {
+        return d;
+    }
+    let pa = ((p >> 24) * plane + 127) / 255;
+    let na = 255 - pa;
+    let ch = |sh: u32| {
+        let sc = (((p >> sh) & 0xFF) * plane + 127) / 255;
+        (sc + (((d >> sh) & 0xFF) * na + 127) / 255).min(255)
+    };
+    0xFF00_0000 | ch(16) << 16 | ch(8) << 8 | ch(0)
 }
 
 #[cfg(all(test, feature = "mock"))]
@@ -526,14 +615,16 @@ mod tests {
 
     /// 128x128 XRGB8888 readback screen with `L` software layers; counts the
     /// primitives drawn on the screen and into layers.
-    struct Fb<const L: usize> {
+    struct Fb<const L: usize, const C: bool> {
         px: RefCell<Vec<u32>>,
         layers: SoftLayers,
         screen_calls: Cell<usize>,
         layer_calls: Cell<usize>,
+        /// `layer_compose` calls.
+        composes: Cell<usize>,
     }
 
-    impl<const L: usize> Fb<L> {
+    impl<const L: usize, const C: bool> Fb<L, C> {
         fn count(&self) -> bool {
             if self.layers.target().is_some() {
                 self.layer_calls.set(self.layer_calls.get() + 1);
@@ -552,7 +643,7 @@ mod tests {
         }
     }
 
-    impl<const L: usize> LcdBackend for Fb<L> {
+    impl<const L: usize, const C: bool> LcdBackend for Fb<L, C> {
         const WIDTH: u16 = S as u16;
         const HEIGHT: u16 = S as u16;
         const HAS_ALPHA: bool = true;
@@ -623,11 +714,20 @@ mod tests {
         fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
             self.layers.place(n, x, y, alpha, visible);
         }
+        const LAYER_COMPOSE: bool = C;
+        fn layer_compose(&self, n: usize, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16, alpha: u8) {
+            assert!(self.layers.target().is_none(), "composed while a layer is targeted");
+            self.screen_calls.set(self.screen_calls.get() + 1);
+            self.composes.set(self.composes.get() + 1);
+            let src = (sx as usize, sy as usize, w as usize, h as usize);
+            let mut px = self.px.borrow_mut();
+            assert!(self.layers.compose_onto(n, src, &mut px, S, (dx as usize, dy as usize), alpha));
+        }
     }
 
-    struct Plat<const L: usize>;
-    impl<const L: usize> Platform for Plat<L> {
-        type LcdB = Fb<L>;
+    struct Plat<const L: usize, const C: bool>;
+    impl<const L: usize, const C: bool> Platform for Plat<L, C> {
+        type LcdB = Fb<L, C>;
         type FlashB = MockFlash;
         type TouchB = MockTouch;
         type BacklightB = MockBacklight;
@@ -643,13 +743,14 @@ mod tests {
         type Renderer = crate::renderer::DefaultRenderer;
     }
 
-    fn ctx<const L: usize>() -> Ctx<Plat<L>> {
+    fn ctx<const L: usize, const C: bool>() -> Ctx<Plat<L, C>> {
         Ctx {
             lcd: LcdImpl::with_backend(Fb {
                 px: RefCell::new(vec![0xFF00_0000; S * S]),
                 layers: SoftLayers::new(),
                 screen_calls: Cell::new(0),
                 layer_calls: Cell::new(0),
+                composes: Cell::new(0),
             }),
             flash: FlashImpl::with_backend(MockFlash),
             fonts: FontList::new(),
@@ -697,7 +798,7 @@ mod tests {
     /// A backdrop with translucent blobs, a rounded bordered panel with
     /// opaque, translucent and rounded children (layer 1 when `layer`), and
     /// a small base widget after it.
-    fn scene<const L: usize>(c: &mut Ctx<Plat<L>>, layer: bool) -> Scene {
+    fn scene<const L: usize, const C: bool>(c: &mut Ctx<Plat<L, C>>, layer: bool) -> Scene {
         let o = &mut c.objs;
         let root = o.alloc_widget().unwrap();
         o.root = root;
@@ -718,13 +819,13 @@ mod tests {
         Scene { panel, child, late }
     }
 
-    fn move_to<const L: usize>(c: &mut Ctx<Plat<L>>, id: WidgetId, x: i16, y: i16) {
+    fn move_to<const L: usize, const C: bool>(c: &mut Ctx<Plat<L, C>>, id: WidgetId, x: i16, y: i16) {
         c.objs.will_move(id);
         c.objs.get_mut(id).location = Offset { x, y };
         c.objs.mark_moved(id);
     }
 
-    fn set_visible<const L: usize>(c: &mut Ctx<Plat<L>>, id: WidgetId, on: bool) {
+    fn set_visible<const L: usize, const C: bool>(c: &mut Ctx<Plat<L, C>>, id: WidgetId, on: bool) {
         let w = c.objs.get_mut(id);
         w.flags = if on { w.flags | FLAG_VISIBLE } else { w.flags & !FLAG_VISIBLE };
         if !c.objs.layer_placement_changed(id) {
@@ -748,7 +849,7 @@ mod tests {
     }
 
     /// (screen, layer) primitive calls since the last call.
-    fn calls<const L: usize>(c: &Ctx<Plat<L>>) -> (usize, usize) {
+    fn calls<const L: usize, const C: bool>(c: &Ctx<Plat<L, C>>) -> (usize, usize) {
         let b = c.lcd.backend();
         let n = (b.screen_calls.get(), b.layer_calls.get());
         b.screen_calls.set(0);
@@ -756,7 +857,7 @@ mod tests {
         n
     }
 
-    fn both<const L: usize>(a: &mut Ctx<Plat<L>>, b: &mut Ctx<Plat<0>>, what: &str) {
+    fn both<const L: usize, const C: bool>(a: &mut Ctx<Plat<L, C>>, b: &mut Ctx<Plat<0, false>>, what: &str) {
         render_dirty(a);
         render_dirty(b);
         assert_same(what, &a.lcd.backend().shown(), &b.lcd.backend().shown());
@@ -764,8 +865,8 @@ mod tests {
 
     #[test]
     fn moving_a_layer_matches_the_tree_and_draws_nothing() {
-        let mut a = ctx::<2>();
-        let mut b = ctx::<0>();
+        let mut a = ctx::<2, false>();
+        let mut b = ctx::<0, false>();
         let sa = scene(&mut a, true);
         let sb = scene(&mut b, true);
         render_all(&mut a);
@@ -785,8 +886,8 @@ mod tests {
 
     #[test]
     fn a_change_inside_a_layer_redraws_only_its_surface() {
-        let mut a = ctx::<2>();
-        let mut b = ctx::<0>();
+        let mut a = ctx::<2, false>();
+        let mut b = ctx::<0, false>();
         let sa = scene(&mut a, true);
         let sb = scene(&mut b, true);
         render_all(&mut a);
@@ -816,8 +917,8 @@ mod tests {
 
     #[test]
     fn hiding_and_showing_a_layer_keeps_or_redraws_its_content() {
-        let mut a = ctx::<2>();
-        let mut b = ctx::<0>();
+        let mut a = ctx::<2, false>();
+        let mut b = ctx::<0, false>();
         let sa = scene(&mut a, true);
         let sb = scene(&mut b, true);
         render_all(&mut a);
@@ -847,8 +948,8 @@ mod tests {
 
     #[test]
     fn a_layer_under_a_later_widget_is_drawn_in_the_tree() {
-        let mut a = ctx::<2>();
-        let mut b = ctx::<0>();
+        let mut a = ctx::<2, false>();
+        let mut b = ctx::<0, false>();
         let sa = scene(&mut a, true);
         let sb = scene(&mut b, true);
         render_all(&mut a);
@@ -873,7 +974,7 @@ mod tests {
 
     #[test]
     fn plane_alpha_fades_without_redrawing() {
-        let mut a = ctx::<2>();
+        let mut a = ctx::<2, false>();
         let sa = scene(&mut a, true);
         render_all(&mut a);
         let opaque = a.lcd.backend().shown();
@@ -897,8 +998,8 @@ mod tests {
 
     #[test]
     fn unmarking_a_layer_draws_it_in_the_tree() {
-        let mut a = ctx::<2>();
-        let mut b = ctx::<0>();
+        let mut a = ctx::<2, false>();
+        let mut b = ctx::<0, false>();
         let sa = scene(&mut a, true);
         let _ = scene(&mut b, false);
         render_all(&mut a);
@@ -908,5 +1009,157 @@ mod tests {
         assert_eq!(a.lcd.layers_allocated(), 0);
         assert_eq!(a.lcd.backend().layers.target(), None);
         assert_same("unmarked", &a.lcd.backend().px.borrow(), &b.lcd.backend().shown());
+    }
+
+    /// The window of layer `n` is shown.
+    fn window_shown<const L: usize, const C: bool>(c: &Ctx<Plat<L, C>>, n: usize) -> bool {
+        c.lcd.backend().layers.surfaces.borrow()[n].as_ref().is_some_and(|s| s.visible)
+    }
+
+    #[test]
+    fn a_layer_under_a_later_widget_is_composed_and_keeps_its_surface() {
+        let mut a = ctx::<2, true>();
+        let mut b = ctx::<0, false>();
+        let sa = scene(&mut a, true);
+        let sb = scene(&mut b, true);
+        render_all(&mut a);
+        render_all(&mut b);
+        assert!(window_shown(&a, 0));
+        calls(&a);
+        // Under `late` (100, 100): composed into the screen, the window hidden.
+        move_to(&mut a, sa.panel, 70, 70);
+        move_to(&mut b, sb.panel, 70, 70);
+        both(&mut a, &mut b, "composed under a later widget");
+        assert!(a.objs.is_active_layer_root(sa.panel), "still a layer");
+        assert!(a.objs.layers.slots[0].composed);
+        assert!(!window_shown(&a, 0));
+        assert_eq!(a.lcd.layers_allocated(), 1, "the surface is kept");
+        let (_, layer) = calls(&a);
+        assert_eq!(layer, 0, "its content is not redrawn");
+        assert!(a.lcd.backend().composes.get() > 0);
+        // Moving while composed: blended at the new place, nothing redrawn in the surface.
+        move_to(&mut a, sa.panel, 75, 60);
+        move_to(&mut b, sb.panel, 75, 60);
+        both(&mut a, &mut b, "composed and moved");
+        assert_eq!(calls(&a).1, 0);
+        // A change inside while composed: drawn in the surface, blended again.
+        a.objs.get_mut(sa.child).background_color = 0xFD20;
+        a.objs.mark_dirty(sa.child);
+        b.objs.get_mut(sb.child).background_color = 0xFD20;
+        b.objs.mark_dirty(sb.child);
+        both(&mut a, &mut b, "composed and changed");
+        assert!(calls(&a).1 > 0);
+        // Plane alpha while composed.
+        a.objs.set_layer_alpha(sa.panel, 255);
+        both(&mut a, &mut b, "composed, alpha set again");
+        // Away again: back in its window, the screen's copy put back, no redraw.
+        move_to(&mut a, sa.panel, 10, 10);
+        move_to(&mut b, sb.panel, 10, 10);
+        both(&mut a, &mut b, "a window again");
+        assert!(!a.objs.layers.slots[0].composed);
+        assert!(window_shown(&a, 0));
+        assert_eq!(calls(&a).1, 0, "the kept surface is shown as it is");
+        // The later widget moves over it and away (the layer itself doesn't move).
+        move_to(&mut a, sa.late, 30, 20);
+        move_to(&mut b, sb.late, 30, 20);
+        both(&mut a, &mut b, "covered by a moved widget");
+        assert!(a.objs.layers.slots[0].composed);
+        move_to(&mut a, sa.late, 100, 100);
+        move_to(&mut b, sb.late, 100, 100);
+        both(&mut a, &mut b, "uncovered");
+        assert!(!a.objs.layers.slots[0].composed);
+        assert_eq!(calls(&a).1, 0);
+    }
+
+    #[test]
+    fn a_composed_layer_hides_shows_and_returns_to_the_tree() {
+        let mut a = ctx::<2, true>();
+        let mut b = ctx::<0, false>();
+        let sa = scene(&mut a, true);
+        let sb = scene(&mut b, true);
+        render_all(&mut a);
+        render_all(&mut b);
+        move_to(&mut a, sa.panel, 70, 70);
+        move_to(&mut b, sb.panel, 70, 70);
+        both(&mut a, &mut b, "composed");
+        set_visible(&mut a, sa.panel, false);
+        set_visible(&mut b, sb.panel, false);
+        both(&mut a, &mut b, "composed, hidden");
+        set_visible(&mut a, sa.panel, true);
+        set_visible(&mut b, sb.panel, true);
+        both(&mut a, &mut b, "composed, shown");
+        // A full redraw while composed.
+        render_all(&mut a);
+        render_all(&mut b);
+        assert_same("render_all", &a.lcd.backend().shown(), &b.lcd.backend().shown());
+        // Moved and unmarked in one frame: drawn in the tree, the old place put back.
+        move_to(&mut a, sa.panel, 60, 64);
+        move_to(&mut b, sb.panel, 60, 64);
+        a.objs.set_layer(sa.panel, 0);
+        both(&mut a, &mut b, "unmarked while composed");
+        assert_eq!(a.lcd.layers_allocated(), 0);
+        assert_eq!(a.objs.layers.composed, 0);
+    }
+
+    #[test]
+    fn a_translucent_widget_over_a_composed_layer() {
+        // Against the tree drawn whole: a dirty render of the tree keeps old
+        // pixels under a see-through widget in front of a moved one (it is
+        // left out of the moved one's clip and not redrawn).
+        fn exact(a: &mut Ctx<Plat<2, true>>, b: &mut Ctx<Plat<0, false>>, what: &str) {
+            render_dirty(a);
+            render_all(b);
+            assert_same(what, &a.lcd.backend().shown(), &b.lcd.backend().shown());
+        }
+        let mut a = ctx::<2, true>();
+        let mut b = ctx::<0, false>();
+        let sa = scene(&mut a, true);
+        let sb = scene(&mut b, true);
+        for (c, late) in [(&mut a.objs, sa.late), (&mut b.objs, sb.late)] {
+            c.update_ext(late, |e| {
+                e.alpha = 120;
+                e.border_radius = 6;
+            });
+        }
+        render_all(&mut a);
+        render_all(&mut b);
+        for (step, &(x, y)) in [(70, 70), (72, 74), (90, 90), (20, 30)].iter().enumerate() {
+            move_to(&mut a, sa.panel, x, y);
+            move_to(&mut b, sb.panel, x, y);
+            exact(&mut a, &mut b, &alloc::format!("step {step}"));
+        }
+        // The translucent widget moving over the still layer, then a fade.
+        for (step, &(x, y)) in [(30, 40), (34, 44), (100, 100)].iter().enumerate() {
+            move_to(&mut a, sa.late, x, y);
+            move_to(&mut b, sb.late, x, y);
+            exact(&mut a, &mut b, &alloc::format!("late step {step}"));
+        }
+        move_to(&mut a, sa.late, 30, 40);
+        render_dirty(&mut a);
+        assert!(a.objs.layers.slots[0].composed);
+        let before = a.lcd.backend().shown();
+        a.objs.set_layer_alpha(sa.panel, 0);
+        render_dirty(&mut a);
+        a.objs.set_layer_alpha(sa.panel, 255);
+        render_dirty(&mut a);
+        assert_same("faded out and in while composed", &a.lcd.backend().shown(), &before);
+    }
+
+    #[test]
+    fn a_layer_composed_at_the_first_frame() {
+        let mut a = ctx::<2, true>();
+        let mut b = ctx::<0, false>();
+        let sa = scene(&mut a, true);
+        let sb = scene(&mut b, true);
+        move_to(&mut a, sa.panel, 70, 70);
+        move_to(&mut b, sb.panel, 70, 70);
+        render_all(&mut a);
+        render_all(&mut b);
+        assert!(a.objs.layers.slots[0].composed);
+        assert_same("first frame", &a.lcd.backend().shown(), &b.lcd.backend().shown());
+        move_to(&mut a, sa.panel, 20, 30);
+        move_to(&mut b, sb.panel, 20, 30);
+        both(&mut a, &mut b, "a window");
+        assert!(window_shown(&a, 0));
     }
 }

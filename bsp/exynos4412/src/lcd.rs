@@ -1251,6 +1251,70 @@ impl LcdBackend for FimdLcd {
     fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
         layers::place(n, x, y, alpha, visible);
     }
+
+    #[cfg(feature = "layers")]
+    const LAYER_COMPOSE: bool = true;
+
+    #[cfg(feature = "layers")]
+    fn layer_compose(&self, n: usize, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16, alpha: u8) {
+        compose_layer(n, (sx as usize, sy as usize), (w as usize, h as usize), (dx as usize, dy as usize), alpha);
+    }
+}
+
+/// `LcdBackend::layer_compose`: blends `size` pixels of layer `n`'s shadow
+/// from `src` over the screen's shadow at `dst`, times plane alpha `alpha`.
+/// The G2D blends (as a sprite blit) when the plane alpha is 255; otherwise,
+/// or if it can't, the CPU.
+#[cfg(feature = "layers")]
+fn compose_layer(n: usize, src: (usize, usize), size: (usize, usize), dst: (usize, usize), alpha: u8) {
+    let t = target();
+    let ((sx, sy), (w, h), (dx, dy)) = (src, size, dst);
+    if t.sprite || w == 0 || h == 0 || dx + w > t.w || dy + h > t.h {
+        return;
+    }
+    #[cfg(feature = "g2d_render")]
+    if alpha == 255
+        && g2d_draw_ready()
+        && let Some((phys, _, lw, lh)) = layers::compose_source(n, Some((sx, sy, w, h)))
+    {
+        let layer = Surface { address: phys, stride: lw * 4, width: lw, height: lh, format: Format::Argb8888 };
+        let ok = g2d_op("layer compose", w * h, |g| {
+            let (from, to) = (g2d::Rect::new(sx, sy, w, h), g2d::Rect::new(dx, dy, w, h));
+            g.blend(&layer, from, Alpha::Premultiplied, &shadow_surface(), to, Filter::Nearest, 255)
+        });
+        if ok {
+            mark(dx, dy, w, h);
+            return;
+        }
+    }
+    let Some((_, px, lw, lh)) = layers::compose_source(n, None) else { return };
+    if sx + w > lw || sy + h > lh {
+        return;
+    }
+    t.fence(dy, dy + h);
+    cpu_blend!(t, w * h);
+    let plane = alpha as u32;
+    timed!({
+        for r in 0..h {
+            // SAFETY: inside the layer's shadow (checked above) and the screen's (clipped by
+            // the caller, checked above); different blocks.
+            let from = unsafe { core::slice::from_raw_parts((px as *const u32).add((sy + r) * lw + sx), w) };
+            let to = unsafe { t.row(dx, dy + r, w) };
+            for (d, &s) in to.iter_mut().zip(from) {
+                if s == 0 {
+                    continue;
+                }
+                // Premultiplied `s` times the plane alpha "over" the opaque screen.
+                let sa = (s >> 24) * plane / 255;
+                let ch = |sh: u32| {
+                    let sc = ((s >> sh) & 0xFF) * plane / 255;
+                    (sc + ((*d >> sh) & 0xFF) * (255 - sa) / 255).min(255)
+                };
+                *d = 0xFF00_0000 | ch(16) << 16 | ch(8) << 8 | ch(0);
+            }
+        }
+        t.mark(dx, dy, w, h);
+    })
 }
 
 // ============================================================================

@@ -301,6 +301,13 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
         for slot in ctx.objs.layers.slots.iter_mut() {
             // The whole screen is drawn: nothing of a layer to restore on it.
             slot.restore = Rect::new(0, 0, 0, 0);
+            slot.recompose = false;
+        }
+        // Composed layers' surfaces first: the screen's pass blends them.
+        for s in 0..crate::layer::MAX_LAYERS {
+            if ctx.objs.layers.slots[s].composed {
+                layer_pass(ctx, s, true);
+            }
         }
         if active != 0 {
             ctx.objs.layers.scope = base_scope(&ctx.objs);
@@ -314,7 +321,8 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
         ctx.objs.layers.scope = crate::layer::Scope::All;
         if active != 0 {
             for s in 0..crate::layer::MAX_LAYERS {
-                if ctx.objs.layers.slots[s].active {
+                let slot = ctx.objs.layers.slots[s];
+                if slot.active && !slot.composed {
                     layer_pass(ctx, s, true);
                 }
             }
@@ -431,6 +439,25 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
 
     #[cfg(feature = "layers")]
     if active != 0 {
+        // Composed layers' surfaces first: what changed in them is blended
+        // into the screen by its passes, their root redrawn there.
+        for s in 0..crate::layer::MAX_LAYERS {
+            if !ctx.objs.layers.slots[s].composed {
+                continue;
+            }
+            if layer_pass(ctx, s, false) {
+                ctx.objs.layers.slots[s].recompose = true;
+            }
+            let slot = &mut ctx.objs.layers.slots[s];
+            if core::mem::take(&mut slot.recompose) && !slot.shown.is_empty() {
+                let (root, shown) = (slot.root, slot.shown);
+                // The root alone: its subtree is not the screen's.
+                ctx.objs.get_mut(root).flags |= crate::widget::FLAG_DIRTY_A;
+                if let Some(ri) = ctx.objs.dfs_index(root) {
+                    mark_front(ctx, ctx.objs.sub_end_at(ri), shown);
+                }
+            }
+        }
         ctx.objs.layers.scope = base_scope(&ctx.objs);
     }
     dirty_passes(ctx, settled, true);
@@ -438,7 +465,8 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     if active != 0 {
         ctx.objs.layers.scope = crate::layer::Scope::All;
         for s in 0..crate::layer::MAX_LAYERS {
-            if ctx.objs.layers.slots[s].active {
+            let slot = ctx.objs.layers.slots[s];
+            if slot.active && !slot.composed {
                 layer_pass(ctx, s, false);
             }
         }
@@ -696,21 +724,41 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
 
 // --- Layers (`layer.rs`) ---
 
-/// Decides which layers are active this render (`ObjPool::layer_eligible`),
-/// (re)allocates their surfaces and hands the ones that stop back to the
-/// tree. Scope must be `All`, origin 0. Returns how many are active.
+/// Decides how each layer is drawn this render (`ObjPool::layer_fit`):
+/// (re)allocates the surfaces of active ones, hands the ones that stop back
+/// to the tree, and for composed ones notes where the screen must show them
+/// (`Slot::shown`; the old place goes to `Slot::restore`). Scope must be
+/// `All`, origin 0. Returns how many are active.
 #[cfg(feature = "layers")]
 fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
-    use crate::layer::{MAX_LAYERS, Slot};
+    use crate::layer::{Fit, MAX_LAYERS, Slot};
+    let none = Rect::new(0, 0, 0, 0);
+    let merge = |a: Rect, b: Rect| {
+        if a.is_empty() {
+            b
+        } else if b.is_empty() {
+            a
+        } else {
+            a.union(&b)
+        }
+    };
     let count = ctx.lcd.layer_count();
+    let can_compose = ctx.lcd.can_compose();
     let mut active = 0;
+    let mut composed = 0u8;
     for s in 0..MAX_LAYERS {
         let mut slot: Slot = ctx.objs.layers.slots[s];
         let live = slot.root.is_some() && ctx.objs.is_live(slot.root);
         let range = if live { ctx.objs.dfs_index(slot.root).map(|ri| (ri, ctx.objs.sub_end_at(ri))) } else { None };
-        let mut want = s < count && range.is_some_and(|(ri, end)| ctx.objs.layer_eligible(s, ri, end));
-        if want {
-            let (ri, end) = range.unwrap_or((0, 0));
+        let mut fit = match range {
+            Some((ri, end)) if s < count => ctx.objs.layer_fit(s, ri, end),
+            _ => Fit::Tree,
+        };
+        if fit == Fit::Compose && !can_compose {
+            fit = Fit::Tree;
+        }
+        let (ri, end) = range.unwrap_or((0, 0));
+        if fit != Fit::Tree {
             let size = ctx.objs.get(slot.root).size;
             if !slot.active || (slot.w, slot.h) != (size.w, size.h) {
                 if ctx.lcd.layer_alloc(s, size.w, size.h) {
@@ -722,17 +770,47 @@ fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
                     slot.w = size.w;
                     slot.h = size.h;
                 } else {
-                    want = false;
+                    fit = Fit::Tree;
                 }
             }
         }
-        if !want && slot.active {
+        if fit == Fit::Tree && slot.active {
             // Drawn in the tree again.
+            if slot.composed && live && !slot.shown.is_empty() {
+                // Where the screen shows its surface (the root may have moved
+                // since) is put back as the root's previous place.
+                ctx.objs.set_prev_rect(slot.root, 0, slot.shown);
+                ctx.objs.get_mut(slot.root).flags |= FLAG_RENDERED;
+            }
             slot.active = false;
+            slot.composed = false;
+            slot.shown = none;
+            slot.recompose = false;
             slot.w = 0;
             slot.h = 0;
             if live {
                 ctx.objs.mark_dirty(slot.root);
+            }
+        }
+        if slot.active {
+            let compose = fit == Fit::Compose;
+            if compose != slot.composed {
+                // Into the screen: drawn there below. Out of it: what the
+                // screen shows of it is put back (its window shows it).
+                slot.restore = merge(slot.restore, slot.shown);
+                slot.shown = none;
+                slot.composed = compose;
+                slot.recompose = compose;
+            }
+            if slot.composed {
+                let at = if ctx.objs.vis_at(ri) && slot.alpha != 0 { ctx.objs.abs_at(ri) } else { none };
+                if at != slot.shown || slot.alpha != slot.shown_alpha {
+                    slot.restore = merge(slot.restore, slot.shown);
+                    slot.shown = at;
+                    slot.shown_alpha = slot.alpha;
+                    slot.recompose = true;
+                }
+                composed |= 1 << s;
             }
         }
         if !slot.active {
@@ -745,7 +823,35 @@ fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
         active += slot.active as usize;
         ctx.objs.layers.slots[s] = slot;
     }
+    ctx.objs.layers.composed = composed;
     active
+}
+
+/// A composed layer is blended again over `area`: the screen's widgets after
+/// it there (from DFS index `from`) are drawn again too. Pass 2 leaves every
+/// later widget out of the root's clip, so a see-through one would keep
+/// showing the old blend; an opaque one is redrawn as a restore would. Layers
+/// shown in windows are not the screen's.
+#[cfg(feature = "layers")]
+fn mark_front<P: Platform>(ctx: &mut Ctx<P>, from: usize, area: Rect) {
+    let mut j = from;
+    while j < ctx.objs.dfs_len() {
+        let id = ctx.objs.dfs_at(j);
+        let slot = ctx.objs.layers.slots.iter().find(|s| s.active && s.root == id).copied();
+        if slot.is_some_and(|s| !s.composed) {
+            j = ctx.objs.sub_end_at(j);
+            continue;
+        }
+        if ctx.objs.vis_at(j) && ctx.objs.abs_at(j).intersects(&area) && !ctx.objs.get(id).is_dirty() {
+            if slot.is_some() {
+                ctx.objs.get_mut(id).flags |= crate::widget::FLAG_DIRTY_A;
+                j = ctx.objs.sub_end_at(j);
+                continue;
+            }
+            ctx.objs.mark_dirty(id);
+        }
+        j += 1;
+    }
 }
 
 /// The screen's scope: every DFS entry but the active layers' subtrees.
@@ -755,7 +861,8 @@ fn base_scope(objs: &ObjPool) -> crate::layer::Scope {
     let mut n = 0;
     for slot in objs.layers.slots.iter().filter(|s| s.active) {
         if let Some(ri) = objs.dfs_index(slot.root) {
-            excl[n] = (ri as u32, objs.sub_end_at(ri) as u32);
+            // A composed layer's root is drawn on the screen (its surface).
+            excl[n] = (ri as u32 + slot.composed as u32, objs.sub_end_at(ri) as u32);
             n += 1;
         }
     }
@@ -764,10 +871,11 @@ fn base_scope(objs: &ObjPool) -> crate::layer::Scope {
 
 /// Draws layer `s`'s dirty widgets into its surface (`all`: every widget,
 /// from a cleared surface). Scope must be `All` on entry and is again after.
+/// True if anything was drawn.
 #[cfg(feature = "layers")]
-fn layer_pass<P: Platform>(ctx: &mut Ctx<P>, s: usize, all: bool) {
+fn layer_pass<P: Platform>(ctx: &mut Ctx<P>, s: usize, all: bool) -> bool {
     let slot = ctx.objs.layers.slots[s];
-    let Some(ri) = ctx.objs.dfs_index(slot.root) else { return };
+    let Some(ri) = ctx.objs.dfs_index(slot.root) else { return false };
     let end = ctx.objs.sub_end_at(ri);
     let abs = ctx.objs.abs_at(ri);
     let mut full = slot.full || all;
@@ -777,7 +885,11 @@ fn layer_pass<P: Platform>(ctx: &mut Ctx<P>, s: usize, all: bool) {
         if ctx.objs.layer_has_dirty(ri, end, false) {
             ctx.objs.layers.slots[s].full = true;
         }
-        return;
+        return false;
+    }
+    if !full && !ctx.objs.layer_has_dirty(ri, end, false) {
+        ctx.objs.layers.slots[s].at = Offset { x: abs.x, y: abs.y };
+        return false;
     }
     let at = Offset { x: abs.x, y: abs.y };
     // Prev rects recorded since the root last moved are relative to a
@@ -803,6 +915,7 @@ fn layer_pass<P: Platform>(ctx: &mut Ctx<P>, s: usize, all: bool) {
     let slot = &mut ctx.objs.layers.slots[s];
     slot.at = at;
     slot.full = false;
+    true
 }
 
 /// Shows every active layer where its root is (scope `All`, origin 0).
@@ -815,7 +928,7 @@ fn place_layers<P: Platform>(ctx: &mut Ctx<P>) {
         }
         if let Some(ri) = ctx.objs.dfs_index(slot.root) {
             let abs = ctx.objs.abs_at(ri);
-            let vis = ctx.objs.vis_at(ri);
+            let vis = ctx.objs.vis_at(ri) && !slot.composed;
             ctx.lcd.layer_place(s, abs.x as i32, abs.y as i32, slot.alpha, vis);
         }
     }
@@ -828,12 +941,18 @@ fn layers_off<P: Platform>(ctx: &mut Ctx<P>) {
     for s in 0..crate::layer::MAX_LAYERS {
         let slot = ctx.objs.layers.slots[s];
         if slot.active {
-            ctx.objs.layers.slots[s].active = false;
-            ctx.objs.layers.slots[s].w = 0;
-            ctx.objs.layers.slots[s].h = 0;
-            ctx.objs.mark_dirty(slot.root);
+            let slot = &mut ctx.objs.layers.slots[s];
+            slot.active = false;
+            slot.composed = false;
+            slot.shown = Rect::new(0, 0, 0, 0);
+            slot.recompose = false;
+            slot.w = 0;
+            slot.h = 0;
+            let root = slot.root;
+            ctx.objs.mark_dirty(root);
         }
     }
+    ctx.objs.layers.composed = 0;
     ctx.lcd.layers_off();
 }
 
@@ -1074,6 +1193,10 @@ fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Rest
 /// None if anything behind it may show through elsewhere (or it paints by
 /// script, `on_paint`).
 fn opaque_radius(tree: &ObjPool, id: WidgetId, abs: &Rect) -> Option<u16> {
+    #[cfg(feature = "layers")]
+    if tree.composed_root(id).is_some() {
+        return None;
+    }
     let w = tree.get(id);
     let ext = &tree.ext(id);
     if is_freeform_shape(w.kind) || ext.alpha < 255 || w.flags & FLAG_HAS_ON_PAINT != 0 {
@@ -1228,6 +1351,10 @@ fn painted_before(tree: &ObjPool, idx: usize, rect: &Rect) -> bool {
 /// A widget that draws no pixel: a label without text, background, border
 /// or background image (tablet demo groups).
 fn paints_nothing(tree: &ObjPool, id: WidgetId) -> bool {
+    #[cfg(feature = "layers")]
+    if tree.composed_root(id).is_some() {
+        return false;
+    }
     let w = tree.get(id);
     if w.kind != KIND_LABEL || w.flags & FLAG_HAS_ON_PAINT != 0 {
         return false;
@@ -1287,6 +1414,10 @@ fn contains(outer: &Rect, inner: &Rect) -> bool {
 /// absolute rect is `abs`)? True for a solid, square-cornered widget with a
 /// background: its border strips plus background fill tile its whole rect.
 pub fn covers_opaquely(tree: &ObjPool, id: WidgetId, abs: &Rect, rect: &Rect) -> bool {
+    #[cfg(feature = "layers")]
+    if tree.composed_root(id).is_some() {
+        return false;
+    }
     let w = tree.get(id);
     let ext = &tree.ext(id);
     if is_freeform_shape(w.kind) || ext.border_radius != 0 || ext.alpha < 255 {
@@ -1308,11 +1439,19 @@ pub fn covers_opaquely(tree: &ObjPool, id: WidgetId, abs: &Rect, rect: &Rect) ->
 /// As the board's renderer reports it (`WidgetRenderer::shows_behind`), else
 /// the built-in rule ([`shows_behind`]).
 fn shows_behind_on<P: Platform>(tree: &ObjPool, id: WidgetId) -> bool {
+    #[cfg(feature = "layers")]
+    if tree.composed_root(id).is_some() {
+        return true;
+    }
     P::Renderer::shows_behind(tree, id).unwrap_or_else(|| shows_behind(tree, id))
 }
 
 /// [`shows_behind_on`] for the built-in drawing.
 pub fn shows_behind(tree: &ObjPool, id: WidgetId) -> bool {
+    #[cfg(feature = "layers")]
+    if tree.composed_root(id).is_some() {
+        return true;
+    }
     if tree.alpha(id) < 255 {
         return true;
     }
@@ -1421,6 +1560,18 @@ fn resolved_text_bg(tree: &ObjPool, widget: &Widget, ext: &WidgetExt, fallback: 
 fn draw_widget<P: Platform>(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) {
     #[cfg(feature = "perf")]
     let t0 = crate::perf::now();
+    #[cfg(feature = "layers")]
+    if let Some(s) = ctx.objs.composed_root(id) {
+        // A composed layer's root on the screen: its surface.
+        let slot = &ctx.objs.layers.slots[s];
+        let (at, size) = (Offset { x: abs.x, y: abs.y }, crate::types::Size { w: slot.w, h: slot.h });
+        for r in clip.iter() {
+            ctx.lcd.layer_compose(s, at, size, r, slot.alpha);
+        }
+        #[cfg(feature = "perf")]
+        crate::perf::add_sub(crate::perf::phase::DRAW, crate::perf::now().wrapping_sub(t0));
+        return;
+    }
     if !P::Renderer::draw(ctx, id, abs, clip) {
         draw_widget_body(ctx, id, abs, clip);
     }

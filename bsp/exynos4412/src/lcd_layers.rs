@@ -128,6 +128,9 @@ struct Layer {
     h: usize,
     /// Drawn in the shadow since the last copy.
     dirty: Boxes,
+    /// The whole shadow is in DRAM (cleaned whole, nothing drawn since): the
+    /// G2D may read it for [`compose_source`] without cleaning again.
+    in_dram: bool,
     /// Copied into the front buffer at the last flip: the other one lacks it.
     prev: Boxes,
     /// The scan buffer the registers name (or the pending commit will).
@@ -299,6 +302,7 @@ pub fn alloc(n: usize, w: usize, h: usize) -> bool {
         w,
         h,
         dirty: Boxes::NONE,
+        in_dram: false,
         prev: Boxes::NONE,
         front: 0,
         flip_at: None,
@@ -371,7 +375,33 @@ pub fn place(n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
 pub fn mark(n: usize, x: usize, y: usize, w: usize, h: usize) {
     if let Some(l) = state().layers.get_mut(n).and_then(Option::as_mut) {
         l.dirty.add([x, y, x + w, y + h]);
+        l.in_dram = false;
     }
+}
+
+/// A composed layer (core `layer.rs`: something is drawn over it, so the screen's passes
+/// blend its shadow in instead of its window showing it): layer `n`'s shadow as (physical
+/// address, the CPU's view of it, width, height). With `for_g2d`, rect (`x`, `y`, `w`, `h`)
+/// of it is first cleaned to DRAM, where the G2D reads it (nothing when drawn uncached; a
+/// large rect cleans the whole cache once, until something is drawn on the layer again).
+pub fn compose_source(n: usize, for_g2d: Option<(usize, usize, usize, usize)>) -> Option<(usize, usize, usize, usize)> {
+    let l = state().layers.get_mut(n)?.as_mut()?;
+    if let Some((x, y, w, h)) = for_g2d
+        && !l.uncached
+        && !l.in_dram
+    {
+        let l2 = L2c::new();
+        if w * h * 4 >= CLEAN_ALL_BYTES && l2.is_enabled() {
+            mmu::clean_l1_all();
+            l2.clean_all();
+            l.in_dram = true;
+        } else {
+            for row in y..y + h {
+                mmu::clean_dcache_range(l.base + (row * l.w + x) * 4, w * 4);
+            }
+        }
+    }
+    Some((l.base, l.px, l.w, l.h))
 }
 
 /// Something waits for [`prepare`]: a shown layer with new pixels, window settings that

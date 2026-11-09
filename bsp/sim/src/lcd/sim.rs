@@ -99,6 +99,9 @@ pub struct SimLcd {
     fb: Framebuffer,
     cursor_x: Cell<u16>,
     cursor_y: Cell<u16>,
+    /// Layers blended into the screen since their window last showed (bit n),
+    /// for the console line.
+    composed: Cell<u8>,
     rect_x_start: Cell<u16>,
     rect_x_end: Cell<u16>,
     rect_y_end: Cell<u16>,
@@ -110,6 +113,7 @@ impl SimLcd {
             fb,
             cursor_x: Cell::new(0),
             cursor_y: Cell::new(0),
+            composed: Cell::new(0),
             rect_x_start: Cell::new(0),
             rect_x_end: Cell::new(0),
             rect_y_end: Cell::new(0),
@@ -265,6 +269,7 @@ impl LcdBackend for SimLcd {
     }
 
     fn layer_free(&self, n: usize) {
+        self.composed.set(self.composed.get() & !(1 << n));
         if self.fb.layers.is_allocated(n) {
             println!("sim: layer {n} freed");
         }
@@ -280,7 +285,25 @@ impl LcdBackend for SimLcd {
     }
 
     fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
+        if visible && self.composed.get() & 1 << n != 0 {
+            self.composed.set(self.composed.get() & !(1 << n));
+            println!("sim: layer {n} in its window again");
+        }
         self.fb.layers.place(n, x, y, alpha, visible);
+    }
+
+    // A layer something is drawn over is blended into the screen from its
+    // kept surface (`ferrite_core::layer`, composed layers).
+    const LAYER_COMPOSE: bool = true;
+
+    fn layer_compose(&self, n: usize, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16, alpha: u8) {
+        if self.composed.get() & 1 << n == 0 {
+            self.composed.set(self.composed.get() | 1 << n);
+            println!("sim: layer {n} composed into the screen");
+        }
+        let src = (sx as usize, sy as usize, w as usize, h as usize);
+        let mut fb = self.fb.draw();
+        self.fb.layers.compose_onto(n, src, &mut fb, WIDTH as usize, (dx as usize, dy as usize), alpha);
     }
 
     fn draw_pixel(&self, x: u16, y: u16, color: u16) {
