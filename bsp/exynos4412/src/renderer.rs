@@ -88,16 +88,23 @@ impl WidgetRenderer<P> for ExynosRenderer {
     }
 
     fn draw(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
-        // A layer pass draws into the layer's surface: the G2D paths below
-        // draw on the screen's shadow.
-        if !lcd::g2d_draw_ready() || ctx.lcd.is_portrait() || lcd::layer_targeted() {
+        if !lcd::g2d_draw_ready() || ctx.lcd.is_portrait() {
             return false;
         }
-        if crate::model3d::draw(ctx, id, abs, clip) {
-            return true;
-        }
-        if draw_picture(ctx, id, abs, clip) {
-            return true;
+        // A layer pass draws into the layer's surface (`abs`, `clip` and the
+        // screen size are the surface's): only sprites are blitted there.
+        // Pictures and models go to the screen's shadow.
+        if lcd::layer_targeted() {
+            if !lcd::layer_blits_ready() {
+                return false;
+            }
+        } else {
+            if crate::model3d::draw(ctx, id, abs, clip) {
+                return true;
+            }
+            if draw_picture(ctx, id, abs, clip) {
+                return true;
+            }
         }
         if !wants_sprite(&ctx.objs, id, abs) {
             return false;

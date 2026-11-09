@@ -491,3 +491,34 @@ pub fn composite(screen: &mut [u32], sw: usize, sh: usize) {
     }
     drop_lines(st);
 }
+
+/// The whole-line ranges holding rect (`x`, `y`, `w`, `h`) of the targeted surface `t`, row
+/// by row, to `f`. The surface starts on a line and its size is a whole number of lines
+/// ([`Layer::surface_words`]), so the ranges stay inside it.
+fn rect_lines(t: &Target, x: usize, y: usize, w: usize, h: usize, f: fn(usize, usize)) {
+    for row in y..y + h {
+        let a = (t.px as usize + (row * t.stride + x) * 4) & !63;
+        let e = (t.px as usize + (row * t.stride + x + w) * 4).next_multiple_of(64);
+        f(a, e - a);
+    }
+}
+
+/// Before the G2D blends into rect (`x`, `y`, `w`, `h`) of the targeted layer's shadow (the
+/// CPU draws it cached): what the CPU drew there goes out to DRAM, as the blend reads it.
+pub fn g2d_begin(t: &Target, x: usize, y: usize, w: usize, h: usize) {
+    let l2 = L2c::new();
+    if w * h * 4 >= CLEAN_ALL_BYTES && l2.is_enabled() {
+        mmu::clean_l1_all();
+        l2.clean_all();
+    } else {
+        rect_lines(t, x, y, w, h, mmu::clean_dcache_range);
+    }
+}
+
+/// After the G2D blended into the rect (or failed, having written part of it): drops its
+/// lines from the caches, so the CPU reads what the G2D wrote; lines pulled in meanwhile (by
+/// speculation too) go with them. [`g2d_begin`] cleaned them and nothing wrote them since, so
+/// the neighbours sharing a line on the rect's edges lose nothing.
+pub fn g2d_end(t: &Target, x: usize, y: usize, w: usize, h: usize) {
+    rect_lines(t, x, y, w, h, mmu::invalidate_dcache_range);
+}

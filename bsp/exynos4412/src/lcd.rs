@@ -1473,6 +1473,10 @@ pub fn blit_sprite(
     #[cfg(feature = "g2d_render")]
     {
         let sprite = Surface { address: px as usize, stride: stride * 4, width: sw, height: sh, format: Format::Argb8888 };
+        #[cfg(feature = "layers")]
+        if let Some(t) = unsafe { *(&raw const LAYER_TARGET) } {
+            return blit_layer(&t, &sprite, sx, sy, dx, dy, w, h);
+        }
         let ok = g2d_op("sprite blit", w * h, |g| {
             let (from, to) = (g2d::Rect::new(sx, sy, w, h), g2d::Rect::new(dx, dy, w, h));
             g.blend(&sprite, from, Alpha::Premultiplied, &shadow_surface(), to, Filter::Nearest, 255)
@@ -1487,6 +1491,136 @@ pub fn blit_sprite(
         let _ = (px, sw, sh, stride, sx, sy, dx, dy, w, h);
         false
     }
+}
+
+/// Layer sprite blits switched on (HTTP `POST /api/layerblit?on=0|1`, for
+/// A/B measurements with the same firmware). Off by default: on the board
+/// (tablet home, 2026-11-09) they saved ~1 ms of CPU blending a second but
+/// cost ~3.1 ms, ~2.7 ms of it the per-line clean + invalidate of the cached
+/// layer shadow (`layers::g2d_begin`/`g2d_end`, ~1 MB a second). Worth it
+/// only once layer surfaces need no cache maintenance (drawn uncached).
+pub static LAYER_BLITS: AtomicBool = AtomicBool::new(false);
+
+/// G2D sprite blits may go into a layer's surface (the board renderer draws
+/// large see-through widgets inside layers that way): G2D drawing is on and
+/// its "over" onto an ARGB8888 target matches the CPU's ([`g2d_over_matches`]).
+pub fn layer_blits_ready() -> bool {
+    #[cfg(all(feature = "g2d_render", feature = "layers"))]
+    {
+        LAYER_BLITS.load(Ordering::Relaxed) && g2d_draw_ready() && g2d_over_matches()
+    }
+    #[cfg(not(all(feature = "g2d_render", feature = "layers")))]
+    {
+        false
+    }
+}
+
+/// [`blit_sprite`] into the targeted layer's surface (premultiplied
+/// ARGB8888, drawn cached by the CPU): cleaned before the G2D reads it,
+/// dropped from the caches after it wrote it.
+#[cfg(all(feature = "g2d_render", feature = "layers"))]
+#[allow(clippy::too_many_arguments)]
+fn blit_layer(t: &Target, sprite: &Surface, sx: usize, sy: usize, dx: usize, dy: usize, w: usize, h: usize) -> bool {
+    if t.layer == NO_LAYER || !g2d_over_matches() {
+        return false;
+    }
+    let target = Surface { address: t.px as usize, stride: t.stride * 4, width: t.w, height: t.h, format: Format::Argb8888 };
+    // The cache maintenance counts as G2D drawing time (`perf`).
+    #[cfg(feature = "perf")]
+    let t0 = crate::perf::cycles();
+    layers::g2d_begin(t, dx, dy, w, h);
+    #[cfg(feature = "perf")]
+    ferrite_core::perf::add_sub(ferrite_core::perf::phase::G2D, crate::perf::cycles().wrapping_sub(t0));
+    let ok = g2d_op("layer sprite blit", w * h, |g| {
+        let (from, to) = (g2d::Rect::new(sx, sy, w, h), g2d::Rect::new(dx, dy, w, h));
+        g.blend(sprite, from, Alpha::Premultiplied, &target, to, Filter::Nearest, 255)
+    });
+    #[cfg(feature = "perf")]
+    let t0 = crate::perf::cycles();
+    layers::g2d_end(t, dx, dy, w, h);
+    #[cfg(feature = "perf")]
+    ferrite_core::perf::add_sub(ferrite_core::perf::phase::G2D, crate::perf::cycles().wrapping_sub(t0));
+    if ok {
+        t.mark(dx, dy, w, h);
+    }
+    ok
+}
+
+/// 0 = not checked yet, 1 = a G2D premultiplied blend onto an ARGB8888
+/// target gives what the CPU's [`over`] gives (alpha byte included, within
+/// rounding), 2 = it does not (layer sprites drawn by the CPU).
+#[cfg(all(feature = "g2d_render", feature = "layers"))]
+static G2D_OVER: AtomicU8 = AtomicU8::new(0);
+
+/// Most a G2D blend byte may differ from the CPU's: both round, differently
+/// (the screen's sprite blits differ by as much).
+#[cfg(all(feature = "g2d_render", feature = "layers"))]
+const OVER_TOLERANCE: u32 = 3;
+
+/// Whether a G2D premultiplied "over" onto an ARGB8888 target computes the
+/// target's alpha as Sa + Da·(1 − Sa) (and the colours likewise), checked
+/// once on translucent, opaque and transparent pixels.
+#[cfg(all(feature = "g2d_render", feature = "layers"))]
+fn g2d_over_matches() -> bool {
+    match G2D_OVER.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    if !g2d_draw_ready() {
+        return false;
+    }
+    #[repr(C, align(64))]
+    struct Lines<T>(T);
+    const N: usize = 32;
+    static mut SRC: Lines<[u32; N]> = Lines([0; N]);
+    static mut DST: Lines<[u32; N]> = Lines([0; N]);
+    // SAFETY: CPU0 only, never reentrant; the G2D is the only other user,
+    // inside `g2d_op` below.
+    let (src, dst) = unsafe { (&mut (*(&raw mut SRC)).0, &mut (*(&raw mut DST)).0) };
+    // Premultiplied pixels: alpha `a`, colour channels at most `a`.
+    let pixel = |a: u32, k: u32| {
+        let c = |m: u32| (a * ((k * m) % 256)) / 255;
+        a << 24 | c(11) << 16 | c(97) << 8 | c(203)
+    };
+    let mut want = [0u32; N];
+    for i in 0..N {
+        let sa = [0u32, 255, 128, 200, 37, 64][i % 6];
+        let da = [0u32, 255, 77, 160][(i / 6) % 4];
+        src[i] = pixel(sa, i as u32 + 1);
+        dst[i] = pixel(da, i as u32 + 5);
+        // S + D·(1 − Sa), per byte.
+        want[i] = (0..4).fold(0, |acc, b| {
+            let (s, d) = ((src[i] >> (8 * b)) & 0xFF, (dst[i] >> (8 * b)) & 0xFF);
+            acc | ((s + (d * (255 - sa) + 127) / 255).min(255)) << (8 * b)
+        });
+    }
+    mmu::clean_dcache_range(src.as_ptr() as usize, N * 4);
+    mmu::clean_dcache_range(dst.as_ptr() as usize, N * 4);
+    let from = Surface { address: src.as_ptr() as usize, stride: N * 4, width: N, height: 1, format: Format::Argb8888 };
+    let to = Surface { address: dst.as_ptr() as usize, ..from };
+    let ok = g2d_op("ARGB blend check", N, |g| {
+        g.blend(&from, g2d::Rect::all(&from), Alpha::Premultiplied, &to, g2d::Rect::all(&to), Filter::Nearest, 255)
+    });
+    mmu::invalidate_dcache_range(dst.as_ptr() as usize, N * 4);
+    if !ok {
+        return false;
+    }
+    // SAFETY: read after the G2D's writes (the op waited for its end).
+    let got = |i: usize| unsafe { core::ptr::read_volatile(dst.as_ptr().add(i)) };
+    let off = |a: u32, b: u32| (0..4).any(|k| ((a >> (8 * k)) & 0xFF).abs_diff((b >> (8 * k)) & 0xFF) > OVER_TOLERANCE);
+    let bad = (0..N).find(|&i| off(got(i), want[i]));
+    if let Some(i) = bad {
+        exynos_4412_rs::println!(
+            "ferrite: G2D ARGB blend differs ({:08x} over {:08x}: {:08x}, want {:08x}): layer sprites by the CPU",
+            src[i],
+            pixel([0u32, 255, 77, 160][(i / 6) % 4], i as u32 + 5),
+            got(i),
+            want[i]
+        );
+    }
+    G2D_OVER.store(if bad.is_none() { 1 } else { 2 }, Ordering::Relaxed);
+    bad.is_none()
 }
 
 /// The shadow as a GPU target: physical address, stride in bytes, width,

@@ -10,6 +10,7 @@
 //! | `POST /restart` | restarts the board |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
 //! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted |
+//! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
 //! | `POST /api/overlay?mode=off\|still\|move\|fade\|full[&x=X&y=Y&alpha=A]` | FIMD window 1 test picture above the UI (`overlay_test.rs`) |
 //!
 //! `/flash` takes the same request as uart_boot's (`ferrite_cli bootflash
@@ -241,6 +242,24 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 }
                 _ => {
                     let on = crate::compose::ENABLED.load(Ordering::Relaxed);
+                    text(socket, "400 Bad Request", if on { "on=0|1 (now on)
+" } else { "on=0|1 (now off)
+" }).await?;
+                }
+            }
+        }
+        (b"POST", b"/api/layerblit") => {
+            use core::sync::atomic::Ordering;
+            match query_param(query, b"on") {
+                Some(v @ (b"0" | b"1")) => {
+                    let on = v == b"1";
+                    crate::lcd::LAYER_BLITS.store(on, Ordering::Relaxed);
+                    text(socket, "200 OK", if on { "layer sprite blits on
+" } else { "layer sprite blits off
+" }).await?;
+                }
+                _ => {
+                    let on = crate::lcd::LAYER_BLITS.load(Ordering::Relaxed);
                     text(socket, "400 Bad Request", if on { "on=0|1 (now on)
 " } else { "on=0|1 (now off)
 " }).await?;
