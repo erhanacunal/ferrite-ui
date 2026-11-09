@@ -156,6 +156,9 @@ impl PlatformRuntime for Exynos4412Platform {
     fn syscall(id: u8, args: &[i32], objs: &mut ObjPool) -> Option<i32> {
         match id {
             SYS_REBOOT => Self::reset(),
+            crate::battery::SYS_BATTERY_MV | crate::battery::SYS_BATTERY_PERCENT | crate::battery::SYS_CHARGER => {
+                crate::battery::syscall(id)
+            }
             crate::model3d::SYS_SHAPE..=crate::model3d::SYS_MESH => crate::model3d::syscall(id, args, objs),
             _ => sysinfo::syscall(id, args, objs, || {
                 let heap = heap::stats();

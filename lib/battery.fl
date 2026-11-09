@@ -1,0 +1,19 @@
+// battery.fl — battery syscalls (exynos4412, sim; batteryMv also on epaper).
+//
+// Ids are duplicated in bsp/exynos4412/src/battery.rs and bsp/sim/src/platform.rs
+// (epaper: SYS_BATTERY_VOLTAGE in lib/epaper.fl) — keep them in sync. Other
+// boards don't answer them: the call stops the program with a VM error.
+// A reading is at most 2 s old (the gauge itself changes slowly).
+
+const SYS_BATTERY_MV      = 0x05;  // battery voltage, mV (-1 = unknown)
+const SYS_BATTERY_PERCENT = 0x08;  // charge, 0..100 % (-1 = unknown)
+const SYS_CHARGER         = 0x09;  // CHARGER_* below
+
+const CHARGER_BATTERY  = 0;  // no power in: running on the battery
+const CHARGER_CHARGING = 1;  // power in, charging
+const CHARGER_FULL     = 2;  // power in, not charging (charged)
+const CHARGER_FAULT    = 3;  // the charger's timer ran out
+
+fn batteryMv() { return syscall(SYS_BATTERY_MV); }
+fn batteryPercent() { return syscall(SYS_BATTERY_PERCENT); }
+fn chargerState() { return syscall(SYS_CHARGER); }

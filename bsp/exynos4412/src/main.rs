@@ -56,6 +56,8 @@ use ferrite_core::usart::UsartImpl;
 
 mod audio;
 mod backlight;
+// Battery syscalls: fuel gauge + charger (`lib/battery.fl`).
+mod battery;
 // Without `wifi` nothing ever takes the bridge: UART2 only.
 #[cfg_attr(not(feature = "wifi"), allow(dead_code))]
 mod bridge;

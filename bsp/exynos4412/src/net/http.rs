@@ -686,6 +686,17 @@ fn status_json() -> String {
         temp.map_or(String::from("null"), |t| alloc::format!("{}", t)),
         crate::cpuclock::IDLE_SLEEP.load(core::sync::atomic::Ordering::Relaxed)
     );
+    // The last battery reading a program asked for (-1 = none yet).
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let _ = write!(
+            s,
+            ",\"battery\":{{\"mv\":{},\"percent\":{},\"charger\":{}}}",
+            crate::battery::LAST_MV.load(Relaxed),
+            crate::battery::LAST_PERCENT.load(Relaxed),
+            crate::battery::LAST_CHARGER.load(Relaxed)
+        );
+    }
     let _ = write!(s, ",\"cpu_mhz\":{}", crate::cpuclock::mhz());
     s.push('}');
     s

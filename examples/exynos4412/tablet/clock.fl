@@ -6,7 +6,7 @@
 // so a face-sized box redrew the whole face every second). The face dots are
 // small circles.
 #include "ui.fl"
-#include "shapes.fl"
+// shapes.fl comes with ui.fl.
 
 const CX = 360;          // face centre (screen)
 const CY = 438;

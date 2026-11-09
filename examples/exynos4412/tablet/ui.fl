@@ -14,6 +14,8 @@
 #include "anim.fl"
 #include "touch.fl"
 #include "sysinfo.fl"
+#include "battery.fl"
+#include "shapes.fl"
 
 const SCREEN_W = 1280;
 const SCREEN_H = 800;
@@ -259,10 +261,50 @@ var ui_vol_icon;
 var ui_vol_lbl;
 var ui_bright_lbl;
 var ui_last_min = -1;
+// Battery: outline, tip, level bar, charging bolt, percentage.
+var ui_bat_body;
+var ui_bat_tip;
+var ui_bat_fill;
+var ui_bat_bolt;
+var ui_bat_lbl;
+var ui_bat_pct = -2;     // last shown (-2 = never)
+var ui_bat_chg = -2;
+var ui_bat_at = 0;       // millis() of the last check
 
 fn ui_status_bar() {
     ui_time_lbl = alloc();
     style_label(28, 0, 240, STATUS_H, F20, WHITE, ALIGN_LEFT, "");
+    parent(0);
+
+    ui_bat_body = alloc();
+    target(ui_bat_body);
+    set(kind, KIND_RECTANGLE);
+    set(location, 998, 13);
+    set(size, 30, 15);
+    set(border, 2, 2, 2, 2);
+    set(border_color, WHITE);
+    set(border_radius, 3);
+    set(visible, OFF);
+    parent(0);
+    ui_bat_tip = alloc();
+    style_box(1028, 18, 3, 5, WHITE, 0);
+    set(visible, OFF);
+    parent(0);
+    ui_bat_fill = alloc();
+    style_box(1001, 16, 0, 9, WHITE, 1);
+    set(visible, OFF);
+    parent(0);
+    ui_bat_bolt = alloc();
+    target(ui_bat_bolt);
+    set(kind, KIND_POLYGON);
+    set(location, 1007, 12);
+    set(size, 12, 17);
+    set(bg_color, YELLOW);
+    set(text, "7,0 0,10 5,10 4,17 11,7 6,7");
+    set(visible, OFF);
+    parent(0);
+    ui_bat_lbl = alloc();
+    style_label(1035, 0, 60, STATUS_H, F16, WHITE, ALIGN_LEFT, "");
     parent(0);
 
     var bi = alloc();
@@ -278,7 +320,47 @@ fn ui_status_bar() {
     style_label(1214, 0, 56, STATUS_H, F16, WHITE, ALIGN_LEFT, "");
     parent(0);
     ui_status_levels();
+    ui_bat_at = millis();
+    ui_battery();
     ui_tick();
+}
+
+// The battery indicator: hidden while the charge is unknown (no gauge, the
+// sim); redrawn only when the percentage or the charger state changes.
+fn ui_battery() {
+    var pct = batteryPercent();
+    var chg = chargerState();
+    if (pct == ui_bat_pct && chg == ui_bat_chg) {
+        return;
+    }
+    ui_bat_pct = pct;
+    ui_bat_chg = chg;
+    var on = pct >= 0;
+    target(ui_bat_body); set(visible, on);
+    target(ui_bat_tip); set(visible, on);
+    target(ui_bat_fill); set(visible, on && pct > 0);
+    target(ui_bat_bolt); set(visible, on && chg == CHARGER_CHARGING);
+    target(ui_bat_lbl);
+    if (!on) {
+        set(text, "");
+        dirty();
+        return;
+    }
+    set(text, sprintf("%d%%", pct));
+    dirty();
+    target(ui_bat_fill);
+    set(size, (24 * pct + 50) / 100, 9);
+    var c = WHITE;
+    if (chg == CHARGER_CHARGING || chg == CHARGER_FULL) {
+        c = GREEN;
+    } else if (pct <= 15) {
+        c = RED;
+    } else if (pct <= 30) {
+        c = ORANGE;
+    }
+    set(bg_color, c);
+    dirty();
+    strClear();
 }
 
 fn day_name(d) -> string {
@@ -322,6 +404,12 @@ fn ui_status_levels() {
 // Once per loop(): the clock, once a minute. Returns 1 when the minute
 // changed (callers update their own clocks then).
 fn ui_tick() {
+    // The battery every 5 s (the gauge changes slowly; a reading costs I2C time).
+    var t = millis();
+    if (t - ui_bat_at >= 5000) {
+        ui_bat_at = t;
+        ui_battery();
+    }
     var now = rtcRead();
     var m = now[1];
     var h = now[2];

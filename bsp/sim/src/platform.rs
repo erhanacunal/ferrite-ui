@@ -117,6 +117,9 @@ impl PlatformRuntime for SimPlatform {
     fn syscall(id: u8, args: &[i32], objs: &mut ObjPool) -> Option<i32> {
         match id {
             0x00 => Some(systick::millis() as i32), // SYS_UPTIME
+            // Battery (lib/battery.fl): none on the host (-1 = unknown, charger 2 = powered),
+            // unless `FERRITE_SIM_BATTERY=PERCENT,CHARGER` fakes one.
+            0x05 | 0x08 | 0x09 => Some(sim_battery(id)),
             // 3D model syscalls (lib/model3d.fl, exynos4412 model3d.rs): the sim has no GPU,
             // so a model widget shows its background; setters succeed, stats are 0.
             0x60..=0x63 | 0x65 => Some(1),
@@ -169,5 +172,23 @@ impl PlatformRuntime for SimPlatform {
                 let _ = window.update_with_buffer(buf, WIDTH as usize, HEIGHT as usize);
             });
         });
+    }
+}
+
+/// `FERRITE_SIM_BATTERY=PERCENT,CHARGER` (e.g. `64,1`): a fake battery for the battery
+/// syscalls (millivolts from a 3.0-4.2 V line); unset = none.
+fn sim_battery(id: u8) -> i32 {
+    static FAKE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    let fake = FAKE.get_or_init(|| {
+        let v = std::env::var("FERRITE_SIM_BATTERY").ok()?;
+        let (p, c) = v.split_once(',')?;
+        Some((p.trim().parse().ok()?, c.trim().parse().ok()?))
+    });
+    match (id, fake) {
+        (0x05, Some((p, _))) => 3000 + 12 * p,
+        (0x08, Some((p, _))) => *p,
+        (0x09, Some((_, c))) => *c,
+        (0x09, None) => 2,
+        _ => -1,
     }
 }
