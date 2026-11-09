@@ -119,6 +119,16 @@ pub fn service() {
     // SAFETY: CPU0 only, not reentrant.
     let st = unsafe { &mut *(&raw mut STATE) };
     let mode = MODE.load(Ordering::Acquire);
+    // The windows belong to the renderer's layers while it uses them.
+    if crate::lcd::layers_in_use() {
+        if mode != OFF {
+            exynos_4412_rs::println!("ferrite: overlay test off: layers in use");
+            MODE.store(OFF, Ordering::Release);
+        }
+        st.mode = OFF;
+        st.shown = None;
+        return;
+    }
     let now = systick::millis();
     if mode != st.mode {
         st.mode = mode;

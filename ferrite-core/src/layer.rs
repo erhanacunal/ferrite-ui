@@ -368,6 +368,11 @@ impl SoftLayers {
         true
     }
 
+    /// Layer `n` has a surface.
+    pub fn is_allocated(&self, n: usize) -> bool {
+        self.surfaces.borrow().get(n).is_some_and(Option::is_some)
+    }
+
     pub fn free(&self, n: usize) {
         if n < MAX_LAYERS {
             self.surfaces.borrow_mut()[n] = None;

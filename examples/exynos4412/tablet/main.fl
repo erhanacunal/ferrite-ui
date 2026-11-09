@@ -624,6 +624,9 @@ fn setup() {
     pager = alloc();
     style_group(-SCREEN_W * ui_page, STATUS_H, SCREEN_W * 2, 560);
     parent(0);
+    // Layer 1 (a FIMD window on the board): a page slide moves the window,
+    // nothing is redrawn for it.
+    set(layer, 1);
     var pg0 = alloc();
     style_group(0, 0, SCREEN_W, 560);
     parent(pager);

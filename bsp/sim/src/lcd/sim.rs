@@ -259,10 +259,15 @@ impl LcdBackend for SimLcd {
     const LAYERS: usize = 4;
 
     fn layer_alloc(&self, n: usize, w: u16, h: u16) -> bool {
-        self.fb.layers.alloc(n, w, h)
+        let ok = self.fb.layers.alloc(n, w, h);
+        println!("sim: layer {n} {w}x{h} {}", if ok { "allocated" } else { "refused" });
+        ok
     }
 
     fn layer_free(&self, n: usize) {
+        if self.fb.layers.is_allocated(n) {
+            println!("sim: layer {n} freed");
+        }
         self.fb.layers.free(n);
     }
 

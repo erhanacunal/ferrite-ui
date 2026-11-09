@@ -77,6 +77,23 @@ use ferrite_core::types::Rect as UiRect;
 
 use crate::systick;
 
+#[cfg(feature = "layers")]
+#[path = "lcd_layers.rs"]
+mod layers;
+
+/// Some layer surface is allocated or shown (FIMD windows 1-4 are the
+/// renderer's then: the overlay board test stays off).
+pub fn layers_in_use() -> bool {
+    #[cfg(feature = "layers")]
+    {
+        layers::in_use()
+    }
+    #[cfg(not(feature = "layers"))]
+    {
+        false
+    }
+}
+
 pub const PANEL: Timing = LTN101AL03;
 const W: usize = PANEL.width;
 const H: usize = PANEL.height;
@@ -134,24 +151,42 @@ fn shadow_uncached() -> bool {
     unsafe { !(*(&raw const SHADOW_PX)).is_null() }
 }
 
-/// Where the primitives draw: the shadow, or a sprite ([`begin_sprite`]).
+/// Where the primitives draw: the shadow, a sprite ([`begin_sprite`]) or a
+/// layer's surface (`layers`: drawn like a sprite, premultiplied, by the CPU).
 #[derive(Clone, Copy)]
 struct Target {
     px: *mut u32,
     stride: usize,
     w: usize,
     h: usize,
+    /// Premultiplied off-screen surface: no G2D, no present fence.
     sprite: bool,
+    /// The layer it is ([`NO_LAYER`] = none): `mark` goes to its dirty box.
+    layer: u8,
 }
+
+const NO_LAYER: u8 = 0xFF;
 
 static mut SPRITE: Option<Target> = None;
 
+/// The layer surface the primitives draw into (`LcdBackend::layer_target`).
+static mut LAYER_TARGET: Option<Target> = None;
+
 #[inline(always)]
 fn target() -> Target {
-    match unsafe { *(&raw const SPRITE) } {
-        Some(t) => t,
-        None => Target { px: back(), stride: W, w: W, h: H, sprite: false },
+    if let Some(t) = unsafe { *(&raw const SPRITE) } {
+        return t;
     }
+    match unsafe { *(&raw const LAYER_TARGET) } {
+        Some(t) => t,
+        None => Target { px: back(), stride: W, w: W, h: H, sprite: false, layer: NO_LAYER },
+    }
+}
+
+/// The primitives draw into a layer's surface: the board renderer's G2D
+/// paths (which draw on the shadow) must not be used.
+pub fn layer_targeted() -> bool {
+    unsafe { (*(&raw const LAYER_TARGET)).is_some() }
 }
 
 impl Target {
@@ -183,6 +218,9 @@ impl Target {
     fn mark(&self, x: usize, y: usize, w: usize, h: usize) {
         if !self.sprite {
             mark(x, y, w, h);
+        } else if self.layer != NO_LAYER {
+            #[cfg(feature = "layers")]
+            layers::mark(self.layer as usize, x, y, w, h);
         }
     }
 
@@ -212,7 +250,7 @@ fn over(d: u32, src: u32, a: u32) -> u32 {
 /// `px` holds `stride * h` words and nothing else references them until
 /// `end_sprite`; `w <= stride`, `w <= W`, `h <= H`.
 pub unsafe fn begin_sprite(px: *mut u32, w: usize, h: usize, stride: usize) {
-    unsafe { *(&raw mut SPRITE) = Some(Target { px, stride, w, h, sprite: true }) };
+    unsafe { *(&raw mut SPRITE) = Some(Target { px, stride, w, h, sprite: true, layer: NO_LAYER }) };
 }
 
 /// Back to the shadow. Cleans the sprite (`px`, `words` long) out of the
@@ -347,6 +385,10 @@ struct Present {
     /// clean per row (the buffer is outside the alias).
     fb: [Option<Framebuffer>; 2],
     nc: [usize; 2],
+    /// Layer window changes that go out with this present's switch (written
+    /// before `STATE` = COPY, taken by [`show`]).
+    #[cfg(feature = "layers")]
+    layers: layers::Commit,
 }
 
 struct PresentCell(UnsafeCell<Present>);
@@ -359,6 +401,8 @@ static PRESENT: PresentCell = PresentCell(UnsafeCell::new(Present {
     front: SCAN_A,
     fb: [None, None],
     nc: [0, 0],
+    #[cfg(feature = "layers")]
+    layers: layers::Commit { windows: [None; layers::COUNT] },
 }));
 
 fn present_state() -> &'static mut Present {
@@ -440,6 +484,8 @@ fn wait_rows(y0: usize, y1: usize) {
 /// that present is done; drawing more meanwhile is wasted.
 pub fn render_due() -> bool {
     let nothing_waits = unsafe { is_empty(&*(&raw const DIRTY)) };
+    #[cfg(feature = "layers")]
+    let nothing_waits = nothing_waits && !layers::pending();
     nothing_waits || STATE.load(Ordering::Acquire) == IDLE
 }
 
@@ -457,6 +503,18 @@ pub fn flush() {
         }
     }
     let d = unsafe { &mut *(&raw mut DIRTY) };
+    // Layers: their new pixels into their back buffers; the window changes
+    // go out with window 0's switch below, or now if it has nothing.
+    #[cfg(feature = "layers")]
+    if STATE.load(Ordering::Acquire) == IDLE {
+        // A layer flip not on screen yet: window 0 waits too (same frame).
+        let Some(commit) = layers::prepare() else { return };
+        if is_empty(d) {
+            layers::commit_now(&commit);
+            return;
+        }
+        present_state().layers = commit;
+    }
     if is_empty(d) {
         return;
     }
@@ -490,7 +548,7 @@ pub fn flush() {
 /// error screens that must be visible before what follows).
 pub fn flush_wait() {
     flush();
-    while unsafe { !is_empty(&*(&raw const DIRTY)) } || STATE.load(Ordering::Acquire) != IDLE {
+    while unsafe { !is_empty(&*(&raw const DIRTY)) } || STATE.load(Ordering::Acquire) != IDLE || layers_pending() {
         match STATE.load(Ordering::Acquire) {
             // The G2D present: drive it to its end.
             COPY if !PRESENTER.load(Ordering::Acquire) => wait_rows(0, H),
@@ -500,6 +558,41 @@ pub fn flush_wait() {
         }
         core::hint::spin_loop();
     }
+}
+
+fn layers_pending() -> bool {
+    #[cfg(feature = "layers")]
+    {
+        layers::pending()
+    }
+    #[cfg(not(feature = "layers"))]
+    {
+        false
+    }
+}
+
+/// Switches the FIMD to scan buffer `i` from the next vsync, with the layer
+/// window changes handed over for this present in the same frame.
+fn show(p: &mut Present, i: usize) -> Result<(), display::Error> {
+    let fimd = Fimd::new();
+    #[cfg(feature = "layers")]
+    let commit = core::mem::take(&mut p.layers);
+    #[cfg(feature = "layers")]
+    let hold = if commit.any() { 1 | commit.mask() } else { 0 };
+    #[cfg(feature = "layers")]
+    if hold != 0 {
+        fimd.hold_updates(hold);
+    }
+    let r = match p.fb[i].as_ref() {
+        Some(fb) => fimd.show(fb),
+        None => Err(display::Error::BadSize),
+    };
+    #[cfg(feature = "layers")]
+    if hold != 0 {
+        commit.apply(&fimd);
+        fimd.release_updates(hold);
+    }
+    r
 }
 
 /// CPU0, IDLE, G2D on: starts the G2D present of `d` (+ the previous box).
@@ -652,9 +745,7 @@ fn g2d_finish(j: &G2dJob) {
     let _ = j;
     FRAMES.fetch_add(1, Ordering::Relaxed);
     let p = present_state();
-    if let Some(fb) = p.fb[1 - p.front].as_ref() {
-        let _ = Fimd::new().show(fb);
-    }
+    let _ = show(p, 1 - p.front);
     FLIP_AT.store(systick::millis(), Ordering::Relaxed);
     STATE.store(FLIP, Ordering::Release);
 }
@@ -713,16 +804,15 @@ fn present(p: &mut Present, rows: impl Fn(usize, usize), copied: impl FnOnce()) 
     copied();
 
     let fimd = Fimd::new();
-    if let Some(fb) = p.fb[back_i].as_ref() {
-        if fimd.show(fb).is_ok() {
-            let want = fb.address() as u32;
-            let mut polls = 0;
-            // No switch (FIMD off): go on as if it happened, as the
-            // registers already name the new buffer.
-            while fimd.scan_address() != want && polls < POLL_LIMIT {
-                polls += 1;
-                core::hint::spin_loop();
-            }
+    if show(p, back_i).is_ok()
+        && let Some(want) = p.fb[back_i].as_ref().map(|fb| fb.address() as u32)
+    {
+        let mut polls = 0;
+        // No switch (FIMD off): go on as if it happened, as the registers
+        // already name the new buffer.
+        while fimd.scan_address() != want && polls < POLL_LIMIT {
+            polls += 1;
+            core::hint::spin_loop();
         }
     }
     p.front = back_i;
@@ -1022,7 +1112,7 @@ impl LcdBackend for FimdLcd {
     fn move_rects(&self, rects: &[UiRect], dx: i16, dy: i16) -> bool {
         // The caller (`LcdImpl::move_rects`) checked that every source and
         // destination is inside the screen.
-        if unsafe { (*(&raw const SPRITE)).is_some() } || rects.is_empty() {
+        if unsafe { (*(&raw const SPRITE)).is_some() } || layer_targeted() || rects.is_empty() {
             return false;
         }
         let rs = rects.iter().map(|r| (r.x as usize, r.y as usize, r.w as usize, r.h as usize));
@@ -1126,6 +1216,35 @@ impl LcdBackend for FimdLcd {
             }
             t.mark(x, y, w, 1);
         })
+    }
+
+    // Retained layers on FIMD windows 1-4 (`lcd_layers.rs`).
+    #[cfg(feature = "layers")]
+    const LAYERS: usize = layers::COUNT;
+
+    #[cfg(feature = "layers")]
+    fn layer_alloc(&self, n: usize, w: u16, h: u16) -> bool {
+        layers::alloc(n, w as usize, h as usize)
+    }
+
+    #[cfg(feature = "layers")]
+    fn layer_free(&self, n: usize) {
+        layers::free(n);
+    }
+
+    #[cfg(feature = "layers")]
+    fn layer_target(&self, n: Option<usize>) {
+        layers::target(n);
+    }
+
+    #[cfg(feature = "layers")]
+    fn layer_clear(&self, x: u16, y: u16, w: u16, h: u16) {
+        layers::clear(x, y, w, h);
+    }
+
+    #[cfg(feature = "layers")]
+    fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
+        layers::place(n, x, y, alpha, visible);
     }
 }
 
@@ -1385,6 +1504,9 @@ pub fn grab() -> Option<alloc::vec::Vec<u32>> {
     copy.try_reserve_exact(PIXELS).ok()?;
     // SAFETY: the shadow holds PIXELS words; nothing draws while CPU0 is here.
     copy.extend_from_slice(unsafe { core::slice::from_raw_parts(back() as *const u32, PIXELS) });
+    // What the FIMD shows over it.
+    #[cfg(feature = "layers")]
+    layers::composite(&mut copy, W, H);
     Some(copy)
 }
 

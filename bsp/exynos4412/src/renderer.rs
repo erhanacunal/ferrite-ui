@@ -88,7 +88,9 @@ impl WidgetRenderer<P> for ExynosRenderer {
     }
 
     fn draw(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
-        if !lcd::g2d_draw_ready() || ctx.lcd.is_portrait() {
+        // A layer pass draws into the layer's surface: the G2D paths below
+        // draw on the screen's shadow.
+        if !lcd::g2d_draw_ready() || ctx.lcd.is_portrait() || lcd::layer_targeted() {
             return false;
         }
         if crate::model3d::draw(ctx, id, abs, clip) {
