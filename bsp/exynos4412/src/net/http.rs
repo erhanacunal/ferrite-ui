@@ -12,6 +12,7 @@
 //! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted |
 //! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
+//! | `POST /api/cpu?mhz=N` | CPU clock, one of 200..1400 in steps of 100 (`cpuclock`), applied by CPU0 after the next pass; without `mhz` the current one |
 //! | `POST /api/overlay?mode=off\|still\|move\|fade\|full[&x=X&y=Y&alpha=A]` | FIMD window 1 test picture above the UI (`overlay_test.rs`) |
 //!
 //! `/flash` takes the same request as uart_boot's (`ferrite_cli bootflash
@@ -282,6 +283,19 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                     text(socket, "400 Bad Request", if on { "uncached=0|1 (now 1)
 " } else { "uncached=0|1 (now 0)
 " }).await?;
+                }
+            }
+        }
+        (b"POST", b"/api/cpu") => {
+            let mut msg = String::new();
+            match query_param(query, b"mhz").and_then(parse_decimal) {
+                Some(mhz) if crate::cpuclock::request(mhz as u32) => {
+                    let _ = writeln!(msg, "CPU clock {} MHz requested (now {} MHz)", mhz, crate::cpuclock::mhz());
+                    text(socket, "200 OK", &msg).await?;
+                }
+                _ => {
+                    let _ = writeln!(msg, "mhz=200..1400 in steps of 100 (now {} MHz)", crate::cpuclock::mhz());
+                    text(socket, "400 Bad Request", &msg).await?;
                 }
             }
         }

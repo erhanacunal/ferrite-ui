@@ -63,6 +63,9 @@ mod flash;
 // The GPU compositor; with `gpu_compose` off only its shaders are used (`gpu::ui` skips them).
 #[cfg_attr(not(feature = "gpu_compose"), allow(dead_code))]
 mod compose;
+// The CPU clock at run time (HTTP `POST /api/cpu?mhz=N`).
+#[cfg_attr(not(feature = "wifi"), allow(dead_code))]
+mod cpuclock;
 mod gpu;
 mod lcd;
 mod model3d;

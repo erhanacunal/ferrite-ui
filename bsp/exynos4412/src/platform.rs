@@ -226,6 +226,8 @@ impl PlatformRuntime for Exynos4412Platform {
         lcd::flush();
         // The compositor switched on/off over HTTP: repaint everything.
         crate::compose::service(ctx);
+        // A CPU clock asked for over HTTP.
+        crate::cpuclock::service();
         // Config writes (touch calibration…): save once they settle.
         crate::flash::save_if_dirty(false);
         // An FS image uploaded over HTTP, a restart request (net/).

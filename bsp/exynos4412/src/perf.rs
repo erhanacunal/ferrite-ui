@@ -64,6 +64,11 @@ pub fn hz() -> u32 {
     unsafe { HZ }
 }
 
+/// The CPU clock changed (`cpuclock`): the cycle counter's new rate.
+pub fn set_hz(hz: u32) {
+    unsafe { HZ = hz };
+}
+
 /// Adds a vsync wait (CPU0 only).
 pub fn add_wait(c: u32) {
     unsafe { WAIT += c as u64 };
