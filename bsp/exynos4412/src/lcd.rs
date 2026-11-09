@@ -14,7 +14,7 @@
 //!   of the last two dirty boxes.
 //!
 //! The scan buffers are written through the HAL's Normal non-cacheable alias
-//! ([`mmu::DRAM_UNCACHED`], the first 16 MiB of DRAM): stores merge in the
+//! ([`mmu::DRAM_UNCACHED`], the first 1 GiB of DRAM): stores merge in the
 //! write buffer and go straight to DRAM, so no cache maintenance is needed.
 //! Cleaning each row instead (one L1 + one PL310 operation per 32-byte line)
 //! held the copy to ~200 MB/s: 17 ms for a full-screen update (29 fps).
@@ -80,6 +80,13 @@ use crate::systick;
 #[cfg(feature = "layers")]
 #[path = "lcd_layers.rs"]
 mod layers;
+
+/// Layer shadows drawn through the uncached alias (`layers::UNCACHED`).
+#[cfg(feature = "layers")]
+pub use layers::UNCACHED as LAYER_UNCACHED;
+/// Without layers: nothing to switch.
+#[cfg(not(feature = "layers"))]
+pub static LAYER_UNCACHED: AtomicBool = AtomicBool::new(false);
 
 /// Some layer surface is allocated or shown (FIMD windows 1-4 are the
 /// renderer's then: the overlay board test stays off).
@@ -1521,10 +1528,12 @@ pub fn layer_blits_ready() -> bool {
 #[cfg(all(feature = "g2d_render", feature = "layers"))]
 #[allow(clippy::too_many_arguments)]
 fn blit_layer(t: &Target, sprite: &Surface, sx: usize, sy: usize, dx: usize, dy: usize, w: usize, h: usize) -> bool {
-    if t.layer == NO_LAYER || !g2d_over_matches() {
+    if !g2d_over_matches() {
         return false;
     }
-    let target = Surface { address: t.px as usize, stride: t.stride * 4, width: t.w, height: t.h, format: Format::Argb8888 };
+    // The G2D takes the physical address, not the CPU's (maybe uncached) view.
+    let Some((phys, _)) = layers::shadow(t) else { return false };
+    let target = Surface { address: phys, stride: t.stride * 4, width: t.w, height: t.h, format: Format::Argb8888 };
     // The cache maintenance counts as G2D drawing time (`perf`).
     #[cfg(feature = "perf")]
     let t0 = crate::perf::cycles();

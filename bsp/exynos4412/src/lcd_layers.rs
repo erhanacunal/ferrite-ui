@@ -19,7 +19,7 @@
 //! or after `FLIP_MS`); a freed block is kept until its window's hide has applied.
 
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use exynos_4412_rs::cpu;
 use exynos_4412_rs::drivers::display::{Fimd, Overlay};
@@ -32,6 +32,13 @@ use crate::systick;
 
 /// Layers = FIMD windows 1-4.
 pub const COUNT: usize = 4;
+
+/// The CPU draws the layers' shadows through the uncached alias
+/// ([`mmu::DRAM_UNCACHED`]) instead of the cached view (HTTP `POST
+/// /api/layercache?uncached=0|1`, applied at the next [`prepare`]). Uncached,
+/// the G2D (layer copies, sprite blits) reads and writes a shadow with no
+/// cache maintenance, but every CPU blend reads DRAM.
+pub static UNCACHED: AtomicBool = AtomicBool::new(false);
 
 /// Copies of at least this many bytes clean the whole cache instead of
 /// their lines.
@@ -113,6 +120,10 @@ struct Layer {
     /// The shadow's address (64-byte aligned); scan buffer `i` follows at `base + (1 + i) *
     /// size * 4`.
     base: usize,
+    /// Where the CPU reaches the shadow: `base`, or its uncached alias.
+    px: usize,
+    /// `px` is the uncached alias: no line of the shadow is cached.
+    uncached: bool,
     w: usize,
     h: usize,
     /// Drawn in the shadow since the last copy.
@@ -141,6 +152,32 @@ impl Layer {
 
     fn scan(&self, i: usize) -> usize {
         self.base + (1 + i) * self.surface_words() * 4
+    }
+
+    /// Switches the CPU's view of the shadow to what [`UNCACHED`] asks (when
+    /// the alias covers it). Cached → uncached: the shadow's lines go out to
+    /// DRAM and are dropped, so later uncached writes are never overwritten by
+    /// a write-back. Uncached → cached: nothing wrote the cached view
+    /// meanwhile, so it holds no dirty line; stale clean ones are dropped.
+    /// Between passes only (nothing holds the old `px`).
+    fn apply_mode(&mut self) {
+        let bytes = self.surface_words() * 4;
+        let alias = mmu::uncached(self.base).filter(|_| mmu::uncached(self.base + bytes - 1).is_some());
+        let want = UNCACHED.load(Ordering::Relaxed) && alias.is_some();
+        if want == self.uncached {
+            return;
+        }
+        if want {
+            mmu::clean_dcache_range(self.base, bytes);
+            mmu::invalidate_dcache_range(self.base, bytes);
+            self.px = alias.unwrap_or(self.base);
+        } else {
+            // SAFETY: a barrier only: the alias's stores are in DRAM first.
+            unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+            mmu::invalidate_dcache_range(self.base, bytes);
+            self.px = self.base;
+        }
+        self.uncached = want;
     }
 
     /// The window's settings this layer wants now: its on-screen part only
@@ -254,8 +291,22 @@ pub fn alloc(n: usize, w: usize, h: usize) -> bool {
     mmu::invalidate_dcache_range(scans, 2 * sw * 4);
     exynos_4412_rs::println!("ferrite: layer {} {}x{} allocated", n, w, h);
     let place = Place { x: 0, y: 0, alpha: 255, visible: false };
-    state().layers[n] =
-        Some(Layer { _mem: mem, base, w, h, dirty: Boxes::NONE, prev: Boxes::NONE, front: 0, flip_at: None, place, index: n });
+    let mut layer = Layer {
+        _mem: mem,
+        base,
+        px: base,
+        uncached: false,
+        w,
+        h,
+        dirty: Boxes::NONE,
+        prev: Boxes::NONE,
+        front: 0,
+        flip_at: None,
+        place,
+        index: n,
+    };
+    layer.apply_mode();
+    state().layers[n] = Some(layer);
     true
 }
 
@@ -290,7 +341,7 @@ fn hide_now(n: usize) {
 /// See `LcdBackend::layer_target`.
 pub fn target(n: Option<usize>) {
     let t = n.map(|n| match state().layers.get(n).and_then(Option::as_ref) {
-        Some(l) => Target { px: l.base as *mut u32, stride: l.w, w: l.w, h: l.h, sprite: true, layer: n as u8 },
+        Some(l) => Target { px: l.px as *mut u32, stride: l.w, w: l.w, h: l.h, sprite: true, layer: n as u8 },
         // Not allocated: draws nothing.
         None => Target { px: core::ptr::null_mut(), stride: 0, w: 0, h: 0, sprite: true, layer: NO_LAYER },
     });
@@ -355,6 +406,9 @@ pub fn prepare() -> Option<Commit> {
             return None;
         }
     }
+    for l in st.layers.iter_mut().flatten() {
+        l.apply_mode();
+    }
     let mut commit = Commit::default();
     for (n, slot) in st.layers.iter_mut().enumerate() {
         if let Some(l) = slot {
@@ -403,12 +457,14 @@ fn copy_to_back(l: &Layer) {
     if bytes == 0 {
         return;
     }
-    let (src, dst) = (l.base as *const u32, l.scan(1 - l.front) as *mut u32);
+    let (src, dst) = (l.px as *const u32, l.scan(1 - l.front) as *mut u32);
     // The G2D reads the shadow's boxes from DRAM. A lot of them: the whole
     // L1 by set/way (~1000 operations) and the PL310 by way (one background
     // operation) cost less than one L1 + one L2 operation per line.
     let l2 = L2c::new();
-    if bytes >= CLEAN_ALL_BYTES && l2.is_enabled() {
+    if l.uncached {
+        // In DRAM already (`g2d_op` puts a barrier before the copy).
+    } else if bytes >= CLEAN_ALL_BYTES && l2.is_enabled() {
         mmu::clean_l1_all();
         l2.clean_all();
     } else {
@@ -506,6 +562,9 @@ fn rect_lines(t: &Target, x: usize, y: usize, w: usize, h: usize, f: fn(usize, u
 /// Before the G2D blends into rect (`x`, `y`, `w`, `h`) of the targeted layer's shadow (the
 /// CPU draws it cached): what the CPU drew there goes out to DRAM, as the blend reads it.
 pub fn g2d_begin(t: &Target, x: usize, y: usize, w: usize, h: usize) {
+    if shadow(t).is_none_or(|(_, uncached)| uncached) {
+        return;
+    }
     let l2 = L2c::new();
     if w * h * 4 >= CLEAN_ALL_BYTES && l2.is_enabled() {
         mmu::clean_l1_all();
@@ -520,5 +579,15 @@ pub fn g2d_begin(t: &Target, x: usize, y: usize, w: usize, h: usize) {
 /// speculation too) go with them. [`g2d_begin`] cleaned them and nothing wrote them since, so
 /// the neighbours sharing a line on the rect's edges lose nothing.
 pub fn g2d_end(t: &Target, x: usize, y: usize, w: usize, h: usize) {
+    if shadow(t).is_none_or(|(_, uncached)| uncached) {
+        return;
+    }
     rect_lines(t, x, y, w, h, mmu::invalidate_dcache_range);
+}
+
+/// The targeted layer's shadow for the G2D: its physical address, and whether the CPU draws it
+/// uncached (no cache maintenance then). None if `t` is no allocated layer.
+pub fn shadow(t: &Target) -> Option<(usize, bool)> {
+    let l = state().layers.get(t.layer as usize)?.as_ref()?;
+    Some((l.base, l.uncached))
 }
