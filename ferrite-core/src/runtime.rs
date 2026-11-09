@@ -1639,6 +1639,31 @@ pub fn set_dropdown_options_visible<P: Platform>(
     ctx.objs.mark_dirty(dropdown);
 }
 
+/// Whether pressing or releasing `id` changes what it draws, so it must be
+/// redrawn: it has a `press_color` (it and the children sharing its
+/// background take it), or its kind reacts to the touch itself (slider,
+/// input, checkbox, radio, dropdown…), or its `on_paint` might. A plain box,
+/// label, button, image or shape without a press colour looks the same:
+/// redrawing it is wasted, and costly for a big one (a full-screen
+/// clickable scrim, or a layer's root, whose whole surface is redrawn and
+/// copied).
+fn press_shows(objs: &ObjPool, id: WidgetId) -> bool {
+    let w = objs.get(id);
+    let plain = matches!(
+        w.kind,
+        widget::KIND_BASE
+            | widget::KIND_LABEL
+            | widget::KIND_BUTTON
+            | widget::KIND_IMAGE
+            | widget::KIND_RECTANGLE
+            | widget::KIND_CIRCLE
+            | widget::KIND_POLYGON
+            | widget::KIND_LINE
+            | widget::KIND_ELLIPSE
+    );
+    !plain || w.flags & widget::FLAG_HAS_ON_PAINT != 0 || objs.press_color(id) != 0
+}
+
 pub fn toggle_dropdown<P: Platform>(ctx: &mut Ctx<P>, dropdown: WidgetId) {
     let expanded = ctx.objs.get(dropdown).flags & widget::FLAG_CHECKED != 0;
     if expanded {
@@ -1718,7 +1743,9 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
                 let hit = crate::touch::hit_test(&mut ctx.objs, event.x, event.y);
                 if hit.is_some() {
                     ctx.objs.get_mut(hit).flags |= widget::FLAG_PRESSED;
-                    ctx.objs.mark_dirty(hit);
+                    if press_shows(&ctx.objs, hit) {
+                        ctx.objs.mark_dirty(hit);
+                    }
                 }
             }
             TouchEventKind::Release => {
@@ -1727,7 +1754,9 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
                     return;
                 }
                 ctx.objs.get_mut(hit).flags &= !widget::FLAG_PRESSED;
-                ctx.objs.mark_dirty(hit);
+                if press_shows(&ctx.objs, hit) {
+                    ctx.objs.mark_dirty(hit);
+                }
                 if ctx.objs.get(hit).flags & widget::FLAG_HAS_ON_CLICK != 0 {
                     tasks.widget_click(&ctx.objs, hit);
                 }
@@ -1906,9 +1935,11 @@ impl FullInput {
                 }
             }
 
-            ctx.objs.mark_dirty(hit);
-            if !tasks.buffered() {
-                render::render_dirty(ctx);
+            if press_shows(&ctx.objs, hit) {
+                ctx.objs.mark_dirty(hit);
+                if !tasks.buffered() {
+                    render::render_dirty(ctx);
+                }
             }
         }
 
@@ -2015,7 +2046,9 @@ impl FullInput {
                 if is_swipe {
                     swipe_widget_id = id;
                 }
-                ctx.objs.mark_dirty(id);
+                if press_shows(&ctx.objs, id) {
+                    ctx.objs.mark_dirty(id);
+                }
             }
         }
 

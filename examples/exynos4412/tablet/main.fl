@@ -197,6 +197,9 @@ fn build_drawer() {
     drawer = alloc();
     style_box(0, SCREEN_H, SCREEN_W, SCREEN_H - STATUS_H, APP_BG, 32);
     parent(0);
+    // Layer 2: it slides over the pager (layer 1), which keeps its window
+    // (a plain widget over it would hand the pager back to the tree).
+    set(layer, 2);
     drawer_handle = alloc();
     target(drawer_handle);
     set(kind, KIND_LABEL);
@@ -242,10 +245,12 @@ fn build_shade() {
     set(clickable, ON);
     set(on_click, @on_scrim);
     parent(0);
+    set(layer, 3);
 
     shade = alloc();
     style_box(0, -SHADE_H - 32, SCREEN_W, SHADE_H + 32, SURFACE, 32);
     parent(0);
+    set(layer, 4);
     // Content sits 32 px down: the top corners stay off screen.
     shade_time = alloc();
     style_label(44, 50, 400, 70, F60, WHITE, ALIGN_LEFT, "");
@@ -424,8 +429,10 @@ fn open_shade(open) {
     if (open) {
         animate(shade, PROP_LOC_Y, -32, 320, EASE_OUT);
         target(scrim);
+        // No dirty(): showing or hiding is a redraw by itself in the tree,
+        // and only a window placement for a layer (a dirty mark would
+        // redraw and copy the whole 1280x800 scrim surface).
         set(visible, ON);
-        dirty();
     } else {
         animate(shade, PROP_LOC_Y, -SHADE_H - 32, 320, EASE_OUT, @on_shade_closed);
     }
@@ -437,7 +444,6 @@ fn on_shade_closed(w, prop) {
     if (!shade_open) {
         target(scrim);
         set(visible, OFF);
-        dirty();
     }
 }
 

@@ -3,10 +3,12 @@
 //! Layer `n` is window `n + 1`, above window 0 (the screen: shadow + scan buffers A/B). Each
 //! layer owns one heap block of three premultiplied ARGB8888 surfaces of its size: a
 //! *shadow* the primitives draw into (cached, like a sprite: [`super::Target`] with `layer`)
-//! and two *scan buffers* the FIMD shows in turn. Drawing marks the layer's own dirty box.
+//! and two *scan buffers* the FIMD shows in turn. Drawing marks the layer's own dirty boxes
+//! ([`Boxes`]: a few, so changes far apart, like two cards on a pager's two pages, are not
+//! copied as one box spanning both).
 //!
-//! [`prepare`] (in `flush`, no present in flight) copies each shown layer's dirty box
-//! (+ the box of its previous flip, which the other buffer lacks) into the buffer the FIMD
+//! [`prepare`] (in `flush`, no present in flight) copies each shown layer's dirty boxes
+//! (+ the boxes of its previous flip, which the other buffer lacks) into the buffer the FIMD
 //! does not scan, cleans it to DRAM, and works out which windows' registers change: a new
 //! buffer, a move, a plane alpha, shown or hidden. Those go out together with window 0's
 //! next flip (`super::show`, one `hold_updates` .. `release_updates`, so both appear in the
@@ -21,6 +23,7 @@ use core::sync::atomic::Ordering;
 
 use exynos_4412_rs::cpu;
 use exynos_4412_rs::drivers::display::{Fimd, Overlay};
+use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::mmu;
 use ferrite_core::fb;
 
@@ -29,6 +32,67 @@ use crate::systick;
 
 /// Layers = FIMD windows 1-4.
 pub const COUNT: usize = 4;
+
+/// Copies of at least this many bytes clean the whole cache instead of
+/// their lines.
+const CLEAN_ALL_BYTES: usize = 256 * 1024;
+/// Dirty boxes kept per layer.
+const BOXES: usize = 4;
+
+/// A few disjoint boxes (x0, y0, x1, y1), together covering what changed.
+#[derive(Clone, Copy)]
+struct Boxes {
+    r: [Rect; BOXES],
+    n: usize,
+}
+
+fn overlaps(a: &Rect, b: &Rect) -> bool {
+    a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
+}
+
+fn area(r: &Rect) -> usize {
+    (r[2] - r[0]) * (r[3] - r[1])
+}
+
+impl Boxes {
+    const NONE: Boxes = Boxes { r: [EMPTY; BOXES], n: 0 };
+
+    fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Rect> {
+        self.r[..self.n].iter()
+    }
+
+    fn remove(&mut self, i: usize) -> Rect {
+        let r = self.r[i];
+        self.n -= 1;
+        self.r[i] = self.r[self.n];
+        r
+    }
+
+    /// Adds `b`: merged with every box it overlaps; when all slots are
+    /// taken, with the box it grows least.
+    fn add(&mut self, mut b: Rect) {
+        if is_empty(&b) {
+            return;
+        }
+        loop {
+            while let Some(i) = (0..self.n).find(|&i| overlaps(&self.r[i], &b)) {
+                b = union(b, self.remove(i));
+            }
+            if self.n < BOXES {
+                self.r[self.n] = b;
+                self.n += 1;
+                return;
+            }
+            let grow = |r: &Rect| area(&union(*r, b)) - area(r);
+            let i = (0..self.n).min_by_key(|&i| grow(&self.r[i])).unwrap_or(0);
+            b = union(b, self.remove(i));
+        }
+    }
+}
 
 /// Freed blocks waiting for their window's hide to apply.
 const DEAD_MAX: usize = 8;
@@ -52,9 +116,9 @@ struct Layer {
     w: usize,
     h: usize,
     /// Drawn in the shadow since the last copy.
-    dirty: Rect,
+    dirty: Boxes,
     /// Copied into the front buffer at the last flip: the other one lacks it.
-    prev: Rect,
+    prev: Boxes,
     /// The scan buffer the registers name (or the pending commit will).
     front: usize,
     /// A buffer switch went out at this `millis`: the other buffer may still be scanned.
@@ -69,8 +133,14 @@ impl Layer {
         self.w * self.h
     }
 
+    /// Words per surface: whole 64-byte lines, so each scan buffer starts
+    /// on one and can be invalidated whole.
+    fn surface_words(&self) -> usize {
+        surface_words(self.w, self.h)
+    }
+
     fn scan(&self, i: usize) -> usize {
-        self.base + (1 + i) * self.size() * 4
+        self.base + (1 + i) * self.surface_words() * 4
     }
 
     /// The window's settings this layer wants now: its on-screen part only
@@ -156,6 +226,10 @@ fn state() -> &'static mut State {
     unsafe { &mut *(&raw mut STATE) }
 }
 
+fn surface_words(w: usize, h: usize) -> usize {
+    (w * h).next_multiple_of(16)
+}
+
 /// See `LcdBackend::layer_alloc`.
 pub fn alloc(n: usize, w: usize, h: usize) -> bool {
     if n >= COUNT || w == 0 || h == 0 {
@@ -163,7 +237,8 @@ pub fn alloc(n: usize, w: usize, h: usize) -> bool {
     }
     free(n);
     const ALIGN: usize = 64;
-    let words = 3 * w * h + ALIGN / 4;
+    let sw = surface_words(w, h);
+    let words = 3 * sw + ALIGN / 4;
     let mut mem = Vec::new();
     if mem.try_reserve_exact(words).is_err() {
         return false;
@@ -171,11 +246,16 @@ pub fn alloc(n: usize, w: usize, h: usize) -> bool {
     // All transparent.
     mem.resize(words, 0u32);
     let base = (mem.as_ptr() as usize).next_multiple_of(ALIGN);
-    // The FIMD reads the scan buffers from DRAM.
-    mmu::clean_dcache_range(base + w * h * 4, 2 * w * h * 4);
+    // The FIMD reads the scan buffers from DRAM, and the G2D writes them
+    // there ([`copy_to_back`]): no cached line of them may stay, or be
+    // written back over the G2D's writes later.
+    let scans = base + sw * 4;
+    mmu::clean_dcache_range(scans, 2 * sw * 4);
+    mmu::invalidate_dcache_range(scans, 2 * sw * 4);
+    exynos_4412_rs::println!("ferrite: layer {} {}x{} allocated", n, w, h);
     let place = Place { x: 0, y: 0, alpha: 255, visible: false };
     state().layers[n] =
-        Some(Layer { _mem: mem, base, w, h, dirty: EMPTY, prev: EMPTY, front: 0, flip_at: None, place, index: n });
+        Some(Layer { _mem: mem, base, w, h, dirty: Boxes::NONE, prev: Boxes::NONE, front: 0, flip_at: None, place, index: n });
     true
 }
 
@@ -183,6 +263,7 @@ pub fn alloc(n: usize, w: usize, h: usize) -> bool {
 pub fn free(n: usize) {
     let st = state();
     let Some(layer) = st.layers.get_mut(n).and_then(Option::take) else { return };
+    exynos_4412_rs::println!("ferrite: layer {} freed", n);
     unsafe {
         if (*(&raw const LAYER_TARGET)).is_some_and(|t| t.layer as usize == n) {
             *(&raw mut LAYER_TARGET) = None;
@@ -238,7 +319,7 @@ pub fn place(n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
 #[inline]
 pub fn mark(n: usize, x: usize, y: usize, w: usize, h: usize) {
     if let Some(l) = state().layers.get_mut(n).and_then(Option::as_mut) {
-        l.dirty = union(l.dirty, [x, y, x + w, y + h]);
+        l.dirty.add([x, y, x + w, y + h]);
     }
 }
 
@@ -247,7 +328,7 @@ pub fn mark(n: usize, x: usize, y: usize, w: usize, h: usize) {
 pub fn pending() -> bool {
     let st = state();
     st.layers.iter().enumerate().any(|(n, l)| match l {
-        Some(l) => (l.place.visible && !is_empty(&l.dirty)) || l.overlay() != st.shown[n],
+        Some(l) => (l.place.visible && !l.dirty.is_empty()) || l.overlay() != st.shown[n],
         None => st.shown[n].is_some(),
     })
 }
@@ -270,7 +351,7 @@ pub fn prepare() -> Option<Commit> {
         }
     }
     for l in st.layers.iter_mut().flatten() {
-        if l.place.visible && !is_empty(&l.dirty) && !l.settled() {
+        if l.place.visible && !l.dirty.is_empty() && !l.settled() {
             return None;
         }
     }
@@ -278,11 +359,11 @@ pub fn prepare() -> Option<Commit> {
     for (n, slot) in st.layers.iter_mut().enumerate() {
         if let Some(l) = slot {
             // A hidden layer keeps its pixels in the shadow until it shows again.
-            if l.place.visible && !is_empty(&l.dirty) {
+            if l.place.visible && !l.dirty.is_empty() {
                 copy_to_back(l);
                 l.front = 1 - l.front;
                 l.prev = l.dirty;
-                l.dirty = EMPTY;
+                l.dirty = Boxes::NONE;
                 l.flip_at = Some(now);
             }
         }
@@ -303,21 +384,62 @@ pub fn prepare() -> Option<Commit> {
 
 /// `prev ∪ dirty` from the shadow into the buffer the FIMD does not scan, cleaned to DRAM.
 fn copy_to_back(l: &Layer) {
-    let r = union(l.prev, l.dirty);
-    let (x0, y0, x1, y1) = (r[0].min(l.w), r[1].min(l.h), r[2].min(l.w), r[3].min(l.h));
-    if x0 >= x1 || y0 >= y1 {
+    let mut boxes = l.prev;
+    for r in l.dirty.iter() {
+        boxes.add(*r);
+    }
+    // Clipped to the surface: (x, y, w, h).
+    let mut list = [(0, 0, 0, 0); BOXES];
+    let mut n = 0;
+    for r in boxes.iter() {
+        let (x0, y0, x1, y1) = (r[0].min(l.w), r[1].min(l.h), r[2].min(l.w), r[3].min(l.h));
+        if x0 < x1 && y0 < y1 {
+            list[n] = (x0, y0, x1 - x0, y1 - y0);
+            n += 1;
+        }
+    }
+    let list = &list[..n];
+    let bytes: usize = list.iter().map(|&(_, _, w, h)| w * h * 4).sum();
+    if bytes == 0 {
         return;
     }
     let (src, dst) = (l.base as *const u32, l.scan(1 - l.front) as *mut u32);
-    let w = x1 - x0;
-    for y in y0..y1 {
-        let at = y * l.w + x0;
-        // SAFETY: inside both surfaces (clipped above); they don't overlap.
-        unsafe { copy_row(src.add(at), dst.add(at), w) };
-        mmu::clean_dcache_range(dst as usize + at * 4, w * 4);
+    // The G2D reads the shadow's boxes from DRAM. A lot of them: the whole
+    // L1 by set/way (~1000 operations) and the PL310 by way (one background
+    // operation) cost less than one L1 + one L2 operation per line.
+    let l2 = L2c::new();
+    if bytes >= CLEAN_ALL_BYTES && l2.is_enabled() {
+        mmu::clean_l1_all();
+        l2.clean_all();
+    } else {
+        for &(x, y, w, h) in list {
+            for row in y..y + h {
+                mmu::clean_dcache_range(l.base + (row * l.w + x) * 4, w * 4);
+            }
+        }
+    }
+    for &(x, y, w, h) in list {
+        if super::g2d_copy_argb(l.base, dst as usize, l.w, l.h, x, y, w, h) {
+            continue;
+        }
+        // By the CPU (G2D drawing off or failed: it may have written part
+        // of the box, which is written again here). The buffer holds no
+        // cached line ([`alloc`], [`composite`]): what a row's lines get
+        // here is cleaned out at once.
+        for row in y..y + h {
+            let at = row * l.w + x;
+            // SAFETY: inside both surfaces (clipped above); they don't overlap.
+            unsafe { copy_row(src.add(at), dst.add(at), w) };
+            // Out to DRAM and out of the cache: whole lines, all inside the
+            // buffer (it starts and ends on a line).
+            let a = (dst as usize + at * 4) & !63;
+            let e = (dst as usize + (at + w) * 4).next_multiple_of(64);
+            mmu::clean_dcache_range(a, e - a);
+            mmu::invalidate_dcache_range(a, e - a);
+        }
     }
     #[cfg(feature = "perf")]
-    super::COPY_BYTES.fetch_add((w * (y1 - y0) * 4) as u32, Ordering::Relaxed);
+    super::COPY_BYTES.fetch_add(bytes as u32, Ordering::Relaxed);
 }
 
 /// Window 0 has nothing new: the layers' changes apply at the next vsync on their own.
@@ -338,7 +460,17 @@ pub fn commit_now(c: &Commit) {
 /// Composites the shown windows over `screen` (a copy of the shadow, `sw` × `sh`) the way
 /// the FIMD does, for screenshots.
 pub fn composite(screen: &mut [u32], sw: usize, sh: usize) {
-    for o in state().shown.iter().flatten() {
+    let st = state();
+    // The scan buffers are written by the G2D: no stale cached line may be
+    // read, nor left behind (a later CPU copy of part of a line would
+    // write the rest of it back).
+    let drop_lines = |st: &State| {
+        for l in st.layers.iter().flatten() {
+            mmu::invalidate_dcache_range(l.scan(0), 2 * l.surface_words() * 4);
+        }
+    };
+    drop_lines(st);
+    for o in st.shown.iter().flatten() {
         let pa = o.alpha as u32;
         for y in 0..o.height.min(sh.saturating_sub(o.y as usize)) {
             let row = (o.address + y * o.stride) as *const u32;
@@ -357,4 +489,5 @@ pub fn composite(screen: &mut [u32], sw: usize, sh: usize) {
             }
         }
     }
+    drop_lines(st);
 }

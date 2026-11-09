@@ -1566,6 +1566,85 @@ pub fn copy_rgb565(addr: usize, sw: usize, sh: usize, sx: usize, sy: usize, dx: 
     }
 }
 
+/// Copies a `w` × `h` rect at (`x`, `y`) from one premultiplied ARGB8888
+/// surface to another of the same size (`sw` × `sh`, rows of `sw` pixels;
+/// physical addresses, the source in DRAM) by the G2D: a layer's shadow
+/// into its scan buffer. False if it did not (G2D drawing off, it changes
+/// the alpha byte ([`g2d_argb_matches`]), or it failed: part of the rect
+/// may be written then).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn g2d_copy_argb(src: usize, dst: usize, sw: usize, sh: usize, x: usize, y: usize, w: usize, h: usize) -> bool {
+    #[cfg(feature = "g2d_render")]
+    {
+        if !g2d_argb_matches() {
+            return false;
+        }
+        let from = Surface { address: src, stride: sw * 4, width: sw, height: sh, format: Format::Argb8888 };
+        let to = Surface { address: dst, ..from };
+        let r = g2d::Rect::new(x, y, w, h);
+        g2d_op("layer copy", w * h, |g| g.copy(&from, r, &to, r, Filter::Nearest))
+    }
+    #[cfg(not(feature = "g2d_render"))]
+    {
+        let _ = (src, dst, sw, sh, x, y, w, h);
+        false
+    }
+}
+
+/// 0 = not checked yet, 1 = a G2D ARGB8888 copy keeps every pixel as it is,
+/// 2 = it does not (layer copies by the CPU).
+#[cfg(feature = "g2d_render")]
+static G2D_ARGB: AtomicU8 = AtomicU8::new(0);
+
+/// Whether a G2D copy between ARGB8888 surfaces keeps the pixels exactly,
+/// alpha byte included (premultiplied, translucent and transparent ones),
+/// checked once.
+#[cfg(feature = "g2d_render")]
+fn g2d_argb_matches() -> bool {
+    match G2D_ARGB.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    #[repr(C, align(64))]
+    struct Lines<T>(T);
+    const N: usize = 32;
+    static mut SRC: Lines<[u32; N]> = Lines([0; N]);
+    static mut DST: Lines<[u32; N]> = Lines([0; N]);
+    // SAFETY: CPU0 only, never reentrant; the G2D is the only other user,
+    // inside `g2d_op` below.
+    let (src, dst) = unsafe { (&mut (*(&raw mut SRC)).0, &mut (*(&raw mut DST)).0) };
+    for (i, p) in src.iter_mut().enumerate() {
+        // Alpha 0, 255 and levels between, colour channels at most alpha.
+        let a = [0u32, 255, 1, 128, 200, 37][i % 6];
+        let c = |k: u32| (a * (k + i as u32 * 7) / 255) % (a + 1);
+        *p = a << 24 | c(11) << 16 | c(97) << 8 | c(203);
+    }
+    dst.fill(0x5A5A_5A5A);
+    mmu::clean_dcache_range(src.as_ptr() as usize, N * 4);
+    mmu::clean_dcache_range(dst.as_ptr() as usize, N * 4);
+    mmu::invalidate_dcache_range(dst.as_ptr() as usize, N * 4);
+    let from = Surface { address: src.as_ptr() as usize, stride: N * 4, width: N, height: 1, format: Format::Argb8888 };
+    let to = Surface { address: dst.as_ptr() as usize, ..from };
+    let ok = g2d_op("ARGB check", N, |g| g.copy(&from, g2d::Rect::all(&from), &to, g2d::Rect::all(&to), Filter::Nearest));
+    if !ok {
+        return false;
+    }
+    mmu::invalidate_dcache_range(dst.as_ptr() as usize, N * 4);
+    // SAFETY: read after the G2D's writes (the op waited for its end).
+    let got = |i: usize| unsafe { core::ptr::read_volatile(dst.as_ptr().add(i)) };
+    let bad = (0..N).find(|&i| got(i) != src[i]);
+    if let Some(i) = bad {
+        exynos_4412_rs::println!(
+            "ferrite: G2D ARGB copy changes pixels ({:08x} -> {:08x}): layer copies by the CPU",
+            src[i],
+            got(i)
+        );
+    }
+    G2D_ARGB.store(if bad.is_none() { 1 } else { 2 }, Ordering::Relaxed);
+    bad.is_none()
+}
+
 /// Most pieces a banded [`g2d_move`] copies one by one (each costs a G2D
 /// setup of ~5 µs; a move by a few pixels goes through the scratch surface
 /// instead).

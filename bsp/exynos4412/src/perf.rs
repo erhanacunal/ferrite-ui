@@ -75,8 +75,17 @@ pub fn take_wait() -> u64 {
     let (cycles, n, bytes) = crate::lcd::take_present_stats();
     if n != 0 {
         ferrite_core::perf::add_sub_n(ferrite_core::perf::phase::PRESENT, cycles as u64, n);
-        ferrite_core::perf::add_count(ferrite_core::perf::count::PRESENT_KB, bytes >> 10);
     }
+    // Bytes also come from layer copies, with no present (`lcd_layers`):
+    // counted whenever there are some, the remainder kept.
+    static mut KB_REM: u32 = 0;
+    // SAFETY: CPU0 only.
+    let rem = unsafe { &mut *(&raw mut KB_REM) };
+    let total = *rem + bytes;
+    if total >= 1024 {
+        ferrite_core::perf::add_count(ferrite_core::perf::count::PRESENT_KB, total >> 10);
+    }
+    *rem = total & 1023;
     unsafe { core::mem::replace(&mut *(&raw mut WAIT), 0) }
 }
 
