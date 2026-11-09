@@ -579,7 +579,7 @@ def format_perf(p: dict) -> list[str]:
         return [f"passes {p['passes']}, VM instructions {p['vm_instr']} (no cycle counter / empty window)"]
     secs = window / 1e6
     lines = [
-        f"CPU clock {p['hz'] / 1e6:.0f} MHz, window {window / 1000:.1f} ms",
+        f"profiler clock {p['hz'] / 1e6:.0f} MHz, window {window / 1000:.1f} ms",
         f"passes {p['passes']} ({_fmt_rate(p['passes'] / secs)}passes/s, "
         f"avg {window / max(p['passes'], 1):.1f} us, max {p['max_pass_us']} us)",
         f"VM {_fmt_rate(p['vm_instr'] / secs)}instr/s ({p['vm_instr']} instructions)",

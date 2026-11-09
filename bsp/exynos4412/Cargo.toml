@@ -31,7 +31,7 @@ gpu_compose = ["g2d_render"]
 # BCM4334 WiFi on CPU3 + an HTTP server and a TCP bridge to the USART
 # protocol (`net/`). Needs the chip firmware at build time
 # (`WIFI_FIRMWARE_DIR`, build.rs) or on CACHE, and FERRITE/WIFI.CFG.
-wifi = ["exynos_4412_rs/wifi-net", "dep:embassy-net", "dep:embassy-time", "dep:embassy-sync"]
+wifi = ["exynos_4412_rs/wifi-net", "dep:embassy-net", "dep:embassy-sync"]
 
 [dependencies]
 ferrite-core = { path = "../../ferrite-core", features = ["external_alloc", "pool_large", "wide_code", "wide_obj", "multi_program", "audio", "fast_vm", "render_cache", "superops"] }
@@ -43,5 +43,5 @@ exynos_4412_rs = { path = "../../vendor/exynos_4412_rs/exynos_4412_rs", features
 embassy-executor = "0.10"
 embassy-futures = "0.1"
 embassy-net = { version = "0.9", features = ["medium-ethernet", "proto-ipv4", "dhcpv4", "dhcpv4-hostname", "tcp"], optional = true }
-embassy-time = { version = "0.5", optional = true }
+embassy-time = "0.5"
 embassy-sync = { version = "0.8", optional = true }

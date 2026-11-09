@@ -12,7 +12,8 @@
 //! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted |
 //! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
-//! | `POST /api/cpu?mhz=N` | CPU clock, one of 200..1400 in steps of 100 (`cpuclock`), applied by CPU0 after the next pass; without `mhz` the current one |
+//! | `POST /api/cpu?mhz=N` | wanted CPU clock, one of 200..1400 in steps of 100 (`cpuclock`), applied by CPU0 after the next pass under the thermal cap; without `mhz` the current one |
+//! | `POST /api/idle?sleep=0\|1` | idle sleep between passes off/on (`cpuclock::IDLE_SLEEP`) |
 //! | `POST /api/overlay?mode=off\|still\|move\|fade\|full[&x=X&y=Y&alpha=A]` | FIMD window 1 test picture above the UI (`overlay_test.rs`) |
 //!
 //! `/flash` takes the same request as uart_boot's (`ferrite_cli bootflash
@@ -290,12 +291,38 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             let mut msg = String::new();
             match query_param(query, b"mhz").and_then(parse_decimal) {
                 Some(mhz) if crate::cpuclock::request(mhz as u32) => {
-                    let _ = writeln!(msg, "CPU clock {} MHz requested (now {} MHz)", mhz, crate::cpuclock::mhz());
+                    let (_, cap, temp) = crate::cpuclock::status();
+                    let _ = writeln!(
+                        msg,
+                        "CPU clock {} MHz requested (now {} MHz, thermal cap {} MHz, {:?} C)",
+                        mhz,
+                        crate::cpuclock::mhz(),
+                        cap,
+                        temp
+                    );
                     text(socket, "200 OK", &msg).await?;
                 }
                 _ => {
                     let _ = writeln!(msg, "mhz=200..1400 in steps of 100 (now {} MHz)", crate::cpuclock::mhz());
                     text(socket, "400 Bad Request", &msg).await?;
+                }
+            }
+        }
+        (b"POST", b"/api/idle") => {
+            use core::sync::atomic::Ordering;
+            match query_param(query, b"sleep") {
+                Some(v @ (b"0" | b"1")) => {
+                    let on = v == b"1";
+                    crate::cpuclock::IDLE_SLEEP.store(on, Ordering::Relaxed);
+                    text(socket, "200 OK", if on { "idle sleep on
+" } else { "idle sleep off
+" }).await?;
+                }
+                _ => {
+                    let on = crate::cpuclock::IDLE_SLEEP.load(Ordering::Relaxed);
+                    text(socket, "400 Bad Request", if on { "sleep=0|1 (now 1)
+" } else { "sleep=0|1 (now 0)
+" }).await?;
                 }
             }
         }
@@ -649,8 +676,17 @@ fn status_json() -> String {
         crate::usart::RX_TOTAL.load(core::sync::atomic::Ordering::Relaxed),
         crate::usart::RX_DROPPED.load(core::sync::atomic::Ordering::Relaxed)
     );
-    #[cfg(feature = "perf")]
-    let _ = write!(s, ",\"cpu_mhz\":{}", crate::perf::hz() / 1_000_000);
+    let (want, cap, temp) = crate::cpuclock::status();
+    let _ = write!(
+        s,
+        ",\"cpu\":{{\"mhz\":{},\"wanted_mhz\":{},\"cap_mhz\":{},\"temp_c\":{},\"idle_sleep\":{}}}",
+        crate::cpuclock::mhz(),
+        want,
+        cap,
+        temp.map_or(String::from("null"), |t| alloc::format!("{}", t)),
+        crate::cpuclock::IDLE_SLEEP.load(core::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = write!(s, ",\"cpu_mhz\":{}", crate::cpuclock::mhz());
     s.push('}');
     s
 }

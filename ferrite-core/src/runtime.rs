@@ -516,6 +516,21 @@ impl<P: PlatformRuntime> Runtime<P> {
         &mut self.ctx
     }
 
+    /// The programs want the CPU again at once: a VM task runs or yielded (its next burst is
+    /// due), callbacks wait, the main program exited (the next one loads), or a USART message is
+    /// half received. Otherwise the next pass only polls (input, `delay` timers, animations,
+    /// presents) and a BSP may sleep a little between passes instead of spinning.
+    pub fn busy(&self) -> bool {
+        let wants = |vm: &Vm| {
+            matches!(vm.state, VmState::Running | VmState::Yielded | VmState::Exit) || vm.has_pending_callbacks()
+        };
+        #[cfg(feature = "multi_program")]
+        if self.tasks.kids.iter().flatten().any(|vm| wants(vm)) {
+            return true;
+        }
+        (self.error_code == 0 && wants(&self.tasks.main)) || !self.protocol.is_idle()
+    }
+
     /// One main-loop pass: VM, USART protocol, input, animations, audio,
     /// render, callbacks, `P::frame_end`.
     pub fn step(&mut self) {

@@ -63,7 +63,7 @@ mod flash;
 // The GPU compositor; with `gpu_compose` off only its shaders are used (`gpu::ui` skips them).
 #[cfg_attr(not(feature = "gpu_compose"), allow(dead_code))]
 mod compose;
-// The CPU clock at run time (HTTP `POST /api/cpu?mhz=N`).
+// The CPU clock at run time (HTTP `POST /api/cpu?mhz=N`), thermal throttling, idle sleep.
 #[cfg_attr(not(feature = "wifi"), allow(dead_code))]
 mod cpuclock;
 mod gpu;
@@ -122,8 +122,6 @@ fn main(_args: BootArgs) -> ! {
     systick::resync();
     mmu::enable();
     L2c::new().enable();
-    #[cfg(feature = "perf")]
-    perf::init(&mct);
     if let Err(e) = heap::init() {
         fail("heap", e);
     }
@@ -134,6 +132,8 @@ fn main(_args: BootArgs) -> ! {
         fail("PMIC bus", e);
     }
     let pmic = Max77686::new(pmic_bus);
+    // Temperature sensor + the rate U-Boot left (thermal throttling, `cpuclock`).
+    cpuclock::init(mct);
     if let Err(e) = touch::init(pmic, mct) {
         // Not fatal: the UI runs without touch (USART still works).
         println!("ferrite: touch ERROR {:?}", e);
@@ -237,6 +237,12 @@ async fn ui_task(ctx: Box<Ctx<Exynos4412Platform>>, touch: TouchImpl<touch::MxtT
     let mut rt = Runtime::<Exynos4412Platform>::new(ctx, touch);
     loop {
         rt.step();
-        embassy_futures::yield_now().await;
+        if cpuclock::IDLE_SLEEP.load(core::sync::atomic::Ordering::Relaxed) && !rt.busy() {
+            // Nothing for the programs to run: CPU0 sleeps in the executor until the timer (or
+            // another task) instead of spinning through empty passes.
+            embassy_time::Timer::after_micros(cpuclock::IDLE_SLEEP_US).await;
+        } else {
+            embassy_futures::yield_now().await;
+        }
     }
 }

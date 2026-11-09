@@ -981,8 +981,6 @@ unsafe fn blend_fill(px: &mut [u32], src: u32, a: u32) {
 /// The presenter core: waits for a hand-over, presents, repeats. No
 /// interrupts: `sev` from CPU0 wakes it.
 fn presenter(_cpu: usize) -> ! {
-    #[cfg(feature = "perf")]
-    crate::perf::enable_counter();
     loop {
         while STATE.load(Ordering::Acquire) != COPY {
             // SAFETY: sleeps until an event (CPU0's `sev`); a spurious wake
