@@ -214,6 +214,16 @@ enum Batch {
     Flat(Tex),
 }
 
+/// A widget's image: where it is drawn (screen), its texture (`shift` texels from the
+/// texture's left edge), and whether it is opaque.
+#[derive(Clone, Copy)]
+struct Picture {
+    at: R,
+    tex: Tex,
+    shift: usize,
+    opaque: bool,
+}
+
 /// Where a widget's pieces start in `prims`, and the rect it paints opaquely whole, if any.
 struct Item {
     start: usize,
@@ -248,6 +258,10 @@ struct State {
     /// A graph's curve points, and triangles cut to a box (`tess_in`), kept for their room.
     gpts: Vec<(i32, i32)>,
     cov_tris: Vec<tess::Vtx>,
+    /// Images that aren't raw opaque RGB565, decoded into textures.
+    images: Images,
+    /// The GPU reads RGB565 rows of any stride (`Ui::any_565_stride`), for this render.
+    any_565: bool,
     /// A GPU error was printed: only the first is.
     told: bool,
     /// One opaque white texel (heap, 64-byte aligned, cleaned): solid pieces are `ui_flat`
@@ -274,6 +288,8 @@ static mut STATE: State = State {
     glyphs: false,
     gpts: Vec::new(),
     cov_tris: Vec::new(),
+    images: Images { entries: Vec::new(), bytes: 0, render: 0 },
+    any_565: false,
     told: false,
     white: 0,
 };
@@ -331,6 +347,77 @@ impl MeshCache {
         }
         self.entries.push(MeshEntry { part: Self::key(&p), used: self.clock, verts, chunks });
         self.entries.len() - 1
+    }
+}
+
+/// Images that are not raw opaque RGB565 (compressed, indexed, with alpha, JPEG) decoded
+/// once into premultiplied ARGB8888 textures (the image drawn into a sprite target), kept by
+/// the image's pixel data address: every widget showing it samples the same texture, whatever
+/// its box. Least recently used ones go past [`IMAGE_BYTES`], never one this render uses.
+struct Images {
+    entries: Vec<ImgTex>,
+    bytes: usize,
+    /// Renders so far: an entry's `used` is the render that last sampled it.
+    render: u32,
+}
+
+struct ImgTex {
+    data: u32,
+    w: usize,
+    h: usize,
+    /// Pixels per row (`w` rounded up to 16), the pixels from `start` words into `px`.
+    stride: usize,
+    px: Vec<u32>,
+    start: usize,
+    used: u32,
+}
+
+const IMAGE_BYTES: usize = 32 << 20;
+const IMAGE_ENTRIES: usize = 64;
+
+impl Images {
+    /// `img` as a texture (decoded now if not held); None without the memory, or larger
+    /// than the panel.
+    fn tex(&mut self, ctx: &Ctx<P>, img: &ferrite_core::image::Image) -> Option<Tex> {
+        let (w, h) = (img.width as usize, img.height as usize);
+        let found = self.entries.iter().position(|e| e.data == img.data_addr() && (e.w, e.h) == (w, h));
+        let at = match found {
+            Some(at) => at,
+            None => {
+                if w == 0 || h == 0 || w > lcd::PANEL.width || h > lcd::PANEL.height {
+                    return None;
+                }
+                let stride = w.next_multiple_of(16);
+                let words = stride * h + 16;
+                let render = self.render;
+                while self.bytes + words * 4 > IMAGE_BYTES || self.entries.len() >= IMAGE_ENTRIES {
+                    let lru = (0..self.entries.len())
+                        .filter(|&i| self.entries[i].used != render)
+                        .max_by_key(|&i| render.wrapping_sub(self.entries[i].used))?;
+                    let old = self.entries.swap_remove(lru);
+                    self.bytes -= old.px.len() * 4;
+                }
+                let mut px = Vec::new();
+                px.try_reserve_exact(words).ok()?;
+                // Transparent: the image composites onto it.
+                px.resize(words, 0u32);
+                let start = ((px.as_ptr() as usize).next_multiple_of(64) - px.as_ptr() as usize) / 4;
+                let base = px[start..].as_mut_ptr();
+                let t = now_us();
+                // SAFETY: `base` has stride * h words in `px`, only the primitives touch them
+                // until `end_sprite`; w, h are within the panel.
+                unsafe { lcd::begin_sprite(base, w, h, stride) };
+                img.draw(&ctx.lcd, &ctx.flash, 0, 0);
+                lcd::end_sprite(base, stride * h);
+                sprite_time(KIND_IMAGE, now_us() - t);
+                self.bytes += px.len() * 4;
+                self.entries.push(ImgTex { data: img.data_addr(), w, h, stride, px, start, used: render });
+                self.entries.len() - 1
+            }
+        };
+        let e = &mut self.entries[at];
+        e.used = self.render;
+        Some(Tex { addr: e.px[e.start..].as_ptr() as usize, w: e.w, h: e.h, stride: e.stride * 4, fmt: Fmt::Argb })
     }
 }
 
@@ -659,6 +746,8 @@ pub fn compose(ctx: &Ctx<P>, areas: &[Rect]) -> bool {
     s.scratch.clear();
     s.tverts.clear();
     s.glyphs = GLYPHS.load(core::sync::atomic::Ordering::Relaxed) && s.atlas.begin();
+    s.images.render = s.images.render.wrapping_add(1);
+    s.any_565 = ui.any_565_stride;
     let collected = s.collect(ctx, &ui, gpu, areas);
     add_time(T_COLLECT, now_us() - t0);
     let result = match collected {
@@ -782,12 +871,12 @@ impl State {
                 // rects and rings, ovals, a tick, a line's wedge.
                 return Some(self.round(objs, id, abs));
             }
-            if matches!(w.kind, KIND_INPUT | KIND_DROPDOWN) && self.glyphs && objs.ext(id).image_id == 0 {
+            if matches!(w.kind, KIND_INPUT | KIND_DROPDOWN) && self.glyphs {
                 if let Some(opaque) = self.field(ctx, id, abs) {
                     return Some(opaque);
                 }
             }
-            if w.kind == KIND_LABEL && self.glyphs && objs.ext(id).image_id == 0 {
+            if w.kind == KIND_LABEL && self.glyphs {
                 if let Some(opaque) = self.label(ctx, id, abs) {
                     return Some(opaque);
                 }
@@ -795,52 +884,64 @@ impl State {
             return self.sprite(ctx, id, abs, keep_after).map(|_| None);
         }
         let e = objs.ext(id);
-        // The picture: a background image at the inside's top left, or an image widget's,
-        // centred in the inside.
-        let mut picture = None;
-        if e.image_id != 0 {
-            let inner = R::of(&render::inner_rect(abs, &e.border));
-            let pic = ctx.images.find(e.image_id).and_then(|img| {
-                if inner.is_empty() || !img.is_raw_opaque() {
-                    return None;
-                }
-                let (pw, ph) = (img.width as i32, img.height as i32);
-                let (x, y) = if w.kind == KIND_IMAGE {
-                    let x = if inner.w() > pw { inner.x0 + (inner.w() - pw) / 2 } else { inner.x0 };
-                    let y = if inner.h() > ph { inner.y0 + (inner.h() - ph) / 2 } else { inner.y0 };
-                    (x, y)
-                } else {
-                    (inner.x0, inner.y0)
-                };
-                let addr = renderer::picture_addr(img.data_addr(), (pw * ph * 2) as usize)?;
-                // From the 64-byte boundary before it: `shift` texels to the left.
-                let shift = (addr % 64) / 2;
-                let stride = pw as usize * 2;
-                if addr % 2 != 0 || (!ui.any_565_stride && stride % 64 != 0) || pw as usize + shift > 4096 {
-                    return None;
-                }
-                let tex = Tex { addr: addr - addr % 64, w: pw as usize + shift, h: ph as usize, stride, fmt: Fmt::Rgb565 };
-                Some((R { x0: x, y0: y, x1: x + pw, y1: y + ph }, tex, shift))
-            });
-            match pic {
-                Some(p) => picture = Some(p),
-                // Not a picture the GPU can read: the whole widget from a sprite.
-                None => return self.sprite(ctx, id, abs, keep_after).map(|_| None),
-            }
-        }
+        let Some(picture) = self.picture(ctx, w.kind, abs, &e) else {
+            // An image the GPU can't have: the whole widget from a sprite.
+            return self.sprite(ctx, id, abs, keep_after).map(|_| None);
+        };
         self.boxes(objs, id, &r);
         let mut opaque = render::covers_opaquely(objs, id, abs, abs).then_some(r);
-        if let Some((at, tex, shift)) = picture {
-            // Clipped to the widget's box, as the scissor does.
-            let shown = at.meet(&r);
-            if !shown.is_empty() {
-                self.flat(shown, at.x0, at.y0, tex, shift);
-                if shown == r && e.border_radius == 0 {
-                    opaque = Some(r);
-                }
-            }
+        if self.put_picture(picture, &r) && e.border_radius == 0 {
+            opaque = Some(r);
         }
         Some(opaque)
+    }
+
+    /// Widget's image as `draw_widget` places it: a background image at the inside's top
+    /// left, an image widget's centred in the inside. Some(None) = no image to draw; None =
+    /// one the GPU can't have (no memory). Raw opaque RGB565 is sampled where it is in the
+    /// flash shadow; anything else from its decoded texture ([`Images`]).
+    fn picture(&mut self, ctx: &Ctx<P>, kind: u8, abs: &Rect, e: &ferrite_core::widget::WidgetExt) -> Option<Option<Picture>> {
+        if e.image_id == 0 || kind == KIND_GRAPH {
+            return Some(None);
+        }
+        let inner = R::of(&render::inner_rect(abs, &e.border));
+        let Some(img) = ctx.images.find(e.image_id) else { return Some(None) };
+        if inner.is_empty() {
+            return Some(None);
+        }
+        let (pw, ph) = (img.width as i32, img.height as i32);
+        let (x, y) = if kind == KIND_IMAGE {
+            let x = if inner.w() > pw { inner.x0 + (inner.w() - pw) / 2 } else { inner.x0 };
+            let y = if inner.h() > ph { inner.y0 + (inner.h() - ph) / 2 } else { inner.y0 };
+            (x, y)
+        } else {
+            (inner.x0, inner.y0)
+        };
+        let at = R { x0: x, y0: y, x1: x + pw, y1: y + ph };
+        if img.is_raw_opaque()
+            && let Some(addr) = renderer::picture_addr(img.data_addr(), (pw * ph * 2) as usize)
+        {
+            // From the 64-byte boundary before it: `shift` texels to the left.
+            let shift = (addr % 64) / 2;
+            let stride = pw as usize * 2;
+            if addr % 2 == 0 && (self.any_565 || stride % 64 == 0) && pw as usize + shift <= 4096 {
+                let tex = Tex { addr: addr - addr % 64, w: pw as usize + shift, h: ph as usize, stride, fmt: Fmt::Rgb565 };
+                return Some(Some(Picture { at, tex, shift, opaque: true }));
+            }
+        }
+        let tex = self.images.tex(ctx, img)?;
+        Some(Some(Picture { at, tex, shift: 0, opaque: false }))
+    }
+
+    /// `p`, cut to the widget's box `r` (as the scissor). True if it covers the box opaquely.
+    fn put_picture(&mut self, p: Option<Picture>, r: &R) -> bool {
+        let Some(p) = p else { return false };
+        let shown = p.at.meet(r);
+        if shown.is_empty() {
+            return false;
+        }
+        self.flat(shown, p.at.x0, p.at.y0, p.tex, p.shift);
+        p.opaque && shown == *r
     }
 
     /// Composed layer `s` (root box `r`): one quad sampling the part of its surface on the
@@ -881,9 +982,14 @@ impl State {
         let w = objs.get(id);
         let e = objs.ext(id);
         let r = R::of(abs);
+        // A background image goes between the box and the text (`draw_widget`).
+        let picture = self.picture(ctx, w.kind, abs, &e)?;
         let (prims, tverts) = (self.prims.len(), self.tverts.len());
         self.boxes(objs, id, &r);
-        let opaque = render::covers_opaquely(objs, id, abs, abs).then_some(r);
+        let mut opaque = render::covers_opaquely(objs, id, abs, abs).then_some(r);
+        if self.put_picture(picture, &r) && e.border_radius == 0 {
+            opaque = Some(r);
+        }
         let color = Lin::flat(rgb(e.text_color, 1.0));
         let tex = self.atlas.tex();
         let a = ATLAS as f32;
@@ -1171,9 +1277,14 @@ impl State {
         let w = objs.get(id);
         let e = objs.ext(id);
         let r = R::of(abs);
+        // A background image goes between the box and the text (`draw_widget`).
+        let picture = self.picture(ctx, w.kind, abs, &e)?;
         let (prims, tverts) = (self.prims.len(), self.tverts.len());
         self.boxes(objs, id, &r);
-        let opaque = render::covers_opaquely(objs, id, abs, abs).then_some(r);
+        let mut opaque = render::covers_opaquely(objs, id, abs, abs).then_some(r);
+        if self.put_picture(picture, &r) && e.border_radius == 0 {
+            opaque = Some(r);
+        }
         let color = Lin::flat(rgb(e.text_color, 1.0));
         let tex = self.atlas.tex();
         let a = ATLAS as f32;
