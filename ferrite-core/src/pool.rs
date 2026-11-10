@@ -64,8 +64,10 @@ pub const MAX_OBJECTS: usize = 0x3FFF;
 /// entry's free tag (bit 31) caps it -- in practice the heap does first.
 #[cfg(feature = "wide_obj")]
 pub const MAX_OBJECTS: usize = 0x7FFF_FFFE;
-/// Largest payload of one object, in words (16-bit header field).
-pub const MAX_OBJ_WORDS: usize = 0xFFFF;
+/// Largest payload of one object, in words. The header field has 16 bits,
+/// and a freed block becomes a hole whose field holds its whole length - 1
+/// (`HDR - 1` words more than the payload), which must fit too.
+pub const MAX_OBJ_WORDS: usize = 0xFFFF - (HDR - 1);
 
 #[cfg(not(feature = "pool_large"))]
 mod profile {
@@ -447,10 +449,11 @@ impl ObjPool {
     fn take_ptr(&mut self) -> Option<ObjPtr> {
         if self.free_head != PTR_NONE {
             let p = self.free_head;
-            let next = (self.table[p as usize] & !FREE_TAG) as ObjPtr;
-            self.free_head = if p == self.free_tail { PTR_NONE } else { next };
-            if self.free_head == PTR_NONE {
+            if p == self.free_tail {
+                self.free_head = PTR_NONE;
                 self.free_tail = PTR_NONE;
+            } else {
+                self.free_head = (self.table[p as usize] & !FREE_TAG) as ObjPtr;
             }
             return Some(p);
         }
@@ -549,17 +552,13 @@ impl ObjPool {
             self.release_block(at + HDR + words, old - words);
             return true;
         }
-        // Last block: extend in place.
-        if at + HDR + old == self.top && self.top + (words - old) <= self.arena.len() {
-            self.arena[at + HDR + old..at + HDR + words].fill(0);
-            put_header(&mut self.arena, at, ptr, ty, words);
-            self.top += words - old;
-            return true;
-        }
-        // Move to top. Compaction may move the block (and may leave it last).
-        if !self.reserve_top(HDR + words) {
+        // The last block only needs the added words (compaction keeps it
+        // last); any other block needs room for a copy at `top`.
+        let need = if at + HDR + old == self.top { words - old } else { HDR + words };
+        if !self.reserve_top(need) {
             return false;
         }
+        // Compaction may have moved the block (and may have left it last).
         let at = self.table[ptr as usize] as usize;
         if at + HDR + old == self.top {
             self.arena[at + HDR + old..at + HDR + words].fill(0);
@@ -750,6 +749,46 @@ mod tests {
         assert_eq!(p.arr(b), Some(&[9][..]));
         assert_eq!(p.arr(a), Some(&[1][..]));
         assert_eq!(p.used_bytes(), 4 * (2 * HDR + 2));
+    }
+
+    #[test]
+    fn last_block_grows_after_compaction_without_room_for_a_copy() {
+        // a, b and one spare word: b needs 2 more, a's hole has them, but a
+        // second copy of b would not fit.
+        let blk = HDR + 3;
+        let mut p = pool(4 * (2 * blk + 1), 8);
+        let a = p.arr_from(&[1, 2, 3]).unwrap();
+        let b = p.arr_from(&[4, 5, 6]).unwrap();
+        p.arr_free(a);
+        assert!(p.resize_obj(b, T_ARRAY, 5));
+        assert_eq!(p.arr(b), Some(&[4, 5, 6, 0, 0][..]));
+        assert_eq!((p.used_bytes(), p.garbage_bytes()), (4 * (HDR + 5), 0));
+        assert!(!p.resize_obj(b, T_ARRAY, blk + 4 + 1), "past the arena");
+        assert_eq!(p.arr(b), Some(&[4, 5, 6, 0, 0][..]));
+    }
+
+    /// The arena of a narrow build is smaller than the largest object.
+    #[cfg(feature = "pool_large")]
+    #[test]
+    fn largest_object_leaves_a_walkable_hole() {
+        let mut p = pool(4 * (2 * (HDR + MAX_OBJ_WORDS) + 2 * (HDR + 1)), 8);
+        assert!(p.arr_alloc(MAX_OBJ_WORDS + 1).is_none());
+        let a = p.arr_alloc(MAX_OBJ_WORDS).unwrap();
+        let b = p.arr_from(&[7]).unwrap();
+        // Freed in the middle: a hole of the object's whole length.
+        p.arr_free(a);
+        assert_eq!(p.garbage_bytes(), 4 * (HDR + MAX_OBJ_WORDS));
+        assert_eq!(p.bytes_of(T_ARRAY), 4 * (HDR + 1));
+        // A resize up to the limit that has to compact and move the block.
+        let c = p.arr_alloc(MAX_OBJ_WORDS - 1).unwrap();
+        let d = p.arr_from(&[8]).unwrap();
+        assert!(p.resize_obj(c, T_ARRAY, MAX_OBJ_WORDS));
+        assert_eq!(p.bytes_of(T_ARRAY), 4 * (2 * (HDR + 1) + HDR + MAX_OBJ_WORDS));
+        p.compact();
+        assert_eq!(p.arr(b), Some(&[7][..]));
+        assert_eq!(p.arr(d), Some(&[8][..]));
+        assert_eq!(p.arr(c).map(|s| s.len()), Some(MAX_OBJ_WORDS));
+        assert_eq!(p.used_bytes(), 4 * (2 * (HDR + 1) + HDR + MAX_OBJ_WORDS));
     }
 
     #[cfg(feature = "wide_obj")]
