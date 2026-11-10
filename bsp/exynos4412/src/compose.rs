@@ -53,7 +53,8 @@ use ferrite_core::render::{self, RoundPart};
 use ferrite_core::types::{Color, Edges, Rect};
 use ferrite_core::widget::{
     FLAG_CLIP_CHILDREN, FLAG_HAS_ON_PAINT, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_IMAGE, KIND_LABEL,
-    KIND_CIRCLE, KIND_ELLIPSE, KIND_GAUGE, KIND_GRAPH, KIND_MODEL3D, KIND_POLYGON, KIND_RECTANGLE, WidgetId,
+    KIND_CHECKBOX, KIND_CIRCLE, KIND_ELLIPSE, KIND_GAUGE, KIND_GRAPH, KIND_LINE, KIND_MODEL3D, KIND_POLYGON,
+    KIND_PROGRESS, KIND_RADIO, KIND_RECTANGLE, KIND_SLIDER, WidgetId,
 };
 
 use crate::gpu::Ui;
@@ -302,7 +303,12 @@ impl MeshCache {
     fn key(p: &RoundPart) -> RoundPart {
         let mut k = *p;
         match &mut k {
-            RoundPart::Oval { color, .. } | RoundPart::Arc { color, .. } | RoundPart::Wedge { color, .. } => *color = 0,
+            RoundPart::Oval { color, .. }
+            | RoundPart::Arc { color, .. }
+            | RoundPart::Wedge { color, .. }
+            | RoundPart::Rect { color, .. }
+            | RoundPart::RoundRect { color, .. }
+            | RoundPart::Path { color, .. } => *color = 0,
         }
         k
     }
@@ -762,6 +768,14 @@ impl State {
                 }
                 // Not convex (or too thin to shrink): the CPU's sprite.
             }
+            if matches!(w.kind, KIND_PROGRESS | KIND_SLIDER | KIND_CHECKBOX | KIND_RADIO | KIND_LINE)
+                && SHAPES.load(core::sync::atomic::Ordering::Relaxed)
+                && objs.ext(id).image_id == 0
+            {
+                // Their box and the few parts over it (`render::round_parts`): rects, rounded
+                // rects and rings, ovals, a tick, a line's wedge.
+                return Some(self.round(objs, id, abs));
+            }
             if w.kind == KIND_LABEL && self.glyphs && objs.ext(id).image_id == 0 {
                 if let Some(opaque) = self.label(ctx, id, abs) {
                     return Some(opaque);
@@ -1061,10 +1075,14 @@ impl State {
         let e = objs.ext(id);
         let r = R::of(abs);
         let mut opaque = None;
-        if w.kind == KIND_GAUGE {
+        if !matches!(w.kind, KIND_CIRCLE | KIND_ELLIPSE | KIND_LINE) {
             self.boxes(objs, id, &r);
             opaque = render::covers_opaquely(objs, id, abs, abs).then_some(r);
         }
+        // A line is cut by the scissor only (its round caps reach past its box), the rest by
+        // their box.
+        let clip = if w.kind == KIND_LINE { R { x0: -0x4000, y0: -0x4000, x1: 0x4000, y1: 0x4000 } } else { r };
+        let r = clip;
         let mut parts = [None; 10];
         let mut n = 0;
         render::round_parts(w, abs, &e, |p| {
@@ -1094,6 +1112,27 @@ impl State {
                     let (ra, rb) = (ra_q8.clamp(0, 150 << 8) as f32 / 256.0, rb_q8.clamp(0, 150 << 8) as f32 / 256.0);
                     let (ax, ay, bx, by) = (ax as f32 + 0.5, ay as f32 + 0.5, bx as f32 + 0.5, by as f32 + 0.5);
                     self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::wedge(m, ax, ay, bx, by, ra, rb));
+                }
+                RoundPart::Rect { x, y, w, h, color } => {
+                    let rect = R { x0: x as i32, y0: y as i32, x1: x as i32 + w as i32, y1: y as i32 + h as i32 };
+                    self.solid(rect.meet(&r), Lin::flat(rgb(color, 1.0)));
+                }
+                RoundPart::RoundRect { x, y, w, h, r: rad, t, color } => {
+                    let (x, y, w, h, rad, t) = (x as i32, y as i32, w as i32, h as i32, rad as i32, t as i32);
+                    let color = Lin::flat(rgb(color, 1.0));
+                    if t == 0 {
+                        self.tess_cached(p, color, r, |m| tess::rounded_fill(m, x, y, w, h, rad));
+                    } else {
+                        self.tess_cached(p, color, r, |m| tess::rounded_ring(m, x, y, w, h, rad, t));
+                    }
+                }
+                RoundPart::Path { pts, n, t, color } => {
+                    let mut f = [(0.0f32, 0.0f32); 3];
+                    for (q, &(px, py)) in f.iter_mut().zip(&pts[..n as usize]) {
+                        *q = (px as f32 + 0.5, py as f32 + 0.5);
+                    }
+                    let rad = t as f32 / 2.0;
+                    self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::outline(m, &f[..n as usize], rad, false));
                 }
             }
         }

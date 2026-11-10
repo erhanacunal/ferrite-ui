@@ -2042,6 +2042,95 @@ pub enum RoundPart {
     /// `LcdImpl::draw_wedge(ax, ay, bx, by, ra_q8, rb_q8, color)` (`draw_line_thick(t)` =
     /// both radii `t · 128`).
     Wedge { ax: i16, ay: i16, bx: i16, by: i16, ra_q8: i32, rb_q8: i32, color: Color },
+    /// A plain rect, cut to the screen (`fill_rect_screen`).
+    Rect { x: i16, y: i16, w: u16, h: u16, color: Color },
+    /// `LcdImpl::fill_rounded_rect_at(x, y, w, h, r, color, 255)` when `t` is 0, else
+    /// `LcdImpl::stroke_rounded_rect(x, y, w, h, r, t, color)`; `r` > 0.
+    RoundRect { x: i16, y: i16, w: u16, h: u16, r: u16, t: u16, color: Color },
+    /// `LcdImpl::draw_polyline(&pts[..n], color, false, t)` (a check mark's tick).
+    Path { pts: [(i16, i16); 3], n: u8, t: u16, color: Color },
+}
+
+/// A fill of `rect` with corner radius `r` as `fill_rounded_rect_screen` draws it: a plain
+/// rect when `r` is 0.
+fn round_rect_part(rect: Rect, r: u16, color: Color) -> RoundPart {
+    if r > 0 {
+        RoundPart::RoundRect { x: rect.x, y: rect.y, w: rect.w, h: rect.h, r, t: 0, color }
+    } else {
+        RoundPart::Rect { x: rect.x, y: rect.y, w: rect.w, h: rect.h, color }
+    }
+}
+
+/// `draw_value_fill`'s parts (readback backends).
+fn value_fill_parts(widget: &Widget, inner: &Rect, ext: &WidgetExt, f: &mut impl FnMut(RoundPart)) {
+    if inner.is_empty() || ext.press_color == 0 {
+        return;
+    }
+    let r = ext.border_radius;
+    let val = ext.value.clamp(0, 100) as u32;
+    let fill_w = ((inner.w as u32) * val / 100) as u16;
+    if fill_w > 0 {
+        let fill = Rect::new(inner.x, inner.y, fill_w, inner.h);
+        let fill_r = if r > 0 { r.min(fill_w / 2).min(inner.h / 2) } else { 0 };
+        f(round_rect_part(fill, fill_r, ext.press_color));
+    }
+    if widget.kind == KIND_SLIDER {
+        let thumb_w: u16 = 6;
+        let thumb_x = (inner.x + fill_w as i16 - (thumb_w as i16 / 2)).max(inner.x).min(inner.x + inner.w as i16 - thumb_w as i16);
+        let thumb = Rect::new(thumb_x, inner.y, thumb_w, inner.h);
+        let color = if widget.border_color != 0 { widget.border_color } else { 0xFFFF };
+        let thumb_r = if r > 0 { r.min(thumb_w / 2).min(inner.h / 2) } else { 0 };
+        f(round_rect_part(thumb, thumb_r, color));
+    }
+}
+
+/// `draw_check_indicator`'s parts (readback backends: smooth).
+fn check_parts(widget: &Widget, inner: &Rect, ext: &WidgetExt, f: &mut impl FnMut(RoundPart)) {
+    if inner.is_empty() {
+        return;
+    }
+    let p = ext.padding;
+    let r = ext.border_radius;
+    let (cx, cy) = (inner.x + p.left as i16, inner.y + p.top as i16);
+    let s = inner.h.saturating_sub(p.top as u16 + p.bottom as u16);
+    if s < 4 {
+        return;
+    }
+    let outline = ext.text_color;
+    let checked = widget.flags & FLAG_CHECKED != 0;
+    let fill = if ext.press_color != 0 { ext.press_color } else { outline };
+    if widget.kind == KIND_CHECKBOX {
+        if r > 0 {
+            let br = r.min(s / 2);
+            f(RoundPart::RoundRect { x: cx, y: cy, w: s, h: s, r: br, t: 1, color: outline });
+            if checked {
+                let inset = (s as i16) / 4;
+                let side = s.saturating_sub(inset as u16 * 2);
+                f(round_rect_part(Rect::new(cx + inset, cy + inset, side, side), br.saturating_sub(inset as u16), fill));
+            }
+        } else {
+            let line = |x, y, w, h| RoundPart::Rect { x, y, w, h, color: outline };
+            f(line(cx, cy, s, 1));
+            f(line(cx, cy + s as i16 - 1, s, 1));
+            f(line(cx, cy, 1, s));
+            f(line(cx + s as i16 - 1, cy, 1, s));
+            if checked {
+                let s = s as i16;
+                let pts = [(cx + s / 4, cy + s / 2), (cx + s * 2 / 5, cy + s * 3 / 4), (cx + s * 3 / 4, cy + s / 4)];
+                f(RoundPart::Path { pts, n: 3, t: 2, color: fill });
+            }
+        }
+    } else {
+        f(RoundPart::Oval { x: cx, y: cy, w: s, h: s, t: 1, color: outline });
+        if checked {
+            let mut d = s * 2 / 3;
+            if (s - d) % 2 != 0 {
+                d -= 1;
+            }
+            let o = ((s - d) / 2) as i16;
+            f(RoundPart::Oval { x: cx + o, y: cy + o, w: d, h: d, t: 0, color: fill });
+        }
+    }
 }
 
 /// The parts a circle / ellipse shape or a gauge (its dial, over the box `draw_widget` paints
@@ -2108,6 +2197,23 @@ pub fn round_parts(widget: &Widget, abs: &Rect, ext: &WidgetExt, mut f: impl FnM
             } else {
                 // `fill_circle(cx, cy, 3)`: the oval inscribed in the 7×7 box around it.
                 f(RoundPart::Oval { x: cx - 3, y: cy - 3, w: 7, h: 7, t: 0, color: needle });
+            }
+            true
+        }
+        KIND_PROGRESS | KIND_SLIDER => {
+            value_fill_parts(widget, &inner_rect(abs, &ext.border), ext, &mut f);
+            true
+        }
+        KIND_CHECKBOX | KIND_RADIO => {
+            check_parts(widget, &inner_rect(abs, &ext.border), ext, &mut f);
+            true
+        }
+        KIND_LINE => {
+            let color = if widget.border_color != 0 { widget.border_color } else { widget.background_color };
+            if color != 0 && abs.w != 0 && abs.h != 0 {
+                let hw = shape_stroke(ext).max(1) as i32 * 128;
+                let (bx, by) = (abs.right() - 1, abs.bottom() - 1);
+                f(RoundPart::Wedge { ax: abs.x, ay: abs.y, bx, by, ra_q8: hw, rb_q8: hw, color });
             }
             true
         }
@@ -3492,6 +3598,13 @@ mod tests {
                 RoundPart::Oval { x, y, w, h, t, color } => lcd.draw_oval(x, y, w, h, t, color),
                 RoundPart::Arc { cx, cy, r, ir, start, end, color } => lcd.fill_arc(cx, cy, r, ir, start, end, color),
                 RoundPart::Wedge { ax, ay, bx, by, ra_q8, rb_q8, color } => lcd.draw_wedge(ax, ay, bx, by, ra_q8, rb_q8, color),
+                RoundPart::Rect { x, y, w, h, color } => fill_rect_screen(lcd, Rect::new(x, y, w, h), color),
+                RoundPart::RoundRect { x, y, w, h, r, t: 0, color } => lcd.fill_rounded_rect_at(x, y, w, h, r, color, 255),
+                RoundPart::RoundRect { x, y, w, h, r, t, color } => lcd.stroke_rounded_rect(x, y, w, h, r, t, color),
+                RoundPart::Path { pts, n, t, color } => {
+                    let pts = pts.map(|(x, y)| Offset { x, y });
+                    lcd.draw_polyline(&pts[..n as usize], color, false, t)
+                }
             }
         }
     }
@@ -3544,6 +3657,51 @@ mod tests {
             let gpu = fresh::<true>();
             draw_parts(&gpu, &parts);
             same(&cpu, &gpu, &format!("shape {kind} {}x{}", abs.w, abs.h));
+        }
+        // Lines, value fills and check indicators (what `draw_widget` adds over the box).
+        let abs = Rect::new(6, 10, 100, 28);
+        let mut cases = alloc::vec::Vec::new();
+        for (t, bg, border) in [(1u8, 0u16, 0xF800u16), (3, 0x07E0, 0), (6, 0x001F, 0x1234)] {
+            cases.push((KIND_LINE, Rect::new(4, 7, 110, 80), t, 0u16, 0i32, false, bg, border));
+            cases.push((KIND_LINE, Rect::new(30, 7, 1, 90), t, 0, 0, false, bg, border));
+        }
+        for kind in [KIND_PROGRESS, KIND_SLIDER] {
+            for (radius, value) in [(0u16, 0i32), (0, 37), (8, 0), (8, 1), (8, 50), (8, 100), (30, 64)] {
+                cases.push((kind, abs, 2, radius, value, false, 0x1234, 0x07E0));
+            }
+        }
+        for kind in [KIND_CHECKBOX, KIND_RADIO] {
+            for (radius, checked) in [(0u16, false), (0, true), (5, false), (5, true), (40, true)] {
+                cases.push((kind, Rect::new(6, 10, 60, 31), 1, radius, 0, checked, 0x1234, 0x07E0));
+            }
+        }
+        for (kind, abs, t, radius, value, checked, bg, border) in cases {
+            let mut w = Widget::DEAD;
+            w.kind = kind;
+            w.background_color = bg;
+            w.border_color = border;
+            if checked {
+                w.flags |= FLAG_CHECKED;
+            }
+            let mut e = WidgetExt::DEFAULT;
+            e.border = crate::types::Edges { top: t, right: t, bottom: t, left: t };
+            e.border_radius = radius;
+            e.value = value as crate::widget::WValue;
+            e.press_color = 0xFD20;
+            e.text_color = 0xFFFF;
+            e.padding = crate::types::Edges { top: 2, right: 2, bottom: 2, left: 3 };
+            let cpu = fresh::<true>();
+            let inner = inner_rect(&abs, &e.border);
+            match kind {
+                KIND_LINE => draw_line_shape(&cpu, &w, &abs, &e),
+                KIND_PROGRESS | KIND_SLIDER => draw_value_fill(&cpu, &w, &inner, &e),
+                _ => draw_check_indicator(&cpu, &w, &inner, &e),
+            }
+            let mut parts = alloc::vec::Vec::new();
+            assert!(round_parts(&w, &abs, &e, |p| parts.push(p)));
+            let gpu = fresh::<true>();
+            draw_parts(&gpu, &parts);
+            same(&cpu, &gpu, &format!("kind {kind} r {radius} value {value} checked {checked} t {t}"));
         }
     }
 
