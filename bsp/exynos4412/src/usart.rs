@@ -12,13 +12,34 @@
 //! While a network client holds the protocol (`bridge.rs`: the TCP bridge
 //! port, or an HTTP API request), RX and TX go through the bridge's rings
 //! instead.
+//!
+//! In standby ([`suspend`] / [`resume`]) CPU1 is stopped and UART2 shut:
+//! interrupts masked, receiver and transmitter off, clock gate closed. Bytes
+//! sent to the board meanwhile are lost; the ring keeps what arrived before.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use exynos_4412_rs::drivers::gic::Gic;
 use exynos_4412_rs::drivers::uart::{Uart, UartId};
 use exynos_4412_rs::embassy::uart::UartRx;
+use exynos_4412_rs::{cpu, embassy, println, smp, soc};
 use ferrite_core::usart::UsartBackend;
+
+use crate::hotplug::Group;
+
+/// The core RX runs on.
+const CORE: usize = 1;
+/// How long [`suspend`] waits for CPU1 to lose power.
+const STOP_MS: u64 = 100;
+/// `CLK_GATE_IP_PERIL` (Exynos 4412 UM 7.9.1): bit n = UARTn's clock.
+const GATE_IP_PERIL: usize = 0xC950;
+
+/// CPU1's task ([`rx_task`]), ended for standby.
+static GROUP: Group = Group::new();
+/// RX runs on CPU1 (else on CPU0, which never stops: [`suspend`] leaves UART2 alone).
+static ON_CPU1: AtomicBool = AtomicBool::new(false);
+/// The RX handle for CPU1's task, set before CPU1 starts.
+static mut RX: Option<UartRx> = None;
 
 pub const UART: UartId = UartId::Uart2;
 
@@ -85,9 +106,112 @@ pub fn start(core: usize) -> UartRx {
     rx
 }
 
+/// CPU0: starts RX on CPU1 with `rx` (from [`start`]). False if CPU1 did not
+/// start: the caller runs [`rx_task`] on CPU0 then.
+pub fn start_core(rx: UartRx) -> bool {
+    // SAFETY: CPU1 is not running; it reads this only after its start.
+    unsafe { *(&raw mut RX) = Some(rx) };
+    GROUP.arm();
+    match smp::start_cpu(CORE, cpu1) {
+        Ok(()) => {
+            ON_CPU1.store(true, Ordering::Release);
+            true
+        }
+        Err(e) => {
+            println!("ferrite: CPU{} ERROR {:?}, UART RX on CPU0", CORE, e);
+            if let Some(id) = UART.irq() {
+                Gic::new().set_target(id, 0);
+            }
+            false
+        }
+    }
+}
+
+/// CPU1: UART2 RX until [`suspend`], then the core stops.
+fn cpu1(_core: usize) -> ! {
+    Gic::new().init_this_cpu();
+    cpu::enable_irq();
+    // SAFETY: written by CPU0 before it started this core.
+    let rx = unsafe { (*(&raw const RX)).expect("RX set before CPU1 starts") };
+    embassy::run_until(
+        |spawner| {
+            GROUP.begin(1);
+            spawner.spawn(rx_task_stoppable(rx).unwrap());
+        },
+        || GROUP.done(),
+        // No wake-up from UART2 for the ended task: its interrupt off, from this side too.
+        || {
+            if let Some(id) = UART.irq() {
+                Gic::new().disable(id);
+            }
+        },
+    );
+    smp::stop_this_cpu()
+}
+
+#[embassy_executor::task]
+async fn rx_task_stoppable(rx: UartRx) {
+    GROUP.run(rx_loop(rx)).await
+}
+
+fn set_gate(open: bool) {
+    let address = (soc::CMU_BASE + GATE_IP_PERIL) as *mut u32;
+    let bit = 1u32 << UART as u32;
+    let masked = cpu::mask_irq();
+    // SAFETY: the CMU's peripheral clock gates, mapped for good; only UART2's bit changes.
+    unsafe {
+        let v = core::ptr::read_volatile(address);
+        core::ptr::write_volatile(address, if open { v | bit } else { v & !bit });
+    }
+    cpu::restore_irq(masked);
+}
+
+/// CPU0, entering standby: stops CPU1 and shuts UART2. True if it did (then
+/// [`resume`] at the wake); false if RX runs on CPU0 or CPU1 did not stop.
+pub fn suspend() -> bool {
+    if !ON_CPU1.load(Ordering::Acquire) {
+        return false;
+    }
+    GROUP.stop();
+    if let Err(status) = smp::wait_offline(CORE, STOP_MS) {
+        println!("ferrite: CPU{} did not stop (status {:#x}), UART left on", CORE, status);
+        return false;
+    }
+    ON_CPU1.store(false, Ordering::Release);
+    // What was printed goes out first (the console's ring too, when it is this UART).
+    exynos_4412_rs::console::flush();
+    Uart::new(UART).flush();
+    if let Some(id) = UART.irq() {
+        Gic::new().disable(id);
+    }
+    // SAFETY: UART2's registers, mapped for good; its interrupt is off and no
+    // core reads it now.
+    unsafe {
+        core::ptr::write_volatile(reg(UINTM), 0xF);
+        core::ptr::write_volatile(reg(UCON), 0);
+    }
+    set_gate(false);
+    true
+}
+
+/// CPU0, at the wake after a [`suspend`] that returned true: UART2 back as
+/// [`start`] sets it, and RX on CPU1 again.
+pub fn resume() {
+    set_gate(true);
+    let rx = start(CORE);
+    if !start_core(rx) {
+        // RX on CPU0 needs a task there, which only boot spawns: none now.
+        println!("ferrite: UART RX off until a restart");
+    }
+}
+
 /// Moves received bytes into the ring for the runtime.
 #[embassy_executor::task]
 pub async fn rx_task(rx: UartRx) {
+    rx_loop(rx).await
+}
+
+async fn rx_loop(rx: UartRx) {
     let mut chunk = [0u8; 256];
     let mut own_drops = 0u32;
     loop {

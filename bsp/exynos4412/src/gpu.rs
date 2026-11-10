@@ -80,12 +80,63 @@ static mut FAILED: bool = false;
 pub fn get() -> Option<&'static mut Shared> {
     // SAFETY: CPU0 only (the renderer and the VM's syscalls, one main loop), never reentrantly.
     let (shared, failed) = unsafe { (&mut *(&raw mut SHARED), &mut *(&raw mut FAILED)) };
+    // SAFETY: as above.
+    if unsafe { *(&raw const ASLEEP) } {
+        return None;
+    }
     if shared.is_none() && !*failed {
         *failed = true;
         *shared = start();
         *failed = shared.is_none();
     }
     shared.as_mut()
+}
+
+/// The GPU's power domain is off for standby ([`suspend`]); [`get`] gives nothing until
+/// [`resume`].
+static mut ASLEEP: bool = false;
+
+/// CPU0, entering standby (no frame in flight: frames are synchronous): the GPU off, its
+/// memory pool kept. True if it was running and is now off.
+pub fn suspend() -> bool {
+    // SAFETY: CPU0 only, as in `get`.
+    let (shared, asleep) = unsafe { (&mut *(&raw mut SHARED), &mut *(&raw mut ASLEEP)) };
+    let Some(shared) = shared.as_mut() else { return false };
+    if *asleep {
+        return false;
+    }
+    match shared.gpu.power_down() {
+        Ok(()) => {
+            *asleep = true;
+            true
+        }
+        Err(e) => {
+            exynos_4412_rs::println!("ferrite: GPU power down failed: {:?}", e);
+            false
+        }
+    }
+}
+
+/// CPU0, at the wake after a [`suspend`] that returned true: the GPU on again at the
+/// compositor's clock. If it does not come back, it stays off for good (as a failed start).
+pub fn resume() {
+    // SAFETY: CPU0 only, as in `get`.
+    let (shared, asleep) = unsafe { (&mut *(&raw mut SHARED), &mut *(&raw mut ASLEEP)) };
+    if !core::mem::replace(asleep, false) {
+        return;
+    }
+    let Some(s) = shared.as_mut() else { return };
+    match s.gpu.power_up() {
+        Ok(_) => {
+            raise_clock();
+        }
+        Err(e) => {
+            note(format_args!("GPU did not come back from standby: {:?}", e));
+            // `get` tries a start once more, which fails (the HAL's pool is taken once) and
+            // sets `FAILED`: callers fall back to the CPU.
+            *shared = None;
+        }
+    }
 }
 
 fn start() -> Option<Shared> {

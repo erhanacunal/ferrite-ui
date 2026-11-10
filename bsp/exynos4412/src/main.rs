@@ -39,7 +39,7 @@ use exynos_4412_rs::drivers::max77686::Max77686;
 use exynos_4412_rs::drivers::pl330::PDMA0_IRQ;
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::exceptions::ExceptionFrame;
-use exynos_4412_rs::{BootArgs, cpu, embassy, heap, mmu, println, smp, soc};
+use exynos_4412_rs::{BootArgs, cpu, embassy, heap, mmu, println, soc};
 
 use ferrite_core::backlight::BacklightImpl;
 use ferrite_core::ctx::Ctx;
@@ -69,6 +69,8 @@ mod compose;
 #[cfg_attr(not(feature = "wifi"), allow(dead_code))]
 mod cpuclock;
 mod gpu;
+// CPU1 / CPU3 stopped for standby and started again.
+mod hotplug;
 mod lcd;
 mod model3d;
 #[cfg(feature = "wifi")]
@@ -149,13 +151,14 @@ fn main(_args: BootArgs) -> ! {
     storage::init();
     flash::init();
 
+    power_off_unused(mct);
+
     let gic = Gic::new();
     gic.init();
     // MCT comparator 0 → embassy-time, to CPU0.
     embassy::init();
     // UART2 RX interrupt to CPU1 (falls back to CPU0 below).
     let rx = usart::start(1);
-    unsafe { *(&raw mut RX) = Some(rx) };
     // Codec + I2S + DMA up now (~0.5 s), so the first sound starts at once
     // and the power-up pop is at boot. Not fatal: the UI runs without sound.
     let mut audio = audio::new(pmic);
@@ -163,16 +166,7 @@ fn main(_args: BootArgs) -> ! {
         println!("ferrite: audio off");
     }
     cpu::enable_irq();
-    let rx_on_cpu0 = match smp::start_cpu(1, cpu1) {
-        Ok(()) => false,
-        Err(e) => {
-            println!("ferrite: CPU1 ERROR {:?}, UART RX on CPU0", e);
-            if let Some(id) = usart::UART.irq() {
-                gic.set_target(id, 0);
-            }
-            true
-        }
-    };
+    let rx_on_cpu0 = !usart::start_core(rx);
     // Presents: the G2D driven by CPU0 (`g2d_present`), else CPU2 as the LCD
     // presenter (copy to the back scan buffer + switch at vsync), so CPU0
     // never waits for the display. Not fatal: presents then run on CPU0.
@@ -211,6 +205,22 @@ fn main(_args: BootArgs) -> ! {
     })
 }
 
+/// Power domains of blocks ferrite never uses (cameras, TV out, video codec,
+/// ISP, GPS) off at boot; U-Boot / reset may leave them on. The GPU (`G3D`)
+/// comes on with the compositor, `LCD0` holds the FIMD and the G2D. `Tv`
+/// first: it is a child of `LCD0`, which stays on.
+fn power_off_unused(mct: exynos_4412_rs::drivers::timer::Mct) {
+    use exynos_4412_rs::drivers::pd::Domain;
+    for d in [Domain::Tv, Domain::Cam, Domain::Mfc, Domain::Isp, Domain::Gps, Domain::GpsAlive] {
+        let was_on = d.is_on();
+        match d.power_off(mct) {
+            Ok(()) if was_on => println!("ferrite: power domain {:?} off", d),
+            Ok(()) => {}
+            Err(e) => println!("ferrite: power domain {:?} stays on: {:?}", d, e),
+        }
+    }
+}
+
 /// Whether CPU3 runs the network executor (its timers need the MCT
 /// interrupt: see `platform::enter_standby`).
 pub fn net_running() -> bool {
@@ -220,17 +230,6 @@ pub fn net_running() -> bool {
     false
 }
 
-/// The UART RX handle for CPU1's task, set before CPU1 starts.
-static mut RX: Option<exynos_4412_rs::embassy::uart::UartRx> = None;
-
-/// CPU1: UART2 RX only.
-fn cpu1(_core: usize) -> ! {
-    Gic::new().init_this_cpu();
-    cpu::enable_irq();
-    // SAFETY: written once by CPU0 before it started this core.
-    let rx = unsafe { (*(&raw const RX)).expect("RX set before CPU1 starts") };
-    embassy::run(|spawner| spawner.spawn(usart::rx_task(rx).unwrap()))
-}
 
 /// CPU0: the ferrite runtime, one main-loop pass per poll. Yields between
 /// passes so other CPU0 tasks (if any) get their turn.

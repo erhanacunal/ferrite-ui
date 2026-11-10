@@ -59,8 +59,8 @@ const TAG_ERROR_RESP: u8 = 0x0A;
 
 type TcpResult<T> = Result<T, embassy_net::tcp::Error>;
 
-#[embassy_executor::task(pool_size = SERVERS)]
-pub async fn server_task(stack: Stack<'static>) {
+/// One HTTP server ([`SERVERS`] of them at once: `http_task` in `net/mod.rs`).
+pub async fn server(stack: Stack<'static>) {
     let mut rx = vec![0u8; SERVER_RX];
     let mut tx = vec![0u8; SERVER_TX];
     loop {

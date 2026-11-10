@@ -32,7 +32,13 @@
 //! ```
 //! Build-time `WIFI_SSID` / `WIFI_PASSWORD` / `WIFI_BAND` (and
 //! `WIFI_FIRMWARE_DIR`, build.rs) are the last fallback.
-//! A lost link is not rejoined (the runner ends; restart the board).
+//! A lost link is not rejoined (the runner ends; restart the board, or go
+//! through standby).
+//!
+//! Standby ([`suspend`] / [`resume`], `platform::enter_standby`): CPU3's tasks
+//! end ([`GROUP`]), CPU3 turns the chip off (`bcm4334::power_off`) and stops
+//! itself; at the wake CPU0 powers the chip again and starts CPU3, which joins
+//! as at boot. While CPU3 is still joining, standby leaves it running.
 
 mod http;
 
@@ -58,6 +64,7 @@ use exynos_4412_rs::wpa::{self, Supplicant};
 use exynos_4412_rs::{cpu, embassy, println, smp, soc};
 
 use crate::bridge;
+use crate::hotplug::Group;
 
 /// Network settings / chip firmware / NVRAM as FS image resources
 /// (`RES_FILE`, ≤ 15 characters) …
@@ -74,6 +81,10 @@ pub const BRIDGE_PORT: u16 = 7000;
 pub const HTTP_PORT: u16 = 80;
 /// The core the network runs on (parked otherwise).
 const CORE: usize = 3;
+/// CPU3's tasks, ended for standby.
+static GROUP: Group = Group::new();
+/// How long [`suspend`] waits for CPU3 to end its tasks and lose power.
+const STOP_MS: u64 = 3000;
 
 static FIRMWARE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wifi_firmware.bin"));
 static NVRAM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wifi_nvram.txt"));
@@ -218,6 +229,7 @@ pub fn start(pmic: Max77686, mct: Mct) {
     // SAFETY: CPU3 is not running yet.
     unsafe { *(&raw mut CONFIG) = Some(cfg) };
     set_state(State::Joining);
+    GROUP.arm();
     if let Err(e) = smp::start_cpu(CORE, cpu3) {
         println!("ferrite: CPU{} ERROR {:?}, wifi off", CORE, e);
         set_state(State::Failed);
@@ -237,6 +249,8 @@ pub enum State {
     Failed = 4,
     /// The WiFi runner stopped (link lost).
     Down = 5,
+    /// Off for standby ([`suspend`]).
+    Asleep = 6,
 }
 
 static STATE: AtomicU8 = AtomicU8::new(State::Off as u8);
@@ -257,7 +271,8 @@ pub fn state_name() -> &'static str {
         2 => "dhcp",
         3 => "up",
         4 => "failed",
-        _ => "down",
+        5 => "down",
+        _ => "asleep",
     }
 }
 
@@ -390,6 +405,7 @@ fn associate(cfg: &WifiConfig, chip: &mut Bcm4334, own: [u8; 6], mct: Mct) -> Re
 fn join(cfg: &WifiConfig, mct: Mct) -> Result<Joined, Error> {
     let begin = mct.count();
     let (mut chip, own) = bring_up(cfg, mct)?;
+    println!("ferrite: wifi chip up in {} ms", (mct.count() - begin) / COUNTS_PER_MS);
     update_link(|l| l.mac = own);
     loop {
         match associate(cfg, &mut chip, own, mct) {
@@ -414,6 +430,7 @@ fn join(cfg: &WifiConfig, mct: Mct) -> Result<Joined, Error> {
 
 /// CPU3: join, then the network tasks.
 fn cpu3(_core: usize) -> ! {
+    println!("ferrite: CPU{} up, joining", CORE);
     Gic::new().init_this_cpu();
     cpu::enable_irq();
     let cfg = config();
@@ -430,8 +447,13 @@ fn cpu3(_core: usize) -> ! {
 
     let mut dhcp = DhcpConfig::default();
     dhcp.hostname = cfg.hostname.as_str().try_into().ok();
-    // SAFETY: the only references to these, taken once, here.
-    let (state, resources) = unsafe { (&mut *addr_of_mut!(WIFI_STATE), &mut *addr_of_mut!(RESOURCES)) };
+    // SAFETY: the only references to these, taken here once per start of this core; the last
+    // start's tasks have ended (`GROUP`), and with them every use of the old ones.
+    let (state, resources) = unsafe {
+        *addr_of_mut!(WIFI_STATE) = wifi::State::new();
+        *addr_of_mut!(RESOURCES) = StackResources::new();
+        (&mut *addr_of_mut!(WIFI_STATE), &mut *addr_of_mut!(RESOURCES))
+    };
     let (device, runner) = wifi::new(state, joined.chip, joined.supplicant, report);
     // `wifi::new` routes the host wake interrupt to CPU0: its task runs here.
     if let Some(eint) = bcm4334::HOST_WAKE.eint() {
@@ -439,32 +461,100 @@ fn cpu3(_core: usize) -> ! {
     }
     let (stack, net_runner) = embassy_net::new(device, Config::dhcpv4(dhcp), resources, joined.seed);
 
-    embassy::run(|spawner| {
-        spawner.spawn(wifi_task(runner).unwrap());
-        spawner.spawn(net_task(net_runner).unwrap());
-        spawner.spawn(dhcp_task(stack).unwrap());
-        spawner.spawn(bridge_task(stack).unwrap());
-        for _ in 0..http::SERVERS {
-            spawner.spawn(http::server_task(stack).unwrap());
+    embassy::run_until(
+        |spawner| {
+            GROUP.begin(4 + http::SERVERS as u32);
+            spawner.spawn(wifi_task(runner).unwrap());
+            spawner.spawn(net_task(net_runner).unwrap());
+            spawner.spawn(dhcp_task(stack).unwrap());
+            spawner.spawn(bridge_task(stack).unwrap());
+            for _ in 0..http::SERVERS {
+                spawner.spawn(http_task(stack).unwrap());
+            }
+        },
+        || GROUP.done(),
+        // Standby: every task has ended, the chip's runner with them; no wake-up from the
+        // chip's host wake for it.
+        || {
+            if let Some(eint) = bcm4334::HOST_WAKE.eint() {
+                Gic::new().disable(eint.irq());
+                eint.mask();
+                eint.clear();
+            }
+        },
+    );
+    bcm4334::power_off();
+    update_link(|l| {
+        l.address = [0; 4];
+        l.prefix = 0;
+    });
+    set_state(State::Asleep);
+    println!("ferrite: wifi off, CPU{} stopping", CORE);
+    smp::stop_this_cpu()
+}
+
+/// CPU0, entering standby: ends CPU3's tasks and waits for it to stop. True
+/// if it did (then [`resume`] at the wake); false while it is still joining
+/// (left running: its polled join cannot be ended) or did not stop in time.
+pub fn suspend() -> bool {
+    if !matches!(STATE.load(Ordering::Acquire), 2 | 3 | 5) {
+        return false;
+    }
+    GROUP.stop();
+    match smp::wait_offline(CORE, STOP_MS) {
+        Ok(_) => true,
+        Err(status) => {
+            println!("ferrite: CPU{} did not stop (status {:#x}), wifi left as it is", CORE, status);
+            false
         }
-    })
+    }
+}
+
+/// CPU0, at the wake after a [`suspend`] that returned true: powers the chip
+/// (~0.45 s: PMIC over I2C0, which CPU0 owns, then the chip's reset) and
+/// starts CPU3, which joins again.
+pub fn resume(pmic: Max77686, mct: Mct) {
+    if let Err(e) = bcm4334::power_on(pmic, mct) {
+        println!("ferrite: wifi power ERROR {:?}", e);
+        set_state(State::Failed);
+        return;
+    }
+    set_state(State::Joining);
+    GROUP.arm();
+    if let Err(e) = smp::start_cpu(CORE, cpu3) {
+        println!("ferrite: CPU{} ERROR {:?}, wifi off", CORE, e);
+        set_state(State::Failed);
+    }
 }
 
 #[embassy_executor::task]
 async fn wifi_task(runner: wifi::Runner<'static>) {
-    let error = runner.run().await;
-    set_state(State::Down);
-    println!("ferrite: wifi stopped: {:?}", error);
+    GROUP
+        .run(async {
+            let error = runner.run().await;
+            set_state(State::Down);
+            println!("ferrite: wifi stopped: {:?}", error);
+        })
+        .await
 }
 
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, wifi::Device<'static>>) {
-    runner.run().await
+    GROUP.run(runner.run()).await
+}
+
+#[embassy_executor::task(pool_size = http::SERVERS)]
+async fn http_task(stack: Stack<'static>) {
+    GROUP.run(http::server(stack)).await
 }
 
 /// Logs (and records) the address each time DHCP gives one.
 #[embassy_executor::task]
 async fn dhcp_task(stack: Stack<'static>) {
+    GROUP.run(dhcp_loop(stack)).await
+}
+
+async fn dhcp_loop(stack: Stack<'static>) {
     loop {
         stack.wait_config_up().await;
         if let Some(c) = stack.config_v4() {
@@ -490,6 +580,10 @@ async fn dhcp_task(stack: Stack<'static>) {
 
 #[embassy_executor::task]
 async fn bridge_task(stack: Stack<'static>) {
+    GROUP.run(bridge_loop(stack)).await
+}
+
+async fn bridge_loop(stack: Stack<'static>) {
     let mut rx = [0; BRIDGE_RX];
     let mut tx = [0; BRIDGE_TX];
     loop {

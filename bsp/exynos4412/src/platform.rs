@@ -263,17 +263,24 @@ impl PlatformRuntime for Exynos4412Platform {
 ///   CPU0 interrupt): `flush_wait` first.
 /// - audio: stopped, its ring silenced: the DMA keeps looping the ring while
 ///   the refill interrupt (CPU0) cannot run.
-/// - WiFi stays joined; CPU3 keeps serving at the lower clock. Its timers
-///   need the MCT comparator interrupt, which normally goes to CPU0: during
-///   standby it goes to CPU0 and CPU3, so CPU3 services it and CPU0 is only
-///   woken by it (which also lets the HAL time a long press). HTTP requests
-///   that need the runtime (bridge, `/flash`) wait until the wake.
-/// - UART2 RX runs on CPU1 and keeps filling its ring. Touch is polled, so
-///   nothing touched meanwhile is delivered.
+/// - GPU: `G3D` power domain off (`gpu::suspend`), on again at the wake.
+/// - WiFi: CPU3 ends its tasks, turns the chip off and stops (`net::suspend`);
+///   at the wake CPU0 powers the chip (~0.45 s) and starts CPU3, which joins
+///   again in the background. If CPU3 is still joining it is left running:
+///   its timers then need the MCT comparator interrupt, which goes to CPU0
+///   and CPU3 meanwhile (CPU0 is only woken by it).
+/// - UART2: CPU1 ends its RX task and stops, UART2's clock gate is closed
+///   (`usart::suspend`); at the wake the UART is set up again and CPU1
+///   restarted. Bytes sent meanwhile are lost.
+/// - Touch is polled, so nothing touched meanwhile is delivered.
 fn enter_standby(ctx: &mut Ctx<Exynos4412Platform>, button: &mut PowerButton) {
     let mct = Mct::new();
     lcd::flush_wait();
     ctx.audio.stop();
+    let gpu = crate::gpu::suspend();
+    #[cfg(feature = "wifi")]
+    let wifi = crate::net::suspend();
+    let uart = crate::usart::suspend();
     let gic = Gic::new();
     let shared_timer = crate::net_running();
     if shared_timer {
@@ -286,11 +293,26 @@ fn enter_standby(ctx: &mut Ctx<Exynos4412Platform>, button: &mut PowerButton) {
     if shared_timer {
         gic.set_target(soc::MCT_G0_IRQ, 0);
     }
+    if uart {
+        crate::usart::resume();
+    }
+    if gpu {
+        crate::gpu::resume();
+    }
+    #[cfg(feature = "wifi")]
+    if wifi {
+        crate::net::resume(Max77686::new(I2c::new(Bus::I2c0)), mct);
+    }
+    #[cfg(not(feature = "wifi"))]
+    let wifi = false;
+    println!("ferrite: standby off: gpu {}, wifi {}, uart {}", gpu, wifi, uart);
     match result {
         Ok(r) => {
             println!(
-                "ferrite: standby {} s, asleep {}%, {} -> {} -> {} MHz",
-                r.standby_us / 1_000_000,
+                "ferrite: standby {} ms ({:?}, {} wakes), asleep {}%, {} -> {} -> {} MHz",
+                r.standby_us / 1000,
+                r.press,
+                r.wakes,
                 r.slept_us * 100 / r.standby_us.max(1),
                 r.before_hz / 1_000_000,
                 r.standby_hz / 1_000_000,
