@@ -2093,28 +2093,42 @@ fn draw_line_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect,
 
 /// Polygon shape: points parsed from `text` ("x,y x,y …", relative to the
 /// widget's top-left), filled with `bg_color` and outlined in `border_color`.
-fn draw_polygon_shape<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+/// What a polygon shape at `abs` draws: its points in screen coordinates (in `out`), how
+/// many, its fill colour (0 = none; only with 3 points or more) and its outline's colour (0 =
+/// none) and thickness. None when it has under 2 points. Shared by `draw_polygon_shape` and
+/// renderers that draw polygons another way.
+pub fn polygon_shape(
+    objs: &ObjPool,
+    widget: &Widget,
+    abs: &Rect,
+    ext: &WidgetExt,
+    out: &mut [Offset; lcd::MAX_POLY_POINTS],
+) -> Option<(usize, Color, Color, u16)> {
     if ext.text_id == crate::pool::PTR_NONE {
-        return;
+        return None;
     }
-    let text = ctx.objs.str_get(ext.text_id);
-    let mut pts = [Offset { x: 0, y: 0 }; lcd::MAX_POLY_POINTS];
-    let n = parse_points(text, &mut pts);
+    let n = parse_points(objs.str_get(ext.text_id), out);
     if n < 2 {
-        return;
+        return None;
     }
     // Points are relative to the widget's top-left (border-box origin).
-    for p in pts[..n].iter_mut() {
+    for p in out[..n].iter_mut() {
         p.x += abs.x;
         p.y += abs.y;
     }
+    let fill = if n >= 3 { widget.background_color } else { 0 };
+    Some((n, fill, widget.border_color, shape_stroke(ext)))
+}
+
+fn draw_polygon_shape<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    let mut pts = [Offset { x: 0, y: 0 }; lcd::MAX_POLY_POINTS];
+    let Some((n, fill, stroke, t)) = polygon_shape(&ctx.objs, widget, abs, ext, &mut pts) else { return };
     let poly = &pts[..n];
-    if widget.background_color != 0 && n >= 3 {
-        ctx.lcd.fill_polygon(poly, widget.background_color);
+    if fill != 0 {
+        ctx.lcd.fill_polygon(poly, fill);
     }
-    if widget.border_color != 0 {
-        let t = shape_stroke(ext);
-        if widget.background_color != 0 && n >= 3 && !ctx.lcd.has_alpha() {
+    if stroke != 0 {
+        if fill != 0 && !ctx.lcd.has_alpha() {
             // The fill is aliased here; a soft outline would mix its inner
             // edge with the backdrop instead of the fill.
             ctx.lcd.draw_polyline_hard(poly, widget.border_color, true, t);

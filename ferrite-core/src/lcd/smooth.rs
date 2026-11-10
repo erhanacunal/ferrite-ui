@@ -1409,6 +1409,81 @@ mod tests {
         }
     }
 
+    /// The GPU's triangles for convex polygons (`tess::convex_fill`) and their outlines
+    /// (`tess::outline`), blended "over" one another, cover pixels as `fill_polygon` and
+    /// `draw_polyline` do: clock hands (fill + a 1 px outline in the same colour) and plain
+    /// fills.
+    #[test]
+    fn tessellated_polygons_match_the_cpu_coverage() {
+        use super::super::tess::{self, Mesh};
+        // A clock hand as `clock.fl` places it: angle, length, tail, half width.
+        let hand = |deg: f32, len: f32, tail: f32, hw: f32| -> Vec<Offset> {
+            let a = deg.to_radians();
+            let (dx, dy) = (libm::sinf(a), -libm::cosf(a));
+            let c = 48.0;
+            let (tx, ty, bx, by) = (c + dx * len, c + dy * len, c - dx * tail, c - dy * tail);
+            let (px, py) = (-dy * hw, dx * hw);
+            [(bx + px, by + py), (tx + px * 0.25, ty + py * 0.25), (tx - px * 0.25, ty - py * 0.25), (bx - px, by - py)]
+                .iter()
+                .map(|&(x, y)| Offset { x: x as i16, y: y as i16 })
+                .collect()
+        };
+        let mut cases: Vec<(String, Vec<Offset>, bool)> = Vec::new();
+        for deg in [0.0, 7.0, 30.0, 45.0, 96.0, 200.0, 333.0] {
+            cases.push((format!("second hand {deg}"), hand(deg, 44.0, 10.0, 3.0), true));
+            cases.push((format!("hour hand {deg}"), hand(deg, 30.0, 6.0, 8.0), true));
+        }
+        let tri = alloc::vec![Offset { x: 10, y: 80 }, Offset { x: 50, y: 8 }, Offset { x: 88, y: 70 }];
+        let quad = alloc::vec![Offset { x: 8, y: 20 }, Offset { x: 70, y: 10 }, Offset { x: 85, y: 60 }, Offset { x: 20, y: 85 }];
+        cases.push(("triangle".into(), tri.clone(), false));
+        cases.push(("quad".into(), quad.clone(), false));
+        cases.push(("triangle + outline".into(), tri, true));
+        cases.push(("quad + outline".into(), quad, true));
+        for (name, pts, stroke) in cases {
+            // The grid keeps each pixel's last coverage: composite the outline over the fill.
+            let (fill, _) = draw(|l| l.fill_polygon(&pts, 1));
+            let (line, _) = draw(|l| {
+                if stroke {
+                    l.draw_polyline(&pts, 1, true, 1);
+                }
+            });
+            let cpu: Vec<u8> = fill
+                .iter()
+                .zip(&line)
+                .map(|(&f, &o)| {
+                    let (f, o) = (f as f32 / 255.0, o as f32 / 255.0);
+                    ((f + o * (1.0 - f)) * 255.0 + 0.5) as u8
+                })
+                .collect();
+            let f: Vec<(f32, f32)> = pts.iter().map(|p| (p.x as f32 + 0.5, p.y as f32 + 0.5)).collect();
+            let (mut verts, mut chunks) = (Vec::new(), Vec::new());
+            let mut m = Mesh { verts: &mut verts, chunks: &mut chunks };
+            assert!(tess::convex_fill(&mut m, &f), "{name}: not drawn");
+            if stroke {
+                tess::outline(&mut m, &f, 0.5, true);
+            }
+            let gpu = tess::raster::coverage_over(&verts, N);
+            let (mut worst, mut sum) = ((0.0f32, 0, 0), 0.0f32);
+            for y in 0..N {
+                for x in 0..N {
+                    let (c, g) = (cpu[y * N + x] as f32 / 255.0, gpu[y * N + x]);
+                    assert!(g <= 1.0 + 1e-3, "{name}: ({x},{y}) covered {g}");
+                    sum += (g - c).abs();
+                    if (g - c).abs() > worst.0 {
+                        worst = ((g - c).abs(), x, y);
+                    }
+                }
+            }
+            let ink: f32 = cpu.iter().map(|&c| c as f32 / 255.0).sum();
+            // Measured: hands up to 0.115 (2–3 px wide, their tips rounded to integers); the
+            // acute corners of the plain shapes 0.28–0.36 on the corner pixel (a ramp puts ½
+            // on a corner point, the CPU ~0.15), under 1 % of the ink overall.
+            let bound = if name.contains("hand") { 0.15 } else { 0.4 };
+            assert!(worst.0 < bound, "{name}: ({}, {}) off by {}", worst.1, worst.2, worst.0);
+            assert!(sum / ink < 0.05, "{name}: mean {} of the ink", sum / ink);
+        }
+    }
+
     /// The GPU's triangles for a 1 px polyline (`tess::polyline`), blended "over" one another
     /// as the GPU does, cover pixels as the CPU's pen does: exactly along straight runs, close
     /// inside sharp turns (overlapping pieces combine instead of the strongest segment winning).

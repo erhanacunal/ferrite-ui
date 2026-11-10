@@ -618,6 +618,177 @@ pub fn wedge(m: &mut Mesh<'_>, ax: f32, ay: f32, bx: f32, by: f32, ra: f32, rb: 
     m.end(s);
 }
 
+/// A convex polygon through `pts` (continuous coordinates, either winding), filled as
+/// `smooth_polygon` covers it (the exact area of each pixel inside): each edge a ramp from
+/// coverage 1 to 0 across `|nx| + |ny|` px (the width over which a pixel box crosses a
+/// straight edge of normal n; the area changes along it as a smooth step, the ramp is its
+/// chord), the corners mitered (HWUI's `getFillVerticesFromPerimeterAA`), the inside a fan.
+/// False (nothing added) when the polygon isn't convex, a corner is too sharp for a miter, or
+/// it is too thin for an inside: the caller draws it another way.
+pub fn convex_fill(m: &mut Mesh<'_>, pts: &[(f32, f32)]) -> bool {
+    // Drop repeated points.
+    let mut p: Vec<(f32, f32)> = Vec::with_capacity(pts.len());
+    for &q in pts {
+        if p.last() != Some(&q) {
+            p.push(q);
+        }
+    }
+    while p.len() > 1 && p.first() == p.last() {
+        p.pop();
+    }
+    let n = p.len();
+    if n < 3 {
+        return n == 0;
+    }
+    let area: f32 = (0..n).map(|i| p[i].0 * p[(i + 1) % n].1 - p[(i + 1) % n].0 * p[i].1).sum();
+    if area.abs() < 1e-3 {
+        return true; // Nothing inside.
+    }
+    let sign = if area > 0.0 { 1.0 } else { -1.0 };
+    // Every turn the same way (collinear points allowed).
+    for i in 0..n {
+        let (a, b, c) = (p[i], p[(i + 1) % n], p[(i + 2) % n]);
+        let cross = (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0);
+        if cross * sign < -1e-3 {
+            return false;
+        }
+    }
+    // Edge i (p[i] → p[i+1]): outward unit normal and half the ramp's width. With y down, a
+    // positive area winds clockwise on screen, its outside to the left of each edge.
+    let edge = |i: usize| {
+        let (a, b) = (p[i], p[(i + 1) % n]);
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let l = libm::sqrtf(dx * dx + dy * dy);
+        let (nx, ny) = (sign * dy / l, -sign * dx / l);
+        (nx, ny, nx * a.0 + ny * a.1, 0.5 * (nx.abs() + ny.abs()))
+    };
+    // Where edges `e0` and `e1`'s lines, moved by `s` × each one's half width, meet.
+    let meet = |e0: usize, e1: usize, s: f32| -> Option<(f32, f32)> {
+        let (n0x, n0y, c0, h0) = edge(e0);
+        let (n1x, n1y, c1, h1) = edge(e1);
+        let det = n0x * n1y - n0y * n1x;
+        if det.abs() < 1e-4 {
+            return None;
+        }
+        let (k0, k1) = (c0 + s * h0, c1 + s * h1);
+        Some(((k0 * n1y - k1 * n0y) / det, (n0x * k1 - n1x * k0) / det))
+    };
+    // Corner i joins edges i − 1 and i. Inside: the moved lines' meeting point (a sharp
+    // corner's lies far in, where the shape is under a pixel wide: the ramp then runs along
+    // it). Outside: the miter, or, once it reaches over twice the ramp's half width from the
+    // point (corners under ~60°: an acute miter put coverage ½ on a tip the CPU covers 0.15),
+    // a bevel (each edge's own offset).
+    let mut inner: Vec<(f32, f32)> = Vec::with_capacity(n);
+    let mut outer: Vec<[(f32, f32); 2]> = Vec::with_capacity(n);
+    for i in 0..n {
+        let e0 = (i + n - 1) % n;
+        let (n0x, n0y, _, h0) = edge(e0);
+        let (n1x, n1y, _, h1) = edge(i);
+        let straight = |s: f32| (p[i].0 + n1x * s * h1, p[i].1 + n1y * s * h1);
+        inner.push(meet(e0, i, -1.0).unwrap_or(straight(-1.0)));
+        let o = match meet(e0, i, 1.0) {
+            Some(m) if (m.0 - p[i].0) * (m.0 - p[i].0) + (m.1 - p[i].1) * (m.1 - p[i].1) <= 4.0 * h0.max(h1) * h0.max(h1) => [m, m],
+            Some(_) => [(p[i].0 + n0x * h0, p[i].1 + n0y * h0), (p[i].0 + n1x * h1, p[i].1 + n1y * h1)],
+            None => [straight(1.0), straight(1.0)],
+        };
+        outer.push(o);
+    }
+    // The inside must keep the outline's winding: an edge shorter than the shrinking (a
+    // hand's tip) comes out reversed. Its two ends become one, where its neighbours' moved
+    // lines meet (the shrunk shape loses that edge). Still reversed: give up.
+    for pass in 0..2 {
+        let mut bad = false;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let (ex, ey) = (p[j].0 - p[i].0, p[j].1 - p[i].1);
+            let (ix, iy) = (inner[j].0 - inner[i].0, inner[j].1 - inner[i].1);
+            if ex * ix + ey * iy < -1e-4 {
+                bad = true;
+                if pass == 0 {
+                    let Some(q) = meet((i + n - 1) % n, j, -1.0) else { return false };
+                    inner[i] = q;
+                    inner[j] = q;
+                }
+            }
+        }
+        if !bad {
+            break;
+        }
+        if pass == 1 {
+            return false;
+        }
+    }
+    // A ramp puts ½ on every corner point, whatever its angle: an acute tip comes out ~0.5
+    // where the CPU's exact area is ~0.15 (vertex alpha's limit, HWUI's too). Giving the
+    // points their own coverage dragged the whole edge between them down instead.
+    let s = m.begin();
+    let v = |(x, y): (f32, f32), a: f32| Vtx { x, y, a };
+    for i in 0..n {
+        let j = (i + 1) % n;
+        m.quad(v(inner[i], 1.0), v(outer[i][1], 0.0), v(outer[j][0], 0.0), v(inner[j], 1.0));
+        if outer[i][0] != outer[i][1] {
+            m.tri(v(inner[i], 1.0), v(outer[i][0], 0.0), v(outer[i][1], 0.0));
+        }
+    }
+    for i in 1..n - 1 {
+        m.tri(v(inner[0], 1.0), v(inner[i], 1.0), v(inner[i + 1], 1.0));
+    }
+    m.end(s);
+    true
+}
+
+/// The outline through `pts` (continuous coordinates; back to the first point when `closed`)
+/// stroked `r` px either side, as `draw_polyline` covers it (`Stroke::cov`: r + ½ − the
+/// distance to the path): each segment a strip along its own normal, each point a disk.
+/// Where they overlap (around the points) the GPU blends them "over" one another where the
+/// CPU takes the strongest: the same inside, a little more coverage on the fringe.
+pub fn outline(m: &mut Mesh<'_>, pts: &[(f32, f32)], r: f32, closed: bool) {
+    let n = pts.len();
+    if n == 0 {
+        return;
+    }
+    let o1 = (r - 0.5).max(0.0);
+    let (c1, o2) = ((r + 0.5 - o1).min(1.0), r + 0.5);
+    let v = |x: f32, y: f32, a: f32| Vtx { x, y, a };
+    let s = m.begin();
+    let segs = if closed && n > 2 { n } else { n - 1 };
+    for i in 0..segs {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let l = libm::sqrtf(dx * dx + dy * dy);
+        if l < 1e-6 {
+            continue;
+        }
+        let (nx, ny) = (-dy / l, dx / l);
+        for side in [1.0f32, -1.0] {
+            let (ox, oy) = (nx * side, ny * side);
+            m.quad(
+                v(a.0 + ox * o2, a.1 + oy * o2, 0.0),
+                v(b.0 + ox * o2, b.1 + oy * o2, 0.0),
+                v(b.0 + ox * o1, b.1 + oy * o1, c1),
+                v(a.0 + ox * o1, a.1 + oy * o1, c1),
+            );
+            if o1 > 0.0 {
+                m.quad(v(a.0 + ox * o1, a.1 + oy * o1, c1), v(b.0 + ox * o1, b.1 + oy * o1, c1), v(b.0, b.1, c1), v(a.0, a.1, c1));
+            }
+        }
+    }
+    let k = 4 * segments(o2);
+    for &(cx, cy) in pts {
+        let at = |i: usize, rad: f32, a: f32| {
+            let t = core::f32::consts::TAU * (i % k) as f32 / k as f32;
+            v(cx + rad * libm::cosf(t), cy + rad * libm::sinf(t), a)
+        };
+        for i in 0..k {
+            if o1 > 0.0 {
+                m.tri(v(cx, cy, c1), at(i, o1, c1), at(i + 1, o1, c1));
+            }
+            m.quad(at(i, o1, c1), at(i, o2, 0.0), at(i + 1, o2, 0.0), at(i + 1, o1, c1));
+        }
+    }
+    m.end(s);
+}
+
 /// A fan around `c`: coverage 1 at the centre, 0 at radius 1.
 fn disk(m: &mut Mesh<'_>, c: (f32, f32)) {
     let centre = Vtx { x: c.0, y: c.1, a: 1.0 };

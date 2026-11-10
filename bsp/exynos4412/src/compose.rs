@@ -17,8 +17,10 @@
 //!   it is in the flash shadow (`ui_flat`);
 //! - a 3D model widget: its buffer (`model3d::texture`);
 //! - a circle / ellipse shape or a gauge: the parts its drawing issues (`render::round_parts`)
-//!   as anti-aliased triangles (`tess::oval`, `tess::wedge`);
-//! - anything else (sliders, other shapes, compressed or alpha images) drawn by the CPU
+//!   as anti-aliased triangles (`tess::oval`, `tess::wedge`); a convex polygon shape as a
+//!   mitered fill (`tess::convex_fill`) and its outline (`tess::outline`). A shape whose
+//!   appearance is cached (or was seen in an earlier frame) comes from its sprite instead;
+//! - anything else (sliders, lines, concave polygons, compressed or alpha images) drawn by the CPU
 //!   the built-in way into a premultiplied sprite (`renderer::Sprite`), cached by appearance like
 //!   the renderer's (a label's text included), and sampled.
 //!
@@ -47,7 +49,7 @@ use ferrite_core::render::{self, RoundPart};
 use ferrite_core::types::{Color, Edges, Rect};
 use ferrite_core::widget::{
     FLAG_CLIP_CHILDREN, FLAG_HAS_ON_PAINT, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_IMAGE, KIND_LABEL,
-    KIND_CIRCLE, KIND_ELLIPSE, KIND_GAUGE, KIND_GRAPH, KIND_MODEL3D, KIND_RECTANGLE, WidgetId,
+    KIND_CIRCLE, KIND_ELLIPSE, KIND_GAUGE, KIND_GRAPH, KIND_MODEL3D, KIND_POLYGON, KIND_RECTANGLE, WidgetId,
 };
 
 use crate::gpu::Ui;
@@ -439,7 +441,7 @@ pub static GLYPHS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// CPU whenever a sample changes: ~5 ms a second for the tablet's perf card). On by default;
 /// HTTP `POST /api/compose?graphs=0|1` switches it for A/B runs.
 pub static GRAPHS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
-/// Circle / ellipse shapes and gauges as tessellated ovals, arcs and wedges (`render::round_parts`,
+/// Circle / ellipse / convex polygon shapes and gauges as tessellated ovals, arcs, wedges and fills (`render::round_parts`,
 /// `tess::oval`/`wedge`) rather than sprites. On by default; HTTP `POST /api/compose?shapes=0|1`
 /// switches it for A/B runs.
 pub static SHAPES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
@@ -641,7 +643,7 @@ impl State {
             if w.kind == KIND_GRAPH && GRAPHS.load(core::sync::atomic::Ordering::Relaxed) {
                 return Some(self.graph(objs, id, abs));
             }
-            if matches!(w.kind, KIND_CIRCLE | KIND_ELLIPSE | KIND_GAUGE)
+            if matches!(w.kind, KIND_CIRCLE | KIND_ELLIPSE | KIND_GAUGE | KIND_POLYGON)
                 && SHAPES.load(core::sync::atomic::Ordering::Relaxed)
                 && objs.ext(id).image_id == 0
             {
@@ -664,7 +666,13 @@ impl State {
                         return self.sprite(ctx, id, abs, keep_after).map(|_| None);
                     }
                 }
-                return Some(self.round(objs, id, abs));
+                if w.kind != KIND_POLYGON {
+                    return Some(self.round(objs, id, abs));
+                }
+                if self.polygon(objs, id, abs) {
+                    return Some(None);
+                }
+                // Not convex (or too thin to shrink): the CPU's sprite.
             }
             if w.kind == KIND_LABEL && self.glyphs && objs.ext(id).image_id == 0 {
                 if let Some(opaque) = self.label(ctx, id, abs) {
@@ -1000,6 +1008,37 @@ impl State {
             }
         }
         opaque
+    }
+
+    /// A polygon shape (`render::polygon_shape`): its fill as a convex polygon with mitered
+    /// edge ramps (`tess::convex_fill`), then its outline (`tess::outline`), cut to the box.
+    /// False (nothing added) when the fill isn't convex or can't be shrunk.
+    fn polygon(&mut self, objs: &ObjPool, id: WidgetId, abs: &Rect) -> bool {
+        let w = objs.get(id);
+        let e = objs.ext(id);
+        let r = R::of(abs);
+        let mut pts = [ferrite_core::types::Offset { x: 0, y: 0 }; ferrite_core::lcd::MAX_POLY_POINTS];
+        let Some((n, fill, stroke, t)) = render::polygon_shape(objs, w, abs, &e, &mut pts) else { return true };
+        let mut f = [(0.0f32, 0.0f32); ferrite_core::lcd::MAX_POLY_POINTS];
+        for (q, p) in f.iter_mut().zip(&pts[..n]) {
+            *q = (p.x as f32 + 0.5, p.y as f32 + 0.5);
+        }
+        let f = &f[..n];
+        let (prims, tverts) = (self.prims.len(), self.tverts.len());
+        if fill != 0 {
+            self.tchunks.clear();
+            if !tess::convex_fill(&mut tess::Mesh { verts: &mut self.tverts, chunks: &mut self.tchunks }, f) {
+                self.tverts.truncate(tverts);
+                self.prims.truncate(prims);
+                return false;
+            }
+            self.emit(Lin::flat(rgb(fill, 1.0)), Some(r));
+        }
+        if stroke != 0 {
+            let rad = t as f32 / 2.0;
+            self.tess_in(Lin::flat(rgb(stroke, 1.0)), Some(r), |m| tess::outline(m, f, rad, true));
+        }
+        true
     }
 
     /// A rounded box: nine pieces, the corners `k` square (the radius, or the border if wider,
