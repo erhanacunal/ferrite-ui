@@ -46,6 +46,7 @@ pub fn buffered_has_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
 
 /// Widgets whose `on_paint` must run right after the render pass that drew
 /// them (fixed capacity — no heap per frame). See `Vm::run_paint`.
+#[derive(Clone, Copy)]
 pub struct PaintList {
     ids: [WidgetId; PAINT_MAX],
     len: usize,
@@ -92,6 +93,45 @@ pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
             out.push(id);
         }
     }
+}
+
+/// Dirty mode, before `render_dirty`: offers each visible widget in `paint` to the board
+/// renderer's capture (`WidgetRenderer::capture_begin`); `run` paints the ones it takes
+/// (one-entry lists) into their captures, with the scissor on the widget's box. Returns
+/// the rest, whose `on_paint` runs on the screen after the render as before. With the
+/// default renderer nothing is taken: `paint` comes back as it was.
+pub fn capture_paint<P: Platform>(
+    ctx: &mut Ctx<P>,
+    paint: &PaintList,
+    mut run: impl FnMut(&mut Ctx<P>, &PaintList),
+) -> PaintList {
+    if !<P::Renderer as WidgetRenderer<P>>::CAPTURES || paint.is_empty() {
+        return *paint;
+    }
+    let mut rest = PaintList::new();
+    for &id in paint.ids() {
+        if !ctx.objs.is_tree_visible(id) {
+            rest.push(id);
+            continue;
+        }
+        let abs = ctx.objs.absolute_rect(id);
+        let Some(boxed) = abs.intersection(&screen_rect(&ctx.lcd)) else {
+            rest.push(id);
+            continue;
+        };
+        if !<P::Renderer as WidgetRenderer<P>>::capture_begin(ctx, id, &abs) {
+            rest.push(id);
+            continue;
+        }
+        let scissor = ctx.lcd.scissor();
+        ctx.lcd.set_scissor(Some(boxed));
+        let mut one = PaintList::new();
+        one.push(id);
+        run(ctx, &one);
+        ctx.lcd.set_scissor(scissor);
+        <P::Renderer as WidgetRenderer<P>>::capture_end(ctx, id);
+    }
+    rest
 }
 
 /// Draw dirty widgets to the current back buffer. For each dirty widget, if

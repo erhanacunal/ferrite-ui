@@ -170,6 +170,10 @@ struct Target {
     sprite: bool,
     /// The layer it is ([`NO_LAYER`] = none): `mark` goes to its dirty box.
     layer: u8,
+    /// Screen position of the target's 0,0 ([`begin_sprite_at`]: an `on_paint` capture
+    /// takes screen coordinates); 0,0 otherwise.
+    ox: i32,
+    oy: i32,
 }
 
 const NO_LAYER: u8 = 0xFF;
@@ -186,7 +190,7 @@ fn target() -> Target {
     }
     match unsafe { *(&raw const LAYER_TARGET) } {
         Some(t) => t,
-        None => Target { px: back(), stride: W, w: W, h: H, sprite: false, layer: NO_LAYER },
+        None => Target { px: back(), stride: W, w: W, h: H, sprite: false, layer: NO_LAYER, ox: 0, oy: 0 },
     }
 }
 
@@ -197,6 +201,13 @@ pub fn layer_targeted() -> bool {
 }
 
 impl Target {
+    /// Screen coordinates (as the primitives get them: `u16`s that may be negative `i16`s)
+    /// to the target's.
+    #[inline(always)]
+    fn local(&self, x: u16, y: u16) -> (u16, u16) {
+        ((x as i16 as i32 - self.ox) as u16, (y as i16 as i32 - self.oy) as u16)
+    }
+
     fn clip(&self, x: u16, y: u16, w: u16, h: u16) -> Option<(usize, usize, usize, usize)> {
         let (x, y) = (x as usize, y as usize);
         if w == 0 || h == 0 || x >= self.w || y >= self.h {
@@ -257,7 +268,16 @@ fn over(d: u32, src: u32, a: u32) -> u32 {
 /// `px` holds `stride * h` words and nothing else references them until
 /// `end_sprite`; `w <= stride`, `w <= W`, `h <= H`.
 pub unsafe fn begin_sprite(px: *mut u32, w: usize, h: usize, stride: usize) {
-    unsafe { *(&raw mut SPRITE) = Some(Target { px, stride, w, h, sprite: true, layer: NO_LAYER }) };
+    unsafe { begin_sprite_at(px, w, h, stride, 0, 0) };
+}
+
+/// [`begin_sprite`] whose 0,0 is the screen's (`x`, `y`): the primitives take screen
+/// coordinates (an `on_paint` capture: the program draws where the widget is).
+///
+/// # Safety
+/// As [`begin_sprite`].
+pub unsafe fn begin_sprite_at(px: *mut u32, w: usize, h: usize, stride: usize, x: i32, y: i32) {
+    unsafe { *(&raw mut SPRITE) = Some(Target { px, stride, w, h, sprite: true, layer: NO_LAYER, ox: x, oy: y }) };
 }
 
 /// Back to the shadow. Cleans the sprite (`px`, `words` long) out of the
@@ -1045,6 +1065,7 @@ impl LcdBackend for FimdLcd {
 
     fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
         let t = target();
+        let (x, y) = t.local(x, y);
         let Some((x, y, w, h)) = t.clip(x, y, w, h) else { return };
         let c = rgb565_to_xrgb(color);
         #[cfg(feature = "g2d_render")]
@@ -1062,6 +1083,7 @@ impl LcdBackend for FimdLcd {
 
     fn draw_pixel(&self, x: u16, y: u16, color: u16) {
         let t = target();
+        let (x, y) = t.local(x, y);
         let (x, y) = (x as usize, y as usize);
         if x < t.w && y < t.h {
             t.fence(y, y + 1);
@@ -1076,6 +1098,7 @@ impl LcdBackend for FimdLcd {
     // `begin_pixels` opened, within one primitive: its fence covers them.
     fn begin_pixels(&self, x: u16, y: u16, w: u16, h: u16) {
         let t = target();
+        let (x, y) = t.local(x, y);
         // The stream writes only inside the clipped window.
         let window = t.clip(x, y, w, h);
         if let Some((_, wy, _, wh)) = window {
@@ -1148,6 +1171,7 @@ impl LcdBackend for FimdLcd {
             return self.fill_rect(x, y, w, h, color);
         }
         let t = target();
+        let (x, y) = t.local(x, y);
         let Some((x, y, w, h)) = t.clip(x, y, w, h) else { return };
         if alpha == 0 {
             return;
@@ -1177,6 +1201,7 @@ impl LcdBackend for FimdLcd {
 
     fn blend_pixel(&self, x: u16, y: u16, color: u16, alpha: u8) {
         let t = target();
+        let (x, y) = t.local(x, y);
         let (x, y) = (x as usize, y as usize);
         if alpha == 0 || x >= t.w || y >= t.h {
             return;
@@ -1195,6 +1220,7 @@ impl LcdBackend for FimdLcd {
     // per pixel (each `blend_pixel` paid all three).
     fn blend_span(&self, x: u16, y: u16, color: u16, alphas: &[u8]) {
         let t = target();
+        let (x, y) = t.local(x, y);
         let Some((x, y, w, _)) = t.clip(x, y, alphas.len() as u16, 1) else { return };
         t.fence(y, y + 1);
         cpu_blend!(t, w);
@@ -1213,6 +1239,7 @@ impl LcdBackend for FimdLcd {
 
     fn blend_row(&self, x: u16, y: u16, colors: &[u16], alphas: &[u8]) {
         let t = target();
+        let (x, y) = t.local(x, y);
         let n = colors.len().min(alphas.len());
         let Some((x, y, w, _)) = t.clip(x, y, n as u16, 1) else { return };
         t.fence(y, y + 1);
@@ -1593,6 +1620,42 @@ pub fn blit_sprite(
         let _ = (px, sw, sh, stride, sx, sy, dx, dy, w, h);
         false
     }
+}
+
+/// [`blit_sprite`] by the CPU, onto whatever the primitives draw into (the shadow): for
+/// when the G2D is off or gave up.
+#[allow(clippy::too_many_arguments)]
+pub fn blend_sprite_cpu(px: *const u32, stride: usize, sx: usize, sy: usize, dx: usize, dy: usize, w: usize, h: usize) {
+    let t = target();
+    if w == 0 || h == 0 || dx + w > t.w || dy + h > t.h {
+        return;
+    }
+    t.fence(dy, dy + h);
+    cpu_blend!(t, w * h);
+    timed!({
+        for r in 0..h {
+            // SAFETY: the caller's rect is inside the sprite; the target rows were checked.
+            let src = unsafe { core::slice::from_raw_parts(px.add((sy + r) * stride + sx), w) };
+            for (d, &s) in unsafe { t.row(dx, dy + r, w) }.iter_mut().zip(src) {
+                let sa = s >> 24;
+                if sa == 0 {
+                    continue;
+                }
+                if sa == 255 {
+                    *d = s;
+                    continue;
+                }
+                // Premultiplied "over": s + d * (1 - sa).
+                let mut out = 0u32;
+                for sh in [0u32, 8, 16, 24] {
+                    let (sc, dc) = ((s >> sh) & 0xFF, (*d >> sh) & 0xFF);
+                    out |= (sc + (dc * (255 - sa) + 127) / 255).min(255) << sh;
+                }
+                *d = out;
+            }
+        }
+        t.mark(dx, dy, w, h);
+    })
 }
 
 /// Layer sprite blits switched on (HTTP `POST /api/layerblit?on=0|1`, for

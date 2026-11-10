@@ -345,9 +345,9 @@ fn hide_now(n: usize) {
 /// See `LcdBackend::layer_target`.
 pub fn target(n: Option<usize>) {
     let t = n.map(|n| match state().layers.get(n).and_then(Option::as_ref) {
-        Some(l) => Target { px: l.px as *mut u32, stride: l.w, w: l.w, h: l.h, sprite: true, layer: n as u8 },
+        Some(l) => Target { px: l.px as *mut u32, stride: l.w, w: l.w, h: l.h, sprite: true, layer: n as u8, ox: 0, oy: 0 },
         // Not allocated: draws nothing.
-        None => Target { px: core::ptr::null_mut(), stride: 0, w: 0, h: 0, sprite: true, layer: NO_LAYER },
+        None => Target { px: core::ptr::null_mut(), stride: 0, w: 0, h: 0, sprite: true, layer: NO_LAYER, ox: 0, oy: 0 },
     });
     unsafe { *(&raw mut LAYER_TARGET) = t };
 }

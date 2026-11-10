@@ -64,6 +64,9 @@ pub trait WidgetRenderer<P: Platform> {
     /// Whether [`compose`](Self::compose) may take dirty renders over.
     const COMPOSES: bool = false;
 
+    /// Whether [`capture_begin`](Self::capture_begin) may take `on_paint` drawing.
+    const CAPTURES: bool = false;
+
     /// Repaint `areas` whole: disjoint screen rects whose corners are on the
     /// [`COMPOSE_GRID`](crate::render::COMPOSE_GRID) (or the screen's
     /// edge), at most [`COMPOSE_AREAS`](crate::render::COMPOSE_AREAS). Every
@@ -96,6 +99,24 @@ pub trait WidgetRenderer<P: Platform> {
     fn partial_redraw(_objs: &ObjPool, _id: WidgetId) -> bool {
         true
     }
+
+    /// Dirty mode, before the render: start capturing widget `id`'s `on_paint` drawing
+    /// (absolute box `abs`). Return `true` to have every primitive drawn until
+    /// [`capture_end`](Self::capture_end) kept off the screen, in a buffer of the widget's
+    /// own (`render::capture_paint` sets the scissor to `abs` meanwhile, so it holds only
+    /// what lands in the box); from then on [`draw`](Self::draw) and
+    /// [`compose`](Self::compose) draw it over the widget wherever the widget is drawn, and
+    /// the `on_paint` is not run on the screen after the render. `false` = run it on the
+    /// screen after the render, as built in, and drop any capture kept for `id` (it is
+    /// stale now).
+    #[inline(always)]
+    fn capture_begin(_ctx: &Ctx<P>, _id: WidgetId, _abs: &Rect) -> bool {
+        false
+    }
+
+    /// Ends the capture [`capture_begin`](Self::capture_begin) started.
+    #[inline(always)]
+    fn capture_end(_ctx: &Ctx<P>, _id: WidgetId) {}
 }
 
 /// The built-in drawing for every widget.
@@ -209,6 +230,71 @@ mod tests {
             CALLS.with(|c| c.borrow_mut().push((ctx.objs.get(id).kind, 0)));
             true
         }
+        // Captures widgets with the background 0xCAFE.
+        const CAPTURES: bool = true;
+        fn capture_begin(ctx: &Ctx<ComposePlatform>, id: WidgetId, abs: &Rect) -> bool {
+            let take = ctx.objs.get(id).background_color == 0xCAFE;
+            CAPTURES.with(|c| c.borrow_mut().push((id, take, *abs)));
+            take
+        }
+        fn capture_end(_: &Ctx<ComposePlatform>, id: WidgetId) {
+            CAPTURES.with(|c| c.borrow_mut().push((id, false, Rect::new(0, 0, 0, 0))));
+        }
+    }
+
+    std::thread_local! {
+        /// `capture_begin` (id, taken, box) and `capture_end` (id, false, empty) calls.
+        static CAPTURES: RefCell<Vec<(WidgetId, bool, Rect)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn captured_on_paint_runs_scissored_to_the_box_before_the_render() {
+        use crate::render::{PaintList, capture_paint};
+        use crate::widget::FLAG_VISIBLE;
+        let mut ctx = compose_ctx();
+        let root = ctx.objs.alloc_widget().unwrap();
+        ctx.objs.root = root;
+        ctx.objs.get_mut(root).size = Size { w: 800, h: 480 };
+        let mk = |ctx: &mut Ctx<ComposePlatform>, x, y, bg| {
+            let id = ctx.objs.alloc_widget().unwrap();
+            ctx.objs.add_child(root, id);
+            let g = ctx.objs.get_mut(id);
+            g.location = Offset { x, y };
+            g.size = Size { w: 100, h: 50 };
+            g.background_color = bg;
+            id
+        };
+        let taken = mk(&mut ctx, 790, 20, 0xCAFE);
+        let declined = mk(&mut ctx, 10, 10, 0x1234);
+        let hidden = mk(&mut ctx, 10, 100, 0xCAFE);
+        ctx.objs.get_mut(hidden).flags &= !FLAG_VISIBLE;
+        let mut paint = PaintList::new();
+        for id in [taken, declined, hidden] {
+            paint.push(id);
+        }
+        let r = |r: Option<Rect>| r.map(|r| (r.x, r.y, r.w, r.h));
+        let mut ran = Vec::new();
+        let rest = capture_paint(&mut ctx, &paint, |ctx, one| {
+            ran.push((one.ids().iter().map(|i| i.0).collect::<Vec<_>>(), r(ctx.lcd.scissor())))
+        });
+        // The taken one painted alone, scissored to its box cut to the screen.
+        assert_eq!(ran, [(vec![taken.0], Some((790, 20, 10, 50)))]);
+        assert_eq!(r(ctx.lcd.scissor()), None, "scissor restored");
+        // The others paint on the screen after the render; a hidden one isn't offered.
+        assert!(rest.ids() == [declined, hidden]);
+        let calls: Vec<_> = CAPTURES
+            .with(|c| core::mem::take(&mut *c.borrow_mut()))
+            .into_iter()
+            .map(|(id, took, b)| (id.0, took, r(Some(b))))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                (taken.0, true, Some((790, 20, 100, 50))),
+                (taken.0, false, Some((0, 0, 0, 0))),
+                (declined.0, false, Some((10, 10, 100, 50))),
+            ]
+        );
     }
     struct ComposePlatform;
     impl Platform for ComposePlatform {

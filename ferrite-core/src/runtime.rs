@@ -1450,6 +1450,8 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, input: 
             }
             let mut paint = render::PaintList::new();
             render::collect_dirty_paint(ctx, &mut paint);
+            // The board renderer may keep on_paint drawing in captures it draws itself.
+            let paint = render::capture_paint(ctx, &paint, |ctx, one| run_paint(ctx, tasks, one));
             render::render_dirty(ctx);
             run_paint(ctx, tasks, &paint);
             input.draw_overlay(ctx, false);

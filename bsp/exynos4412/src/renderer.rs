@@ -40,6 +40,14 @@
 //! first ([`WidgetRenderer::compose`], `compose.rs`), which draws widget
 //! kinds it has no shader for from these sprites; when it declines, the
 //! built-in passes run and [`ExynosRenderer::draw`] is asked as before.
+//!
+//! **`on_paint` captures.** A dirty widget's `on_paint` drawing is captured before the
+//! render ([`WidgetRenderer::capture_begin`]): the primitives draw it into a premultiplied
+//! ARGB8888 buffer of the widget's box (screen coordinates, scissored to the box), kept per
+//! widget ([`Captures`]). Wherever the widget is drawn afterwards (its own redraw, a
+//! restore behind something, a compositor area) the capture goes over it: the G2D or the
+//! CPU blends it in the passes, the GPU samples it in the compositor, which no longer
+//! declines renders with such widgets. Drawing outside the widget's box is cut off.
 
 use alloc::vec::Vec;
 
@@ -51,7 +59,7 @@ use ferrite_core::renderer::WidgetRenderer;
 use ferrite_core::types::{Edges, Rect};
 use ferrite_core::widget::{
     FLAG_CHECKED, FLAG_MULTI_LINE, FLAG_PRESSED, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_CIRCLE, KIND_ELLIPSE,
-    KIND_GRAPH, KIND_IMAGE, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_RECTANGLE, WidgetId,
+    FLAG_HAS_ON_PAINT, KIND_GRAPH, KIND_IMAGE, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_RECTANGLE, WidgetId,
 };
 
 use crate::lcd;
@@ -74,6 +82,7 @@ pub struct ExynosRenderer;
 
 impl WidgetRenderer<P> for ExynosRenderer {
     const COMPOSES: bool = cfg!(feature = "gpu_compose");
+    const CAPTURES: bool = true;
 
     fn compose(ctx: &Ctx<P>, areas: &[Rect]) -> bool {
         #[cfg(feature = "gpu_compose")]
@@ -88,61 +97,199 @@ impl WidgetRenderer<P> for ExynosRenderer {
     }
 
     fn draw(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
-        if !lcd::g2d_draw_ready() || ctx.lcd.is_portrait() {
-            return false;
+        let Some(c) = captures().get(&ctx.objs, id, abs) else { return draw_plain(ctx, id, abs, clip) };
+        if !draw_plain(ctx, id, abs, clip) {
+            render::draw_default(ctx, id, abs, clip);
         }
-        // A layer pass draws into the layer's surface (`abs`, `clip` and the
-        // screen size are the surface's): only sprites are blitted there.
-        // Pictures and models go to the screen's shadow.
-        if lcd::layer_targeted() {
-            if !lcd::layer_blits_ready() {
-                return false;
-            }
-        } else {
-            if crate::model3d::draw(ctx, id, abs, clip) {
-                return true;
-            }
-            if draw_picture(ctx, id, abs, clip) {
-                return true;
-            }
-        }
-        if !wants_sprite(&ctx.objs, id, abs) {
-            return false;
-        }
-        let key = appearance(ctx, id, abs);
-        let cache = cache();
-        let at = match cache.find(key) {
-            Some(at) => at,
-            // Drawn once before: worth a sprite now.
-            None if cache.seen(key) => match cache.insert(ctx, id, abs, key, None) {
-                Some(at) => at,
-                None => return false,
-            },
-            None => {
-                // First sighting: drawn by the CPU this time.
-                #[cfg(feature = "perf")]
-                ferrite_core::perf::add_count(ferrite_core::perf::count::SPRITE_FIRST, 1);
-                return false;
-            }
-        };
-        let sprite = &cache.entries[at];
+        // The program's drawing over it.
         let screen = Rect::new(0, 0, ctx.lcd.width(), ctx.lcd.height());
         for cr in clip.iter() {
-            // Clip rects lie inside the widget's box; the screen cuts a
-            // widget partly off it (a sliding page).
             let Some(r) = cr.intersection(abs).and_then(|r| r.intersection(&screen)) else { continue };
             let (sx, sy) = ((r.x - abs.x) as usize, (r.y - abs.y) as usize);
-            let (dx, dy) = (r.x as usize, r.y as usize);
-            let px = sprite.pixels();
-            #[cfg(feature = "perf")]
-            ferrite_core::perf::add_count(ferrite_core::perf::count::SPRITE_BLITS, 1);
-            if !lcd::blit_sprite(px, sprite.w, sprite.h, sprite.stride, sx, sy, dx, dy, r.w as usize, r.h as usize) {
-                // The G2D gave up (it stays off): this rect by the CPU.
-                render::draw_default(ctx, id, abs, &ClipRegion::from_rect(r));
+            let (dx, dy, w, h) = (r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+            let px = c.pixels();
+            if !(lcd::g2d_draw_ready() && lcd::blit_sprite(px, c.w, c.h, c.stride, sx, sy, dx, dy, w, h)) {
+                lcd::blend_sprite_cpu(px, c.stride, sx, sy, dx, dy, w, h);
             }
         }
         true
     }
+
+    fn shows_behind(objs: &ObjPool, id: WidgetId) -> Option<bool> {
+        // A captured drawing blends over the widget: where the widget doesn't paint
+        // opaquely, what is behind must be put back first, or it blends over itself.
+        if objs.get(id).flags & FLAG_HAS_ON_PAINT == 0 {
+            return None;
+        }
+        let abs = objs.absolute_rect(id);
+        if captures().get(objs, id, &abs).is_some() && !render::covers_opaquely(objs, id, &abs, &abs) {
+            return Some(true);
+        }
+        None
+    }
+
+    fn capture_begin(ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> bool {
+        captures().begin(ctx, id, abs)
+    }
+
+    fn capture_end(_ctx: &Ctx<P>, _id: WidgetId) {
+        captures().end();
+    }
+}
+
+/// [`ExynosRenderer::draw`] without a capture.
+fn draw_plain(ctx: &Ctx<P>, id: WidgetId, abs: &Rect, clip: &ClipRegion) -> bool {
+    if !lcd::g2d_draw_ready() || ctx.lcd.is_portrait() {
+        return false;
+    }
+    // A layer pass draws into the layer's surface (`abs`, `clip` and the
+    // screen size are the surface's): only sprites are blitted there.
+    // Pictures and models go to the screen's shadow.
+    if lcd::layer_targeted() {
+        if !lcd::layer_blits_ready() {
+            return false;
+        }
+    } else {
+        if crate::model3d::draw(ctx, id, abs, clip) {
+            return true;
+        }
+        if draw_picture(ctx, id, abs, clip) {
+            return true;
+        }
+    }
+    if !wants_sprite(&ctx.objs, id, abs) {
+        return false;
+    }
+    let key = appearance(ctx, id, abs);
+    let cache = cache();
+    let at = match cache.find(key) {
+        Some(at) => at,
+        // Drawn once before: worth a sprite now.
+        None if cache.seen(key) => match cache.insert(ctx, id, abs, key, None) {
+            Some(at) => at,
+            None => return false,
+        },
+        None => {
+            // First sighting: drawn by the CPU this time.
+            #[cfg(feature = "perf")]
+            ferrite_core::perf::add_count(ferrite_core::perf::count::SPRITE_FIRST, 1);
+            return false;
+        }
+    };
+    let sprite = &cache.entries[at];
+    let screen = Rect::new(0, 0, ctx.lcd.width(), ctx.lcd.height());
+    for cr in clip.iter() {
+        // Clip rects lie inside the widget's box; the screen cuts a
+        // widget partly off it (a sliding page).
+        let Some(r) = cr.intersection(abs).and_then(|r| r.intersection(&screen)) else { continue };
+        let (sx, sy) = ((r.x - abs.x) as usize, (r.y - abs.y) as usize);
+        let (dx, dy) = (r.x as usize, r.y as usize);
+        let px = sprite.pixels();
+        #[cfg(feature = "perf")]
+        ferrite_core::perf::add_count(ferrite_core::perf::count::SPRITE_BLITS, 1);
+        if !lcd::blit_sprite(px, sprite.w, sprite.h, sprite.stride, sx, sy, dx, dy, r.w as usize, r.h as usize) {
+            // The G2D gave up (it stays off): this rect by the CPU.
+            render::draw_default(ctx, id, abs, &ClipRegion::from_rect(r));
+        }
+    }
+    true
+}
+
+/// Memory the `on_paint` captures may hold.
+const CAPTURE_BYTES: usize = 32 << 20;
+
+/// One widget's captured `on_paint` drawing (premultiplied ARGB8888, its box's size).
+pub(crate) struct Capture {
+    id: WidgetId,
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+    /// Pixels per row (`w` rounded up to `ROW_ALIGN`).
+    pub(crate) stride: usize,
+    px: Vec<u32>,
+    /// The pixels start `start` words into `px` (64-byte aligned).
+    start: usize,
+}
+
+impl Capture {
+    pub(crate) fn pixels(&self) -> *const u32 {
+        self.px[self.start..].as_ptr()
+    }
+}
+
+/// The widgets' captures, and the one being drawn.
+pub(crate) struct Captures {
+    entries: Vec<Capture>,
+    bytes: usize,
+    /// Index of the capture being drawn (between `begin` and `end`).
+    open: Option<usize>,
+}
+
+impl Captures {
+    /// Widget `id`'s capture, if it has one of its box's size and still has an `on_paint`.
+    pub(crate) fn get(&self, objs: &ObjPool, id: WidgetId, abs: &Rect) -> Option<&Capture> {
+        if self.entries.is_empty() || objs.get(id).flags & FLAG_HAS_ON_PAINT == 0 {
+            return None;
+        }
+        self.entries.iter().find(|c| c.id == id && c.w == abs.w as usize && c.h == abs.h as usize)
+    }
+
+    /// `WidgetRenderer::capture_begin`: the primitives draw into `id`'s capture (cleared, of
+    /// `abs`'s size, at `abs`'s position) until [`end`](Self::end). False (and `id`'s old
+    /// capture dropped) when it can't: portrait, a box larger than the panel, no memory.
+    fn begin(&mut self, ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> bool {
+        // Captures of widgets that are gone or no longer paint.
+        let objs = &ctx.objs;
+        let mut i = 0;
+        while i < self.entries.len() {
+            let c = &self.entries[i];
+            if c.id == id || !objs.is_live(c.id) || objs.get(c.id).flags & FLAG_HAS_ON_PAINT == 0 {
+                self.bytes -= c.px.len() * 4;
+                self.entries.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        let (w, h) = (abs.w as usize, abs.h as usize);
+        if ctx.lcd.is_portrait() || lcd::layer_targeted() || w == 0 || h == 0 || w > lcd::PANEL.width || h > lcd::PANEL.height {
+            return false;
+        }
+        let stride = w.next_multiple_of(ROW_ALIGN);
+        let words = stride * h + ROW_ALIGN;
+        if self.bytes + words * 4 > CAPTURE_BYTES {
+            return false;
+        }
+        let mut px = Vec::new();
+        if px.try_reserve_exact(words).is_err() {
+            return false;
+        }
+        // Transparent: the drawing composites onto it.
+        px.resize(words, 0);
+        let start = ((px.as_ptr() as usize).next_multiple_of(ROW_ALIGN * 4) - px.as_ptr() as usize) / 4;
+        let base = px[start..].as_mut_ptr();
+        // SAFETY: `base` has stride * h words in `px` (whose heap block doesn't move when the
+        // Vec does), only the primitives touch them until `end`; w, h are within the panel.
+        unsafe { lcd::begin_sprite_at(base, w, h, stride, abs.x as i32, abs.y as i32) };
+        self.bytes += words * 4;
+        self.entries.push(Capture { id, w, h, stride, px, start });
+        self.open = Some(self.entries.len() - 1);
+        true
+    }
+
+    /// `WidgetRenderer::capture_end`: back to the screen, the capture cleaned for the G2D
+    /// and the GPU.
+    fn end(&mut self) {
+        if let Some(at) = self.open.take() {
+            let c = &self.entries[at];
+            lcd::end_sprite(c.pixels(), c.stride * c.h);
+        }
+    }
+}
+
+static mut CAPTURES: Captures = Captures { entries: Vec::new(), bytes: 0, open: None };
+
+pub(crate) fn captures() -> &'static mut Captures {
+    // SAFETY: CPU0 only, never reentrant (as `cache`).
+    unsafe { &mut *(&raw mut CAPTURES) }
 }
 
 /// Draws widget `id` if it is only an opaque picture of exactly its size: a

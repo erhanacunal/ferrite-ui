@@ -810,11 +810,22 @@ impl State {
                 i += 1;
                 continue;
             }
-            if w.flags & FLAG_HAS_ON_PAINT != 0 {
-                return Err(ON_PAINT);
-            }
+            // The program's drawing goes over the widget, from its capture (made before the
+            // render, `renderer::Captures`); without one it would be drawn on the screen
+            // after the render, which the GPU's areas would cover: the passes draw.
+            let capture = if w.flags & FLAG_HAS_ON_PAINT != 0 {
+                match renderer::captures().get(objs, id, &abs) {
+                    Some(c) => Some(Tex { addr: c.pixels() as usize, w: c.w, h: c.h, stride: c.stride * 4, fmt: Fmt::Argb }),
+                    None => return Err(ON_PAINT),
+                }
+            } else {
+                None
+            };
             let start = self.prims.len();
             let Some(opaque) = self.widget(ctx, ui, gpu, id, &abs, keep_after) else { return Err(WIDGET) };
+            if let Some(tex) = capture {
+                self.flat(r, abs.x as i32, abs.y as i32, tex, 0);
+            }
             self.items.push(Item { start, opaque });
             i += 1;
         }

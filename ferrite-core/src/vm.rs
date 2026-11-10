@@ -2011,6 +2011,7 @@ impl Vm {
                 RenderMode::Dirty => {
                     let mut paint = render::PaintList::new();
                     render::collect_dirty_paint(ctx, &mut paint);
+                    let paint = render::capture_paint(ctx, &paint, |ctx, one| self.run_paint(ctx, one));
                     render::render_dirty(ctx);
                     self.run_paint(ctx, &paint);
                 }
