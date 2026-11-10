@@ -227,6 +227,12 @@ pub trait InputHandler<P: PlatformRuntime>: Sized {
     /// Per-frame housekeeping unrelated to a touch event (cursor blink).
     fn tick(&mut self, _ctx: &mut Ctx<P>) {}
 
+    /// Nothing for `tick` to do on its own (no cursor blinking): the passes may
+    /// stop until an event (`Runtime::idle_ms`).
+    fn idle(&self) -> bool {
+        true
+    }
+
     /// Draw any overlay (on-screen keyboard) on top of the rendered frame.
     /// `buffered` selects the double-buffered redraw cadence.
     fn draw_overlay(&mut self, _ctx: &Ctx<P>, _buffered: bool) {}
@@ -529,6 +535,45 @@ impl<P: PlatformRuntime> Runtime<P> {
             return true;
         }
         (self.error_code == 0 && wants(&self.tasks.main)) || !self.protocol.is_idle()
+    }
+
+    /// How long the runtime can go without a pass, for a BSP that sleeps
+    /// between passes: `Some(0)` = keep passing (code to run, an animation, a
+    /// touch down, something to draw, a sound streaming, the keyboard's
+    /// cursor), `Some(ms)` = until the earliest `delay` ends, None = until an
+    /// event (a touch, a message): nothing time-based is pending. The BSP
+    /// still passes for its own work (presents, polled keys, messages from
+    /// other cores).
+    pub fn idle_ms(&self) -> Option<u32> {
+        if self.busy() || !self.touch.is_idle() || !self.input.idle() || self.ctx.objs.maybe_dirty {
+            return Some(0);
+        }
+        #[cfg(feature = "layers")]
+        if self.ctx.objs.layers.placed {
+            return Some(0);
+        }
+        #[cfg(feature = "audio")]
+        if self.ctx.audio.playing() {
+            return Some(0);
+        }
+        if self.error_code != 0 {
+            return None;
+        }
+        let now = self.ctx.systick.millis();
+        let mut left: Option<u32> = None;
+        #[cfg(feature = "multi_program")]
+        let kids = self.tasks.kids.iter().filter_map(|k| k.as_deref());
+        #[cfg(not(feature = "multi_program"))]
+        let kids = core::iter::empty::<&Vm>();
+        for vm in core::iter::once(&*self.tasks.main).chain(kids) {
+            if vm.animating() {
+                return Some(0);
+            }
+            if let Some(ms) = vm.wait_left(now) {
+                left = Some(left.map_or(ms, |l| l.min(ms)));
+            }
+        }
+        left
     }
 
     /// One main-loop pass: VM, USART protocol, input, animations, audio,
@@ -1861,6 +1906,10 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
         self.scroll_id = WidgetId::NONE;
         self.scroll_active = false;
         ctx.cursor_visible = false;
+    }
+
+    fn idle(&self) -> bool {
+        !self.kb.visible
     }
 
     fn forget_dead(&mut self, ctx: &mut Ctx<P>) {

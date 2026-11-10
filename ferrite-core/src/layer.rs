@@ -1103,9 +1103,7 @@ mod tests {
 
     #[test]
     fn a_translucent_widget_over_a_composed_layer() {
-        // Against the tree drawn whole: a dirty render of the tree keeps old
-        // pixels under a see-through widget in front of a moved one (it is
-        // left out of the moved one's clip and not redrawn).
+        // Against the tree drawn whole (the strictest reference).
         fn exact(a: &mut Ctx<Plat<2, true>>, b: &mut Ctx<Plat<0, false>>, what: &str) {
             render_dirty(a);
             render_all(b);
@@ -1143,6 +1141,42 @@ mod tests {
         a.objs.set_layer_alpha(sa.panel, 255);
         render_dirty(&mut a);
         assert_same("faded out and in while composed", &a.lcd.backend().shown(), &before);
+    }
+
+    #[test]
+    fn tree_redraws_a_see_through_widget_in_front_of_a_changed_one() {
+        // No layers: a dirty render must match a full redraw when a widget
+        // moves under, or changes under, a translucent widget drawn after it.
+        let mut a = ctx::<0, false>();
+        let mut b = ctx::<0, false>();
+        let sa = scene(&mut a, false);
+        let sb = scene(&mut b, false);
+        for (c, late) in [(&mut a.objs, sa.late), (&mut b.objs, sb.late)] {
+            c.update_ext(late, |e| {
+                e.alpha = 120;
+                e.border_radius = 6;
+            });
+        }
+        render_all(&mut a);
+        render_all(&mut b);
+        let check = |a: &mut Ctx<Plat<0, false>>, b: &mut Ctx<Plat<0, false>>, what: &str| {
+            render_dirty(a);
+            render_all(b);
+            assert_same(what, &a.lcd.backend().shown(), &b.lcd.backend().shown());
+        };
+        for (step, &(x, y)) in [(70, 70), (72, 74), (90, 90), (20, 30)].iter().enumerate() {
+            move_to(&mut a, sa.panel, x, y);
+            move_to(&mut b, sb.panel, x, y);
+            check(&mut a, &mut b, &alloc::format!("moved, step {step}"));
+        }
+        move_to(&mut a, sa.panel, 85, 85);
+        move_to(&mut b, sb.panel, 85, 85);
+        check(&mut a, &mut b, "under the widget");
+        a.objs.get_mut(sa.child).background_color = 0xFD20;
+        a.objs.mark_dirty(sa.child);
+        b.objs.get_mut(sb.child).background_color = 0xFD20;
+        b.objs.mark_dirty(sb.child);
+        check(&mut a, &mut b, "changed under the widget");
     }
 
     #[test]

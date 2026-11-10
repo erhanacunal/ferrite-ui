@@ -450,12 +450,10 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
             }
             let slot = &mut ctx.objs.layers.slots[s];
             if core::mem::take(&mut slot.recompose) && !slot.shown.is_empty() {
-                let (root, shown) = (slot.root, slot.shown);
-                // The root alone: its subtree is not the screen's.
+                let root = slot.root;
+                // The root alone: its subtree is not the screen's. (Pass 2
+                // redraws the see-through widgets in front of it too.)
                 ctx.objs.get_mut(root).flags |= crate::widget::FLAG_DIRTY_A;
-                if let Some(ri) = ctx.objs.dfs_index(root) {
-                    mark_front(ctx, ctx.objs.sub_end_at(ri), shown);
-                }
             }
         }
         ctx.objs.layers.scope = base_scope(&ctx.objs);
@@ -612,12 +610,25 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
         let mut occ_count: usize = 0;
         let abs = ctx.objs.abs_at(di);
 
+        let alpha = ctx.lcd.has_alpha();
         for j in sub_end..ctx.objs.dfs_len() {
             if ctx.objs.vis_at(j) {
                 let other_abs = ctx.objs.abs_at(j);
-                if abs.intersects(&other_abs) && occ_count < 32 {
+                if !abs.intersects(&other_abs) {
+                    continue;
+                }
+                if occ_count < 32 {
                     occluders[occ_count] = other_abs;
                     occ_count += 1;
+                }
+                // Left out of this subtree's clip, a see-through widget in
+                // front would keep showing what was behind it before: it is
+                // drawn again too (it restores behind itself first, this
+                // subtree included). Later in DFS order, so this pass still
+                // reaches it.
+                let jid = ctx.objs.dfs_at(j);
+                if alpha && !ctx.objs.get(jid).is_dirty() && shows_behind_on::<P>(&ctx.objs, jid) {
+                    ctx.objs.mark_dirty(jid);
                 }
             }
         }
@@ -825,33 +836,6 @@ fn layers_sync<P: Platform>(ctx: &mut Ctx<P>) -> usize {
     }
     ctx.objs.layers.composed = composed;
     active
-}
-
-/// A composed layer is blended again over `area`: the screen's widgets after
-/// it there (from DFS index `from`) are drawn again too. Pass 2 leaves every
-/// later widget out of the root's clip, so a see-through one would keep
-/// showing the old blend; an opaque one is redrawn as a restore would. Layers
-/// shown in windows are not the screen's.
-#[cfg(feature = "layers")]
-fn mark_front<P: Platform>(ctx: &mut Ctx<P>, from: usize, area: Rect) {
-    let mut j = from;
-    while j < ctx.objs.dfs_len() {
-        let id = ctx.objs.dfs_at(j);
-        let slot = ctx.objs.layers.slots.iter().find(|s| s.active && s.root == id).copied();
-        if slot.is_some_and(|s| !s.composed) {
-            j = ctx.objs.sub_end_at(j);
-            continue;
-        }
-        if ctx.objs.vis_at(j) && ctx.objs.abs_at(j).intersects(&area) && !ctx.objs.get(id).is_dirty() {
-            if slot.is_some() {
-                ctx.objs.get_mut(id).flags |= crate::widget::FLAG_DIRTY_A;
-                j = ctx.objs.sub_end_at(j);
-                continue;
-            }
-            ctx.objs.mark_dirty(id);
-        }
-        j += 1;
-    }
 }
 
 /// The screen's scope: every DFS entry but the active layers' subtrees.

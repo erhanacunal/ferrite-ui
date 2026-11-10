@@ -239,12 +239,18 @@ async fn ui_task(ctx: Box<Ctx<Exynos4412Platform>>, touch: TouchImpl<touch::MxtT
     let mut rt = Runtime::<Exynos4412Platform>::new(ctx, touch);
     loop {
         rt.step();
-        if cpuclock::IDLE_SLEEP.load(core::sync::atomic::Ordering::Relaxed) && !rt.busy() {
-            // Nothing for the programs to run: CPU0 sleeps in the executor until the timer (or
-            // another task) instead of spinning through empty passes.
-            embassy_time::Timer::after_micros(cpuclock::IDLE_SLEEP_US).await;
-        } else {
+        if !cpuclock::IDLE_SLEEP.load(core::sync::atomic::Ordering::Relaxed) || rt.busy() {
             embassy_futures::yield_now().await;
+            continue;
+        }
+        // Nothing for the programs to run: CPU0 sleeps in the executor instead of spinning
+        // through empty passes. Briefly while something needs passes (an animation, a touch,
+        // a present); otherwise until the next `delay` ends or a touch comes, at most
+        // `IDLE_MAX_MS`.
+        match rt.idle_ms() {
+            Some(ms) if ms > 0 && lcd::settled() => touch::sleep_until_touch(ms.min(cpuclock::IDLE_MAX_MS)).await,
+            None if lcd::settled() => touch::sleep_until_touch(cpuclock::IDLE_MAX_MS).await,
+            _ => embassy_time::Timer::after_micros(cpuclock::IDLE_SLEEP_US).await,
         }
     }
 }

@@ -1198,6 +1198,22 @@ impl Vm {
         self.cb_head != self.cb_tail
     }
 
+    /// Some property animation is running (`tick_animations` changes a value
+    /// every pass).
+    pub fn animating(&self) -> bool {
+        self.anims.iter().any(|a| a.active)
+    }
+
+    /// Milliseconds from `now` until the running code's `delay` ends (0 if it
+    /// has), None if it is not waiting on one.
+    pub fn wait_left(&self, now: u32) -> Option<u32> {
+        if self.state != VmState::Waiting {
+            return None;
+        }
+        let left = self.wait_until.wrapping_sub(now);
+        Some(if left < 0x8000_0000 { left } else { 0 })
+    }
+
     /// True if a queued callback may start now. The main program can be
     /// interrupted anywhere outside a critical section. A suspended callback
     /// (delay, yield) holds the queue until it finishes, so handlers stay in
@@ -4488,6 +4504,21 @@ mod anim_tests {
         assert_eq!(vm.var_get(0), 1);
         assert!(vm.state == VmState::Waiting);
         assert_eq!(vm.wait_until, 500);
+    }
+
+    #[test]
+    fn wait_left_counts_down_to_the_delay_end() {
+        // main @0: delay(500); HALT
+        let code = [OP_PUSH_I16, 0xF4, 0x01, OP_DELAY, OP_HALT];
+        let mut ctx = mock_ctx();
+        let mut vm = cb_vm(&code);
+        assert_eq!(vm.wait_left(0), None, "not waiting yet");
+        vm.tick(&mut ctx, 10);
+        assert_eq!(vm.wait_left(0), Some(500));
+        assert_eq!(vm.wait_left(499), Some(1));
+        assert_eq!(vm.wait_left(500), Some(0));
+        assert_eq!(vm.wait_left(700), Some(0), "past the end: due now");
+        assert!(!vm.animating());
     }
 
     #[test]

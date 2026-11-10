@@ -11,7 +11,9 @@
 //! TODO: multitouch — a `TouchBackend` extension (points[]) + VM gesture
 //! callbacks (pinch/rotate) behind a ferrite-core feature.
 
+use exynos_4412_rs::drivers::gpio::Pull;
 use exynos_4412_rs::drivers::i2c::{Bus, I2c};
+use exynos_4412_rs::embassy::eint::EintInput;
 use exynos_4412_rs::drivers::max77686::Max77686;
 use exynos_4412_rs::drivers::mxt::{self, Message, Mxt};
 use exynos_4412_rs::drivers::timer::Mct;
@@ -104,6 +106,23 @@ impl TouchBackend for MxtTouch {
         // Releases are explicit T9 messages, not missing samples.
         1
     }
+}
+
+/// Sleeps (CPU0 in the executor) until `ms` have passed or the controller has a message for
+/// us: CHG low, through its wake-up interrupt. The pin is the interrupt's only meanwhile and a
+/// plain input again after, as [`State::drain`] reads its level (not relied on while the pin
+/// is in its interrupt function). A message already waiting ends the sleep at once. Without a
+/// controller, just the timer.
+pub async fn sleep_until_touch(ms: u32) {
+    let timer = embassy_time::Timer::after_millis(u64::from(ms));
+    if state().is_none() {
+        return timer.await;
+    }
+    let Some(chg) = EintInput::new(mxt::CHG, Pull::None) else { return timer.await };
+    embassy_futures::select::select(timer, chg.wait_low()).await;
+    // Back to the polled input. If the interrupt is still unmasked (the timer ended the
+    // sleep), the input function keeps it from firing; a late one only wakes nothing.
+    mxt::CHG.set_input(Pull::None);
 }
 
 /// Identity mapping: the controller's T9 ORIENT already matches the panel.

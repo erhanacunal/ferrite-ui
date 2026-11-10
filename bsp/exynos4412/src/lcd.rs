@@ -567,6 +567,13 @@ pub fn flush_wait() {
     }
 }
 
+/// Nothing drawn waits to be presented and no present or layer change is in
+/// flight: `flush` has nothing to drive (CPU0 may sleep longer than a pass).
+pub fn settled() -> bool {
+    let nothing_drawn = unsafe { is_empty(&*(&raw const DIRTY)) };
+    nothing_drawn && STATE.load(Ordering::Acquire) == IDLE && !layers_pending()
+}
+
 fn layers_pending() -> bool {
     #[cfg(feature = "layers")]
     {
@@ -1234,6 +1241,7 @@ impl LcdBackend for FimdLcd {
 
     #[cfg(feature = "layers")]
     fn layer_free(&self, n: usize) {
+        COMPOSED.fetch_and(!(1 << n), Ordering::Relaxed);
         layers::free(n);
     }
 
@@ -1249,6 +1257,9 @@ impl LcdBackend for FimdLcd {
 
     #[cfg(feature = "layers")]
     fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
+        if visible && COMPOSED.fetch_and(!(1 << n), Ordering::Relaxed) & 1 << n != 0 {
+            exynos_4412_rs::println!("ferrite: layer {} in its window again", n);
+        }
         layers::place(n, x, y, alpha, visible);
     }
 
@@ -1257,30 +1268,40 @@ impl LcdBackend for FimdLcd {
 
     #[cfg(feature = "layers")]
     fn layer_compose(&self, n: usize, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16, alpha: u8) {
+        if COMPOSED.fetch_or(1 << n, Ordering::Relaxed) & 1 << n == 0 {
+            exynos_4412_rs::println!("ferrite: layer {} composed into the screen", n);
+        }
         compose_layer(n, (sx as usize, sy as usize), (w as usize, h as usize), (dx as usize, dy as usize), alpha);
     }
 }
 
+/// Layers composed into the screen since they were last placed in their
+/// window (bit n), only for the console lines (as the sim prints them).
+#[cfg(feature = "layers")]
+static COMPOSED: AtomicU8 = AtomicU8::new(0);
+
 /// `LcdBackend::layer_compose`: blends `size` pixels of layer `n`'s shadow
 /// from `src` over the screen's shadow at `dst`, times plane alpha `alpha`.
-/// The G2D blends (as a sprite blit) when the plane alpha is 255; otherwise,
-/// or if it can't, the CPU.
+/// The G2D blends (as a sprite blit) when the plane alpha is 255, or below it
+/// once its global-alpha "over" has been checked ([`g2d_global_alpha_matches`]);
+/// otherwise, or if it can't, the CPU.
 #[cfg(feature = "layers")]
 fn compose_layer(n: usize, src: (usize, usize), size: (usize, usize), dst: (usize, usize), alpha: u8) {
     let t = target();
     let ((sx, sy), (w, h), (dx, dy)) = (src, size, dst);
-    if t.sprite || w == 0 || h == 0 || dx + w > t.w || dy + h > t.h {
+    // Plane alpha 0 leaves the screen as it is.
+    if t.sprite || w == 0 || h == 0 || alpha == 0 || dx + w > t.w || dy + h > t.h {
         return;
     }
     #[cfg(feature = "g2d_render")]
-    if alpha == 255
-        && g2d_draw_ready()
+    if g2d_draw_ready()
+        && (alpha == 255 || g2d_global_alpha_matches())
         && let Some((phys, _, lw, lh)) = layers::compose_source(n, Some((sx, sy, w, h)))
     {
         let layer = Surface { address: phys, stride: lw * 4, width: lw, height: lh, format: Format::Argb8888 };
         let ok = g2d_op("layer compose", w * h, |g| {
             let (from, to) = (g2d::Rect::new(sx, sy, w, h), g2d::Rect::new(dx, dy, w, h));
-            g.blend(&layer, from, Alpha::Premultiplied, &shadow_surface(), to, Filter::Nearest, 255)
+            g.blend(&layer, from, Alpha::Premultiplied, &shadow_surface(), to, Filter::Nearest, alpha)
         });
         if ok {
             mark(dx, dy, w, h);
@@ -1691,6 +1712,93 @@ fn g2d_over_matches() -> bool {
         );
     }
     G2D_OVER.store(if bad.is_none() { 1 } else { 2 }, Ordering::Relaxed);
+    bad.is_none()
+}
+
+/// 0 = not checked yet, 1 = a G2D premultiplied blend with a global alpha
+/// onto the XRGB8888 screen gives what [`compose_layer`]'s CPU loop gives
+/// (within [`OVER_TOLERANCE`]), 2 = it does not (plane alpha < 255 composed
+/// by the CPU).
+#[cfg(all(feature = "g2d_render", feature = "layers"))]
+static G2D_GA: AtomicU8 = AtomicU8::new(0);
+
+/// Whether the G2D's "over" with a global alpha Ga (the vendor kernel's
+/// `ga_coeff_table` SRC_OVER: Ga·Sc + (1 − Sa·Ga)·Dc, which `G2d::blend`
+/// programs register for register) matches the CPU's, onto an XRGB8888
+/// target like the screen's shadow. Checked once, on translucent, opaque and
+/// transparent pixels at several global alphas; the result goes to the
+/// console either way.
+#[cfg(all(feature = "g2d_render", feature = "layers"))]
+fn g2d_global_alpha_matches() -> bool {
+    match G2D_GA.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    if !g2d_draw_ready() {
+        return false;
+    }
+    #[repr(C, align(64))]
+    struct Lines<T>(T);
+    const N: usize = 32;
+    static mut SRC: Lines<[u32; N]> = Lines([0; N]);
+    static mut DST: Lines<[u32; N]> = Lines([0; N]);
+    // SAFETY: CPU0 only, never reentrant; the G2D is the only other user,
+    // inside `g2d_op` below.
+    let (src, dst) = unsafe { (&mut (*(&raw mut SRC)).0, &mut (*(&raw mut DST)).0) };
+    // Premultiplied source pixels: alpha `a`, colour channels at most `a`.
+    let pixel = |a: u32, k: u32| {
+        let c = |m: u32| (a * ((k * m) % 256)) / 255;
+        a << 24 | c(11) << 16 | c(97) << 8 | c(203)
+    };
+    // Opaque screen pixels, as the CPU writes them.
+    let screen = |k: u32| 0xFF00_0000 | ((k * 53) % 256) << 16 | ((k * 149) % 256) << 8 | ((k * 31) % 256);
+    let from = Surface { address: src.as_ptr() as usize, stride: N * 4, width: N, height: 1, format: Format::Argb8888 };
+    let to = Surface { address: dst.as_ptr() as usize, format: Format::Xrgb8888, ..from };
+    let mut bad = None;
+    for ga in [1u32, 64, 128, 200, 254] {
+        let mut want = [0u32; N];
+        for i in 0..N {
+            src[i] = pixel([0u32, 255, 128, 200, 37, 64][i % 6], i as u32 + 1);
+            dst[i] = screen(i as u32 + 7);
+            // `compose_layer`'s CPU loop, colour channels only.
+            let (s, d) = (src[i], dst[i]);
+            let sa = (s >> 24) * ga / 255;
+            want[i] = (0..3).fold(0, |acc, b| {
+                let sc = ((s >> (8 * b)) & 0xFF) * ga / 255;
+                acc | (sc + ((d >> (8 * b)) & 0xFF) * (255 - sa) / 255).min(255) << (8 * b)
+            });
+        }
+        mmu::clean_dcache_range(src.as_ptr() as usize, N * 4);
+        mmu::clean_dcache_range(dst.as_ptr() as usize, N * 4);
+        let ok = g2d_op("global alpha check", N, |g| {
+            g.blend(&from, g2d::Rect::all(&from), Alpha::Premultiplied, &to, g2d::Rect::all(&to), Filter::Nearest, ga as u8)
+        });
+        mmu::invalidate_dcache_range(dst.as_ptr() as usize, N * 4);
+        if !ok {
+            // The G2D failed outright (and is given up): no verdict to keep.
+            return false;
+        }
+        // SAFETY: read after the G2D's writes (the op waited for its end).
+        let got = |i: usize| unsafe { core::ptr::read_volatile(dst.as_ptr().add(i)) } & 0x00FF_FFFF;
+        let off = |a: u32, b: u32| (0..3).any(|k| ((a >> (8 * k)) & 0xFF).abs_diff((b >> (8 * k)) & 0xFF) > OVER_TOLERANCE);
+        if let Some(i) = (0..N).find(|&i| off(got(i), want[i])) {
+            bad = Some((ga, src[i], screen(i as u32 + 7), got(i), want[i]));
+            break;
+        }
+    }
+    match bad {
+        None => exynos_4412_rs::println!("ferrite: G2D global alpha matches: plane alpha < 255 composed by the G2D"),
+        Some((ga, s, d, got, want)) => exynos_4412_rs::println!(
+            "ferrite: G2D global alpha differs (ga {}, {:08x} over {:08x}: {:06x}, want {:06x}): plane alpha < 255 composed by the CPU",
+            ga,
+            s,
+            d,
+            got,
+            want
+        ),
+    }
+    G2D_GA.store(if bad.is_none() { 1 } else { 2 }, Ordering::Relaxed);
     bad.is_none()
 }
 

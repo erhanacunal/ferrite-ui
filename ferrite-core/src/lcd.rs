@@ -2,7 +2,7 @@
 /// Hardware backends implement this trait; the framework uses LcdImpl<B> for all drawing.
 use core::cell::Cell;
 
-use crate::types::{Offset, Rect, Size};
+use crate::types::{Offset, Rect};
 
 /// Anti-aliased variants of the shape primitives, used on blend-capable
 /// backends (`LcdBackend::HAS_ALPHA`).
@@ -387,7 +387,7 @@ impl<B: LcdBackend> LcdImpl<B> {
     /// signed), over the screen inside `r` (cut to the surface, the screen
     /// and the scissor). Screen targeted only.
     #[cfg(feature = "layers")]
-    pub fn layer_compose(&self, n: usize, at: Offset, size: Size, r: &Rect, alpha: u8) {
+    pub fn layer_compose(&self, n: usize, at: Offset, size: crate::types::Size, r: &Rect, alpha: u8) {
         if self.layers_alloc.get() & 1 << n == 0 || self.target.get().is_some() || alpha == 0 {
             return;
         }

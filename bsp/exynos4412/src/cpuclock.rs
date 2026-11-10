@@ -14,9 +14,12 @@
 //! CPU0 applies everything in `frame_end` ([`service`]): `vdd_arm` (PMIC BUCK2 on I2C0, which
 //! CPU0 owns) is raised before a faster clock and lowered after a slower one.
 //!
-//! **Idle sleep.** When the programs do not need the CPU (`Runtime::busy`), `ui_task` waits
-//! [`IDLE_SLEEP_US`] between passes instead of spinning ([`IDLE_SLEEP`], HTTP `POST
-//! /api/idle?sleep=0|1`): CPU0 sleeps in the executor meanwhile.
+//! **Idle sleep.** When the programs do not need the CPU (`Runtime::busy`), `ui_task` sleeps
+//! between passes instead of spinning ([`IDLE_SLEEP`], HTTP `POST /api/idle?sleep=0|1`): CPU0
+//! waits in the executor. [`IDLE_SLEEP_US`] while something needs passes (`Runtime::idle_ms`
+//! = 0: an animation, a touch down, a render or a present in flight); otherwise until the next
+//! `delay` ends, at most [`IDLE_MAX_MS`], or a touch (the controller's CHG interrupt,
+//! `touch::sleep_until_touch`), like SurfaceFlinger's vsync on demand.
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
@@ -48,8 +51,15 @@ const MAX_MHZ: u32 = 1400;
 
 /// Idle sleep on (default) or off.
 pub static IDLE_SLEEP: AtomicBool = AtomicBool::new(true);
-/// How long `ui_task` waits between idle passes.
+/// How long `ui_task` waits between idle passes while something needs passes
+/// (`Runtime::idle_ms` = 0: an animation, a touch down, a render or present in
+/// flight).
 pub const IDLE_SLEEP_US: u64 = 1000;
+/// The longest idle sleep when nothing time-based is pending (until a `delay`
+/// ends, else this): CPU0 also wakes for a touch (the controller's CHG
+/// interrupt), and polls its own work this often (power keys, UART and
+/// network messages from the other cores, the thermal reading).
+pub const IDLE_MAX_MS: u32 = 20;
 
 /// A rate asked for over HTTP (MHz), 0 = nothing pending.
 static REQUEST: AtomicU32 = AtomicU32::new(0);

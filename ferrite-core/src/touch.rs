@@ -129,6 +129,11 @@ impl<B: TouchBackend> TouchImpl<B> {
         }
     }
 
+    /// No touch is down or being released (nothing to track between polls).
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, TouchState::Idle)
+    }
+
     pub fn poll(&mut self) -> Option<TouchEvent> {
         if self.state == TouchState::Idle && !self.be.is_active() {
             return None;
