@@ -1842,8 +1842,7 @@ fn draw_widget_body<P: Platform>(
             match widget.kind {
                 KIND_PROGRESS | KIND_SLIDER => draw_value_fill(&ctx.lcd, widget, &inner, ext),
                 KIND_CHECKBOX | KIND_RADIO => draw_check_indicator(&ctx.lcd, widget, &inner, ext),
-                KIND_INPUT => draw_input_text(ctx, widget, abs, ext),
-                _ => draw_dropdown(ctx, widget, abs, ext),
+                _ => draw_field(ctx, widget, abs, ext),
             }
         }
         ctx.lcd.set_scissor(None);
@@ -2490,188 +2489,146 @@ pub(crate) fn input_first_line(font: &crate::font::Font, text: &[u8], cw: u16, c
     cur_line.unwrap_or(li.saturating_sub(1)).saturating_sub(rows - 1)
 }
 
-/// Draw input text with cursor in the content area.
-fn draw_input_text<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
-    let font = match ctx.fonts.resolve(ext.font_id) {
-        Some(f) => f,
-        None => return,
-    };
+/// What an input or dropdown draws over its box, in drawing order ([`field_contents`]).
+pub enum FieldItem<'a> {
+    /// `font.draw_str(line, x, y, text_color, bg)`: with `bg`, each glyph's cell is painted
+    /// opaquely (the coverage mixed with `bg`); without, the glyphs blend over what is there.
+    Text { font: &'a crate::font::Font, line: &'a [u8], x: i16, y: i16, bg: Option<Color> },
+    /// The cursor bar (`Rect`) or the dropdown's chevron (`Path`, 1 px).
+    Part(RoundPart),
+}
 
+/// Draws one [`RoundPart`] as its drawing issues it (any backend).
+fn draw_round_part<B: LcdBackend>(lcd: &LcdImpl<B>, p: RoundPart) {
+    match p {
+        RoundPart::Oval { x, y, w, h, t, color } => lcd.draw_oval(x, y, w, h, t, color),
+        RoundPart::Arc { cx, cy, r, ir, start, end, color } => lcd.fill_arc(cx, cy, r, ir, start, end, color),
+        RoundPart::Wedge { ax, ay, bx, by, ra_q8, rb_q8, color } => lcd.draw_wedge(ax, ay, bx, by, ra_q8, rb_q8, color),
+        RoundPart::Rect { x, y, w, h, color } => fill_rect_screen(lcd, Rect::new(x, y, w, h), color),
+        RoundPart::RoundRect { x, y, w, h, r, t: 0, color } => lcd.fill_rounded_rect_at(x, y, w, h, r, color, 255),
+        RoundPart::RoundRect { x, y, w, h, r, t, color } => lcd.stroke_rounded_rect(x, y, w, h, r, t, color),
+        RoundPart::Path { pts, n, t, color } => {
+            let pts = pts.map(|(x, y)| Offset { x, y });
+            lcd.draw_polyline(&pts[..n as usize], color, false, t);
+        }
+    }
+}
+
+/// Draw input text with cursor, or a dropdown's text and arrow, in the content area.
+fn draw_field<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
+    field_contents(ctx, widget, abs, ext, |item| match item {
+        FieldItem::Text { font, line, x, y, bg } => {
+            font.draw_str(&ctx.lcd, &ctx.flash, line, x, y, ext.text_color, bg);
+        }
+        FieldItem::Part(p) => draw_round_part(&ctx.lcd, p),
+    });
+}
+
+/// What an input (`KIND_INPUT`: its text, single or multi-line, and the cursor while focused
+/// and blinking on) or a dropdown (its text and disclosure arrow) draws over its box, in
+/// order. The drawing confines it to the box (scissor). Shared by `draw_widget` and renderers
+/// that draw it another way (exynos4412's GPU compositor).
+pub fn field_contents<'a, P: Platform>(
+    ctx: &'a Ctx<P>,
+    widget: &Widget,
+    abs: &Rect,
+    ext: &WidgetExt,
+    mut f: impl FnMut(FieldItem<'a>),
+) {
+    let Some(font) = ctx.fonts.resolve(ext.font_id) else { return };
     let b = ext.border;
     let p = ext.padding;
     let cx = abs.x + b.left as i16 + p.left as i16;
     let cy = abs.y + b.top as i16 + p.top as i16;
-    let cw = abs
-        .w
-        .saturating_sub(b.left as u16 + b.right as u16 + p.left as u16 + p.right as u16);
-    let ch = abs
-        .h
-        .saturating_sub(b.top as u16 + b.bottom as u16 + p.top as u16 + p.bottom as u16);
-
+    let cw = abs.w.saturating_sub(b.left as u16 + b.right as u16 + p.left as u16 + p.right as u16);
+    let ch = abs.h.saturating_sub(b.top as u16 + b.bottom as u16 + p.top as u16 + p.bottom as u16);
     if cw == 0 || ch == 0 {
         return;
     }
-
     let lh = font.line_height() as i16;
     let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
-
     let bg_color = effective_bg(&ctx.objs, widget, ext);
     let bg = if bg_color == 0 { None } else { Some(bg_color) };
+    let has_text = ext.text_id != crate::pool::PTR_NONE && ext.font_id != 0xFF;
+    let text: &'a [u8] = if has_text { ctx.objs.str_get(ext.text_id) } else { &[] };
 
-    if widget.flags & FLAG_MULTI_LINE != 0 {
-        draw_input_lines(ctx, widget, ext, font, cx, cy, cw, ch, bg);
+    if widget.kind == KIND_DROPDOWN {
+        let arrow_w: u16 = 18;
+        let text_w = cw.saturating_sub(arrow_w + 4);
+        // The selected text whatever `font_id` says (a missing font was handled above).
+        let text: &'a [u8] = if ext.text_id != crate::pool::PTR_NONE { ctx.objs.str_get(ext.text_id) } else { &[] };
+        if text_w > 0 && !text.is_empty() {
+            f(FieldItem::Text { font, line: text, x: cx, y: ty, bg });
+        }
+        if cw >= arrow_w && ch >= 8 {
+            let ax = cx + cw as i16 - arrow_w as i16 + 4;
+            let mid_y = cy + ch as i16 / 2;
+            let color = if ext.text_color != 0 { ext.text_color } else { 0xFFFF };
+            let d = if widget.flags & FLAG_CHECKED != 0 { -3 } else { 3 };
+            let pts = [(ax, mid_y - d), (ax + 5, mid_y + d), (ax + 10, mid_y - d)];
+            f(FieldItem::Part(RoundPart::Path { pts, n: 3, t: 1, color }));
+        }
         return;
     }
 
-    // Draw text if present
-    let has_text = ext.text_id != crate::pool::PTR_NONE && ext.font_id != 0xFF;
-    if has_text {
-        let text = ctx.objs.str_get(ext.text_id);
-        if !text.is_empty() {
-            font.draw_str(&ctx.lcd, &ctx.flash, text, cx, ty, ext.text_color, bg);
-        }
-    }
-
-    // Draw cursor when focused
-    if widget.flags & FLAG_FOCUSED != 0 && ctx.cursor_visible {
-        let cursor_pos = ext.value.max(0) as usize;
-        let mut cursor_x = cx;
-        if has_text {
-            let text = ctx.objs.str_get(ext.text_id);
-            let end = cursor_pos.min(text.len());
-            let mut byte_pos = 0;
-            while byte_pos < end {
-                if let Some(cp) = crate::font::utf8_next(text, &mut byte_pos) {
-                    if cp != 0xFFFF {
-                        cursor_x += font.char_width_cp(cp) as i16;
-                    }
-                } else {
+    let focused = widget.flags & FLAG_FOCUSED != 0 && ctx.cursor_visible;
+    if widget.flags & FLAG_MULTI_LINE != 0 {
+        // Word-wrapped lines from the top of the content box, scrolled to keep the cursor
+        // line visible, and the cursor.
+        let cursor = (ext.value.max(0) as usize).min(text.len());
+        let first = input_first_line(font, text, cw, ch, cursor);
+        let rows = (ch as i16 / lh.max(1)).max(1);
+        let mut li = 0usize;
+        let mut i = 0;
+        let mut cursor_done = false;
+        while i <= text.len() {
+            let (end, next) = font.wrap_line(text, i, cw);
+            if li >= first {
+                let row = (li - first) as i16;
+                if row >= rows {
                     break;
                 }
-            }
-        }
-        // Draw 2px wide cursor line
-        let cursor_y = cy + (ch as i16 - lh) / 2;
-        let cursor_h = lh as u16;
-        if cursor_x >= cx && cursor_x < cx + cw as i16 {
-            fill_rect_screen(
-                &ctx.lcd,
-                Rect::new(cursor_x, cursor_y, 2, cursor_h),
-                ext.text_color,
-            );
-        }
-    }
-}
-
-/// Multi-line input: word-wrapped lines from the top of the content box,
-/// scrolled to keep the cursor line visible, and the cursor.
-#[allow(clippy::too_many_arguments)]
-fn draw_input_lines<P: Platform>(
-    ctx: &Ctx<P>,
-    widget: &Widget,
-    ext: &WidgetExt,
-    font: &crate::font::Font,
-    cx: i16,
-    cy: i16,
-    cw: u16,
-    ch: u16,
-    bg: Option<Color>,
-) {
-    let lh = font.line_height() as i16;
-    let has_text = ext.text_id != crate::pool::PTR_NONE && ext.font_id != 0xFF;
-    let text: &[u8] = if has_text { ctx.objs.str_get(ext.text_id) } else { &[] };
-    let cursor = (ext.value.max(0) as usize).min(text.len());
-    let first = input_first_line(font, text, cw, ch, cursor);
-    let rows = (ch as i16 / lh.max(1)).max(1);
-    let focused = widget.flags & FLAG_FOCUSED != 0 && ctx.cursor_visible;
-
-    let mut li = 0usize;
-    let mut i = 0;
-    let mut cursor_done = false;
-    while i <= text.len() {
-        let (end, next) = font.wrap_line(text, i, cw);
-        if li >= first {
-            let row = (li - first) as i16;
-            if row >= rows {
-                break;
-            }
-            let ly = cy + row * lh;
-            let line = &text[i..end];
-            if !line.is_empty() {
-                font.draw_str(&ctx.lcd, &ctx.flash, line, cx, ly + (lh * 3) / 4, ext.text_color, bg);
-            }
-            if focused && !cursor_done && cursor >= i && cursor <= end {
-                cursor_done = true;
-                let x = cx + font.text_width(&text[i..cursor]) as i16;
-                if x < cx + cw as i16 {
-                    fill_rect_screen(&ctx.lcd, Rect::new(x, ly, 2, lh as u16), ext.text_color);
+                let ly = cy + row * lh;
+                let line = &text[i..end];
+                if !line.is_empty() {
+                    f(FieldItem::Text { font, line, x: cx, y: ly + (lh * 3) / 4, bg });
+                }
+                if focused && !cursor_done && cursor >= i && cursor <= end {
+                    cursor_done = true;
+                    let x = cx + font.text_width(&text[i..cursor]) as i16;
+                    if x < cx + cw as i16 {
+                        let color = ext.text_color;
+                        f(FieldItem::Part(RoundPart::Rect { x, y: ly, w: 2, h: lh as u16, color }));
+                    }
                 }
             }
+            li += 1;
+            i = next;
         }
-        li += 1;
-        i = next;
-    }
-}
-
-/// Draw dropdown selected text and the disclosure arrow in the content area.
-fn draw_dropdown<P: Platform>(ctx: &Ctx<P>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
-    let font = match ctx.fonts.resolve(ext.font_id) {
-        Some(f) => f,
-        None => return,
-    };
-
-    let b = ext.border;
-    let p = ext.padding;
-    let cx = abs.x + b.left as i16 + p.left as i16;
-    let cy = abs.y + b.top as i16 + p.top as i16;
-    let cw = abs
-        .w
-        .saturating_sub(b.left as u16 + b.right as u16 + p.left as u16 + p.right as u16);
-    let ch = abs
-        .h
-        .saturating_sub(b.top as u16 + b.bottom as u16 + p.top as u16 + p.bottom as u16);
-
-    if cw == 0 || ch == 0 {
         return;
     }
 
-    let arrow_w: u16 = 18;
-    let text_w = cw.saturating_sub(arrow_w + 4);
-    let lh = font.line_height() as i16;
-    let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
-    let bg_color = effective_bg(&ctx.objs, widget, ext);
-    let bg = if bg_color == 0 { None } else { Some(bg_color) };
-
-    if ext.text_id != crate::pool::PTR_NONE && text_w > 0 {
-        let text = ctx.objs.str_get(ext.text_id);
-        if !text.is_empty() {
-            font.draw_str(&ctx.lcd, &ctx.flash, text, cx, ty, ext.text_color, bg);
-        }
+    if !text.is_empty() {
+        f(FieldItem::Text { font, line: text, x: cx, y: ty, bg });
     }
-
-    if cw >= arrow_w && ch >= 8 {
-        let ax = cx + cw as i16 - arrow_w as i16 + 4;
-        let mid_y = cy + ch as i16 / 2;
-        let color = if ext.text_color != 0 {
-            ext.text_color
-        } else {
-            0xFFFF
-        };
-        let d = if widget.flags & FLAG_CHECKED != 0 { -3 } else { 3 };
-        if ctx.lcd.smooth() {
-            let chevron = [
-                Offset { x: ax, y: mid_y - d },
-                Offset { x: ax + 5, y: mid_y + d },
-                Offset { x: ax + 10, y: mid_y - d },
-            ];
-            ctx.lcd.draw_polyline(&chevron, color, false, 1);
-        } else {
-            ctx.lcd.draw_line(ax, mid_y - d, ax + 5, mid_y + d, color);
-            ctx.lcd.draw_line(ax + 5, mid_y + d, ax + 10, mid_y - d, color);
+    if focused {
+        let end = (ext.value.max(0) as usize).min(text.len());
+        let mut cursor_x = cx;
+        let mut byte_pos = 0;
+        while byte_pos < end {
+            match crate::font::utf8_next(text, &mut byte_pos) {
+                Some(cp) if cp != 0xFFFF => cursor_x += font.char_width_cp(cp) as i16,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        // A 2 px wide bar.
+        if cursor_x >= cx && cursor_x < cx + cw as i16 {
+            let y = cy + (ch as i16 - lh) / 2;
+            f(FieldItem::Part(RoundPart::Rect { x: cursor_x, y, w: 2, h: lh as u16, color: ext.text_color }));
         }
     }
 }
-
 /// Gauge layout inside the widget's inner rect: a 270° arc from 135°
 /// (bottom-left) to 45° (bottom-right), clockwise through the top, tick marks
 /// in a band just outside it, the needle inside it. Everything stays inside
@@ -3594,18 +3551,7 @@ mod tests {
     /// Draws `parts` with the primitives they name.
     fn draw_parts(lcd: &LcdImpl<Fb<true>>, parts: &[RoundPart]) {
         for p in parts {
-            match *p {
-                RoundPart::Oval { x, y, w, h, t, color } => lcd.draw_oval(x, y, w, h, t, color),
-                RoundPart::Arc { cx, cy, r, ir, start, end, color } => lcd.fill_arc(cx, cy, r, ir, start, end, color),
-                RoundPart::Wedge { ax, ay, bx, by, ra_q8, rb_q8, color } => lcd.draw_wedge(ax, ay, bx, by, ra_q8, rb_q8, color),
-                RoundPart::Rect { x, y, w, h, color } => fill_rect_screen(lcd, Rect::new(x, y, w, h), color),
-                RoundPart::RoundRect { x, y, w, h, r, t: 0, color } => lcd.fill_rounded_rect_at(x, y, w, h, r, color, 255),
-                RoundPart::RoundRect { x, y, w, h, r, t, color } => lcd.stroke_rounded_rect(x, y, w, h, r, t, color),
-                RoundPart::Path { pts, n, t, color } => {
-                    let pts = pts.map(|(x, y)| Offset { x, y });
-                    lcd.draw_polyline(&pts[..n as usize], color, false, t)
-                }
-            }
+            draw_round_part(lcd, *p);
         }
     }
 

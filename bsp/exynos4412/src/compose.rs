@@ -53,7 +53,7 @@ use ferrite_core::render::{self, RoundPart};
 use ferrite_core::types::{Color, Edges, Rect};
 use ferrite_core::widget::{
     FLAG_CLIP_CHILDREN, FLAG_HAS_ON_PAINT, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_IMAGE, KIND_LABEL,
-    KIND_CHECKBOX, KIND_CIRCLE, KIND_ELLIPSE, KIND_GAUGE, KIND_GRAPH, KIND_LINE, KIND_MODEL3D, KIND_POLYGON,
+    KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE, KIND_GRAPH, KIND_INPUT, KIND_LINE, KIND_MODEL3D, KIND_POLYGON,
     KIND_PROGRESS, KIND_RADIO, KIND_RECTANGLE, KIND_SLIDER, WidgetId,
 };
 
@@ -776,6 +776,11 @@ impl State {
                 // rects and rings, ovals, a tick, a line's wedge.
                 return Some(self.round(objs, id, abs));
             }
+            if matches!(w.kind, KIND_INPUT | KIND_DROPDOWN) && self.glyphs && objs.ext(id).image_id == 0 {
+                if let Some(opaque) = self.field(ctx, id, abs) {
+                    return Some(opaque);
+                }
+            }
             if w.kind == KIND_LABEL && self.glyphs && objs.ext(id).image_id == 0 {
                 if let Some(opaque) = self.label(ctx, id, abs) {
                     return Some(opaque);
@@ -1092,51 +1097,107 @@ impl State {
             }
         });
         for &p in parts.iter().flatten() {
-            match p {
-                RoundPart::Oval { x, y, w, h, t, color } => {
-                    let (a, b) = (w as f32 / 2.0, h as f32 / 2.0);
-                    let (cx, cy) = (x as f32 + a, y as f32 + b);
-                    // `smooth_oval`'s ring has a hole while its inner radii are over ½.
-                    let t = t as f32;
-                    let hole = (t > 0.0 && a - t > 0.5 && b - t > 0.5).then_some((a - t, b - t));
-                    self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::oval(m, cx, cy, a, b, hole, None));
-                }
-                RoundPart::Arc { cx, cy, r: rad, ir, start, end, color } => {
-                    let (fx, fy) = (cx as f32 + 0.5, cy as f32 + 0.5);
-                    let a = rad as f32 + 0.5;
-                    let hole = (ir > 1).then(|| (ir as f32 - 0.5, ir as f32 - 0.5));
-                    let arc = Some((start as f32, end as f32));
-                    self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::oval(m, fx, fy, a, a, hole, arc));
-                }
-                RoundPart::Wedge { ax, ay, bx, by, ra_q8, rb_q8, color } => {
-                    let (ra, rb) = (ra_q8.clamp(0, 150 << 8) as f32 / 256.0, rb_q8.clamp(0, 150 << 8) as f32 / 256.0);
-                    let (ax, ay, bx, by) = (ax as f32 + 0.5, ay as f32 + 0.5, bx as f32 + 0.5, by as f32 + 0.5);
-                    self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::wedge(m, ax, ay, bx, by, ra, rb));
-                }
-                RoundPart::Rect { x, y, w, h, color } => {
-                    let rect = R { x0: x as i32, y0: y as i32, x1: x as i32 + w as i32, y1: y as i32 + h as i32 };
-                    self.solid(rect.meet(&r), Lin::flat(rgb(color, 1.0)));
-                }
-                RoundPart::RoundRect { x, y, w, h, r: rad, t, color } => {
-                    let (x, y, w, h, rad, t) = (x as i32, y as i32, w as i32, h as i32, rad as i32, t as i32);
-                    let color = Lin::flat(rgb(color, 1.0));
-                    if t == 0 {
-                        self.tess_cached(p, color, r, |m| tess::rounded_fill(m, x, y, w, h, rad));
-                    } else {
-                        self.tess_cached(p, color, r, |m| tess::rounded_ring(m, x, y, w, h, rad, t));
-                    }
-                }
-                RoundPart::Path { pts, n, t, color } => {
-                    let mut f = [(0.0f32, 0.0f32); 3];
-                    for (q, &(px, py)) in f.iter_mut().zip(&pts[..n as usize]) {
-                        *q = (px as f32 + 0.5, py as f32 + 0.5);
-                    }
-                    let rad = t as f32 / 2.0;
-                    self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::outline(m, &f[..n as usize], rad, false));
-                }
-            }
+            self.part(p, r);
         }
         opaque
+    }
+
+    /// An input or a dropdown: its box, then what `render::field_contents` lists, cut to the
+    /// box: text as atlas glyph quads (each over a solid cell of the background when the CPU
+    /// paints glyph cells opaquely), the cursor bar and the chevron as parts. Its opaque rect;
+    /// None (nothing added) if a glyph doesn't fit in the atlas.
+    fn field(&mut self, ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> Option<Option<R>> {
+        let objs = &ctx.objs;
+        let w = objs.get(id);
+        let e = objs.ext(id);
+        let r = R::of(abs);
+        let (prims, tverts) = (self.prims.len(), self.tverts.len());
+        self.boxes(objs, id, &r);
+        let opaque = render::covers_opaquely(objs, id, abs, abs).then_some(r);
+        let color = Lin::flat(rgb(e.text_color, 1.0));
+        let tex = self.atlas.tex();
+        let a = ATLAS as f32;
+        let mut ok = true;
+        render::field_contents(ctx, w, abs, &e, |item| match item {
+            render::FieldItem::Text { font, line, x, y, bg } => {
+                font.for_each_glyph(line, x, y, |cp, g, gx, gy| {
+                    let (gx, gy) = (gx as i32, gy as i32);
+                    let at = R { x0: gx, y0: gy, x1: gx + g.width as i32, y1: gy + g.height as i32 };
+                    let shown = at.meet(&r);
+                    if !ok || shown.is_empty() {
+                        return;
+                    }
+                    let Some((sx, sy)) = self.atlas.slot(&ctx.flash, font, cp, g, &mut self.cov) else {
+                        ok = false;
+                        return;
+                    };
+                    if let Some(bg) = bg {
+                        self.solid(shown, Lin::flat(rgb(bg, 1.0)));
+                    }
+                    let u = ((sx as i32 - gx) as f32 / a, 1.0 / a);
+                    let v = ((sy as i32 - gy) as f32 / a, 1.0 / a);
+                    self.prims.push(Prim::Flat { rect: shown, u, v, color, tex });
+                });
+            }
+            render::FieldItem::Part(p) => {
+                if ok {
+                    self.part(p, r);
+                }
+            }
+        });
+        if !ok {
+            self.prims.truncate(prims);
+            self.tverts.truncate(tverts);
+            return None;
+        }
+        Some(opaque)
+    }
+
+    /// One part (`render::RoundPart`) as triangles or a solid, cut to `r`.
+    fn part(&mut self, p: RoundPart, r: R) {
+        match p {
+            RoundPart::Oval { x, y, w, h, t, color } => {
+                let (a, b) = (w as f32 / 2.0, h as f32 / 2.0);
+                let (cx, cy) = (x as f32 + a, y as f32 + b);
+                // `smooth_oval`'s ring has a hole while its inner radii are over ½.
+                let t = t as f32;
+                let hole = (t > 0.0 && a - t > 0.5 && b - t > 0.5).then_some((a - t, b - t));
+                self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::oval(m, cx, cy, a, b, hole, None));
+            }
+            RoundPart::Arc { cx, cy, r: rad, ir, start, end, color } => {
+                let (fx, fy) = (cx as f32 + 0.5, cy as f32 + 0.5);
+                let a = rad as f32 + 0.5;
+                let hole = (ir > 1).then(|| (ir as f32 - 0.5, ir as f32 - 0.5));
+                let arc = Some((start as f32, end as f32));
+                self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::oval(m, fx, fy, a, a, hole, arc));
+            }
+            RoundPart::Wedge { ax, ay, bx, by, ra_q8, rb_q8, color } => {
+                let (ra, rb) = (ra_q8.clamp(0, 150 << 8) as f32 / 256.0, rb_q8.clamp(0, 150 << 8) as f32 / 256.0);
+                let (ax, ay, bx, by) = (ax as f32 + 0.5, ay as f32 + 0.5, bx as f32 + 0.5, by as f32 + 0.5);
+                self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::wedge(m, ax, ay, bx, by, ra, rb));
+            }
+            RoundPart::Rect { x, y, w, h, color } => {
+                let rect = R { x0: x as i32, y0: y as i32, x1: x as i32 + w as i32, y1: y as i32 + h as i32 };
+                self.solid(rect.meet(&r), Lin::flat(rgb(color, 1.0)));
+            }
+            RoundPart::RoundRect { x, y, w, h, r: rad, t, color } => {
+                let (x, y, w, h, rad, t) = (x as i32, y as i32, w as i32, h as i32, rad as i32, t as i32);
+                let color = Lin::flat(rgb(color, 1.0));
+                if t == 0 {
+                    self.tess_cached(p, color, r, |m| tess::rounded_fill(m, x, y, w, h, rad));
+                } else {
+                    self.tess_cached(p, color, r, |m| tess::rounded_ring(m, x, y, w, h, rad, t));
+                }
+            }
+            RoundPart::Path { pts, n, t, color } => {
+                let mut f = [(0.0f32, 0.0f32); 3];
+                for (q, &(px, py)) in f.iter_mut().zip(&pts[..n as usize]) {
+                    *q = (px as f32 + 0.5, py as f32 + 0.5);
+                }
+                let rad = t as f32 / 2.0;
+                self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::outline(m, &f[..n as usize], rad, false));
+            }
+        }
     }
 
     /// A polygon shape (`render::polygon_shape`): its fill as a convex polygon with mitered
