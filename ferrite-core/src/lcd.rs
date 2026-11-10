@@ -7,6 +7,7 @@ use crate::types::{Offset, Rect};
 /// Anti-aliased variants of the shape primitives, used on blend-capable
 /// backends (`LcdBackend::HAS_ALPHA`).
 mod smooth;
+pub mod tess;
 
 /// Maximum vertices a polygon shape can hold (bounds the scanline-fill
 /// intersection buffer and the point parser; 16 × 4 B = 64 B of stack).

@@ -2131,6 +2131,21 @@ fn draw_label_text<P: Platform>(
     ext: &WidgetExt,
     bg: Option<Color>,
 ) {
+    label_lines(ctx, widget, abs, ext, |font, line, x, y| {
+        font.draw_str(&ctx.lcd, &ctx.flash, line, x, y, ext.text_color, bg);
+    });
+}
+
+/// A label's text as its drawing lays it out: `f(font, line, pen x, baseline y)` for each
+/// line drawn (one unless multi-line). The glyphs are drawn clipped to the label's box.
+/// Public for board renderers that draw text their own way (exynos4412's GPU compositor).
+pub fn label_lines<P: Platform>(
+    ctx: &Ctx<P>,
+    widget: &Widget,
+    abs: &Rect,
+    ext: &WidgetExt,
+    mut f: impl FnMut(&crate::font::Font, &[u8], i16, i16),
+) {
     if ext.text_id == crate::pool::PTR_NONE || ext.font_id == 0xFF {
         return;
     }
@@ -2188,7 +2203,7 @@ fn draw_label_text<P: Platform>(
                     ALIGN_RIGHT => cx + cw as i16 - lw,
                     _ => cx,
                 };
-                font.draw_str(&ctx.lcd, &ctx.flash, line, lx, ly + (lh * 3) / 4, ext.text_color, bg);
+                f(font, line, lx, ly + (lh * 3) / 4);
             }
             li += 1;
             i = next;
@@ -2202,7 +2217,7 @@ fn draw_label_text<P: Platform>(
             _ => cx,
         };
         let ty = cy + (ch as i16 - lh) / 2 + (lh * 3) / 4;
-        font.draw_str(&ctx.lcd, &ctx.flash, text, tx, ty, ext.text_color, bg);
+        f(font, text, tx, ty);
     }
 }
 
@@ -2674,6 +2689,41 @@ fn draw_graph<B: LcdBackend>(
     inner: &Rect,
     ext: &WidgetExt,
 ) {
+    let style = graph_style(inner, ext);
+    // One path for the whole curve: anti-aliased segments share pixels
+    // instead of drawing them twice.
+    let mut pen = lcd.pen(style.line, 1);
+    let mut prev: Option<(i16, i16)> = None;
+    graph_points(objs, inner, ext, |x, y| {
+        if let (Some((px, py)), Some(fill)) = (prev, style.fill) {
+            fill_under_segment(lcd, px, py, x, y, style.baseline, fill);
+        }
+        pen.to(x, y);
+        prev = Some((x, y));
+    });
+}
+
+/// How a graph draws its curve: line colour, the fill under it (if any), down to `baseline`
+/// (the inner rect's last row).
+pub struct GraphStyle {
+    pub line: Color,
+    pub fill: Option<Color>,
+    pub baseline: i16,
+}
+
+/// The style of graph `ext` in `inner` (see [`graph_points`]).
+pub fn graph_style(inner: &Rect, ext: &WidgetExt) -> GraphStyle {
+    let line = if ext.text_color != 0 && ext.text_color != 0xFFFF { ext.text_color } else { 0xFFFF };
+    let fill = (ext.image_id & GRAPH_FLAG_FILL != 0 && ext.gradient_color != 0).then_some(ext.gradient_color);
+    GraphStyle { line, fill, baseline: inner.y + inner.h as i16 - 1 }
+}
+
+/// The points of graph `ext`'s curve in `inner`, in order: `f(x, y)` for each, as the
+/// drawing strokes them (a 1 px anti-aliased line through them, and with a fill each segment
+/// `(x0, y0) → (x1, y1)` filled as `fill_under_segment` does). Nothing if there are fewer than
+/// two samples or the rect is too small. Public for board renderers that draw graphs their
+/// own way (exynos4412's GPU compositor).
+pub fn graph_points(objs: &ObjPool, inner: &Rect, ext: &WidgetExt, mut f: impl FnMut(i16, i16)) {
     if inner.is_empty() || inner.w < 2 || inner.h < 2 {
         return;
     }
@@ -2738,33 +2788,12 @@ fn draw_graph<B: LcdBackend>(
         samples[idx]
     };
 
-    let line_color = if ext.text_color != 0 && ext.text_color != 0xFFFF {
-        ext.text_color
-    } else {
-        0xFFFF
-    };
-    let flags = ext.image_id;
-    let linear = flags & GRAPH_FLAG_LINEAR != 0;
-    let do_fill = flags & GRAPH_FLAG_FILL != 0 && ext.gradient_color != 0;
-    let baseline_y = (inner_y0 + inner_h) as i16;
-
-    let mut prev_x = plot_x(0) as i16;
-    let mut prev_y = plot_y(samples[0]) as i16;
-    // One path for the whole curve: anti-aliased segments share pixels
-    // instead of drawing them twice.
-    let mut pen = lcd.pen(line_color, 1);
-    pen.to(prev_x, prev_y);
+    let linear = ext.image_id & GRAPH_FLAG_LINEAR != 0;
+    f(plot_x(0) as i16, plot_y(samples[0]) as i16);
 
     if linear {
         for i in 1..count {
-            let cx = plot_x(i) as i16;
-            let cy = plot_y(samples[i]) as i16;
-            if do_fill {
-                fill_under_segment(lcd, prev_x, prev_y, cx, cy, baseline_y, ext.gradient_color);
-            }
-            pen.to(cx, cy);
-            prev_x = cx;
-            prev_y = cy;
+            f(plot_x(i) as i16, plot_y(samples[i]) as i16);
         }
         return;
     }
@@ -2793,13 +2822,7 @@ fn draw_graph<B: LcdBackend>(
                 + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
                 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3;
             let cy = ((two_pt / 2) >> 8) as i16;
-            let cx = (x1 + s) as i16;
-            if do_fill {
-                fill_under_segment(lcd, prev_x, prev_y, cx, cy, baseline_y, ext.gradient_color);
-            }
-            pen.to(cx, cy);
-            prev_x = cx;
-            prev_y = cy;
+            f((x1 + s) as i16, cy);
         }
     }
 }

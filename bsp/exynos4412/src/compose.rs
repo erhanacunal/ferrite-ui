@@ -8,9 +8,11 @@
 //! widget moving over a translucent one costs nothing more than drawing both.
 //!
 //! **What draws what.** A widget becomes a list of pieces ([`Prim`]):
-//! - its box (background, gradient, translucency, border, rounded corners) from the
-//!   `ui_round` shader: nine pieces when rounded (corners anti-aliased from the rounded box's
-//!   distance), else the border strips and the inside, as `draw_widget` lays them out;
+//! - its box (background, gradient, translucency, border, rounded corners): solid pieces, and
+//!   when rounded anti-aliased triangles (`ferrite_core::lcd::tess`, coverage per vertex;
+//!   [`TESS`] off: the `ui_round` shader's corner squares), as `draw_widget` lays them out;
+//! - a label's text (without a picture): one quad per glyph from the glyph atlas ([`Atlas`],
+//!   white × coverage, times the text colour), laid out by `render::label_lines`;
 //! - a raw opaque RGB565 picture (a background image, an image widget's picture) sampled where
 //!   it is in the flash shadow (`ui_flat`);
 //! - a 3D model widget: its buffer (`model3d::texture`);
@@ -37,12 +39,13 @@ use alloc::vec::Vec;
 use exynos_4412_rs::drivers::mali::Filter;
 use exynos_4412_rs::gpu::{self, Area, Blend, Frame, Gpu, Target};
 use ferrite_core::ctx::Ctx;
+use ferrite_core::lcd::tess;
 use ferrite_core::pool::ObjPool;
 use ferrite_core::render;
 use ferrite_core::types::{Color, Edges, Rect};
 use ferrite_core::widget::{
     FLAG_CLIP_CHILDREN, FLAG_HAS_ON_PAINT, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_IMAGE, KIND_LABEL,
-    KIND_MODEL3D, KIND_RECTANGLE, WidgetId,
+    KIND_GRAPH, KIND_MODEL3D, KIND_RECTANGLE, WidgetId,
 };
 
 use crate::gpu::Ui;
@@ -169,12 +172,17 @@ enum Prim {
     /// `ui_flat`: `tex` over `rect`, texel coordinates `u.0 + u.1 * x` (and v likewise),
     /// times `color` (solid colours: the white texel times it).
     Flat { rect: R, u: (f32, f32), v: (f32, f32), color: Lin, tex: Tex },
+    /// `ui_flat` with the white texel: triangles `start..start + len` of `State::tverts`
+    /// (`ferrite_core::lcd::tess`, coverage per vertex) inside `bbox`, times `color`. Not cut
+    /// to a frame: the GPU clips them to it.
+    Tris { bbox: R, start: u32, len: u32, color: Lin, white: usize },
 }
 
 impl Prim {
     fn rect(&self) -> R {
         match *self {
             Prim::Round { rect, .. } | Prim::Flat { rect, .. } => rect,
+            Prim::Tris { bbox, .. } => bbox,
         }
     }
 
@@ -182,6 +190,7 @@ impl Prim {
         match *self {
             Prim::Round { .. } => Batch::Round,
             Prim::Flat { tex, .. } => Batch::Flat(tex),
+            Prim::Tris { white, .. } => Batch::Flat(Tex { addr: white, w: 1, h: 1, stride: 64, fmt: Fmt::Argb }),
         }
     }
 }
@@ -211,6 +220,19 @@ struct State {
     border: Vec<[f32; 4]>,
     uv: Vec<[f32; 2]>,
     color: Vec<[f32; 4]>,
+    /// Anti-aliased triangles of this render's `Prim::Tris` (`tess`), and the tessellator's
+    /// chunks of the shape being added.
+    tverts: Vec<tess::Vtx>,
+    tchunks: Vec<tess::Chunk>,
+    /// Glyphs of labels, for `ui_flat` text.
+    atlas: Atlas,
+    /// One glyph's coverage while it is put in the atlas.
+    cov: Vec<u8>,
+    /// This render draws label text from the atlas ([`GLYPHS`] on, the atlas allocated).
+    glyphs: bool,
+    /// A graph's curve points, and triangles cut to a box (`tess_in`), kept for their room.
+    gpts: Vec<(i32, i32)>,
+    cov_tris: Vec<tess::Vtx>,
     /// A GPU error was printed: only the first is.
     told: bool,
     /// One opaque white texel (heap, 64-byte aligned, cleaned): solid pieces are `ui_flat`
@@ -229,9 +251,114 @@ static mut STATE: State = State {
     border: Vec::new(),
     uv: Vec::new(),
     color: Vec::new(),
+    tverts: Vec::new(),
+    tchunks: Vec::new(),
+    atlas: Atlas::new(),
+    cov: Vec::new(),
+    glyphs: false,
+    gpts: Vec::new(),
+    cov_tris: Vec::new(),
     told: false,
     white: 0,
 };
+
+/// Side of the glyph atlas in texels (ARGB8888: 4 MB). The GPU's mediump texture
+/// coordinates were checked exact across 1280 texels (`gpu.rs` self-test).
+const ATLAS: usize = 1024;
+
+/// Label glyphs as premultiplied white × coverage (ARGB8888), packed in rows: a glyph is put
+/// in the first time a render shows it and stays until the atlas is full; then it is emptied
+/// at the start of the next render (the frames are synchronous: nothing samples it then). A
+/// label whose glyph doesn't fit is drawn from a sprite meanwhile.
+struct Atlas {
+    /// Heap, 64-byte aligned, `ATLAS`² texels; 0 = not allocated yet, 1 = no memory.
+    addr: usize,
+    /// (font, codepoint) key → the glyph's top left in the atlas.
+    slots: alloc::collections::BTreeMap<u64, (u16, u16)>,
+    /// Where the next glyph goes: the current row's top and next free column, its height.
+    x: u16,
+    y: u16,
+    row_h: u16,
+    full: bool,
+}
+
+impl Atlas {
+    const fn new() -> Self {
+        Self { addr: 0, slots: alloc::collections::BTreeMap::new(), x: 0, y: 0, row_h: 0, full: false }
+    }
+
+    fn tex(&self) -> Tex {
+        Tex { addr: self.addr, w: ATLAS, h: ATLAS, stride: ATLAS * 4, fmt: Fmt::Argb }
+    }
+
+    /// Ready for a render: allocated (false if there is no memory), emptied if it filled up.
+    fn begin(&mut self) -> bool {
+        if self.addr == 0 {
+            let layout = core::alloc::Layout::from_size_align(ATLAS * ATLAS * 4, 64).unwrap();
+            // SAFETY: a non-zero size; the block is kept for good.
+            let p = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            self.addr = if p.is_null() { 1 } else { p as usize };
+            if !p.is_null() {
+                exynos_4412_rs::mmu::clean_dcache_range(self.addr, ATLAS * ATLAS * 4);
+            }
+        }
+        if self.addr == 1 {
+            return false;
+        }
+        if self.full {
+            self.slots.clear();
+            (self.x, self.y, self.row_h, self.full) = (0, 0, 0, false);
+        }
+        true
+    }
+
+    /// Glyph `g` of `font` (codepoint `cp`) in the atlas: its top left. None if it doesn't fit.
+    fn slot(
+        &mut self,
+        flash: &ferrite_core::flash::FlashImpl<<P as ferrite_core::platform::Platform>::FlashB>,
+        font: &ferrite_core::font::Font,
+        cp: u16,
+        g: &ferrite_core::font::GfxGlyph,
+        cov: &mut Vec<u8>,
+    ) -> Option<(u16, u16)> {
+        let key = (font.bitmap_addr() as u64) << 32 | (font.bpp as u64) << 24 | (font.font_id as u64) << 16 | cp as u64;
+        if let Some(&at) = self.slots.get(&key) {
+            return Some(at);
+        }
+        if self.full {
+            return None;
+        }
+        // One texel apart (none would be sampled across with exact coordinates; a margin
+        // costs nothing).
+        let (w, h) = (g.width as u16 + 1, g.height as u16 + 1);
+        if self.x + w > ATLAS as u16 {
+            (self.x, self.y, self.row_h) = (0, self.y + self.row_h, 0);
+        }
+        if self.y + h > ATLAS as u16 || w > ATLAS as u16 {
+            self.full = true;
+            return None;
+        }
+        let at = (self.x, self.y);
+        self.x += w;
+        self.row_h = self.row_h.max(h);
+        let n = g.width as usize * g.height as usize;
+        cov.clear();
+        cov.resize(n, 0);
+        font.glyph_coverage(flash, g, cov);
+        let gw = g.width as usize;
+        for row in 0..g.height as usize {
+            let line = self.addr + ((at.1 as usize + row) * ATLAS + at.0 as usize) * 4;
+            // SAFETY: inside the atlas block (the glyph fits where it is put).
+            let px = unsafe { core::slice::from_raw_parts_mut(line as *mut u32, gw) };
+            for (p, &c) in px.iter_mut().zip(&cov[row * gw..(row + 1) * gw]) {
+                *p = c as u32 * 0x0101_0101;
+            }
+            exynos_4412_rs::mmu::clean_dcache_range(line, gw * 4);
+        }
+        self.slots.insert(key, at);
+        Some(at)
+    }
+}
 
 fn state() -> &'static mut State {
     // SAFETY: CPU0 only, from the render pass, never reentrantly.
@@ -243,6 +370,19 @@ fn state() -> &'static mut State {
 /// ~0.3 ms fixed cost per GPU frame). HTTP `POST /api/compose?on=1|0` switches it, for A/B
 /// runs and screenshots of the same scene both ways.
 pub static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Rounded boxes as anti-aliased triangles (`ferrite_core::lcd::tess`: coverage per vertex,
+/// `ui_flat` two instructions a pixel) rather than `ui_round` corner squares (the shader
+/// works the coverage out per pixel, ~a dozen instructions). On by default; HTTP
+/// `POST /api/compose?tess=0|1` switches it for A/B runs.
+pub static TESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Label text as glyph quads from the atlas ([`Atlas`]) rather than a sprite of the whole
+/// label (drawn by the CPU, and again whenever the text changes). On by default; HTTP
+/// `POST /api/compose?glyphs=0|1` switches it for A/B runs.
+pub static GLYPHS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Graphs as solid fill columns + a tessellated polyline rather than a sprite (drawn by the
+/// CPU whenever a sample changes: ~5 ms a second for the tablet's perf card). On by default;
+/// HTTP `POST /api/compose?graphs=0|1` switches it for A/B runs.
+pub static GRAPHS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 /// [`ENABLED`] changed: the whole screen is repainted the new way ([`service`]).
 pub static REPAINT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -265,7 +405,25 @@ pub static COUNTS: [core::sync::atomic::AtomicU32; 9] = [const { core::sync::ato
 /// [`TIMES`]' slots. GPU frames, their draws, pieces and pixels; the HAL's GP / PP / whole-frame
 /// times (resets and L2 clear included in the last); CPU time building and running the frames,
 /// and in whole `compose` calls (gathering the pieces and drawing sprites included).
-pub const TIME_NAMES: [&str; 9] = ["frames", "draws", "pieces", "kpx", "gp_us", "pp_us", "frame_hw_us", "frame_us", "compose_us"];
+/// Then: the pieces' gathering (`collect`, sprites included); sprites drawn by the CPU (cache
+/// misses and this-render-only ones) and their time; the slowest such sprite's time and its
+/// widget kind (`*_max`: the largest seen since boot).
+pub const TIME_NAMES: [&str; 14] = [
+    "frames",
+    "draws",
+    "pieces",
+    "kpx",
+    "gp_us",
+    "pp_us",
+    "frame_hw_us",
+    "frame_us",
+    "compose_us",
+    "collect_us",
+    "sprites",
+    "sprite_us",
+    "sprite_max_us",
+    "sprite_max_kind",
+];
 const T_FRAMES: usize = 0;
 const T_DRAWS: usize = 1;
 const T_PIECES: usize = 2;
@@ -275,7 +433,23 @@ const T_PP: usize = 5;
 const T_HW: usize = 6;
 const T_FRAME: usize = 7;
 const T_COMPOSE: usize = 8;
-pub static TIMES: [core::sync::atomic::AtomicU64; 9] = [const { core::sync::atomic::AtomicU64::new(0) }; 9];
+const T_COLLECT: usize = 9;
+const T_SPRITES: usize = 10;
+const T_SPRITE_US: usize = 11;
+const T_SPRITE_MAX: usize = 12;
+const T_SPRITE_MAX_KIND: usize = 13;
+pub static TIMES: [core::sync::atomic::AtomicU64; 14] = [const { core::sync::atomic::AtomicU64::new(0) }; 14];
+
+/// A sprite of a widget of `kind` took `us` to draw.
+fn sprite_time(kind: u8, us: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    add_time(T_SPRITES, 1);
+    add_time(T_SPRITE_US, us);
+    if us > TIMES[T_SPRITE_MAX].load(Relaxed) {
+        TIMES[T_SPRITE_MAX].store(us, Relaxed);
+        TIMES[T_SPRITE_MAX_KIND].store(kind as u64, Relaxed);
+    }
+}
 
 fn add_time(slot: usize, n: u64) {
     TIMES[slot].fetch_add(n, core::sync::atomic::Ordering::Relaxed);
@@ -327,7 +501,11 @@ pub fn compose(ctx: &Ctx<P>, areas: &[Rect]) -> bool {
     s.prims.clear();
     s.items.clear();
     s.scratch.clear();
-    let result = match s.collect(ctx, &ui, gpu, areas) {
+    s.tverts.clear();
+    s.glyphs = GLYPHS.load(core::sync::atomic::Ordering::Relaxed) && s.atlas.begin();
+    let collected = s.collect(ctx, &ui, gpu, areas);
+    add_time(T_COLLECT, now_us() - t0);
+    let result = match collected {
         Err(slot) => slot,
         Ok(()) if s.draw(&ui, gpu, areas) => TAKEN,
         Ok(()) => GPU_ERROR,
@@ -400,6 +578,14 @@ impl State {
             if is_empty_label(objs, id) {
                 return Some(None);
             }
+            if w.kind == KIND_GRAPH && GRAPHS.load(core::sync::atomic::Ordering::Relaxed) {
+                return Some(self.graph(objs, id, abs));
+            }
+            if w.kind == KIND_LABEL && self.glyphs && objs.ext(id).image_id == 0 {
+                if let Some(opaque) = self.label(ctx, id, abs) {
+                    return Some(opaque);
+                }
+            }
             return self.sprite(ctx, id, abs, keep_after).map(|_| None);
         }
         let e = objs.ext(id);
@@ -451,6 +637,48 @@ impl State {
         Some(opaque)
     }
 
+    /// A label without a picture: its box, then a quad per glyph from the atlas, laid out as
+    /// `render::label_lines` lays the text out, cut to the box (as the drawing's scissor), in
+    /// the text colour times the glyph's coverage. Its opaque rect; None (nothing added) if a
+    /// glyph doesn't fit in the atlas.
+    fn label(&mut self, ctx: &Ctx<P>, id: WidgetId, abs: &Rect) -> Option<Option<R>> {
+        let objs = &ctx.objs;
+        let w = objs.get(id);
+        let e = objs.ext(id);
+        let r = R::of(abs);
+        let (prims, tverts) = (self.prims.len(), self.tverts.len());
+        self.boxes(objs, id, &r);
+        let opaque = render::covers_opaquely(objs, id, abs, abs).then_some(r);
+        let color = Lin::flat(rgb(e.text_color, 1.0));
+        let tex = self.atlas.tex();
+        let a = ATLAS as f32;
+        let mut ok = true;
+        render::label_lines(ctx, w, abs, &e, |font, line, x, y| {
+            font.for_each_glyph(line, x, y, |cp, g, gx, gy| {
+                let (gx, gy) = (gx as i32, gy as i32);
+                let at = R { x0: gx, y0: gy, x1: gx + g.width as i32, y1: gy + g.height as i32 };
+                let shown = at.meet(&r);
+                if !ok || shown.is_empty() {
+                    return;
+                }
+                let Some((sx, sy)) = self.atlas.slot(&ctx.flash, font, cp, g, &mut self.cov) else {
+                    ok = false;
+                    return;
+                };
+                // Screen x shows texel sx + (x - gx), y likewise.
+                let u = ((sx as i32 - gx) as f32 / a, 1.0 / a);
+                let v = ((sy as i32 - gy) as f32 / a, 1.0 / a);
+                self.prims.push(Prim::Flat { rect: shown, u, v, color, tex });
+            });
+        });
+        if !ok {
+            self.prims.truncate(prims);
+            self.tverts.truncate(tverts);
+            return None;
+        }
+        Some(opaque)
+    }
+
     /// The widget's box as `draw_widget` paints it: border and background.
     fn boxes(&mut self, objs: &ObjPool, id: WidgetId, r: &R) {
         let w = objs.get(id);
@@ -474,6 +702,19 @@ impl State {
                 Lin::flat(rgb(bg, alpha))
             };
             let border = if bw > 0 { rgb(w.border_color, 1.0) } else { [0.0; 4] };
+            if TESS.load(core::sync::atomic::Ordering::Relaxed) {
+                // As `draw_widget`: the fill (inset half the border, its radius as much
+                // smaller), then the border ring over it.
+                if draw_bg {
+                    let rad = (e.border_radius as i32 - inset).max(0);
+                    self.tess(fill, |m| tess::rounded_fill(m, g.x0, g.y0, g.w(), g.h(), rad));
+                }
+                if bw > 0 {
+                    let rad = e.border_radius as i32;
+                    self.tess(Lin::flat(border), |m| tess::rounded_ring(m, r.x0, r.y0, r.w(), r.h(), rad, bw));
+                }
+                return;
+            }
             self.rounded(r, e.border_radius as i32, bw, fill, border);
             return;
         }
@@ -506,6 +747,101 @@ impl State {
         if !rect.is_empty() {
             self.prims.push(solid_prim(rect, fill, self.white));
         }
+    }
+
+    /// A shape from the tessellator (`f` adds it), in `color`: one `Prim::Tris` a chunk, so
+    /// a frame takes only the chunks that meet it.
+    fn tess(&mut self, color: Lin, f: impl FnOnce(&mut tess::Mesh<'_>)) {
+        self.tess_in(color, None, f);
+    }
+
+    /// [`tess`](Self::tess), cut to `clip` (as the drawing's scissor would): a chunk reaching
+    /// past it is replaced by its clipped triangles (`tess::clip`).
+    fn tess_in(&mut self, color: Lin, clip: Option<R>, f: impl FnOnce(&mut tess::Mesh<'_>)) {
+        self.tchunks.clear();
+        f(&mut tess::Mesh { verts: &mut self.tverts, chunks: &mut self.tchunks });
+        for i in 0..self.tchunks.len() {
+            let c = self.tchunks[i];
+            let mut bbox = R { x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1 };
+            let (mut start, mut len) = (c.start, c.len);
+            if let Some(k) = clip {
+                if !k.contains(&bbox) {
+                    if !k.meets(&bbox) {
+                        continue;
+                    }
+                    // The cut triangles go after everything; they refer only to themselves.
+                    let at = self.tverts.len();
+                    let mut cut = core::mem::take(&mut self.cov_tris);
+                    cut.clear();
+                    tess::clip(&self.tverts[start..start + len], k.x0 as f32, k.y0 as f32, k.x1 as f32, k.y1 as f32, &mut cut);
+                    self.tverts.extend_from_slice(&cut);
+                    self.cov_tris = cut;
+                    (start, len) = (at, self.tverts.len() - at);
+                    bbox = bbox.meet(&k);
+                    if len == 0 {
+                        continue;
+                    }
+                }
+            }
+            self.prims.push(Prim::Tris { bbox, start: start as u32, len: len as u32, color, white: self.white });
+        }
+    }
+
+    /// A graph (`render::draw_graph`): its box, the fill under the curve as solid columns
+    /// (`fill_under_segment`'s, runs of equal ones merged), then the curve as a 1 px
+    /// anti-aliased polyline (`tess::polyline`), both cut to the box. The CPU interleaves fill
+    /// and line per segment; here the line goes over all of the fill. Its opaque rect.
+    fn graph(&mut self, objs: &ObjPool, id: WidgetId, abs: &Rect) -> Option<R> {
+        let e = objs.ext(id);
+        let r = R::of(abs);
+        self.boxes(objs, id, &r);
+        let opaque = render::covers_opaquely(objs, id, abs, abs).then_some(r);
+        let inner = render::inner_rect(abs, &e.border);
+        let style = render::graph_style(&inner, &e);
+        let mut pts = core::mem::take(&mut self.gpts);
+        pts.clear();
+        render::graph_points(objs, &inner, &e, |x, y| pts.push((x as i32, y as i32)));
+        if let Some(fill) = style.fill {
+            let fill = Lin::flat(rgb(fill, 1.0));
+            let base = style.baseline as i32;
+            // The column at x from `fill_under_segment`: rows top..bottom.
+            let mut run: Option<(i32, i32, i32, i32)> = None; // x0, x1, top, bottom
+            let mut column = |this: &mut Self, x: i32, y: i32| {
+                let (top, bot) = (y.min(base), y.max(base));
+                if bot <= top {
+                    return;
+                }
+                match run {
+                    Some((x0, x1, t, b)) if x1 == x && t == top && b == bot => run = Some((x0, x + 1, t, b)),
+                    _ => {
+                        if let Some((x0, x1, t, b)) = run {
+                            this.solid(R { x0, y0: t, x1, y1: b }.meet(&r), fill);
+                        }
+                        run = Some((x, x + 1, top, bot));
+                    }
+                }
+            };
+            for w in pts.windows(2) {
+                let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+                if x1 == x0 {
+                    column(self, x0, y0);
+                    continue;
+                }
+                let (dx, dy) = (x1 - x0, y1 - y0);
+                let step = if dx > 0 { 1 } else { -1 };
+                let mut x = x0;
+                while x != x1 {
+                    column(self, x, y0 + dy * (x - x0) / dx);
+                    x += step;
+                }
+            }
+            if let Some((x0, x1, t, b)) = run {
+                self.solid(R { x0, y0: t, x1, y1: b }.meet(&r), fill);
+            }
+        }
+        self.tess_in(Lin::flat(rgb(style.line, 1.0)), Some(r), |m| tess::polyline(m, &pts));
+        self.gpts = pts;
+        opaque
     }
 
     /// A rounded box: nine pieces, the corners `k` square (the radius, or the border if wider,
@@ -572,7 +908,12 @@ impl State {
             let key = renderer::appearance(ctx, id, abs);
             found = match cache.find(key) {
                 Some(at) => Some(at),
-                None if cache.seen(key) => cache.insert(ctx, id, abs, key, Some(keep_after)),
+                None if cache.seen(key) => {
+                    let t = now_us();
+                    let at = cache.insert(ctx, id, abs, key, Some(keep_after));
+                    sprite_time(kind, now_us() - t);
+                    at
+                }
                 None => None,
             };
         }
@@ -582,7 +923,9 @@ impl State {
                 (s.pixels() as usize, s.w, s.h, s.stride)
             }
             None => {
+                let t = now_us();
                 let s = Sprite::draw(ctx, id, abs, 0)?;
+                sprite_time(kind, now_us() - t);
                 let got = (s.pixels() as usize, s.w, s.h, s.stride);
                 self.scratch.push(s);
                 got
@@ -680,8 +1023,20 @@ impl State {
         shown.map(|_| ())
     }
 
-    /// Two triangles of `p` over `rect` (inside the frame `c`) into the batch's vertices.
+    /// Two triangles of `p` over `rect` (inside the frame `c`) into the batch's vertices; a
+    /// `Prim::Tris` whole (the GPU clips it to the frame).
     fn push(&mut self, p: &Prim, rect: &R, c: &R) {
+        if let Prim::Tris { start, len, color, .. } = *p {
+            let (start, len) = (start as usize, len as usize);
+            let (ox, oy) = (c.x0 as f32, c.y0 as f32);
+            for v in &self.tverts[start..start + len] {
+                self.pos.push([v.x - ox, v.y - oy]);
+                self.uv.push([0.5, 0.5]);
+                let k = color.at(v.x, v.y);
+                self.color.push([k[0] * v.a, k[1] * v.a, k[2] * v.a, k[3] * v.a]);
+            }
+            return;
+        }
         let corners = [(rect.x0, rect.y0), (rect.x1, rect.y0), (rect.x0, rect.y1), (rect.x1, rect.y0), (rect.x1, rect.y1), (rect.x0, rect.y1)];
         for (x, y) in corners {
             let (fx, fy) = (x as f32, y as f32);
@@ -697,6 +1052,7 @@ impl State {
                     self.uv.push([u.0 + u.1 * fx, v.0 + v.1 * fy]);
                     self.color.push(color.at(fx, fy));
                 }
+                Prim::Tris { .. } => unreachable!("pushed above"),
             }
         }
     }

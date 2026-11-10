@@ -1276,6 +1276,133 @@ mod tests {
         }
     }
 
+    /// The GPU's triangles for a rounded rect (`tess`), rasterized at pixel centres, cover
+    /// every pixel as the CPU does (within the vertex-alpha approximation of the corner ramp),
+    /// and no pixel twice.
+    #[test]
+    fn tessellated_round_rects_match_the_cpu_coverage() {
+        use super::super::tess::{self, Mesh};
+        let cases = [
+            (60u16, 30u16, 10u16, 0u16),
+            (60, 30, 15, 0),
+            (50, 50, 25, 3),
+            (80, 40, 12, 2),
+            (20, 9, 4, 1),
+            (30, 30, 0, 2),
+            (70, 44, 14, 14),
+            (64, 40, 3, 6),
+            (40, 40, 30, 4),
+            (11, 7, 2, 0),
+            (12, 12, 6, 6),
+        ];
+        for (w, h, r, t) in cases {
+            let (cpu, _) = draw(|l| {
+                if t == 0 {
+                    l.fill_rounded_rect(8, 8, w, h, r, 1)
+                } else {
+                    l.stroke_rounded_rect(8, 8, w, h, r, t, 1)
+                }
+            });
+            let (mut verts, mut chunks) = (Vec::new(), Vec::new());
+            let mut m = Mesh { verts: &mut verts, chunks: &mut chunks };
+            if t == 0 {
+                tess::rounded_fill(&mut m, 8, 8, w as i32, h as i32, r as i32);
+            } else {
+                tess::rounded_ring(&mut m, 8, 8, w as i32, h as i32, r as i32, t as i32);
+            }
+            let gpu = tess::raster::coverage(&verts, N);
+            let mut worst = (0.0f32, 0, 0);
+            for y in 0..N {
+                for x in 0..N {
+                    let (c, g) = (cpu[y * N + x] as f32 / 255.0, gpu[y * N + x]);
+                    assert!(g <= 1.0 + 1e-4, "rrect {w}x{h} r={r} t={t}: ({x},{y}) covered {g}");
+                    if c == 1.0 || c == 0.0 {
+                        // Solid and empty pixels stay so (straight edges and insides exact).
+                        assert!((g - c).abs() < 0.08, "rrect {w}x{h} r={r} t={t}: ({x},{y}) cpu {c} gpu {g}");
+                    }
+                    if (g - c).abs() > worst.0 {
+                        worst = ((g - c).abs(), x, y);
+                    }
+                }
+            }
+            // The corner ramps: chords for arcs, coverage interpolated across a triangle
+            // instead of by distance.
+            // 2.5·√r segments a quarter: at most ~0.07 here (0.11 with 1.8·√r, 0.04 with 3.6·√r).
+            assert!(worst.0 < 0.08, "rrect {w}x{h} r={r} t={t}: ({}, {}) off by {}", worst.1, worst.2, worst.0);
+        }
+    }
+
+    /// The GPU's triangles for a 1 px polyline (`tess::polyline`), blended "over" one another
+    /// as the GPU does, cover pixels as the CPU's pen does: exactly along straight runs, close
+    /// inside sharp turns (overlapping pieces combine instead of the strongest segment winning).
+    #[test]
+    fn tessellated_polylines_match_the_cpu_pen() {
+        use super::super::tess::{self, Mesh};
+        // A graph-like curve: 1 px steps across, a spike, a plateau.
+        let graph: Vec<(i32, i32)> = (0..70)
+            .map(|i| {
+                let y = match i {
+                    20..=24 => 20 + (i - 20) * 9,
+                    25..=29 => 56 - (i - 25) * 9,
+                    40..=55 => 30,
+                    _ => 50 + ((i * 7) % 11) - 5,
+                };
+                (12 + i, y)
+            })
+            .collect();
+        // Smooth peaks over a flat line, sampled every pixel (the tablet's perf graph).
+        let peaks: Vec<(i32, i32)> = (0..80)
+            .map(|i| {
+                let f = |c: f32, w: f32, h: f32| h * libm::expf(-((i as f32 - c) / w) * ((i as f32 - c) / w));
+                (8 + i, (80.0 - f(25.0, 3.0, 45.0) - f(50.0, 2.0, 30.0) - f(62.0, 6.0, 20.0)) as i32)
+            })
+            .collect();
+        let cases: [(&str, Vec<(i32, i32)>); 6] = [
+            ("horizontal", vec![(10, 40), (80, 40)]),
+            ("diagonal", vec![(10, 10), (70, 50)]),
+            ("steep", vec![(40, 5), (47, 90)]),
+            ("zigzag", vec![(10, 60), (30, 20), (50, 60), (70, 20), (85, 60)]),
+            ("graph", graph),
+            ("peaks", peaks),
+        ];
+        for (name, pts) in cases {
+            let (cpu, hits) = draw(|l| {
+                let mut pen = l.pen(1, 1);
+                for &(x, y) in &pts {
+                    pen.to(x as i16, y as i16);
+                }
+            });
+            assert_single_hits(&hits, name);
+            let (mut verts, mut chunks) = (Vec::new(), Vec::new());
+            tess::polyline(&mut Mesh { verts: &mut verts, chunks: &mut chunks }, &pts);
+            let gpu = tess::raster::coverage_over(&verts, N);
+            let (mut worst, mut sum, mut over) = ((0.0f32, 0, 0), 0.0f32, 0.0f32);
+            for y in 0..N {
+                for x in 0..N {
+                    let (c, g) = (cpu[y * N + x] as f32 / 255.0, gpu[y * N + x]);
+                    over = over.max(g);
+                    sum += (g - c).abs();
+                    if (g - c).abs() > worst.0 {
+                        worst = ((g - c).abs(), x, y);
+                    }
+                }
+            }
+            let ink: f32 = cpu.iter().map(|&c| c as f32 / 255.0).sum();
+            let what = format!("{name}: ({}, {}) off by {:.3}, mean {:.3} of the ink", worst.1, worst.2, worst.0, sum / ink);
+            assert!(over <= 1.0 + 1e-4, "{what}");
+            // Measured: straight lines 0 / 0.015 / 0.008; the zigzag's apexes 0.23, the
+            // graph's sharpest turns 0.15, the peaks' tips 0.26; 2–4 % of the ink overall.
+            let straight = pts.len() == 2;
+            assert!(worst.0 < if straight { 0.02 } else { 0.3 }, "{what}");
+            assert!(sum / ink < 0.05, "{what}");
+            // Few vertices: flat and gently sloping runs become long segments (the peaks:
+            // 80 points, 456 vertices; a disk at every point made 2868).
+            if name == "peaks" {
+                assert!(verts.len() < 600, "{name}: {} vertices", verts.len());
+            }
+        }
+    }
+
     /// Skipping the rows outside the scissor changes nothing inside it.
     #[test]
     fn scissored_round_rect_matches_the_full_draw() {
