@@ -35,9 +35,12 @@
 //!
 //! It declines (the built-in passes draw this render) when it cannot do all of it: the GPU or
 //! its shaders missing (`gpu::Ui`), portrait mode, an area under the on-screen keyboard
-//! (`ObjPool::overlay`), a scroll container (its viewport clipping and scrollbar), an
-//! `on_paint` widget, a widget larger than the panel that needs a sprite, no memory, or a GPU
+//! (`ObjPool::overlay`), an `on_paint` widget, a widget larger than the panel that needs a sprite, no memory, or a GPU
 //! error (printed). A GPU error after some frames were shown leaves them: they are right.
+//!
+//! Scroll containers are drawn like the passes draw them: a child not wholly inside the
+//! viewport is left out with its subtree, nothing is cut to the viewport, and the scrollbar
+//! (`render::scrollbar_parts`) goes over the container's subtree.
 //!
 //! The GPU's anti-aliasing and rounding differ a little from the CPU's, so the pixels are not
 //! identical to the built-in drawing's.
@@ -564,7 +567,7 @@ pub const COUNT_NAMES: [&str; 10] = [
     "keyboard",
     "no_gpu",
     "no_shaders",
-    "clip_or_on_paint",
+    "on_paint",
     "widget",
     "gpu_error",
     "small_areas",
@@ -575,7 +578,7 @@ const PORTRAIT: usize = 2;
 const KEYBOARD: usize = 3;
 const NO_GPU: usize = 4;
 const NO_UI: usize = 5;
-const CLIP: usize = 6;
+const ON_PAINT: usize = 6;
 const WIDGET: usize = 7;
 const GPU_ERROR: usize = 8;
 const SMALL: usize = 9;
@@ -769,8 +772,20 @@ impl State {
         let areas: Vec<R> = areas.iter().map(R::of).collect();
         let keep_after = renderer::cache().tick();
         let n = objs.dfs_len();
+        // Scroll containers whose subtree is being walked: (its end, the container). Their
+        // scrollbars go over their children, once the walk leaves the subtree.
+        let mut open: Vec<(usize, WidgetId)> = Vec::new();
         let mut i = 0;
-        while i < n {
+        loop {
+            while let Some(&(end, sc)) = open.last()
+                && end <= i
+            {
+                open.pop();
+                self.scrollbar(objs, sc, &areas);
+            }
+            if i >= n {
+                break;
+            }
             if !objs.vis_at(i) {
                 i = objs.sub_end_at(i);
                 continue;
@@ -786,14 +801,17 @@ impl State {
                     continue;
                 }
             }
+            let w = objs.get(id);
+            if w.flags & FLAG_CLIP_CHILDREN != 0 {
+                open.push((objs.sub_end_at(i), id));
+            }
             let r = R::of(&abs);
             if !areas.iter().any(|a| a.meets(&r)) {
                 i += 1;
                 continue;
             }
-            let w = objs.get(id);
-            if w.flags & (FLAG_CLIP_CHILDREN | FLAG_HAS_ON_PAINT) != 0 {
-                return Err(CLIP);
+            if w.flags & FLAG_HAS_ON_PAINT != 0 {
+                return Err(ON_PAINT);
             }
             let start = self.prims.len();
             let Some(opaque) = self.widget(ctx, ui, gpu, id, &abs, keep_after) else { return Err(WIDGET) };
@@ -801,6 +819,23 @@ impl State {
             i += 1;
         }
         Ok(())
+    }
+
+    /// Scroll container `id`'s scrollbar (`render::scrollbar_parts`: track, thumb), if it has
+    /// one where `areas` are. The passes draw it after every widget; here it goes over the
+    /// container's own subtree only, in painter's order, so a later widget over the list
+    /// stays on top.
+    fn scrollbar(&mut self, objs: &ObjPool, id: WidgetId, areas: &[R]) {
+        let Some(parts) = render::scrollbar_parts(objs, id) else { return };
+        let track = R::of(&parts[0].0);
+        if !areas.iter().any(|a| a.meets(&track)) {
+            return;
+        }
+        let start = self.prims.len();
+        for (rect, color) in parts {
+            self.solid(R::of(&rect), Lin::flat(rgb(color, 1.0)));
+        }
+        self.items.push(Item { start, opaque: Some(track) });
     }
 
     /// Widget `id`'s pieces; the rect it paints opaquely, if any. None to decline.

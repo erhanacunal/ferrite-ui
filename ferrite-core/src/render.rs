@@ -143,7 +143,10 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
 
     // Pass 2: draw dirty visible widgets at their current rect
     clear_painted(&mut ctx.objs);
-    for i in 0..ctx.objs.dfs_len() {
+    let mut next = 0;
+    while next < ctx.objs.dfs_len() {
+        let i = next;
+        next += 1;
         let id = ctx.objs.dfs_at(i);
         let w = ctx.objs.get(id);
         if !w.is_dirty_buf(buf) || !ctx.objs.vis_at(i) {
@@ -152,17 +155,10 @@ pub fn render_buffered_content<P: Platform>(ctx: &mut Ctx<P>) -> PaintList {
 
         let abs = ctx.objs.abs_at(i);
 
-        // Viewport clipping for children of scroll containers
-        let sp = ctx.objs.scroll_parent_at(i);
-        if sp.is_some() {
-            let viewport = ctx.objs.scroll_viewport(sp);
-            if abs.x < viewport.x
-                || abs.y < viewport.y
-                || abs.right() > viewport.right()
-                || abs.bottom() > viewport.bottom()
-            {
-                continue; // outside or partially visible
-            }
+        // Children of scroll containers: outside or partly visible — skip the subtree.
+        if scroll_hidden(&ctx.objs, i, &abs) {
+            next = ctx.objs.sub_end_at(i);
+            continue;
         }
 
         // Translucent widgets and transparent labels must not blend over
@@ -222,6 +218,20 @@ fn set_buf_prev_rect(tree: &mut ObjPool, id: WidgetId, buf: u8, rect: Rect) {
     tree.set_prev_rect(id, buf, rect);
 }
 
+/// Whether DFS entry `i` (at `abs`) is left out as a scroll container's child: not wholly
+/// inside its nearest scroll container's viewport (text can't be partially clipped). Draw
+/// loops skip its whole subtree with it (`render_all` always did), so a partly visible row
+/// doesn't leave its children drawn without it; occluder and restore loops ignore it.
+/// Board compositors apply the same rule.
+pub fn scroll_hidden(objs: &ObjPool, i: usize, abs: &Rect) -> bool {
+    let sp = objs.scroll_parent_at(i);
+    if sp.is_none() {
+        return false;
+    }
+    let v = objs.scroll_viewport(sp);
+    abs.x < v.x || abs.y < v.y || abs.right() > v.right() || abs.bottom() > v.bottom()
+}
+
 /// Redraw widgets that sit behind widget `target_idx` (earlier in DFS order),
 /// clipped to `stale`. Used to restore pixels under a moved/hidden widget.
 /// Reads the DFS order from the tree cache — ensure_dfs must have been called
@@ -246,7 +256,8 @@ fn restore_behind<P: Platform>(ctx: &mut Ctx<P>, idx: usize, area: Rect) {
     redraw_behind(ctx, idx, area);
     let end = ctx.objs.sub_end_at(idx);
     for j in end..ctx.objs.dfs_len() {
-        if ctx.objs.vis_at(j) && ctx.objs.abs_at(j).intersects(&area) {
+        let jabs = ctx.objs.abs_at(j);
+        if ctx.objs.vis_at(j) && jabs.intersects(&area) && !scroll_hidden(&ctx.objs, j, &jabs) {
             let jid = ctx.objs.dfs_at(j);
             if !ctx.objs.get(jid).is_dirty() {
                 ctx.objs.mark_dirty(jid);
@@ -273,18 +284,39 @@ fn redraw_behind_region<P: Platform>(
             ctx.lcd.layer_clear(r);
         }
     }
-    for i in 0..target_idx {
+    let mut i = 0;
+    while i < target_idx {
         if !ctx.objs.vis_at(i) {
+            i += 1;
             continue;
         }
         let uid = ctx.objs.dfs_at(i);
         let u_abs = ctx.objs.abs_at(i);
+        if scroll_hidden(&ctx.objs, i, &u_abs) {
+            // Scrolled out of its container's view: not on the screen, nor its subtree.
+            i = ctx.objs.sub_end_at(i);
+            continue;
+        }
+        i += 1;
         if !u_abs.intersects(bounds) {
             continue;
         }
         draw_widget(ctx, uid, &u_abs, clip);
         // Partly redrawn (possibly with a newer value than recorded).
         ctx.objs.forget_drawn(uid);
+    }
+    // The scrollbars of containers repainted here go over their children again.
+    for i in 0..target_idx {
+        let id = ctx.objs.dfs_at(i);
+        if ctx.objs.get(id).flags & FLAG_CLIP_CHILDREN != 0
+            && ctx.objs.vis_at(i)
+            && ctx.objs.abs_at(i).intersects(bounds)
+            && let Some(parts) = scrollbar_parts(&ctx.objs, id)
+        {
+            for (rect, color) in parts {
+                fill_clipped(&ctx.lcd, &rect, color, clip);
+            }
+        }
     }
 }
 
@@ -352,29 +384,14 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
         }
         let abs = ctx.objs.abs_at(i);
 
-        // Viewport clipping for children of scroll containers
-        let sp = ctx.objs.scroll_parent_at(i);
-        if sp.is_some() {
-            let viewport = ctx.objs.scroll_viewport(sp);
-            // Only draw if FULLY inside viewport (text can't be partially clipped)
-            if abs.x >= viewport.x
-                && abs.y >= viewport.y
-                && abs.right() <= viewport.right()
-                && abs.bottom() <= viewport.bottom()
-            {
-                draw_widget(ctx, id, &abs, &full);
-                ctx.objs.get_mut(id).flags |= FLAG_RENDERED;
-                record_drawn(ctx, id, &abs);
-            } else {
-                // Outside or partially visible — skip entire subtree
-                i = ctx.objs.sub_end_at(i);
-                continue;
-            }
-        } else {
-            draw_widget(ctx, id, &abs, &full);
-            ctx.objs.get_mut(id).flags |= FLAG_RENDERED;
-            record_drawn(ctx, id, &abs);
+        // Children of scroll containers: outside or partly visible — skip the subtree.
+        if scroll_hidden(&ctx.objs, i, &abs) {
+            i = ctx.objs.sub_end_at(i);
+            continue;
         }
+        draw_widget(ctx, id, &abs, &full);
+        ctx.objs.get_mut(id).flags |= FLAG_RENDERED;
+        record_drawn(ctx, id, &abs);
         i += 1;
     }
 
@@ -641,7 +658,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
         for j in sub_end..ctx.objs.dfs_len() {
             if ctx.objs.vis_at(j) {
                 let other_abs = ctx.objs.abs_at(j);
-                if !abs.intersects(&other_abs) {
+                if !abs.intersects(&other_abs) || scroll_hidden(&ctx.objs, j, &other_abs) {
                     continue;
                 }
                 if occ_count < 32 {
@@ -672,33 +689,27 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
         let keep = !ctx.objs.shifted.is_empty() && shift_keep(ctx, di, &abs);
 
         // Flat iteration over dirty widget + its descendants
-        for si in di..sub_end {
+        let mut next = di;
+        while next < sub_end {
+            let si = next;
+            next += 1;
             let sid = ctx.objs.dfs_at(si);
             if !ctx.objs.vis_at(si) {
                 continue;
             }
 
             let sabs = ctx.objs.abs_at(si);
+            // Children of scroll containers: outside or partly visible — skip the subtree.
+            if scroll_hidden(&ctx.objs, si, &sabs) {
+                next = ctx.objs.sub_end_at(si);
+                continue;
+            }
 
             let mut clip = ClipRegion::from_rect(sabs);
             clip.clip_to_bounds(&screen_rect(&ctx.lcd));
             if keep {
                 // One rect cut by at most MAX_CLIP_RECTS disjoint ones: fits.
                 clip.restrict(&ctx.objs.shift_keep);
-            }
-
-            // Viewport clipping for children of scroll containers
-            let sp = ctx.objs.scroll_parent_at(si);
-            if sp.is_some() {
-                let viewport = ctx.objs.scroll_viewport(sp);
-                // Only draw if fully inside viewport (text can't be partially clipped)
-                if sabs.x < viewport.x
-                    || sabs.y < viewport.y
-                    || sabs.right() > viewport.right()
-                    || sabs.bottom() > viewport.bottom()
-                {
-                    continue;
-                }
             }
 
             for oi in 0..occ_count {
@@ -3080,15 +3091,17 @@ const SCROLLBAR_TRACK: Color = 0x18C3; // dark gray
 const SCROLLBAR_THUMB: Color = 0x6B4D; // medium gray
 const SCROLLBAR_MIN_THUMB: u16 = 16; // minimum thumb height
 
-/// Draw scrollbar on the right side of a scroll container.
-fn draw_scrollbar<P: Platform>(ctx: &Ctx<P>, id: WidgetId, _abs: &Rect) {
-    let content_h = ctx.objs.content_height(id);
-    let cr = ctx.objs.content_rect(id);
+/// What scroll container `id`'s scrollbar draws, in screen coordinates: the track, then the
+/// thumb over it (each a solid rect in its colour). None when all content fits. Shared by the
+/// passes ([`draw_scrollbar`]) and board compositors.
+pub fn scrollbar_parts(objs: &ObjPool, id: WidgetId) -> Option<[(Rect, Color); 2]> {
+    let content_h = objs.content_height(id);
+    let cr = objs.content_rect(id);
     if cr.h == 0 || content_h <= cr.h {
-        return; // no scrollbar needed — all content fits
+        return None; // no scrollbar needed — all content fits
     }
 
-    let scroll_y = ctx.objs.value(id).max(0) as u32;
+    let scroll_y = objs.value(id).max(0) as u32;
     let ch = content_h as u32;
     let vh = cr.h as u32;
 
@@ -3096,11 +3109,6 @@ fn draw_scrollbar<P: Platform>(ctx: &Ctx<P>, id: WidgetId, _abs: &Rect) {
     let track_x = cr.x + cr.w as i16 - SCROLLBAR_W as i16;
     let track_y = cr.y;
     let track_h = cr.h;
-    fill_rect_screen(
-        &ctx.lcd,
-        Rect::new(track_x, track_y, SCROLLBAR_W, track_h),
-        SCROLLBAR_TRACK,
-    );
 
     // Thumb: proportional size and position
     let thumb_h = ((vh * track_h as u32) / ch)
@@ -3113,11 +3121,19 @@ fn draw_scrollbar<P: Platform>(ctx: &Ctx<P>, id: WidgetId, _abs: &Rect) {
     } else {
         track_y
     };
-    fill_rect_screen(
-        &ctx.lcd,
-        Rect::new(track_x, thumb_y, SCROLLBAR_W, thumb_h),
-        SCROLLBAR_THUMB,
-    );
+    Some([
+        (Rect::new(track_x, track_y, SCROLLBAR_W, track_h), SCROLLBAR_TRACK),
+        (Rect::new(track_x, thumb_y, SCROLLBAR_W, thumb_h), SCROLLBAR_THUMB),
+    ])
+}
+
+/// Draw scrollbar on the right side of a scroll container.
+fn draw_scrollbar<P: Platform>(ctx: &Ctx<P>, id: WidgetId, _abs: &Rect) {
+    if let Some(parts) = scrollbar_parts(&ctx.objs, id) {
+        for (rect, color) in parts {
+            fill_rect_screen(&ctx.lcd, rect, color);
+        }
+    }
 }
 
 /// Draw rect clipped against clip region.
@@ -3946,6 +3962,58 @@ mod shift_tests {
         }
         assert!(b.lcd.backend().moved.get() == 0);
         assert!(shifted_frames >= 6, "only {shifted_frames} frames shifted");
+    }
+
+    /// A scroll container whose rows (each with a child) scroll under a translucent widget
+    /// below it that is redrawn too: the dirty render must match a full redraw. It used to
+    /// differ two ways: the restore behind the translucent widget drew rows scrolled out of
+    /// the view there, and a partly visible row's child was drawn without its row.
+    #[test]
+    fn scrolled_children_match_a_full_redraw() {
+        let build = |c: &mut Ctx<Plat<false>>| {
+            let o = &mut c.objs;
+            let root = o.alloc_widget().unwrap();
+            o.root = root;
+            o.get_mut(root).size = Size { w: S as u16, h: S as u16 };
+            o.get_mut(root).background_color = 0x1082;
+            let list = rect(o, root, Rect::new(10, 10, 70, 64), 0x2124, 0, 255);
+            o.get_mut(list).flags |= FLAG_CLIP_CHILDREN;
+            o.update_ext(list, |e| e.padding = Edges { top: 2, right: 2, bottom: 2, left: 2 });
+            for i in 0..8 {
+                let row = rect(o, list, Rect::new(0, i * 15, 52, 13), 0x4208 + i as u16 * 0x0841, 3, 255);
+                rect(o, row, Rect::new(30, 3, 16, 7), 0xFFE0, 0, 255);
+            }
+            let veil = rect(o, root, Rect::new(0, 70, S as u16, 40), 0xF800, 6, 110);
+            (list, veil)
+        };
+        let mut a = ctx::<false>();
+        let mut b = ctx::<false>();
+        let (la, va) = build(&mut a);
+        let (lb, vb) = build(&mut b);
+        render_all(&mut a);
+        for (step, scroll) in [6, 13, 20, 33, 52, 41, 0].into_iter().enumerate() {
+            for (c, l) in [(&mut a.objs, la), (&mut b.objs, lb)] {
+                c.get_mut(l).value = scroll;
+                c.mark_dirty(l);
+            }
+            // The translucent widget below changes too: it restores what is behind it.
+            a.objs.get_mut(va).background_color ^= 0x0841;
+            a.objs.mark_dirty(va);
+            b.objs.get_mut(vb).background_color = a.objs.get(va).background_color;
+            render_dirty(&mut a);
+            render_all(&mut b);
+            let (pa, pb) = (a.lcd.backend().px.borrow(), b.lcd.backend().px.borrow());
+            for i in 0..S * S {
+                assert!(
+                    pa[i] == pb[i],
+                    "step {step} (scroll {scroll}): pixel ({}, {}) {:04x} vs {:04x}",
+                    i % S,
+                    i / S,
+                    pa[i],
+                    pb[i]
+                );
+            }
+        }
     }
 
     /// A panel and one of its children moving in the same frame: the

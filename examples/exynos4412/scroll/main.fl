@@ -1,0 +1,253 @@
+// main.fl — scroll containers on the exynos4412 (GPU compositor test)
+//
+// Two scroll containers: a list of 40 labels on the left, and 24 rows of mixed widgets
+// (checkbox, slider, progress bar, circle, button) on the right. "Auto scroll" scrolls both
+// up and down forever (an animation of their scroll value), so the cost can be measured
+// without touching (`ferrite_cli.py perf`, /api/status, or the line at the bottom). Drag a
+// list to scroll it by hand.
+
+#include "core.fl"
+#include "color.fl"
+#include "anim.fl"
+#include "shapes.fl"
+#include "sysinfo.fl"
+
+const ITEMS = 40;
+const ITEM_H = 56;
+const ROWS = 24;
+const ROW_H = 72;
+const VIEW_H = 600;
+
+var title_lbl;
+var list;
+var mixed;
+var auto_btn;
+var auto_lbl;
+var info_lbl;
+var auto_on = 1;
+var since = 0;
+var passes0 = 0;
+var frames0 = 0;
+
+fn rgb565(r, g, b) {
+    return (r & 0xF8) * 256 + (g & 0xFC) * 8 + b / 8;
+}
+
+fn set_auto() {
+    if (auto_on) {
+        animate(list, PROP_VALUE, ITEMS * ITEM_H - VIEW_H + 8, 6000, EASE_IN_OUT | REPEAT_YOYO);
+        animate(mixed, PROP_VALUE, ROWS * ROW_H - VIEW_H + 8, 4500, EASE_IN_OUT | REPEAT_YOYO);
+        target(auto_lbl);
+        set(text, "Auto scroll: on");
+    } else {
+        stopAnim(list);
+        stopAnim(mixed);
+        target(auto_lbl);
+        set(text, "Auto scroll: off");
+    }
+    dirty();
+    return 0;
+}
+
+fn make_list() {
+    list = alloc();
+    target(list);
+    set(location, 60, 90);
+    set(size, 540, VIEW_H + 12);
+    set(bg_color, rgb565(20, 22, 34));
+    set(border, 2, 2, 2, 2);
+    set(border_color, rgb565(60, 70, 110));
+    set(border_radius, 12);
+    set(padding, 4, 4, 4, 4);
+    set(clip_children, ON);
+    set(clickable, ON);
+    parent(0);
+
+    var i = 0;
+    while (i < ITEMS) {
+        var item = alloc();
+        target(item);
+        set(kind, KIND_LABEL);
+        set(location, 4, i * ITEM_H);
+        set(size, 506, ITEM_H - 6);
+        set(bg_color, rgb565(36 + (i % 4) * 8, 38, 58));
+        set(press_color, rgb565(50, 80, 130));
+        set(border_radius, 8);
+        set(padding, 14, 8, 10, 8);
+        set(text_color, WHITE);
+        set(font_id, 0);
+        set(clickable, ON);
+        strClear();
+        set(text, concat(concat(str("Item "), itos(i + 1)), str(" - drag the list to scroll")));
+        parent(list);
+        i++;
+    }
+    return 0;
+}
+
+fn make_mixed() {
+    mixed = alloc();
+    target(mixed);
+    set(location, 660, 90);
+    set(size, 560, VIEW_H + 12);
+    set(bg_color, rgb565(24, 30, 26));
+    set(border, 2, 2, 2, 2);
+    set(border_color, rgb565(70, 110, 80));
+    set(border_radius, 12);
+    set(padding, 4, 4, 4, 4);
+    set(clip_children, ON);
+    set(clickable, ON);
+    parent(0);
+
+    var i = 0;
+    while (i < ROWS) {
+        var row = alloc();
+        target(row);
+        set(location, 4, i * ROW_H);
+        set(size, 526, ROW_H - 8);
+        set(bg_color, rgb565(40, 52, 44));
+        set(border_radius, 10);
+        parent(mixed);
+
+        var cb = alloc();
+        target(cb);
+        set(kind, KIND_CHECKBOX);
+        set(location, 12, 18);
+        set(size, 28, 28);
+        set(bg_color, rgb565(30, 36, 32));
+        set(border, 2, 2, 2, 2);
+        set(border_color, rgb565(140, 200, 150));
+        set(text_color, rgb565(140, 220, 150));
+        set(clickable, ON);
+        set(checked, i % 2);
+        parent(row);
+
+        var sl = alloc();
+        target(sl);
+        set(kind, KIND_SLIDER);
+        set(location, 56, 20);
+        set(size, 190, 24);
+        set(bg_color, rgb565(30, 36, 32));
+        set(press_color, rgb565(120, 200, 140));
+        set(border_radius, 12);
+        set(clickable, ON);
+        set(value, (i * 37) % 100);
+        parent(row);
+
+        var pb = alloc();
+        target(pb);
+        set(kind, KIND_PROGRESS);
+        set(location, 262, 26);
+        set(size, 130, 12);
+        set(bg_color, rgb565(30, 36, 32));
+        set(press_color, rgb565(230, 180, 80));
+        set(border_radius, 6);
+        set(value, (i * 53) % 100);
+        parent(row);
+
+        var c = alloc();
+        target(c);
+        set(kind, KIND_CIRCLE);
+        set(location, 408, 14);
+        set(size, 36, 36);
+        set(bg_color, rgb565(80 + (i * 40) % 160, 120, 200));
+        set(border, 2, 2, 2, 2);
+        set(border_color, WHITE);
+        parent(row);
+
+        var b = alloc();
+        target(b);
+        set(kind, KIND_BUTTON);
+        set(location, 456, 14);
+        set(size, 60, 36);
+        set(bg_color, rgb565(70, 90, 140));
+        set(press_color, rgb565(110, 140, 210));
+        set(border_radius, 8);
+        set(text_color, WHITE);
+        set(text_align, ALIGN_CENTER);
+        set(font_id, 0);
+        set(clickable, ON);
+        strClear();
+        set(text, itos(i + 1));
+        parent(row);
+        i++;
+    }
+    return 0;
+}
+
+fn setup() {
+    target(0);
+    set(bg_color, rgb565(12, 12, 18));
+
+    title_lbl = alloc();
+    target(title_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 0, 24);
+    set(size, 1280, 40);
+    set(text, "Scroll containers: drag a list, or tap Auto scroll");
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(font_id, 0);
+    parent(0);
+
+    make_list();
+    make_mixed();
+
+    auto_btn = alloc();
+    target(auto_btn);
+    set(kind, KIND_BUTTON);
+    set(location, 60, 722);
+    set(size, 240, 56);
+    set(bg_color, rgb565(60, 80, 140));
+    set(press_color, rgb565(100, 130, 210));
+    set(border_radius, 12);
+    set(clickable, ON);
+    set(on_click, @on_auto);
+    parent(0);
+
+    auto_lbl = alloc();
+    target(auto_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 0, 0);
+    set(size, 240, 56);
+    set(text_color, WHITE);
+    set(text_align, ALIGN_CENTER);
+    set(font_id, 0);
+    parent(auto_btn);
+
+    info_lbl = alloc();
+    target(info_lbl);
+    set(kind, KIND_LABEL);
+    set(location, 340, 722);
+    set(size, 880, 56);
+    set(text_color, rgb565(160, 170, 200));
+    set(font_id, 0);
+    parent(0);
+
+    set_auto();
+    since = millis();
+    passes0 = sysPasses();
+    frames0 = sysFrames();
+    return 0;
+}
+
+fn on_auto(wid) {
+    auto_on = 1 - auto_on;
+    set_auto();
+}
+
+fn loop() {
+    var now = millis();
+    if (now - since >= 2000) {
+        var p = sysPasses();
+        var f = sysFrames();
+        strClear();
+        target(info_lbl);
+        set(text, concat(concat(concat(str("passes/s "), itos((p - passes0) * 1000 / (now - since))),
+                                str("   frames/s ")), itos((f - frames0) * 1000 / (now - since))));
+        dirty();
+        since = now;
+        passes0 = p;
+        frames0 = f;
+    }
+}
