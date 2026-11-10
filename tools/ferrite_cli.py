@@ -2,7 +2,7 @@
 """ferrite-cli — Host-side tool for communicating with ferrite-ui devices.
 
 Implements the USART protobuf protocol (see protocol.rs).
-Commands: ping, restart, meminfo, memdetail, perf, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime, monitor, bootflash <file>
+Commands: ping, restart, meminfo, memdetail, perf, stackinfo, execute <file>, writefs <file>, send <data...>, calibrate, settime, monitor, bootflash <file>, savefw <file>
 
 Usage:
     python ferrite_cli.py -p COM3 ping
@@ -25,6 +25,7 @@ exynos4412 (uart_boot loads FERRITE/FLASH.BIN into the flash shadow at boot):
     python ferrite_cli.py -p COM3 bootflash flash.bin --reset         (UART; restarts the app first)
     python ferrite_cli.py --host 192.168.1.50 bootflash flash.bin --wait 30   (WiFi, no serial port)
     python ferrite_cli.py -p COM3 --host exynos bootflash flash.bin --reset  (restart over UART, upload over WiFi)
+    python ferrite_cli.py --host exynos savefw ferrite-ui.bin       (save the firmware, restart into it)
 """
 
 import argparse
@@ -1369,6 +1370,23 @@ def ub_http_send(host: str, path: str, data: bytes, wait: float) -> bool:
     return resp.status == 200
 
 
+def cmd_savefw(path: str, host: str, wait: float) -> bool:
+    """exynos4412: POSTs a firmware .bin to /save, which a running ferrite and
+    uart_boot both answer: saved as FERRITE/FERRITE.BIN, then the board restarts
+    (ferrite) or runs it (uart_boot)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        print(f"savefw: {e}", file=sys.stderr)
+        return False
+    if len(data) < 0x28 or data[0x24:0x28] != (0x016F2818).to_bytes(4, "little"):
+        print("savefw: not a firmware .bin (no zImage magic at 0x24; objcopy the ELF first)",
+              file=sys.stderr)
+        return False
+    return ub_http_send(host, "/save", data, wait)
+
+
 def cmd_bootflash(ser: serial.Serial | None, path: str, host: str | None, fs_base: int,
                   wait: float, reset: bool, app: str | None, save: bool, run: bool) -> bool:
     """Saves an FS image as FERRITE/FLASH.BIN through uart_boot, then starts the
@@ -1478,7 +1496,19 @@ def main():
     p_bf.add_argument("--no-run", action="store_true",
                       help="leave uart_boot waiting (default with -p: send its 'r' key to restart into the app)")
 
+    p_sf = sub.add_parser("savefw",
+                          help="exynos4412 over WiFi (--host): save a firmware .bin as "
+                               "FERRITE/FERRITE.BIN and restart into it (running ferrite or uart_boot)")
+    p_sf.add_argument("file", help="firmware .bin (rust-objcopy -O binary of the ELF)")
+    p_sf.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
+                      help="wait this long for the board's HTTP server")
+
     args = parser.parse_args()
+
+    if args.command == "savefw":
+        if args.host is None:
+            parser.error("savefw needs --host (WiFi)")
+        sys.exit(0 if cmd_savefw(args.file, args.host, args.wait) else 1)
 
     if args.command == "bootflash" and args.port is None:
         if args.host is None:

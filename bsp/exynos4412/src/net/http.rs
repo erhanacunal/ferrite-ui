@@ -2,11 +2,12 @@
 //!
 //! | Request | Does |
 //! |---|---|
-//! | `GET /` | a small dashboard page (status, memory, profile, FS upload) |
+//! | `GET /` | a small dashboard page (status, memory, profile, FS and firmware upload) |
 //! | `GET /api/status` | JSON: WiFi link, address, uptime, heap, passes/frames |
 //! | `GET /api/mem` | JSON: the `memdetail` table (asked through the bridge) |
 //! | `GET /api/perf?ms=N` | JSON: the main-loop profile over N ms (default 1000, `perf` feature) |
 //! | `POST /flash` (or `/fs`, or `PUT`) | an FS image (or a whole `FLASH.BIN`): checked, saved as `FERRITE/FLASH.BIN`, then a restart |
+//! | `POST /save` (or `PUT`) | a firmware `.bin`: checked, saved as `FERRITE/FERRITE.BIN` (uart_boot's file, with its `EXYNBOOT` header), then a restart, so uart_boot boots it |
 //! | `POST /restart` | restarts the board |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
 //! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`) |
@@ -20,6 +21,11 @@
 //! --host` works against both): `Content-Length` required, `X-CRC32` (8 hex
 //! digits, zlib CRC-32 of the body) checked when present, `Expect:
 //! 100-continue` answered. The image must mount and pass its FS checksum.
+//! `/save` takes uart_boot's `/save` request too (`ferrite_cli savefw`):
+//! the body needs the zImage magic at 0x24, as uart_boot checks. The
+//! firmware runs from RAM (uart_boot copied it there), so its file can be
+//! replaced while it runs; a `FERRITE/STAY` file keeps uart_boot from
+//! booting it after the restart.
 //!
 //! `/api/mem` and `/api/perf` hold the protocol bridge while they ask
 //! (409 while a `tcp://` bridge client is connected).
@@ -225,7 +231,14 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
             let want = header(head, b"x-crc32").and_then(parse_hex);
             let expect = header(head, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
             let early = &request[head_end..filled];
-            upload(socket, length, want, expect, early).await?;
+            upload(socket, super::Upload::Fs, length, want, expect, early).await?;
+        }
+        (b"POST" | b"PUT", b"/save") => {
+            let length = header(head, b"content-length").and_then(parse_decimal);
+            let want = header(head, b"x-crc32").and_then(parse_hex);
+            let expect = header(head, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
+            let early = &request[head_end..filled];
+            upload(socket, super::Upload::Firmware, length, want, expect, early).await?;
         }
         (b"GET", b"/api/screen") => match super::screenshot().await {
             Some(px) => screen_bmp(socket, &px).await?,
@@ -771,10 +784,17 @@ fn status_json() -> String {
     s
 }
 
-// --- FS image upload ------------------------------------------------------------------------------
+// --- FS image / firmware upload ---------------------------------------------------------------
+
+/// A zImage (the `.bin` uart_boot runs) has this word at [`ZIMAGE_MAGIC_OFFSET`].
+const ZIMAGE_MAGIC: u32 = 0x016f_2818;
+const ZIMAGE_MAGIC_OFFSET: usize = 0x24;
+/// The largest firmware uart_boot takes (its `MAX_LEN`).
+const FIRMWARE_MAX: usize = 64 << 20;
 
 async fn upload(
     socket: &mut TcpSocket<'_>,
+    kind: super::Upload,
     length: Option<usize>,
     want: Option<u32>,
     expect: bool,
@@ -783,7 +803,11 @@ async fn upload(
     let Some(length) = length else {
         return text(socket, "411 Length Required", "Send a Content-Length\n").await;
     };
-    if !(16..=crate::flash::SIZE).contains(&length) {
+    let max = match kind {
+        super::Upload::Fs => crate::flash::SIZE,
+        super::Upload::Firmware => FIRMWARE_MAX,
+    };
+    if !(16..=max).contains(&length) {
         return text(socket, "413 Content Too Large", "16 B .. 64 MiB\n").await;
     }
     if super::flash_status() != super::FLASH_IDLE {
@@ -803,20 +827,28 @@ async fn upload(
     while done < length {
         let n = socket.read(&mut body[done..]).await?;
         if n == 0 {
-            println!("ferrite: HTTP flash body ended after {} of {} bytes", done, length);
+            println!("ferrite: HTTP {} body ended after {} of {} bytes", kind.name(), done, length);
             return Ok(());
         }
         done += n;
     }
     let ms = begin.elapsed().as_millis().max(1);
     let got = !ferrite_core::fs::crc32_update(!0, &body);
-    println!("ferrite: HTTP flash {} bytes in {} ms, {} KiB/s", length, ms, length as u64 * 1000 / 1024 / ms);
+    println!("ferrite: HTTP {} {} bytes in {} ms, {} KiB/s", kind.name(), length, ms, length as u64 * 1000 / 1024 / ms);
     if let Some(want) = want
         && want != got
     {
         return text(socket, "400 Bad Request", "CRC mismatch: X-CRC32 does not match the body\n").await;
     }
-    if !super::submit_image(body) {
+    if kind == super::Upload::Firmware {
+        let magic = body
+            .get(ZIMAGE_MAGIC_OFFSET..ZIMAGE_MAGIC_OFFSET + 4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+        if magic != Some(ZIMAGE_MAGIC) {
+            return text(socket, "400 Bad Request", "Not a firmware .bin (no zImage magic at 0x24)\n").await;
+        }
+    }
+    if !super::submit_image(kind, body, got) {
         return text(socket, "409 Conflict", "Busy: another upload is being saved\n").await;
     }
     // CPU0 checks and saves it (net::service).
@@ -832,7 +864,13 @@ async fn upload(
         Timer::after(Duration::from_millis(10)).await;
     };
     let result = match status {
-        super::FLASH_SAVED => text(socket, "200 OK", "CRC OK, saved FERRITE/FLASH.BIN; restarting\n").await,
+        super::FLASH_SAVED => {
+            let answer = match kind {
+                super::Upload::Fs => "CRC OK, saved FERRITE/FLASH.BIN; restarting\n",
+                super::Upload::Firmware => "CRC OK, saved FERRITE/FERRITE.BIN; restarting into it\n",
+            };
+            text(socket, "200 OK", answer).await
+        }
         super::FLASH_BAD_IMAGE => {
             text(socket, "400 Bad Request", "Not a valid FS image (mount or checksum failed)\n").await
         }
@@ -869,7 +907,9 @@ button{font:inherit;padding:4px 12px;border:1px solid var(--line);background:non
 <h2>Memory <button onclick="mem()">Refresh</button></h2><table id="mem"></table>
 <h2>Profile <button onclick="perf()">Measure 1 s</button></h2><div id="pinfo" class="mute"></div><table id="perf"></table>
 <h2>FS image</h2>
-<input type="file" id="f"> <button onclick="up()">Upload &amp; restart</button> <span id="ur" class="mute"></span>
+<input type="file" id="f"> <button onclick="up('f','/flash','ur')">Upload &amp; restart</button> <span id="ur" class="mute"></span>
+<h2>Firmware (.bin)</h2>
+<input type="file" id="fw"> <button onclick="up('fw','/save','fr')">Save &amp; restart into it</button> <span id="fr" class="mute"></span>
 <p><button onclick="if(confirm('Restart the board?'))fetch('/restart',{method:'POST'})">Restart</button></p>
 <script>
 const $=id=>document.getElementById(id);
@@ -889,8 +929,8 @@ const w=j.window_us,n=Math.max(j.passes,1);
 $('pinfo').textContent=(j.hz/1e6).toFixed(0)+' MHz · '+(w/1000).toFixed(1)+' ms window · '+j.passes+' passes ('+(j.passes/w*1e6).toFixed(0)+'/s, max '+j.max_pass_us+' µs) · VM '+(j.vm_instructions/w).toFixed(1)+' M instr/s';
 $('perf').innerHTML='<tr><th>phase<th>ms<th>share<th>µs/pass'+j.phases.map(p=>'<tr><td>'+(p.sub?'&nbsp;&nbsp;':'')+p.name+'<td>'+(p.us/1000).toFixed(1)+'<td>'+(100*p.us/w).toFixed(1)+'%<td>'+(p.us/n).toFixed(1)).join('')+
 j.counts.map(c=>'<tr><td class="mute">'+c.name+'<td>'+c.n+'<td><td>'+(c.n/n).toFixed(1)).join('')}
-async function up(){const f=$('f').files[0];if(!f)return;$('ur').textContent='uploading '+f.size+' bytes…';
-try{const r=await fetch('/flash',{method:'POST',body:f});$('ur').textContent=await r.text()}catch(e){$('ur').textContent='failed: '+e}}
+async function up(i,u,o){const f=$(i).files[0];if(!f)return;$(o).textContent='uploading '+f.size+' bytes…';
+try{const r=await fetch(u,{method:'POST',body:f});$(o).textContent=await r.text()}catch(e){$(o).textContent='failed: '+e}}
 status();setInterval(status,2000);mem();
 </script></body></html>
 "#;

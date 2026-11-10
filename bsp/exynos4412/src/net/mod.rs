@@ -660,8 +660,28 @@ pub(crate) async fn write_all(socket: &mut TcpSocket<'_>, mut data: &[u8]) -> Re
 
 // --- CPU0 mailbox: uploaded FS images, restarts -----------------------------------------------
 
-/// `POST /flash`: an image for CPU0 to check and save ([`service`]).
-static UPLOAD: CriticalSectionMutex<RefCell<Option<Vec<u8>>>> = CriticalSectionMutex::new(RefCell::new(None));
+/// What an upload is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Upload {
+    /// `POST /flash`: an FS image, saved as `FERRITE/FLASH.BIN`.
+    Fs,
+    /// `POST /save`: a firmware `.bin`, saved as `FERRITE/FERRITE.BIN` for uart_boot to boot.
+    Firmware,
+}
+
+impl Upload {
+    pub fn name(self) -> &'static str {
+        match self {
+            Upload::Fs => "flash",
+            Upload::Firmware => "firmware",
+        }
+    }
+}
+
+/// `POST /flash` / `/save`: an image (its kind and CRC-32) for CPU0 to check and save
+/// ([`service`]).
+static UPLOAD: CriticalSectionMutex<RefCell<Option<(Upload, Vec<u8>, u32)>>> =
+    CriticalSectionMutex::new(RefCell::new(None));
 /// [`UPLOAD`]'s outcome, `FLASH_*`.
 static FLASH_STATUS: AtomicU8 = AtomicU8::new(FLASH_IDLE);
 pub const FLASH_IDLE: u8 = 0;
@@ -677,12 +697,12 @@ static ANSWERED: AtomicBool = AtomicBool::new(false);
 static RESTART: AtomicBool = AtomicBool::new(false);
 
 /// CPU3: hands an uploaded image over. False if one is already pending.
-pub(crate) fn submit_image(image: Vec<u8>) -> bool {
+pub(crate) fn submit_image(kind: Upload, image: Vec<u8>, crc: u32) -> bool {
     if FLASH_STATUS.compare_exchange(FLASH_IDLE, FLASH_PENDING, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return false;
     }
     ANSWERED.store(false, Ordering::Release);
-    UPLOAD.lock(|u| *u.borrow_mut() = Some(image));
+    UPLOAD.lock(|u| *u.borrow_mut() = Some((kind, image, crc)));
     true
 }
 
@@ -755,6 +775,29 @@ fn install(image: Vec<u8>) -> u8 {
     if crate::storage::save(&full) { FLASH_SAVED } else { FLASH_SAVE_FAILED }
 }
 
+/// uart_boot's saved application (`uart_boot/src/cache.rs`, keep in sync): `FERRITE/FERRITE.BIN`
+/// = `EXYNBOOT` + length u32 LE + CRC-32 u32 LE + the image.
+const FIRMWARE_FILE: &str = "FERRITE.BIN";
+const FIRMWARE_MAGIC: &[u8; 8] = b"EXYNBOOT";
+
+/// CPU0: saves an uploaded firmware (checked by CPU3: CRC, zImage magic) as uart_boot's
+/// application. The running firmware is in RAM, so its file may change under it.
+fn install_firmware(image: Vec<u8>, crc: u32) -> u8 {
+    if !crate::storage::available() {
+        return FLASH_NO_STORAGE;
+    }
+    let mut file = Vec::new();
+    if file.try_reserve_exact(16 + image.len()).is_err() {
+        return FLASH_TOO_LARGE;
+    }
+    file.extend_from_slice(FIRMWARE_MAGIC);
+    file.extend_from_slice(&(image.len() as u32).to_le_bytes());
+    file.extend_from_slice(&crc.to_le_bytes());
+    file.extend_from_slice(&image);
+    drop(image);
+    if crate::storage::save_named(FIRMWARE_FILE, &file) { FLASH_SAVED } else { FLASH_SAVE_FAILED }
+}
+
 /// Screenshot mailbox (HTTP `GET /api/screen`): CPU3 raises [`SCREEN_WANTED`], CPU0 copies the
 /// shadow between passes into [`SCREEN`] (None = no memory) and raises [`SCREEN_READY`].
 static SCREEN_WANTED: AtomicBool = AtomicBool::new(false);
@@ -787,11 +830,14 @@ pub fn service() {
         SCREEN_READY.store(true, Ordering::Release);
     }
     if FLASH_STATUS.load(Ordering::Acquire) == FLASH_PENDING
-        && let Some(image) = UPLOAD.lock(|u| u.borrow_mut().take())
+        && let Some((kind, image, crc)) = UPLOAD.lock(|u| u.borrow_mut().take())
     {
         let len = image.len();
-        let status = install(image);
-        println!("ferrite: HTTP flash upload, {} bytes: status {}", len, status);
+        let status = match kind {
+            Upload::Fs => install(image),
+            Upload::Firmware => install_firmware(image, crc),
+        };
+        println!("ferrite: HTTP {} upload, {} bytes: status {}", kind.name(), len, status);
         FLASH_STATUS.store(status, Ordering::Release);
         if status == FLASH_SAVED {
             // Let CPU3 answer before the board goes away.
