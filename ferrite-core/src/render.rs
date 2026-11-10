@@ -432,9 +432,31 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     let active = 0usize;
 
     // A board that repaints whole areas (a GPU) takes the render over.
-    if active == 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && compose_dirty(ctx) {
+    if active == 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && compose_dirty(ctx, false) {
         ctx.objs.geo_end();
         return;
+    }
+    // With layers: the screen's part (their subtrees left out), unless a
+    // layer is composed into the screen (its surface is drawn there by the
+    // passes). The layers' surfaces are drawn by the passes after.
+    #[cfg(feature = "layers")]
+    if active != 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && ctx.objs.layers.composed == 0 {
+        ctx.objs.layers.scope = base_scope(&ctx.objs);
+        let taken = compose_dirty(ctx, true);
+        ctx.objs.layers.scope = crate::layer::Scope::All;
+        if taken {
+            for s in 0..crate::layer::MAX_LAYERS {
+                if ctx.objs.layers.slots[s].active {
+                    layer_pass(ctx, s, false);
+                }
+            }
+            place_layers(ctx);
+            ctx.objs.geo_end();
+            clear_all_dirty(ctx);
+            ctx.objs.shifted.clear();
+            ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+            return;
+        }
     }
 
     #[cfg(feature = "layers")]
@@ -1016,14 +1038,23 @@ fn bounds(a: &Rect, b: &Rect) -> Rect {
 /// dirty widget's box where it is visible or was drawn, and where a moved
 /// one was drawn), offers it to `WidgetRenderer::compose`, and if taken does
 /// the bookkeeping the passes would. False = declined, nothing changed.
+///
+/// `layered`: active layers, the scope is the screen's (`base_scope`): only
+/// its widgets count, plus what the screen drew of layers that just took
+/// over their surface (`Slot::restore`, repainted without them). The caller
+/// then draws the layers and settles; their widgets' flags are left alone.
 #[inline(never)]
-fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
+fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
+    #[cfg(feature = "layers")]
+    let mine = |objs: &ObjPool, di: usize| objs.in_scope(di);
+    #[cfg(not(feature = "layers"))]
+    let mine = |_: &ObjPool, _: usize| true;
     let screen = screen_rect(&ctx.lcd);
     let mut areas = Areas::new();
     for di in 0..ctx.objs.dfs_len() {
         let id = ctx.objs.dfs_at(di);
         let w = ctx.objs.get(id);
-        if !w.is_dirty() {
+        if !w.is_dirty() || !mine(&ctx.objs, di) {
             continue;
         }
         if ctx.objs.vis_at(di) || w.flags & FLAG_RENDERED != 0 {
@@ -1031,12 +1062,24 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
         }
         areas.add(buf_prev_rect(&ctx.objs, id, 0), &screen);
     }
+    #[cfg(feature = "layers")]
+    if layered {
+        for slot in ctx.objs.layers.slots.iter().filter(|s| s.active) {
+            areas.add(slot.restore, &screen);
+        }
+    }
     if areas.n > 0 && !<P::Renderer as WidgetRenderer<P>>::compose(ctx, &areas.list[..areas.n]) {
         return false;
     }
+    #[cfg(feature = "layers")]
+    if layered {
+        for slot in ctx.objs.layers.slots.iter_mut() {
+            slot.restore = Rect::new(0, 0, 0, 0);
+        }
+    }
     for di in 0..ctx.objs.dfs_len() {
         let id = ctx.objs.dfs_at(di);
-        if !ctx.objs.get(id).is_dirty() {
+        if !ctx.objs.get(id).is_dirty() || !mine(&ctx.objs, di) {
             continue;
         }
         // Where a moved widget was drawn: repainted.
@@ -1052,9 +1095,11 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
     // What gauges recorded of their last drawing is stale: the areas were
     // drawn another way.
     ctx.objs.draw_epoch = ctx.objs.draw_epoch.wrapping_add(1);
-    clear_all_dirty(ctx);
-    ctx.objs.shifted.clear();
-    ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+    if !layered {
+        clear_all_dirty(ctx);
+        ctx.objs.shifted.clear();
+        ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+    }
     true
 }
 

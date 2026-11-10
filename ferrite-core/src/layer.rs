@@ -1196,4 +1196,166 @@ mod tests {
         both(&mut a, &mut b, "a window");
         assert!(window_shown(&a, 0));
     }
+
+    std::thread_local! {
+        /// Areas each `SoftComposer::compose` call got.
+        static COMPOSED: RefCell<Vec<Vec<Rect>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A whole-area renderer done in software: each area repainted from
+    /// scratch, every visible widget touching it in DFS order (as a GPU
+    /// compositor does).
+    struct SoftComposer;
+    impl crate::renderer::WidgetRenderer<CPlat> for SoftComposer {
+        const COMPOSES: bool = true;
+        fn compose(ctx: &Ctx<CPlat>, areas: &[Rect]) -> bool {
+            COMPOSED.with(|c| c.borrow_mut().push(areas.to_vec()));
+            let o = &ctx.objs;
+            for a in areas {
+                let clip = crate::clip::ClipRegion::from_rect(*a);
+                for i in 0..o.dfs_len() {
+                    let abs = o.abs_at(i);
+                    if o.vis_at(i) && abs.intersects(a) {
+                        crate::render::draw_default(ctx, o.dfs_at(i), &abs, &clip);
+                    }
+                }
+            }
+            true
+        }
+    }
+
+    struct CPlat;
+    impl Platform for CPlat {
+        type LcdB = Fb<2, false>;
+        type FlashB = MockFlash;
+        type TouchB = MockTouch;
+        type BacklightB = MockBacklight;
+        type RtcB = MockRtc;
+        type UsartB = MockUsart;
+        type SystickB = MockSystick;
+        #[cfg(feature = "audio")]
+        type AudioB = crate::audio::NoAudio;
+        #[cfg(feature = "jpeg")]
+        type JpegB = crate::jpeg::NoJpeg;
+        type GpioB = MockGpio;
+        type EepromB = MockEeprom;
+        type Renderer = SoftComposer;
+    }
+
+    fn composing_ctx() -> Ctx<CPlat> {
+        let c = ctx::<2, false>();
+        Ctx {
+            lcd: c.lcd,
+            flash: c.flash,
+            fonts: c.fonts,
+            images: c.images,
+            objs: c.objs,
+            fs: c.fs,
+            backlight: c.backlight,
+            rtc: c.rtc,
+            usart: c.usart,
+            systick: c.systick,
+            #[cfg(feature = "audio")]
+            audio: c.audio,
+            #[cfg(feature = "jpeg")]
+            jpeg: c.jpeg,
+            gpio: c.gpio,
+            eeprom: c.eeprom,
+            cursor_visible: c.cursor_visible,
+            #[cfg(feature = "multi_program")]
+            tasks: c.tasks,
+        }
+    }
+
+    fn composed() -> Vec<Vec<Rect>> {
+        COMPOSED.with(|c| core::mem::take(&mut *c.borrow_mut()))
+    }
+
+    #[test]
+    fn a_composing_renderer_draws_the_screen_around_active_layers() {
+        let mut a = composing_ctx();
+        let mut b = ctx::<0, false>();
+        let sa = scene_composing(&mut a);
+        let sb = scene(&mut b, true);
+        let step = |a: &mut Ctx<CPlat>, b: &mut Ctx<Plat<0, false>>, what: &str| {
+            render_dirty(a);
+            render_dirty(b);
+            let mut shown = a.lcd.backend().px.borrow().clone();
+            a.lcd.backend().layers.composite(&mut shown, S, S);
+            assert_same(what, &shown, &b.lcd.backend().shown());
+        };
+        step(&mut a, &mut b, "first frame");
+        assert!(a.objs.is_active_layer_root(sa.panel));
+        assert_eq!(composed().len(), 1, "the screen was composed");
+        // A screen widget changes: composed; the layer is not redrawn.
+        for (c, d) in [(&mut a.objs, sa.late), (&mut b.objs, sb.late)] {
+            c.get_mut(d).background_color = 0xF800;
+            c.mark_dirty(d);
+        }
+        calls_of(&a.lcd);
+        step(&mut a, &mut b, "screen change");
+        let areas = composed();
+        assert_eq!(areas.len(), 1);
+        assert!(areas[0].iter().all(|r| !r.intersects(&Rect::new(20, 30, 60, 40))));
+        assert_eq!(calls_of(&a.lcd).1, 0, "nothing drawn into the layer");
+        // A change inside the layer: drawn into its surface, nothing composed.
+        for (c, d) in [(&mut a.objs, sa.child), (&mut b.objs, sb.child)] {
+            c.get_mut(d).background_color = 0x07E0;
+            c.mark_dirty(d);
+        }
+        step(&mut a, &mut b, "layer change");
+        assert!(composed().is_empty());
+        assert!(calls_of(&a.lcd).1 > 0, "drawn into the layer");
+        // Moved: a placement.
+        for (c, d) in [(&mut a.objs, sa.panel), (&mut b.objs, sb.panel)] {
+            c.will_move(d);
+            c.get_mut(d).location = Offset { x: 40, y: 50 };
+            c.mark_moved(d);
+        }
+        step(&mut a, &mut b, "moved");
+        assert!(composed().is_empty());
+        // Back in the tree: composed without layers, where it was put back.
+        a.objs.set_layer(sa.panel, 0);
+        b.objs.set_layer(sb.panel, 0);
+        step(&mut a, &mut b, "dropped");
+        assert!(!a.objs.is_active_layer_root(sa.panel));
+        assert_eq!(composed().len(), 1);
+        // A layer again, after it was drawn in the tree: the screen's copy of
+        // it goes (`Slot::restore`, composed), its surface shows it.
+        a.objs.set_layer(sa.panel, 1);
+        b.objs.set_layer(sb.panel, 1);
+        step(&mut a, &mut b, "layer again");
+        assert!(a.objs.is_active_layer_root(sa.panel));
+        let areas = composed();
+        assert_eq!(areas.len(), 1);
+        assert!(areas[0].iter().any(|r| r.intersects(&Rect::new(40, 50, 60, 40))));
+    }
+
+    fn scene_composing(c: &mut Ctx<CPlat>) -> Scene {
+        let o = &mut c.objs;
+        let root = o.alloc_widget().unwrap();
+        o.root = root;
+        o.get_mut(root).size = Size { w: S as u16, h: S as u16 };
+        o.get_mut(root).background_color = 0x1082;
+        rect(o, root, Rect::new(-10, 40, 90, 90), 0xF81F, 45, 90);
+        rect(o, root, Rect::new(70, -20, 70, 60), 0x07E0, 20, 60);
+        let panel = rect(o, root, Rect::new(20, 30, 60, 40), 0x39E7, 8, 255);
+        o.update_ext(panel, |e| e.border = Edges { top: 2, right: 2, bottom: 2, left: 2 });
+        o.get_mut(panel).border_color = 0xFFE0;
+        let child = rect(o, panel, Rect::new(5, 5, 20, 10), 0x001F, 0, 255);
+        rect(o, panel, Rect::new(30, 4, 22, 22), 0xF800, 6, 128);
+        rect(o, panel, Rect::new(8, 20, 40, 12), 0x07FF, 5, 200);
+        let late = rect(o, root, Rect::new(100, 100, 20, 20), 0xFFFF, 0, 255);
+        o.set_layer(panel, 1);
+        Scene { panel, child, late }
+    }
+
+    /// (screen, layer) primitive calls of a `Fb<2, false>` since the last call.
+    fn calls_of(lcd: &LcdImpl<Fb<2, false>>) -> (usize, usize) {
+        let b = lcd.backend();
+        let n = (b.screen_calls.get(), b.layer_calls.get());
+        b.screen_calls.set(0);
+        b.layer_calls.set(0);
+        n
+    }
 }
