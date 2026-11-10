@@ -1205,18 +1205,27 @@ mod tests {
     /// A whole-area renderer done in software: each area repainted from
     /// scratch, every visible widget touching it in DFS order (as a GPU
     /// compositor does).
+    /// A composed layer's root is its surface, blended in (as the GPU samples it).
     struct SoftComposer;
-    impl crate::renderer::WidgetRenderer<CPlat> for SoftComposer {
+    impl<const C: bool> crate::renderer::WidgetRenderer<CPlat<C>> for SoftComposer {
         const COMPOSES: bool = true;
-        fn compose(ctx: &Ctx<CPlat>, areas: &[Rect]) -> bool {
+        fn compose(ctx: &Ctx<CPlat<C>>, areas: &[Rect]) -> bool {
             COMPOSED.with(|c| c.borrow_mut().push(areas.to_vec()));
             let o = &ctx.objs;
             for a in areas {
                 let clip = crate::clip::ClipRegion::from_rect(*a);
                 for i in 0..o.dfs_len() {
                     let abs = o.abs_at(i);
-                    if o.vis_at(i) && abs.intersects(a) {
-                        crate::render::draw_default(ctx, o.dfs_at(i), &abs, &clip);
+                    if !o.vis_at(i) || !abs.intersects(a) {
+                        continue;
+                    }
+                    let id = o.dfs_at(i);
+                    if let Some(s) = o.composed_root(id) {
+                        let slot = &o.layers.slots[s];
+                        let size = Size { w: slot.w, h: slot.h };
+                        ctx.lcd.layer_compose(s, Offset { x: abs.x, y: abs.y }, size, a, slot.alpha);
+                    } else {
+                        crate::render::draw_default(ctx, id, &abs, &clip);
                     }
                 }
             }
@@ -1224,9 +1233,10 @@ mod tests {
         }
     }
 
-    struct CPlat;
-    impl Platform for CPlat {
-        type LcdB = Fb<2, false>;
+    /// `C`: the backend can compose layers into the screen.
+    struct CPlat<const C: bool = false>;
+    impl<const C: bool> Platform for CPlat<C> {
+        type LcdB = Fb<2, C>;
         type FlashB = MockFlash;
         type TouchB = MockTouch;
         type BacklightB = MockBacklight;
@@ -1242,8 +1252,8 @@ mod tests {
         type Renderer = SoftComposer;
     }
 
-    fn composing_ctx() -> Ctx<CPlat> {
-        let c = ctx::<2, false>();
+    fn composing_ctx<const C: bool>() -> Ctx<CPlat<C>> {
+        let c = ctx::<2, C>();
         Ctx {
             lcd: c.lcd,
             flash: c.flash,
@@ -1273,7 +1283,7 @@ mod tests {
 
     #[test]
     fn a_composing_renderer_draws_the_screen_around_active_layers() {
-        let mut a = composing_ctx();
+        let mut a = composing_ctx::<false>();
         let mut b = ctx::<0, false>();
         let sa = scene_composing(&mut a);
         let sb = scene(&mut b, true);
@@ -1331,7 +1341,66 @@ mod tests {
         assert!(areas[0].iter().any(|r| r.intersects(&Rect::new(40, 50, 60, 40))));
     }
 
-    fn scene_composing(c: &mut Ctx<CPlat>) -> Scene {
+    #[test]
+    fn a_composing_renderer_draws_a_composed_layer_from_its_surface() {
+        // The layer is composed (a later widget over it), and the composing
+        // renderer still takes the screen: the root is its surface.
+        let mut a = composing_ctx::<true>();
+        let mut b = ctx::<0, false>();
+        let sa = scene_composing(&mut a);
+        let sb = scene(&mut b, true);
+        let step = |a: &mut Ctx<CPlat<true>>, b: &mut Ctx<Plat<0, false>>, what: &str| {
+            render_dirty(a);
+            render_dirty(b);
+            assert_same(what, &a.lcd.backend().shown(), &b.lcd.backend().shown());
+        };
+        step(&mut a, &mut b, "first frame");
+        composed();
+        // Under the later widget: composed into the screen.
+        for (c, d) in [(&mut a.objs, sa.panel), (&mut b.objs, sb.panel)] {
+            c.will_move(d);
+            c.get_mut(d).location = Offset { x: 70, y: 70 };
+            c.mark_moved(d);
+        }
+        step(&mut a, &mut b, "composed");
+        assert!(a.objs.layers.slots[0].composed);
+        assert_eq!(composed().len(), 1, "the compositor took it");
+        // A change inside it: drawn into the surface, then composed.
+        for (c, d) in [(&mut a.objs, sa.child), (&mut b.objs, sb.child)] {
+            c.get_mut(d).background_color = 0x07E0;
+            c.mark_dirty(d);
+        }
+        calls_of(&a.lcd);
+        step(&mut a, &mut b, "changed while composed");
+        assert!(calls_of(&a.lcd).1 > 0, "drawn into the layer");
+        let areas = composed();
+        assert_eq!(areas.len(), 1);
+        assert!(areas[0].iter().any(|r| r.intersects(&Rect::new(70, 70, 60, 40))));
+        // Faded out (the tree has no group opacity: hidden there) and in,
+        // moved while composed, then back in its window.
+        a.objs.set_layer_alpha(sa.panel, 0);
+        set_visible(&mut b, sb.panel, false);
+        step(&mut a, &mut b, "faded out while composed");
+        a.objs.set_layer_alpha(sa.panel, 255);
+        set_visible(&mut b, sb.panel, true);
+        step(&mut a, &mut b, "faded in while composed");
+        for (c, d) in [(&mut a.objs, sa.panel), (&mut b.objs, sb.panel)] {
+            c.will_move(d);
+            c.get_mut(d).location = Offset { x: 74, y: 76 };
+            c.mark_moved(d);
+        }
+        step(&mut a, &mut b, "moved while composed");
+        assert!(a.objs.layers.slots[0].composed);
+        for (c, d) in [(&mut a.objs, sa.panel), (&mut b.objs, sb.panel)] {
+            c.will_move(d);
+            c.get_mut(d).location = Offset { x: 20, y: 30 };
+            c.mark_moved(d);
+        }
+        step(&mut a, &mut b, "a window again");
+        assert!(!a.objs.layers.slots[0].composed);
+    }
+
+    fn scene_composing<const C: bool>(c: &mut Ctx<CPlat<C>>) -> Scene {
         let o = &mut c.objs;
         let root = o.alloc_widget().unwrap();
         o.root = root;
@@ -1351,7 +1420,7 @@ mod tests {
     }
 
     /// (screen, layer) primitive calls of a `Fb<2, false>` since the last call.
-    fn calls_of(lcd: &LcdImpl<Fb<2, false>>) -> (usize, usize) {
+    fn calls_of<const C: bool>(lcd: &LcdImpl<Fb<2, C>>) -> (usize, usize) {
         let b = lcd.backend();
         let n = (b.screen_calls.get(), b.layer_calls.get());
         b.screen_calls.set(0);

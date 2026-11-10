@@ -719,6 +719,12 @@ impl State {
         let objs = &ctx.objs;
         let w = objs.get(id);
         let r = R::of(abs);
+        #[cfg(feature = "layers")]
+        if let Some(s) = objs.composed_root(id) {
+            // A composed layer's root: its surface (premultiplied ARGB), times the plane alpha.
+            let screen = R { x0: 0, y0: 0, x1: ctx.lcd.width() as i32, y1: ctx.lcd.height() as i32 };
+            return self.layer(objs, ui, s, &r, &screen).then_some(None);
+        }
         if w.kind == KIND_MODEL3D {
             match crate::model3d::texture(ctx, id, abs, gpu) {
                 Some((addr, w16, h16)) => {
@@ -837,6 +843,35 @@ impl State {
         Some(opaque)
     }
 
+    /// Composed layer `s` (root box `r`): one quad sampling the part of its surface on the
+    /// screen. The texture starts at that part (from the 64-byte boundary before it), so it
+    /// is at most a screen wide: the fragment shader's texel coordinates are exact across
+    /// 1280 texels (`gpu.rs` self-test), not across a 2560-wide pager. False to decline.
+    #[cfg(feature = "layers")]
+    fn layer(&mut self, objs: &ObjPool, ui: &Ui, s: usize, r: &R, screen: &R) -> bool {
+        let slot = &objs.layers.slots[s];
+        let shown = r.meet(screen);
+        if shown.is_empty() || slot.alpha == 0 {
+            return true;
+        }
+        let (sx, sy) = ((shown.x0 - r.x0) as usize, (shown.y0 - r.y0) as usize);
+        let (w, h) = (shown.w() as usize, shown.h() as usize);
+        let Some((base, lw, lh)) = lcd::layer_texture(s, sx, sy, w, h) else { return false };
+        let stride = lw * 4;
+        if sx + w > lw || sy + h > lh || (!ui.any_565_stride && stride % 64 != 0) {
+            return false;
+        }
+        let addr = base + (sy * lw + sx) * 4;
+        let shift = (addr % 64) / 4;
+        let tex = Tex { addr: addr - addr % 64, w: w + shift, h, stride, fmt: Fmt::Argb };
+        let (tw, th) = (tex.w as f32, tex.h as f32);
+        let u = ((shift as f32 - shown.x0 as f32) / tw, 1.0 / tw);
+        let v = (-(shown.y0 as f32) / th, 1.0 / th);
+        let a = slot.alpha as f32 / 255.0;
+        self.prims.push(Prim::Flat { rect: shown, u, v, color: Lin::flat([a; 4]), tex });
+        true
+    }
+
     /// A label without a picture: its box, then a quad per glyph from the atlas, laid out as
     /// `render::label_lines` lays the text out, cut to the box (as the drawing's scissor), in
     /// the text colour times the glyph's coverage. Its opaque rect; None (nothing added) if a
@@ -907,13 +942,18 @@ impl State {
             {
                 // As `draw_widget`: the fill (inset half the border, its radius as much
                 // smaller), then the border ring over it.
+                // From the mesh cache: the same box at the origin, moved into place.
                 if draw_bg {
                     let rad = (e.border_radius as i32 - inset).max(0);
-                    self.tess(fill, |m| tess::rounded_fill(m, g.x0, g.y0, g.w(), g.h(), rad));
+                    let (w, h) = (g.w(), g.h());
+                    let key = RoundPart::RoundRect { x: 0, y: 0, w: w as u16, h: h as u16, r: rad as u16, t: 0, color: 0 };
+                    self.tess_cached_at(key, (g.x0, g.y0), fill, None, |m| tess::rounded_fill(m, 0, 0, w, h, rad));
                 }
                 if bw > 0 {
                     let rad = e.border_radius as i32;
-                    self.tess(Lin::flat(border), |m| tess::rounded_ring(m, r.x0, r.y0, r.w(), r.h(), rad, bw));
+                    let (w, h) = (r.w(), r.h());
+                    let key = RoundPart::RoundRect { x: 0, y: 0, w: w as u16, h: h as u16, r: rad as u16, t: bw as u16, color: 0 };
+                    self.tess_cached_at(key, (r.x0, r.y0), Lin::flat(border), None, |m| tess::rounded_ring(m, 0, 0, w, h, rad, bw));
                 }
                 return;
             }
@@ -969,20 +1009,40 @@ impl State {
     /// [`MeshCache`] when the same part was tessellated before (a clock face and its dots stay
     /// put while the hands move: their trigonometry was most of the render's CPU time).
     fn tess_cached(&mut self, part: RoundPart, color: Lin, clip: R, f: impl FnOnce(&mut tess::Mesh<'_>)) {
-        let at = match self.meshes.find(&part) {
-            Some(at) => at,
+        self.tess_cached_at(part, (0, 0), color, Some(clip), f);
+    }
+
+    /// [`tess_cached`](Self::tess_cached) of a shape `f` adds at the origin, keyed by `part`
+    /// (the shape at the origin), moved by `at` when copied: the same box anywhere (a card
+    /// sliding with its page) hits the cache.
+    fn tess_cached_at(&mut self, part: RoundPart, at: (i32, i32), color: Lin, clip: Option<R>, f: impl FnOnce(&mut tess::Mesh<'_>)) {
+        let found = match self.meshes.find(&part) {
+            Some(i) => i,
             None => {
                 let (mut verts, mut chunks) = (Vec::new(), Vec::new());
                 f(&mut tess::Mesh { verts: &mut verts, chunks: &mut chunks });
                 self.meshes.insert(part, verts, chunks)
             }
         };
-        let e = &self.meshes.entries[at];
+        let e = &self.meshes.entries[found];
         let base = self.tverts.len();
-        self.tverts.extend_from_slice(&e.verts);
+        let (dx, dy) = at;
+        if (dx, dy) == (0, 0) {
+            self.tverts.extend_from_slice(&e.verts);
+        } else {
+            let (fx, fy) = (dx as f32, dy as f32);
+            self.tverts.extend(e.verts.iter().map(|v| tess::Vtx { x: v.x + fx, y: v.y + fy, a: v.a }));
+        }
         self.tchunks.clear();
-        self.tchunks.extend(e.chunks.iter().map(|c| tess::Chunk { start: c.start + base, ..*c }));
-        self.emit(color, Some(clip));
+        self.tchunks.extend(e.chunks.iter().map(|c| tess::Chunk {
+            start: c.start + base,
+            len: c.len,
+            x0: c.x0 + dx,
+            y0: c.y0 + dy,
+            x1: c.x1 + dx,
+            y1: c.y1 + dy,
+        }));
+        self.emit(color, clip);
     }
 
     /// `self.tchunks` (triangles in `self.tverts`) as `Prim::Tris`, cut to `clip`.

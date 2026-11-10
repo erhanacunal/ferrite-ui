@@ -436,33 +436,11 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
         ctx.objs.geo_end();
         return;
     }
-    // With layers: the screen's part (their subtrees left out), unless a
-    // layer is composed into the screen (its surface is drawn there by the
-    // passes). The layers' surfaces are drawn by the passes after.
-    #[cfg(feature = "layers")]
-    if active != 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES && ctx.objs.layers.composed == 0 {
-        ctx.objs.layers.scope = base_scope(&ctx.objs);
-        let taken = compose_dirty(ctx, true);
-        ctx.objs.layers.scope = crate::layer::Scope::All;
-        if taken {
-            for s in 0..crate::layer::MAX_LAYERS {
-                if ctx.objs.layers.slots[s].active {
-                    layer_pass(ctx, s, false);
-                }
-            }
-            place_layers(ctx);
-            ctx.objs.geo_end();
-            clear_all_dirty(ctx);
-            ctx.objs.shifted.clear();
-            ctx.objs.settled_epoch = ctx.objs.draw_epoch;
-            return;
-        }
-    }
-
     #[cfg(feature = "layers")]
     if active != 0 {
         // Composed layers' surfaces first: what changed in them is blended
-        // into the screen by its passes, their root redrawn there.
+        // into the screen (by the compositor or the passes), their root
+        // redrawn there.
         for s in 0..crate::layer::MAX_LAYERS {
             if !ctx.objs.layers.slots[s].composed {
                 continue;
@@ -478,6 +456,33 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
                 ctx.objs.get_mut(root).flags |= crate::widget::FLAG_DIRTY_A;
             }
         }
+    }
+    // With layers: the screen's part (their subtrees left out; a composed
+    // layer's root is its surface). The windowed layers' surfaces are drawn
+    // by the passes after.
+    #[cfg(feature = "layers")]
+    if active != 0 && <P::Renderer as WidgetRenderer<P>>::COMPOSES {
+        ctx.objs.layers.scope = base_scope(&ctx.objs);
+        let taken = compose_dirty(ctx, true);
+        ctx.objs.layers.scope = crate::layer::Scope::All;
+        if taken {
+            for s in 0..crate::layer::MAX_LAYERS {
+                let slot = ctx.objs.layers.slots[s];
+                if slot.active && !slot.composed {
+                    layer_pass(ctx, s, false);
+                }
+            }
+            place_layers(ctx);
+            ctx.objs.geo_end();
+            clear_all_dirty(ctx);
+            ctx.objs.shifted.clear();
+            ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+            return;
+        }
+    }
+
+    #[cfg(feature = "layers")]
+    if active != 0 {
         ctx.objs.layers.scope = base_scope(&ctx.objs);
     }
     dirty_passes(ctx, settled, true);

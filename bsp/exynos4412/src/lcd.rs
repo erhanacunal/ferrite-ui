@@ -1275,6 +1275,18 @@ impl LcdBackend for FimdLcd {
     }
 }
 
+/// The GPU compositor samples a composed layer's shadow: layer `n`'s shadow as (address,
+/// width, height), rect (`x`, `y`, `w`, `h`) of it cleaned to DRAM first (as for the G2D).
+/// None if the layer has no surface.
+#[cfg(feature = "layers")]
+pub fn layer_texture(n: usize, x: usize, y: usize, w: usize, h: usize) -> Option<(usize, usize, usize)> {
+    if COMPOSED.fetch_or(1 << n, Ordering::Relaxed) & 1 << n == 0 {
+        exynos_4412_rs::println!("ferrite: layer {} composed into the screen", n);
+    }
+    let (base, _, lw, lh) = layers::compose_source(n, Some((x, y, w, h)))?;
+    Some((base, lw, lh))
+}
+
 /// Layers composed into the screen since they were last placed in their
 /// window (bit n), only for the console lines (as the sim prints them).
 #[cfg(feature = "layers")]
