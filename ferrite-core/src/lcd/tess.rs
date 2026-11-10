@@ -106,14 +106,19 @@ fn segments(r: f32) -> usize {
 fn quarter(m: &mut Mesh<'_>, cx: f32, cy: f32, sx: f32, sy: f32, rings: &[(f32, f32)]) {
     let outer = rings.last().map_or(0.0, |r| r.0);
     let n = segments(outer);
-    let at = |i: usize, rad: f32, a: f32| {
+    // The rays' directions, once (every ray is used by each ring, twice).
+    let mut dirs = [(0.0f32, 0.0f32); 33];
+    for (i, d) in dirs.iter_mut().enumerate().take(n + 1) {
         let t = core::f32::consts::FRAC_PI_2 * i as f32 / n as f32;
         // Exact ends: the rays the neighbouring pieces' edges lie on.
-        let (c, s) = match i {
+        *d = match i {
             0 => (1.0, 0.0),
             _ if i == n => (0.0, 1.0),
             _ => (libm::cosf(t), libm::sinf(t)),
         };
+    }
+    let at = |i: usize, rad: f32, a: f32| {
+        let (c, s) = dirs[i];
         Vtx { x: cx + sx * rad * c, y: cy + sy * rad * s, a }
     };
     let centre = Vtx { x: cx, y: cy, a: rings[0].1 };

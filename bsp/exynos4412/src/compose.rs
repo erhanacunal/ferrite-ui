@@ -24,7 +24,11 @@
 //!   the built-in way into a premultiplied sprite (`renderer::Sprite`), cached by appearance like
 //!   the renderer's (a label's text included), and sampled.
 //!
-//! **Frames.** An area is cut into frames of at most `gpu::MAX_TILES` tiles (full-width strips:
+//! **Frames.** The core's areas are first merged pairwise while one frame over both is
+//! estimated cheaper (`merge_areas`: ~0.38 ms fixed per frame, ~11 µs per thousand pixels),
+//! and until none overlap. A render that would still take more than `FREE_FRAMES` frames
+//! averaging under `MIN_FRAME_KPX` thousand pixels is declined (`small_areas`).
+//! An area is cut into frames of at most `gpu::MAX_TILES` tiles (full-width strips:
 //! 96 lines of a 1280-pixel line). A frame starts at the last widget that paints the whole
 //! frame opaquely: nothing before it shows. Its pieces, clipped to the frame, are batched while
 //! the program and texture stay the same; each batch is one mesh of the frame and one draw.
@@ -79,6 +83,10 @@ impl R {
 
     fn is_empty(&self) -> bool {
         self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+
+    fn rect(&self) -> Rect {
+        Rect::new(self.x0 as i16, self.y0 as i16, self.w() as u16, self.h() as u16)
     }
 
     fn meet(&self, o: &R) -> R {
@@ -423,16 +431,22 @@ fn state() -> &'static mut State {
     unsafe { &mut *(&raw mut STATE) }
 }
 
-/// Off = the passes draw everything. Starts off: on the board the compositor matched the
-/// passes on page slides and was 2x slower on the Monitor stress test (many small areas,
-/// ~0.3 ms fixed cost per GPU frame). HTTP `POST /api/compose?on=1|0` switches it, for A/B
-/// runs and screenshots of the same scene both ways.
-pub static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Off = the passes draw everything. On at boot since 2026-11-10 (board, render per present,
+/// compositor vs passes): Clock app 2.0 vs 8.4–10 ms, Monitor stress test 2.2 vs 2.7 ms
+/// (after merging areas into fewer frames and `ui_round` for small corners), page slide
+/// 9.8–10.2 vs 9.4–9.5 ms. HTTP `POST /api/compose?on=1|0` switches it, for A/B runs and
+/// screenshots of the same scene both ways.
+pub static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 /// Rounded boxes as anti-aliased triangles (`ferrite_core::lcd::tess`: coverage per vertex,
 /// `ui_flat` two instructions a pixel) rather than `ui_round` corner squares (the shader
 /// works the coverage out per pixel, ~a dozen instructions). On by default; HTTP
 /// `POST /api/compose?tess=0|1` switches it for A/B runs.
 pub static TESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// With [`TESS`], only corners of at least this radius are triangles; smaller ones stay
+/// `ui_round` squares (HTTP `?tess_min=N`). The shader's cost grows with r², the triangles'
+/// (CPU building, cache cleans, the GP) with √r: the Monitor stress test's ~120 r = 8 boxes a
+/// render took 3.85 ms per present as triangles, 2.0 ms as `ui_round` (passes 2.7 ms).
+pub static TESS_MIN_RADIUS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(12);
 /// Label text as glyph quads from the atlas ([`Atlas`]) rather than a sprite of the whole
 /// label (drawn by the CPU, and again whenever the text changes). On by default; HTTP
 /// `POST /api/compose?glyphs=0|1` switches it for A/B runs.
@@ -450,8 +464,18 @@ pub static REPAINT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 
 /// Why renders were composed or declined, counted since boot (HTTP `/api/status`): the
 /// names of [`COUNTS`]' slots.
-pub const COUNT_NAMES: [&str; 9] =
-    ["composed", "switched_off", "portrait", "keyboard", "no_gpu", "no_shaders", "clip_or_on_paint", "widget", "gpu_error"];
+pub const COUNT_NAMES: [&str; 10] = [
+    "composed",
+    "switched_off",
+    "portrait",
+    "keyboard",
+    "no_gpu",
+    "no_shaders",
+    "clip_or_on_paint",
+    "widget",
+    "gpu_error",
+    "small_areas",
+];
 const TAKEN: usize = 0;
 const OFF: usize = 1;
 const PORTRAIT: usize = 2;
@@ -461,7 +485,56 @@ const NO_UI: usize = 5;
 const CLIP: usize = 6;
 const WIDGET: usize = 7;
 const GPU_ERROR: usize = 8;
-pub static COUNTS: [core::sync::atomic::AtomicU32; 9] = [const { core::sync::atomic::AtomicU32::new(0) }; 9];
+const SMALL: usize = 9;
+pub static COUNTS: [core::sync::atomic::AtomicU32; 10] = [const { core::sync::atomic::AtomicU32::new(0) }; 10];
+
+/// Frames a render may take before [`MIN_FRAME_KPX`] applies (HTTP `?free_frames=`).
+pub static FREE_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+/// Past [`FREE_FRAMES`] frames, the average frame must cover this many thousand pixels, or
+/// the render is declined (HTTP `?min_kpx=`, 0 = never). A frame's fixed cost (~0.38 ms on the
+/// board: resets, starting the units, cache cleans, the CPU setting it up) against the PPs'
+/// ~11 µs per thousand pixels: the Monitor stress test's ~7.5 frames of ~9 Kpx a render took
+/// 5.1 ms per present against the passes' 2.7 ms.
+pub static MIN_FRAME_KPX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(32);
+
+/// A frame's fixed cost and the PPs' cost per thousand pixels, in µs (board, 2026-11-10).
+const FRAME_FIXED_US: i32 = 380;
+const FRAME_KPX_US: i32 = 11;
+
+/// GPU frames `a` (whole tiles) is cut into: full-width strips of at most `MAX_TILES` tiles.
+fn frames_of(a: &R) -> i32 {
+    let across = ((a.w() + TILE - 1) / TILE).max(1);
+    let lines = ((gpu::MAX_TILES as i32 / across).max(1) * TILE).min(a.h().max(TILE));
+    (a.h() + lines - 1) / lines
+}
+
+/// The estimated cost of `a`'s frames, µs.
+fn cost_of(a: &R) -> i32 {
+    frames_of(a) * FRAME_FIXED_US + a.w() * a.h() / 1000 * FRAME_KPX_US
+}
+
+/// `areas` merged pairwise while one frame over both costs less than theirs apart
+/// ([`cost_of`]), and until none overlap.
+fn merge_areas(areas: &[Rect]) -> Vec<R> {
+    let mut out: Vec<R> = areas.iter().map(R::of).filter(|a| !a.is_empty()).collect();
+    loop {
+        let mut best: Option<(usize, usize, i32)> = None;
+        for i in 0..out.len() {
+            for j in i + 1..out.len() {
+                let (a, b) = (out[i], out[j]);
+                let u = R { x0: a.x0.min(b.x0), y0: a.y0.min(b.y0), x1: a.x1.max(b.x1), y1: a.y1.max(b.y1) };
+                let gain = if a.meets(&b) { i32::MAX } else { cost_of(&a) + cost_of(&b) - cost_of(&u) };
+                if gain > 0 && best.is_none_or(|(_, _, g)| gain > g) {
+                    best = Some((i, j, gain));
+                }
+            }
+        }
+        let Some((i, j, _)) = best else { return out };
+        let b = out.swap_remove(j);
+        let a = &mut out[i];
+        *a = R { x0: a.x0.min(b.x0), y0: a.y0.min(b.y0), x1: a.x1.max(b.x1), y1: a.y1.max(b.y1) };
+    }
+}
 
 /// Where the compositor's time goes, summed since boot (HTTP `/api/status`): the names of
 /// [`TIMES`]' slots. GPU frames, their draws, pieces and pixels; the HAL's GP / PP / whole-frame
@@ -469,8 +542,9 @@ pub static COUNTS: [core::sync::atomic::AtomicU32; 9] = [const { core::sync::ato
 /// and in whole `compose` calls (gathering the pieces and drawing sprites included).
 /// Then: the pieces' gathering (`collect`, sprites included); sprites drawn by the CPU (cache
 /// misses and this-render-only ones) and their time; the slowest such sprite's time and its
-/// widget kind (`*_max`: the largest seen since boot).
-pub const TIME_NAMES: [&str; 14] = [
+/// widget kind (`*_max`: the largest seen since boot). Then the CPU time of starting frames
+/// (`Gpu::frame`) and of running them (`Frame::show`: cache cleans + the hardware time).
+pub const TIME_NAMES: [&str; 16] = [
     "frames",
     "draws",
     "pieces",
@@ -485,6 +559,8 @@ pub const TIME_NAMES: [&str; 14] = [
     "sprite_us",
     "sprite_max_us",
     "sprite_max_kind",
+    "begin_us",
+    "show_us",
 ];
 const T_FRAMES: usize = 0;
 const T_DRAWS: usize = 1;
@@ -500,7 +576,9 @@ const T_SPRITES: usize = 10;
 const T_SPRITE_US: usize = 11;
 const T_SPRITE_MAX: usize = 12;
 const T_SPRITE_MAX_KIND: usize = 13;
-pub static TIMES: [core::sync::atomic::AtomicU64; 14] = [const { core::sync::atomic::AtomicU64::new(0) }; 14];
+const T_BEGIN: usize = 14;
+const T_SHOW: usize = 15;
+pub static TIMES: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::atomic::AtomicU64::new(0) }; 16];
 
 /// A sprite of a widget of `kind` took `us` to draw.
 fn sprite_time(kind: u8, us: u64) {
@@ -544,6 +622,16 @@ pub fn compose(ctx: &Ctx<P>, areas: &[Rect]) -> bool {
     if ctx.lcd.is_portrait() {
         return count(PORTRAIT);
     }
+    use core::sync::atomic::Ordering::Relaxed;
+    let merged = merge_areas(areas);
+    let frames: i32 = merged.iter().map(frames_of).sum();
+    let kpx: i32 = merged.iter().map(|a| a.w() * a.h() / 1000).sum();
+    let min_kpx = MIN_FRAME_KPX.load(Relaxed) as i32;
+    if frames > FREE_FRAMES.load(Relaxed) as i32 && kpx < min_kpx * frames {
+        return count(SMALL);
+    }
+    let merged: Vec<Rect> = merged.iter().map(R::rect).collect();
+    let areas = &merged[..];
     if let Some(o) = ctx.objs.overlay {
         if areas.iter().any(|a| a.intersects(&o)) {
             return count(KEYBOARD);
@@ -795,7 +883,9 @@ impl State {
                 Lin::flat(rgb(bg, alpha))
             };
             let border = if bw > 0 { rgb(w.border_color, 1.0) } else { [0.0; 4] };
-            if TESS.load(core::sync::atomic::Ordering::Relaxed) {
+            if TESS.load(core::sync::atomic::Ordering::Relaxed)
+                && e.border_radius as u32 >= TESS_MIN_RADIUS.load(core::sync::atomic::Ordering::Relaxed)
+            {
                 // As `draw_widget`: the fill (inset half the border, its radius as much
                 // smaller), then the border ring over it.
                 if draw_bg {
@@ -1176,6 +1266,7 @@ impl State {
         let first = self.items.iter().rposition(|it| it.opaque.is_some_and(|o| o.contains(c))).unwrap_or(0);
         let from = self.items.get(first).map_or(self.prims.len(), |it| it.start);
         let mut frame = gpu.frame(Area::new(c.x0 as usize, c.y0 as usize, c.w() as usize, c.h() as usize), 0xFF00_0000);
+        add_time(T_BEGIN, now_us() - started);
         let scale = [2.0 / c.w() as f32, 2.0 / c.h() as f32];
         let mut batch = None;
         let mut drew = false;
@@ -1206,7 +1297,9 @@ impl State {
             self.push(&black, c, c);
             self.flush(ui, &mut frame, black.batch(), scale)?;
         }
+        let showing = now_us();
         let shown = frame.show();
+        add_time(T_SHOW, now_us() - showing);
         add_time(T_FRAMES, 1);
         add_time(T_KPX, (c.w() * c.h()) as u64 / 1000);
         if let Ok(t) = &shown {

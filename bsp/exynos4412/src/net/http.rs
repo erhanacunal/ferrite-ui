@@ -9,7 +9,7 @@
 //! | `POST /flash` (or `/fs`, or `PUT`) | an FS image (or a whole `FLASH.BIN`): checked, saved as `FERRITE/FLASH.BIN`, then a restart |
 //! | `POST /restart` | restarts the board |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
-//! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites |
+//! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses, polygons and gauges as triangles / sprites; `?tess_min=N` smallest corner radius as triangles; `?free_frames=N` / `?min_kpx=N` the small-areas rule (`compose::FREE_FRAMES`, `MIN_FRAME_KPX`) |
 //! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
 //! | `POST /api/cpu?mhz=N` | wanted CPU clock, one of 200..1400 in steps of 100 (`cpuclock`), applied by CPU0 after the next pass under the thermal cap; without `mhz` the current one |
@@ -268,6 +268,28 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 text(socket, "200 OK", if on { "Circles, ellipses, polygons and gauges as triangles
 " } else { "Circles, ellipses, polygons and gauges from sprites
 " }).await?;
+                return Ok(false);
+            }
+            let number = |name: &[u8]| {
+                query_param(query, name).and_then(|v| core::str::from_utf8(v).ok()).and_then(|v| v.parse::<u32>().ok())
+            };
+            if let Some(n) = number(b"tess_min").filter(|&n| n <= 1024) {
+                crate::compose::TESS_MIN_RADIUS.store(n, Ordering::Relaxed);
+                crate::compose::REPAINT.store(true, Ordering::Release);
+                text(socket, "200 OK", "Smallest corner radius drawn as triangles set
+").await?;
+                return Ok(false);
+            }
+            if let Some(n) = number(b"free_frames").filter(|&n| n <= 64) {
+                crate::compose::FREE_FRAMES.store(n, Ordering::Relaxed);
+                text(socket, "200 OK", "Frames before the per-frame size rule set
+").await?;
+                return Ok(false);
+            }
+            if let Some(n) = number(b"min_kpx").filter(|&n| n <= 4096) {
+                crate::compose::MIN_FRAME_KPX.store(n, Ordering::Relaxed);
+                text(socket, "200 OK", "Smallest average frame size set (0 = no rule)
+").await?;
                 return Ok(false);
             }
             match query_param(query, b"on") {
@@ -681,6 +703,13 @@ fn status_json() -> String {
         crate::compose::GRAPHS.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::SHAPES.load(core::sync::atomic::Ordering::Relaxed),
         crate::gpu::status().replace('"', "'")
+    );
+    let _ = write!(
+        s,
+        ",\"tess_min\":{},\"free_frames\":{},\"min_kpx\":{}",
+        crate::compose::TESS_MIN_RADIUS.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::FREE_FRAMES.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::MIN_FRAME_KPX.load(core::sync::atomic::Ordering::Relaxed)
     );
     for (name, n) in crate::compose::COUNT_NAMES.iter().zip(&crate::compose::COUNTS) {
         let _ = write!(s, ",\"{}\":{}", name, n.load(core::sync::atomic::Ordering::Relaxed));
