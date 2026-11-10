@@ -144,6 +144,77 @@ fn hdr_words(h: u32) -> usize {
     (h >> 16) as usize
 }
 
+/// What the render passes keep between frames about the widget tree.
+pub(crate) struct RenderState {
+    /// Bumped whenever something outside the widget renderer may have drawn
+    /// over widgets (VM drawing builtins, erased areas). A widget redrawn
+    /// incrementally (gauge) trusts its on-screen pixels only if they were
+    /// drawn in the current epoch.
+    pub(crate) draw_epoch: u32,
+    /// Some widget may have a dirty bit set. Raised by everything that sets
+    /// one (`mark_dirty`, `alloc_widget`); lowered only by a render scan that
+    /// found no dirty widget. While it is down the render passes skip their
+    /// DFS scans, so an idle main-loop pass doesn't walk the tree.
+    pub(crate) maybe_dirty: bool,
+    /// Widgets `mark_dirty` was called on since the last render (the roots
+    /// of what changed; a move, `mark_moved`, is not listed). `changed_n`
+    /// past `CHANGED_MAX` = more than fit: anything may have changed. A
+    /// moved subtree with nothing listed in it only moved, so its pixels can
+    /// be shifted instead of redrawn (`render::shift_moved`).
+    pub(crate) changed: [WidgetId; CHANGED_MAX],
+    pub(crate) changed_n: u8,
+    /// `draw_epoch` when the last dirty render ended: equal at the start of
+    /// the next one = nothing drew over the screen between them, so every
+    /// widget still shows what it last drew.
+    pub(crate) settled_epoch: u32,
+    /// This render's shifted pixels: (DFS index of the moved subtree root,
+    /// destination rect). Pass 2 leaves them alone. Empty on boards that
+    /// cannot move pixels (never allocated there).
+    pub(crate) shifted: Vec<(usize, crate::types::Rect)>,
+    /// Scratch for pass 2: the part of a shifted subtree's box still to draw.
+    pub(crate) shift_keep: Vec<crate::types::Rect>,
+    /// Geometry by DFS index for the current render pass (`geo.rs`).
+    #[cfg(feature = "render_cache")]
+    pub(crate) geo: Vec<crate::geo::Geo>,
+    #[cfg(feature = "render_cache")]
+    pub(crate) geo_stack: Vec<u32>,
+    #[cfg(feature = "render_cache")]
+    pub(crate) geo_valid: bool,
+}
+
+impl RenderState {
+    fn new() -> Self {
+        Self {
+            draw_epoch: 0,
+            maybe_dirty: false,
+            changed: [WidgetId::NONE; CHANGED_MAX],
+            changed_n: 0,
+            settled_epoch: u32::MAX,
+            shifted: Vec::new(),
+            shift_keep: Vec::new(),
+            #[cfg(feature = "render_cache")]
+            geo: Vec::new(),
+            #[cfg(feature = "render_cache")]
+            geo_stack: Vec::new(),
+            #[cfg(feature = "render_cache")]
+            geo_valid: false,
+        }
+    }
+
+    /// Forget the tree (every object dropped). `draw_epoch` keeps counting:
+    /// the screen still shows what was drawn.
+    fn reset(&mut self) {
+        self.maybe_dirty = false;
+        self.changed_n = 0;
+        self.settled_epoch = self.draw_epoch.wrapping_sub(1);
+        self.shifted.clear();
+        #[cfg(feature = "render_cache")]
+        {
+            self.geo_valid = false;
+        }
+    }
+}
+
 pub struct ObjPool {
     pub(crate) arena: Box<[u32]>,
     table: Box<[Off]>,
@@ -178,33 +249,8 @@ pub struct ObjPool {
     /// Scratch widget returned by `get_mut` for an id that names no widget,
     /// so a stale id behaves like a destroyed widget instead of panicking.
     pub(crate) dead: Widget,
-    /// Bumped whenever something outside the widget renderer may have drawn
-    /// over widgets (VM drawing builtins, erased areas). A widget redrawn
-    /// incrementally (gauge) trusts its on-screen pixels only if they were
-    /// drawn in the current epoch.
-    pub(crate) draw_epoch: u32,
-    /// Some widget may have a dirty bit set. Raised by everything that sets
-    /// one (`mark_dirty`, `alloc_widget`); lowered only by a render scan that
-    /// found no dirty widget. While it is down the render passes skip their
-    /// DFS scans, so an idle main-loop pass doesn't walk the tree.
-    pub(crate) maybe_dirty: bool,
-    /// Widgets `mark_dirty` was called on since the last render (the roots
-    /// of what changed; a move, `mark_moved`, is not listed). `changed_n`
-    /// past `CHANGED_MAX` = more than fit: anything may have changed. A
-    /// moved subtree with nothing listed in it only moved, so its pixels can
-    /// be shifted instead of redrawn (`render::shift_moved`).
-    pub(crate) changed: [WidgetId; CHANGED_MAX],
-    pub(crate) changed_n: u8,
-    /// `draw_epoch` when the last dirty render ended: equal at the start of
-    /// the next one = nothing drew over the screen between them, so every
-    /// widget still shows what it last drew.
-    pub(crate) settled_epoch: u32,
-    /// This render's shifted pixels: (DFS index of the moved subtree root,
-    /// destination rect). Pass 2 leaves them alone. Empty on boards that
-    /// cannot move pixels (never allocated there).
-    pub(crate) shifted: Vec<(usize, crate::types::Rect)>,
-    /// Scratch for pass 2: the part of a shifted subtree's box still to draw.
-    pub(crate) shift_keep: Vec<crate::types::Rect>,
+    /// Render bookkeeping (`render.rs`, `geo.rs`).
+    pub(crate) render: RenderState,
     /// What is drawn over the widgets from outside the tree (the on-screen keyboard), set by
     /// the input handler: a board renderer that repaints whole areas
     /// (`WidgetRenderer::compose`) leaves areas that touch it to the built-in passes.
@@ -212,13 +258,6 @@ pub struct ObjPool {
     /// Retained layers: roots, plane alphas, the running pass's scope (`layer.rs`).
     #[cfg(feature = "layers")]
     pub layers: crate::layer::Layers,
-    /// Geometry by DFS index for the current render pass (`geo.rs`).
-    #[cfg(feature = "render_cache")]
-    pub(crate) geo: Vec<crate::geo::Geo>,
-    #[cfg(feature = "render_cache")]
-    pub(crate) geo_stack: Vec<u32>,
-    #[cfg(feature = "render_cache")]
-    pub(crate) geo_valid: bool,
 }
 
 impl ObjPool {
@@ -250,22 +289,10 @@ impl ObjPool {
             dfs_cache: Vec::new(),
             dfs_valid: false,
             dead: Widget::DEAD,
-            draw_epoch: 0,
-            maybe_dirty: false,
-            changed: [WidgetId::NONE; CHANGED_MAX],
-            changed_n: 0,
-            settled_epoch: u32::MAX,
-            shifted: Vec::new(),
+            render: RenderState::new(),
             overlay: None,
-            shift_keep: Vec::new(),
             #[cfg(feature = "layers")]
             layers: crate::layer::Layers::new(),
-            #[cfg(feature = "render_cache")]
-            geo: Vec::new(),
-            #[cfg(feature = "render_cache")]
-            geo_stack: Vec::new(),
-            #[cfg(feature = "render_cache")]
-            geo_valid: false,
         }
     }
 
@@ -333,18 +360,11 @@ impl ObjPool {
         self.root = WidgetId::NONE;
         self.dfs_cache.clear();
         self.dfs_valid = false;
-        self.maybe_dirty = false;
-        self.changed_n = 0;
-        self.settled_epoch = self.draw_epoch.wrapping_sub(1);
-        self.shifted.clear();
+        self.render.reset();
         #[cfg(feature = "layers")]
         {
             // The surfaces stay shown until the next render hides them.
             self.layers = crate::layer::Layers::new();
-        }
-        #[cfg(feature = "render_cache")]
-        {
-            self.geo_valid = false;
         }
     }
 
@@ -392,7 +412,7 @@ impl ObjPool {
         use core::mem::size_of;
         let tasks = if cfg!(feature = "multi_program") { 2 * self.table.len() } else { 0 };
         #[cfg(feature = "render_cache")]
-        let geo = self.geo.capacity() * size_of::<crate::geo::Geo>() + self.geo_stack.capacity() * 4;
+        let geo = self.render.geo.capacity() * size_of::<crate::geo::Geo>() + self.render.geo_stack.capacity() * 4;
         #[cfg(not(feature = "render_cache"))]
         let geo = 0;
         self.arena.len() * 4

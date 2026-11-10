@@ -53,16 +53,16 @@ impl ObjPool {
     pub(crate) fn geo_end(&mut self) {
         #[cfg(feature = "render_cache")]
         {
-            self.geo_valid = false;
+            self.render.geo_valid = false;
         }
     }
 
     #[cfg(feature = "render_cache")]
     fn geo_build(&mut self) {
-        self.geo_valid = false;
+        self.render.geo_valid = false;
         let n = self.dfs_cache.len();
-        let mut geo = core::mem::take(&mut self.geo);
-        let mut stack = core::mem::take(&mut self.geo_stack);
+        let mut geo = core::mem::take(&mut self.render.geo);
+        let mut stack = core::mem::take(&mut self.render.geo_stack);
         geo.clear();
         stack.clear();
         if geo.try_reserve(n).is_ok() && stack.try_reserve(n).is_ok() {
@@ -106,16 +106,16 @@ impl ObjPool {
                 geo.push(Geo { abs, ox, oy, end: n as u32, sp, vis });
                 stack.push(i as u32);
             }
-            self.geo_valid = true;
+            self.render.geo_valid = true;
         }
-        self.geo = geo;
-        self.geo_stack = stack;
+        self.render.geo = geo;
+        self.render.geo_stack = stack;
     }
 
     #[cfg(feature = "render_cache")]
     #[inline(always)]
     fn geo(&self, i: usize) -> Option<&Geo> {
-        if self.geo_valid { self.geo.get(i) } else { None }
+        if self.render.geo_valid { self.render.geo.get(i) } else { None }
     }
 
     /// `absolute_rect` of DFS entry `i`.
@@ -225,12 +225,12 @@ mod tests {
             .map(|i| (t.abs_at(i), t.vis_at(i), t.scroll_parent_at(i).0, t.sub_end_at(i)))
             .collect();
         t.geo_begin();
-        assert!(t.geo_valid);
+        assert!(t.render.geo_valid);
         for i in 0..n {
             let got = (t.abs_at(i), t.vis_at(i), t.scroll_parent_at(i).0, t.sub_end_at(i));
             assert!(got == live[i], "entry {i}");
         }
         t.geo_end();
-        assert!(!t.geo_valid);
+        assert!(!t.render.geo_valid);
     }
 }

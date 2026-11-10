@@ -180,7 +180,7 @@ impl ObjPool {
             }
         }
         self.layers.placed = true;
-        self.maybe_dirty = true;
+        self.render.maybe_dirty = true;
     }
 
     /// The layer `id` is the root of (1..=MAX_LAYERS), 0 = none.
@@ -193,7 +193,7 @@ impl ObjPool {
         if let Some(s) = self.layers.slots.iter_mut().find(|s| s.root == id && id.is_some()) {
             s.alpha = a.clamp(0, 255) as u8;
             self.layers.placed = true;
-            self.maybe_dirty = true;
+            self.render.maybe_dirty = true;
         }
     }
 
@@ -213,7 +213,7 @@ impl ObjPool {
     pub fn layer_placement_changed(&mut self, id: WidgetId) -> bool {
         if self.is_active_layer_root(id) {
             self.layers.placed = true;
-            self.maybe_dirty = true;
+            self.render.maybe_dirty = true;
             return true;
         }
         false

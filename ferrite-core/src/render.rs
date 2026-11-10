@@ -24,7 +24,7 @@ pub fn screen_rect<B: LcdBackend>(lcd: &LcdImpl<B>) -> Rect {
 
 /// Check if the back buffer has any dirty widgets.
 pub fn buffered_has_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
-    if !ctx.objs.maybe_dirty {
+    if !ctx.objs.render.maybe_dirty {
         return false;
     }
     let buf = ctx.lcd.back_buf();
@@ -39,7 +39,7 @@ pub fn buffered_has_dirty<P: Platform>(ctx: &mut Ctx<P>) -> bool {
     }
     // Nothing dirty in either buffer: idle passes can skip the scan.
     if !other {
-        ctx.objs.maybe_dirty = false;
+        ctx.objs.render.maybe_dirty = false;
     }
     false
 }
@@ -82,7 +82,7 @@ impl PaintList {
 /// Dirty-mode counterpart of the list `render_buffered_content` returns: the
 /// dirty on_paint widgets, collected *before* `render_dirty` clears the flags.
 pub fn collect_dirty_paint<P: Platform>(ctx: &mut Ctx<P>, out: &mut PaintList) {
-    if !ctx.objs.maybe_dirty {
+    if !ctx.objs.render.maybe_dirty {
         return;
     }
     ctx.objs.ensure_dfs();
@@ -404,7 +404,7 @@ pub fn render_all<P: Platform>(ctx: &mut Ctx<P>) {
     ctx.objs.geo_end();
     clear_all_dirty(ctx);
     // Everything shows what it last drew (see `render_dirty`'s `settled`).
-    ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+    ctx.objs.render.settled_epoch = ctx.objs.render.draw_epoch;
 }
 
 /// Iterative full redraw of DFS entries `lo..hi` (`ensure_dfs` +
@@ -453,12 +453,12 @@ fn render_all_iterative<P: Platform>(ctx: &mut Ctx<P>, lo: usize, hi: usize) {
 /// This prevents hidden panels from overwriting visible siblings that share
 /// the same screen area (e.g. tab panels stacked at the same position).
 pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
-    if !ctx.objs.maybe_dirty {
+    if !ctx.objs.render.maybe_dirty {
         return;
     }
     // Every widget still shows what it last drew: nothing drew over the
     // screen since the last render, and the tree kept its shape.
-    let settled = ctx.objs.draw_epoch == ctx.objs.settled_epoch && ctx.objs.dfs_valid;
+    let settled = ctx.objs.render.draw_epoch == ctx.objs.render.settled_epoch && ctx.objs.dfs_valid;
     ctx.objs.ensure_dfs();
 
     let mut has_dirty = false;
@@ -477,7 +477,7 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     if !has_dirty && !placed {
         // Dirty mode uses only the A bits: nothing left to draw until a
         // widget is marked again.
-        ctx.objs.maybe_dirty = false;
+        ctx.objs.render.maybe_dirty = false;
         ctx.objs.clear_changed();
         return;
     }
@@ -532,8 +532,8 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
             place_layers(ctx);
             ctx.objs.geo_end();
             clear_all_dirty(ctx);
-            ctx.objs.shifted.clear();
-            ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+            ctx.objs.render.shifted.clear();
+            ctx.objs.render.settled_epoch = ctx.objs.render.draw_epoch;
             return;
         }
     }
@@ -558,8 +558,8 @@ pub fn render_dirty<P: Platform>(ctx: &mut Ctx<P>) {
     ctx.objs.geo_end();
 
     clear_all_dirty(ctx);
-    ctx.objs.shifted.clear();
-    ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+    ctx.objs.render.shifted.clear();
+    ctx.objs.render.settled_epoch = ctx.objs.render.draw_epoch;
 }
 
 /// The passes of `render_dirty` over the running scope: the screen (`base`,
@@ -664,8 +664,8 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
 
     // A restore after the shift that drew over shifted pixels (a widget
     // behind the panel restored there): the panel is drawn there again.
-    if !ctx.objs.shifted.is_empty() {
-        let shifted = &mut ctx.objs.shifted;
+    if !ctx.objs.render.shifted.is_empty() {
+        let shifted = &mut ctx.objs.render.shifted;
         shifted.retain(|&(sdi, r)| {
             !restores.full && !restores.list[..restores.n].iter().any(|&(i, a)| i != sdi && a.intersects(&r))
         });
@@ -725,8 +725,8 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
         let moved_fresh = restores.fresh_behind(di, abs) && !painted_before(&ctx.objs, di, &abs);
 
         // Its pixels were shifted (pass 0): draw only what came into view
-        // (`shift_keep`, kept in `ctx.objs.shift_keep`).
-        let keep = !ctx.objs.shifted.is_empty() && shift_keep(ctx, di, &abs);
+        // (`shift_keep`, kept in `ctx.objs.render.shift_keep`).
+        let keep = !ctx.objs.render.shifted.is_empty() && shift_keep(ctx, di, &abs);
 
         // Flat iteration over dirty widget + its descendants
         let mut next = di;
@@ -749,7 +749,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>, settled: bool, base: bool) {
             clip.clip_to_bounds(&screen_rect(&ctx.lcd));
             if keep {
                 // One rect cut by at most MAX_CLIP_RECTS disjoint ones: fits.
-                clip.restrict(&ctx.objs.shift_keep);
+                clip.restrict(&ctx.objs.render.shift_keep);
             }
 
             for oi in 0..occ_count {
@@ -1150,11 +1150,11 @@ fn compose_dirty<P: Platform>(ctx: &mut Ctx<P>, layered: bool) -> bool {
     }
     // What gauges recorded of their last drawing is stale: the areas were
     // drawn another way.
-    ctx.objs.draw_epoch = ctx.objs.draw_epoch.wrapping_add(1);
+    ctx.objs.render.draw_epoch = ctx.objs.render.draw_epoch.wrapping_add(1);
     if !layered {
         clear_all_dirty(ctx);
-        ctx.objs.shifted.clear();
-        ctx.objs.settled_epoch = ctx.objs.draw_epoch;
+        ctx.objs.render.shifted.clear();
+        ctx.objs.render.settled_epoch = ctx.objs.render.draw_epoch;
     }
     true
 }
@@ -1187,7 +1187,7 @@ const SHIFT_MAX: usize = crate::clip::MAX_CLIP_RECTS;
 /// restore would overwrite the other's source).
 #[inline(never)]
 fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Restores) {
-    ctx.objs.shifted.clear();
+    ctx.objs.render.shifted.clear();
     if !settled || ctx.lcd.is_portrait() {
         return;
     }
@@ -1267,7 +1267,7 @@ fn shift_moved<P: Platform>(ctx: &mut Ctx<P>, settled: bool, restores: &mut Rest
         ctx.objs.set_prev_rect(id, 0, Rect::new(0, 0, 0, 0));
         restores.push(di, old);
         for m in &moves {
-            ctx.objs.shifted.push((di, dest(m)));
+            ctx.objs.render.shifted.push((di, dest(m)));
         }
         touched = Some(touched.map_or(span, |t| t.union(&span)));
     }
@@ -1348,18 +1348,18 @@ fn plan_moves(tree: &ObjPool, old: &Rect, new: &Rect, radius: u16, front: usize,
 }
 
 /// For the dirty subtree at DFS index `di` (root at `abs`): if pass 0 moved
-/// its pixels, put in `ctx.objs.shift_keep` the part of its box still to be
+/// its pixels, put in `ctx.objs.render.shift_keep` the part of its box still to be
 /// drawn (on screen, minus the moved rects) and return true. False = draw
 /// it whole (nothing moved, or the region overflowed).
 #[inline(never)]
 fn shift_keep<P: Platform>(ctx: &mut Ctx<P>, di: usize, abs: &Rect) -> bool {
-    if !ctx.objs.shifted.iter().any(|&(i, _)| i == di) {
+    if !ctx.objs.render.shifted.iter().any(|&(i, _)| i == di) {
         return false;
     }
     let mut keep = ClipRegion::from_rect(*abs);
     keep.clip_to_bounds(&screen_rect(&ctx.lcd));
     let mut exact = true;
-    for &(i, r) in &ctx.objs.shifted {
+    for &(i, r) in &ctx.objs.render.shifted {
         if i == di {
             exact &= keep.subtract(&r);
         }
@@ -1367,8 +1367,8 @@ fn shift_keep<P: Platform>(ctx: &mut Ctx<P>, di: usize, abs: &Rect) -> bool {
     if !exact {
         return false;
     }
-    ctx.objs.shift_keep.clear();
-    ctx.objs.shift_keep.extend_from_slice(keep.iter());
+    ctx.objs.render.shift_keep.clear();
+    ctx.objs.render.shift_keep.extend_from_slice(keep.iter());
     true
 }
 

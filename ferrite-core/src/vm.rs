@@ -4182,15 +4182,15 @@ mod anim_tests {
         ctx.objs.root = root;
         let child = one_widget(&mut ctx);
         ctx.objs.add_child(root, child);
-        assert!(ctx.objs.maybe_dirty, "new widgets start dirty");
+        assert!(ctx.objs.render.maybe_dirty, "new widgets start dirty");
         crate::render::render_dirty(&mut ctx);
         assert!(!ctx.objs.get(child).is_dirty());
         // The pass that drew keeps the hint; the next scan finds nothing.
         crate::render::render_dirty(&mut ctx);
-        assert!(!ctx.objs.maybe_dirty);
+        assert!(!ctx.objs.render.maybe_dirty);
         // Marking raises it again, and the widget is drawn.
         ctx.objs.mark_dirty(child);
-        assert!(ctx.objs.maybe_dirty);
+        assert!(ctx.objs.render.maybe_dirty);
         let mut paint = crate::render::PaintList::new();
         crate::render::collect_dirty_paint(&mut ctx, &mut paint);
         crate::render::render_dirty(&mut ctx);
@@ -4200,11 +4200,11 @@ mod anim_tests {
         ctx.objs.get_mut(root).clear_dirty_buf(0);
         ctx.objs.get_mut(child).clear_dirty_buf(0);
         assert!(!crate::render::buffered_has_dirty(&mut ctx));
-        assert!(ctx.objs.maybe_dirty, "B bits still set");
+        assert!(ctx.objs.render.maybe_dirty, "B bits still set");
         ctx.objs.get_mut(root).clear_dirty_buf(1);
         ctx.objs.get_mut(child).clear_dirty_buf(1);
         assert!(!crate::render::buffered_has_dirty(&mut ctx));
-        assert!(!ctx.objs.maybe_dirty);
+        assert!(!ctx.objs.render.maybe_dirty);
     }
 
     #[test]

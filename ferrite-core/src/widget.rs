@@ -558,7 +558,7 @@ impl ObjPool {
         *cast_mut::<Widget>(self.payload_mut(p, T_WIDGET)?) = Widget::NEW;
         self.dfs_valid = false;
         // A new widget starts dirty (Widget::NEW).
-        self.maybe_dirty = true;
+        self.render.maybe_dirty = true;
         self.note_changed(WidgetId(p));
         Some(WidgetId(p))
     }
@@ -849,12 +849,12 @@ impl ObjPool {
     /// epoch. None means redraw it whole.
     pub(crate) fn drawn_value(&self, id: WidgetId, key: u32) -> Option<WValue> {
         let s = self.sec::<SecDrawn>(id)?;
-        (s.key == key && s.epoch == self.draw_epoch).then_some(s.value as WValue)
+        (s.key == key && s.epoch == self.render.draw_epoch).then_some(s.value as WValue)
     }
 
     /// Record that `id` is now fully drawn with appearance `key` and `value`.
     pub(crate) fn set_drawn(&mut self, id: WidgetId, key: u32, value: WValue) {
-        let epoch = self.draw_epoch;
+        let epoch = self.render.draw_epoch;
         if let Some(s) = self.ensure_sec::<SecDrawn>(id) {
             *s = SecDrawn { key, epoch, value: value as i32 };
         }
@@ -870,7 +870,7 @@ impl ObjPool {
     /// Something drew over the screen outside the widget renderer: no
     /// incrementally drawn widget may trust its pixels any more.
     pub fn screen_touched(&mut self) {
-        self.draw_epoch = self.draw_epoch.wrapping_add(1);
+        self.render.draw_epoch = self.render.draw_epoch.wrapping_add(1);
     }
 
     // --- Tree operations ---
@@ -1174,7 +1174,7 @@ impl ObjPool {
     }
 
     fn dirty_subtree(&mut self, id: WidgetId) {
-        self.maybe_dirty = true;
+        self.render.maybe_dirty = true;
         self.get_mut(id).flags |= FLAG_DIRTY_AB;
         let mut child = self.get(id).first_child;
         while child.is_some() {
@@ -1184,25 +1184,25 @@ impl ObjPool {
     }
 
     fn note_changed(&mut self, id: WidgetId) {
-        let n = self.changed_n as usize;
+        let n = self.render.changed_n as usize;
         if n < CHANGED_MAX {
-            if !self.changed[..n].contains(&id) {
-                self.changed[n] = id;
-                self.changed_n += 1;
+            if !self.render.changed[..n].contains(&id) {
+                self.render.changed[n] = id;
+                self.render.changed_n += 1;
             }
         } else {
-            self.changed_n = CHANGED_MAX as u8 + 1;
+            self.render.changed_n = CHANGED_MAX as u8 + 1;
         }
     }
 
     /// Whether anything in `root`'s subtree was listed as changed since the
     /// last render (or more than the list holds changed).
     pub(crate) fn changed_within(&self, root: WidgetId) -> bool {
-        let n = self.changed_n as usize;
+        let n = self.render.changed_n as usize;
         if n > CHANGED_MAX {
             return true;
         }
-        self.changed[..n].iter().any(|&c| {
+        self.render.changed[..n].iter().any(|&c| {
             let mut w = c;
             let mut depth = 0;
             while w.is_some() && depth <= self.count() {
@@ -1218,7 +1218,7 @@ impl ObjPool {
 
     /// Forget the changed list (a render consumed it).
     pub(crate) fn clear_changed(&mut self) {
-        self.changed_n = 0;
+        self.render.changed_n = 0;
     }
 
     /// Rebuild DFS cache if invalidated.

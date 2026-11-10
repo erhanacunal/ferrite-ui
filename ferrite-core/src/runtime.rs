@@ -545,7 +545,7 @@ impl<P: PlatformRuntime> Runtime<P> {
     /// still passes for its own work (presents, polled keys, messages from
     /// other cores).
     pub fn idle_ms(&self) -> Option<u32> {
-        if self.busy() || !self.touch.is_idle() || !self.input.idle() || self.ctx.objs.maybe_dirty {
+        if self.busy() || !self.touch.is_idle() || !self.input.idle() || self.ctx.objs.render.maybe_dirty {
             return Some(0);
         }
         #[cfg(feature = "layers")]
