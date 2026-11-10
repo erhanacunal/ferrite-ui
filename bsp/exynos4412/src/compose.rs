@@ -16,7 +16,9 @@
 //! - a raw opaque RGB565 picture (a background image, an image widget's picture) sampled where
 //!   it is in the flash shadow (`ui_flat`);
 //! - a 3D model widget: its buffer (`model3d::texture`);
-//! - anything else (text, gauges, sliders, shapes, compressed or alpha images) drawn by the CPU
+//! - a circle / ellipse shape or a gauge: the parts its drawing issues (`render::round_parts`)
+//!   as anti-aliased triangles (`tess::oval`, `tess::wedge`);
+//! - anything else (sliders, other shapes, compressed or alpha images) drawn by the CPU
 //!   the built-in way into a premultiplied sprite (`renderer::Sprite`), cached by appearance like
 //!   the renderer's (a label's text included), and sampled.
 //!
@@ -41,11 +43,11 @@ use exynos_4412_rs::gpu::{self, Area, Blend, Frame, Gpu, Target};
 use ferrite_core::ctx::Ctx;
 use ferrite_core::lcd::tess;
 use ferrite_core::pool::ObjPool;
-use ferrite_core::render;
+use ferrite_core::render::{self, RoundPart};
 use ferrite_core::types::{Color, Edges, Rect};
 use ferrite_core::widget::{
     FLAG_CLIP_CHILDREN, FLAG_HAS_ON_PAINT, KIND_BASE, KIND_BUTTON, KIND_BUTTON_GROUP, KIND_IMAGE, KIND_LABEL,
-    KIND_GRAPH, KIND_MODEL3D, KIND_RECTANGLE, WidgetId,
+    KIND_CIRCLE, KIND_ELLIPSE, KIND_GAUGE, KIND_GRAPH, KIND_MODEL3D, KIND_RECTANGLE, WidgetId,
 };
 
 use crate::gpu::Ui;
@@ -224,6 +226,8 @@ struct State {
     /// chunks of the shape being added.
     tverts: Vec<tess::Vtx>,
     tchunks: Vec<tess::Chunk>,
+    /// Round parts' triangles from earlier renders.
+    meshes: MeshCache,
     /// Glyphs of labels, for `ui_flat` text.
     atlas: Atlas,
     /// One glyph's coverage while it is put in the atlas.
@@ -253,6 +257,7 @@ static mut STATE: State = State {
     color: Vec::new(),
     tverts: Vec::new(),
     tchunks: Vec::new(),
+    meshes: MeshCache { entries: Vec::new(), clock: 0 },
     atlas: Atlas::new(),
     cov: Vec::new(),
     glyphs: false,
@@ -261,6 +266,57 @@ static mut STATE: State = State {
     told: false,
     white: 0,
 };
+
+/// Triangles of round parts (`tess::oval`/`wedge`) by the part, colour aside: the clock
+/// face, its dots and the gauges' tracks are tessellated once. Positions are absolute, so a
+/// moved shape is a new entry; entries unused for [MESH_KEEP] lookups go once the cache
+/// holds [MESH_MAX].
+struct MeshCache {
+    entries: Vec<MeshEntry>,
+    /// Lookups so far: an entry's `used` is the clock at its last one.
+    clock: u32,
+}
+
+struct MeshEntry {
+    part: RoundPart,
+    used: u32,
+    verts: Vec<tess::Vtx>,
+    chunks: Vec<tess::Chunk>,
+}
+
+const MESH_MAX: usize = 256;
+const MESH_KEEP: u32 = 1024;
+
+impl MeshCache {
+    /// The part with its colour left out (the triangles don't depend on it).
+    fn key(p: &RoundPart) -> RoundPart {
+        let mut k = *p;
+        match &mut k {
+            RoundPart::Oval { color, .. } | RoundPart::Arc { color, .. } | RoundPart::Wedge { color, .. } => *color = 0,
+        }
+        k
+    }
+
+    fn find(&mut self, p: &RoundPart) -> Option<usize> {
+        self.clock = self.clock.wrapping_add(1);
+        let k = Self::key(p);
+        let at = self.entries.iter().position(|e| e.part == k)?;
+        self.entries[at].used = self.clock;
+        Some(at)
+    }
+
+    fn insert(&mut self, p: RoundPart, verts: Vec<tess::Vtx>, chunks: Vec<tess::Chunk>) -> usize {
+        if self.entries.len() >= MESH_MAX {
+            let now = self.clock;
+            self.entries.retain(|e| now.wrapping_sub(e.used) < MESH_KEEP);
+            if self.entries.len() >= MESH_MAX {
+                self.entries.clear();
+            }
+        }
+        self.entries.push(MeshEntry { part: Self::key(&p), used: self.clock, verts, chunks });
+        self.entries.len() - 1
+    }
+}
 
 /// Side of the glyph atlas in texels (ARGB8888: 4 MB). The GPU's mediump texture
 /// coordinates were checked exact across 1280 texels (`gpu.rs` self-test).
@@ -383,6 +439,10 @@ pub static GLYPHS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// CPU whenever a sample changes: ~5 ms a second for the tablet's perf card). On by default;
 /// HTTP `POST /api/compose?graphs=0|1` switches it for A/B runs.
 pub static GRAPHS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Circle / ellipse shapes and gauges as tessellated ovals, arcs and wedges (`render::round_parts`,
+/// `tess::oval`/`wedge`) rather than sprites. On by default; HTTP `POST /api/compose?shapes=0|1`
+/// switches it for A/B runs.
+pub static SHAPES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 /// [`ENABLED`] changed: the whole screen is repainted the new way ([`service`]).
 pub static REPAINT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -581,6 +641,31 @@ impl State {
             if w.kind == KIND_GRAPH && GRAPHS.load(core::sync::atomic::Ordering::Relaxed) {
                 return Some(self.graph(objs, id, abs));
             }
+            if matches!(w.kind, KIND_CIRCLE | KIND_ELLIPSE | KIND_GAUGE)
+                && SHAPES.load(core::sync::atomic::Ordering::Relaxed)
+                && objs.ext(id).image_id == 0
+            {
+                // A shape that stays the same is one textured quad from a cached sprite, far
+                // fewer vertices than its triangles (board, Clock app: 10.6 vs 6.0 ms a
+                // second with the face and dots as triangles). Triangles for what the cache
+                // doesn't hold: a first sighting, and gauges (no appearance key: their value
+                // changes).
+                if renderer::appearance_complete(w.kind) {
+                    let cache = renderer::cache();
+                    let key = renderer::appearance(ctx, id, abs);
+                    let cached = cache.find(key).is_some()
+                        || (cache.seen(key) && {
+                            let t = now_us();
+                            let got = cache.insert(ctx, id, abs, key, Some(keep_after));
+                            sprite_time(w.kind, now_us() - t);
+                            got.is_some()
+                        });
+                    if cached {
+                        return self.sprite(ctx, id, abs, keep_after).map(|_| None);
+                    }
+                }
+                return Some(self.round(objs, id, abs));
+            }
             if w.kind == KIND_LABEL && self.glyphs && objs.ext(id).image_id == 0 {
                 if let Some(opaque) = self.label(ctx, id, abs) {
                     return Some(opaque);
@@ -760,6 +845,31 @@ impl State {
     fn tess_in(&mut self, color: Lin, clip: Option<R>, f: impl FnOnce(&mut tess::Mesh<'_>)) {
         self.tchunks.clear();
         f(&mut tess::Mesh { verts: &mut self.tverts, chunks: &mut self.tchunks });
+        self.emit(color, clip);
+    }
+
+    /// A round part's triangles (`tess::oval`/`wedge`, `f` adds them), cut to `clip`, from
+    /// [`MeshCache`] when the same part was tessellated before (a clock face and its dots stay
+    /// put while the hands move: their trigonometry was most of the render's CPU time).
+    fn tess_cached(&mut self, part: RoundPart, color: Lin, clip: R, f: impl FnOnce(&mut tess::Mesh<'_>)) {
+        let at = match self.meshes.find(&part) {
+            Some(at) => at,
+            None => {
+                let (mut verts, mut chunks) = (Vec::new(), Vec::new());
+                f(&mut tess::Mesh { verts: &mut verts, chunks: &mut chunks });
+                self.meshes.insert(part, verts, chunks)
+            }
+        };
+        let e = &self.meshes.entries[at];
+        let base = self.tverts.len();
+        self.tverts.extend_from_slice(&e.verts);
+        self.tchunks.clear();
+        self.tchunks.extend(e.chunks.iter().map(|c| tess::Chunk { start: c.start + base, ..*c }));
+        self.emit(color, Some(clip));
+    }
+
+    /// `self.tchunks` (triangles in `self.tverts`) as `Prim::Tris`, cut to `clip`.
+    fn emit(&mut self, color: Lin, clip: Option<R>) {
         for i in 0..self.tchunks.len() {
             let c = self.tchunks[i];
             let mut bbox = R { x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1 };
@@ -841,6 +951,54 @@ impl State {
         }
         self.tess_in(Lin::flat(rgb(style.line, 1.0)), Some(r), |m| tess::polyline(m, &pts));
         self.gpts = pts;
+        opaque
+    }
+
+    /// A circle / ellipse shape or a gauge: a gauge's box (`draw_widget` paints it first), then
+    /// the anti-aliased parts its drawing issues (`render::round_parts`) as tessellated ovals,
+    /// arcs and wedges, cut to the box. Each part blends over the ones before, as on the CPU.
+    /// Its opaque rect.
+    fn round(&mut self, objs: &ObjPool, id: WidgetId, abs: &Rect) -> Option<R> {
+        let w = objs.get(id);
+        let e = objs.ext(id);
+        let r = R::of(abs);
+        let mut opaque = None;
+        if w.kind == KIND_GAUGE {
+            self.boxes(objs, id, &r);
+            opaque = render::covers_opaquely(objs, id, abs, abs).then_some(r);
+        }
+        let mut parts = [None; 10];
+        let mut n = 0;
+        render::round_parts(w, abs, &e, |p| {
+            if n < parts.len() {
+                parts[n] = Some(p);
+                n += 1;
+            }
+        });
+        for &p in parts.iter().flatten() {
+            match p {
+                RoundPart::Oval { x, y, w, h, t, color } => {
+                    let (a, b) = (w as f32 / 2.0, h as f32 / 2.0);
+                    let (cx, cy) = (x as f32 + a, y as f32 + b);
+                    // `smooth_oval`'s ring has a hole while its inner radii are over ½.
+                    let t = t as f32;
+                    let hole = (t > 0.0 && a - t > 0.5 && b - t > 0.5).then_some((a - t, b - t));
+                    self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::oval(m, cx, cy, a, b, hole, None));
+                }
+                RoundPart::Arc { cx, cy, r: rad, ir, start, end, color } => {
+                    let (fx, fy) = (cx as f32 + 0.5, cy as f32 + 0.5);
+                    let a = rad as f32 + 0.5;
+                    let hole = (ir > 1).then(|| (ir as f32 - 0.5, ir as f32 - 0.5));
+                    let arc = Some((start as f32, end as f32));
+                    self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::oval(m, fx, fy, a, a, hole, arc));
+                }
+                RoundPart::Wedge { ax, ay, bx, by, ra_q8, rb_q8, color } => {
+                    let (ra, rb) = (ra_q8.clamp(0, 150 << 8) as f32 / 256.0, rb_q8.clamp(0, 150 << 8) as f32 / 256.0);
+                    let (ax, ay, bx, by) = (ax as f32 + 0.5, ay as f32 + 0.5, bx as f32 + 0.5, by as f32 + 0.5);
+                    self.tess_cached(p, Lin::flat(rgb(color, 1.0)), r, |m| tess::wedge(m, ax, ay, bx, by, ra, rb));
+                }
+            }
+        }
         opaque
     }
 

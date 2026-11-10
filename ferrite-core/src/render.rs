@@ -1986,6 +1986,90 @@ fn draw_smooth_oval_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, ext:
     }
 }
 
+/// One anti-aliased primitive of a round widget, as its drawing on a readback backend issues
+/// it ([`round_parts`]): for renderers that draw them another way (a GPU's triangles).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundPart {
+    /// `LcdImpl::draw_oval(x, y, w, h, t, color)`.
+    Oval { x: i16, y: i16, w: u16, h: u16, t: u16, color: Color },
+    /// `LcdImpl::fill_arc(cx, cy, r, ir, start, end, color)`.
+    Arc { cx: i16, cy: i16, r: i16, ir: i16, start: i16, end: i16, color: Color },
+    /// `LcdImpl::draw_wedge(ax, ay, bx, by, ra_q8, rb_q8, color)` (`draw_line_thick(t)` =
+    /// both radii `t · 128`).
+    Wedge { ax: i16, ay: i16, bx: i16, by: i16, ra_q8: i32, rb_q8: i32, color: Color },
+}
+
+/// The parts a circle / ellipse shape or a gauge (its dial, over the box `draw_widget` paints
+/// first) draws on a readback backend, in drawing order, for a widget at `abs`. False for
+/// other kinds. Mirrors `draw_circle_shape`/`draw_ellipse_shape` (smooth) and `draw_gauge`
+/// (test `round_parts_draw_what_the_widget_draws`).
+pub fn round_parts(widget: &Widget, abs: &Rect, ext: &WidgetExt, mut f: impl FnMut(RoundPart)) -> bool {
+    match widget.kind {
+        KIND_CIRCLE | KIND_ELLIPSE => {
+            let bx = if widget.kind == KIND_CIRCLE {
+                let d = abs.w.min(abs.h);
+                Rect::new(abs.x + ((abs.w - d) / 2) as i16, abs.y + ((abs.h - d) / 2) as i16, d, d)
+            } else {
+                *abs
+            };
+            let stroke = widget.border_color != 0;
+            let t = shape_stroke(ext);
+            if widget.background_color != 0 {
+                let inset = if stroke { t / 2 } else { 0 };
+                f(RoundPart::Oval {
+                    x: bx.x + inset as i16,
+                    y: bx.y + inset as i16,
+                    w: bx.w.saturating_sub(inset * 2),
+                    h: bx.h.saturating_sub(inset * 2),
+                    t: 0,
+                    color: widget.background_color,
+                });
+            }
+            if stroke {
+                f(RoundPart::Oval { x: bx.x, y: bx.y, w: bx.w, h: bx.h, t, color: widget.border_color });
+            }
+            true
+        }
+        KIND_GAUGE => {
+            let Some(g) = GaugeGeom::new(&inner_rect(abs, &ext.border)) else { return true };
+            let (cx, cy) = (g.cx, g.cy);
+            let val = ext.value.clamp(0, 100) as i32;
+            let value_angle = GaugeGeom::angle(val);
+            let track = if widget.border_color != 0 { widget.border_color } else { 0x3186 };
+            let arc = |start, end, color| RoundPart::Arc { cx, cy, r: g.outer_r, ir: g.inner_r, start, end, color };
+            f(arc(GAUGE_ARC_START, GAUGE_ARC_END, track));
+            if val > 0 && ext.press_color != 0 {
+                let end = if val >= 100 { GAUGE_ARC_END } else { (value_angle % 360) as i16 };
+                f(arc(GAUGE_ARC_START, end, ext.press_color));
+            }
+            for i in 0..=4 {
+                let angle = GAUGE_ARC_START as i32 + i * GAUGE_ARC_SWEEP / 4;
+                let (ax, ay) = g.point(angle, g.tick_r0);
+                let (bx, by) = g.point(angle, g.tick_r1);
+                f(RoundPart::Wedge { ax, ay, bx, by, ra_q8: 256, rb_q8: 256, color: track });
+            }
+            let needle = if ext.text_color != 0 && ext.text_color != 0xFFFF { ext.text_color } else { 0xFFFF };
+            if g.needle_r > 4 {
+                let (bx, by) = g.point(value_angle, g.needle_r);
+                f(RoundPart::Wedge {
+                    ax: cx,
+                    ay: cy,
+                    bx,
+                    by,
+                    ra_q8: GAUGE_NEEDLE_BASE_Q8,
+                    rb_q8: GAUGE_NEEDLE_TIP_Q8,
+                    color: needle,
+                });
+            } else {
+                // `fill_circle(cx, cy, 3)`: the oval inscribed in the 7×7 box around it.
+                f(RoundPart::Oval { x: cx - 3, y: cy - 3, w: 7, h: 7, t: 0, color: needle });
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Line shape: the widget-box diagonal `(x,y) → (x+w-1, y+h-1)`, drawn in
 /// `border_color` (falling back to `bg_color`) at the border thickness.
 fn draw_line_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
@@ -3339,6 +3423,68 @@ mod tests {
                     assert!(a[i] == b[i], "alpha={ALPHA} {old}->{new}: pixel ({}, {})", i % FB, i / FB);
                 }
             }
+        }
+    }
+
+    /// Draws `parts` with the primitives they name.
+    fn draw_parts(lcd: &LcdImpl<Fb<true>>, parts: &[RoundPart]) {
+        for p in parts {
+            match *p {
+                RoundPart::Oval { x, y, w, h, t, color } => lcd.draw_oval(x, y, w, h, t, color),
+                RoundPart::Arc { cx, cy, r, ir, start, end, color } => lcd.fill_arc(cx, cy, r, ir, start, end, color),
+                RoundPart::Wedge { ax, ay, bx, by, ra_q8, rb_q8, color } => lcd.draw_wedge(ax, ay, bx, by, ra_q8, rb_q8, color),
+            }
+        }
+    }
+
+    #[test]
+    fn round_parts_draw_what_the_widget_draws() {
+        let same = |a: &LcdImpl<Fb<true>>, b: &LcdImpl<Fb<true>>, what: &str| {
+            let (a, b) = (a.backend().px.borrow(), b.backend().px.borrow());
+            for i in 0..FB * FB {
+                assert!(a[i] == b[i], "{what}: pixel ({}, {})", i % FB, i / FB);
+            }
+        };
+        for value in [0i16, 1, 33, 50, 99, 100] {
+            let cpu = fresh::<true>();
+            paint_gauge(&cpu, value, &[GAUGE_BOX]);
+            let mut w = Widget::DEAD;
+            w.kind = KIND_GAUGE;
+            w.border_color = 0x3186;
+            let mut e = WidgetExt::DEFAULT;
+            e.value = value as crate::widget::WValue;
+            e.press_color = 0x05FF;
+            e.text_color = 0xF800;
+            let mut parts = alloc::vec::Vec::new();
+            assert!(round_parts(&w, &GAUGE_BOX, &e, |p| parts.push(p)));
+            let gpu = fresh::<true>();
+            gpu.fill_rect(GAUGE_BOX.x as u16, GAUGE_BOX.y as u16, GAUGE_BOX.w, GAUGE_BOX.h, GAUGE_BG);
+            draw_parts(&gpu, &parts);
+            same(&cpu, &gpu, &format!("gauge {value}"));
+        }
+        for (kind, abs, bg, border, t) in [
+            (KIND_CIRCLE, Rect::new(5, 9, 90, 70), 0x1234u16, 0xF800u16, 3u8),
+            (KIND_CIRCLE, Rect::new(5, 9, 41, 41), 0x1234, 0, 1),
+            (KIND_ELLIPSE, Rect::new(3, 20, 110, 60), 0x07E0, 0x001F, 4),
+            (KIND_ELLIPSE, Rect::new(3, 20, 51, 90), 0, 0xFFFF, 1),
+        ] {
+            let mut w = Widget::DEAD;
+            w.kind = kind;
+            w.background_color = bg;
+            w.border_color = border;
+            let mut e = WidgetExt::DEFAULT;
+            e.border = crate::types::Edges { top: t, right: t, bottom: t, left: t };
+            let cpu = fresh::<true>();
+            if kind == KIND_CIRCLE {
+                draw_circle_shape(&cpu, &w, &abs, &e);
+            } else {
+                draw_ellipse_shape(&cpu, &w, &abs, &e);
+            }
+            let mut parts = alloc::vec::Vec::new();
+            assert!(round_parts(&w, &abs, &e, |p| parts.push(p)));
+            let gpu = fresh::<true>();
+            draw_parts(&gpu, &parts);
+            same(&cpu, &gpu, &format!("shape {kind} {}x{}", abs.w, abs.h));
         }
     }
 

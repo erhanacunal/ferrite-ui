@@ -387,6 +387,237 @@ pub fn clip(tris: &[Vtx], x0: f32, y0: f32, x1: f32, y1: f32, out: &mut Vec<Vtx>
     }
 }
 
+/// Angular segments a chunk of a ring holds.
+const RING_CHUNK: usize = 16;
+
+/// The ellipse (or ring) `smooth_ring` covers, centred on (`cx`, `cy`) (continuous
+/// coordinates): its outer edge (coverage ½) has semi-axes `a`, `b`, a hole's edge `hole`
+/// (`None`: filled); each edge is a ramp one pixel wide across it, measured along the
+/// ellipse's normal (`smooth.rs`: `ramp(0.5 ∓ ellipse_sd)`, for circles `r + 1 − d` /
+/// `d − ir + 1`).
+///
+/// `arc` = (start, end) in degrees, clockwise from +x (y down), circles only: the ring is cut
+/// by the two rays, each with a ramp from ½ px outside to ½ px inside (`Sector`). Coverage
+/// across a ray times coverage across the ring is interpolated over the triangles.
+pub fn oval(m: &mut Mesh<'_>, cx: f32, cy: f32, a: f32, b: f32, hole: Option<(f32, f32)>, arc: Option<(f32, f32)>) {
+    if a <= 0.0 || b <= 0.0 {
+        return;
+    }
+    // Rings from the inside out: (offset along the outer edge's normal, coverage across the
+    // ring, measured from the hole's edge). Every ring is sampled on
+    // the outer edge's normals: lines that don't cross inside the ring, so a thin ring can't
+    // fold (an inner ellipse sampled on its own drifts along the ring).
+    let hole = hole.filter(|&(ia, ib)| ia > 0.0 && ib > 0.0 && ia < a && ib < b);
+    let mut rings: [(f32, f32, bool); 4] = [(0.0, 0.0, false); 4];
+    let mut n = 0;
+    if hole.is_some() {
+        rings[0] = (-0.5, 0.0, true);
+        rings[1] = (0.5, 1.0, true);
+        n = 2;
+    }
+    rings[n] = (-0.5, 1.0, false);
+    rings[n + 1] = (0.5, 0.0, false);
+    let rings = &rings[..n + 2];
+    let filled = n == 0;
+    // Ring `k`'s vertex on the outer edge's normal at angle t (`inner` rings measured from
+    // where that normal meets the hole's edge): the samples crowd where the curvature is.
+    let vert = |k: usize, t: f32| {
+        let (s, c) = (libm::sinf(t), libm::cosf(t));
+        let d = libm::sqrtf(a * a * c * c + b * b * s * s).max(1e-6);
+        let (px, py) = (a * a * c / d, b * b * s / d);
+        let (mut off, mut cov, inner) = rings[k];
+        if let Some((ia, ib)) = hole {
+            // P − k·n on the hole's ellipse: the smaller root of A k² + B k + C = 0.
+            let qa = (c / ia) * (c / ia) + (s / ib) * (s / ib);
+            let qb = -2.0 * (px * c / (ia * ia) + py * s / (ib * ib));
+            let qc = (px / ia) * (px / ia) + (py / ib) * (py / ib) - 1.0;
+            let disc = qb * qb - 4.0 * qa * qc;
+            let depth = if disc >= 0.0 { (-qb - libm::sqrtf(disc)) / (2.0 * qa) } else { a - ia };
+            if inner {
+                off -= depth;
+            }
+            if depth < 1.0 && (k == 1 || k == 2) {
+                // Thinner than a pixel here (an ellipse ring near its long axis' ends): the
+                // two ramps overlap, and the CPU multiplies them. One ring in the middle.
+                off = -depth * 0.5;
+                cov = (0.5 + depth * 0.5) * (0.5 + depth * 0.5);
+            }
+        }
+        // Past the centre (a tiny ellipse's inner fringe): the centre.
+        if a + off <= 0.0 || b + off <= 0.0 {
+            return Vtx { x: cx, y: cy, a: cov };
+        }
+        Vtx { x: cx + px + off * c, y: cy + py + off * s, a: cov }
+    };
+    let deg = core::f32::consts::PI / 180.0;
+    match arc {
+        None => {
+            // Equal steps of the normal's angle: the chords' sagitta is largest where the
+            // curvature radius is (the flat sides, b²/a), so size the steps by it.
+            let segs = 4 * segments((a * a / b).max(b * b / a));
+            // Every ring's vertex at every sample, worked out once.
+            let mut tab: Vec<[Vtx; 4]> = Vec::with_capacity(segs);
+            for i in 0..segs {
+                let t = core::f32::consts::TAU * i as f32 / segs as f32;
+                let mut row = [Vtx { x: 0.0, y: 0.0, a: 0.0 }; 4];
+                for (k, v) in row.iter_mut().enumerate().take(rings.len()) {
+                    *v = vert(k, t);
+                }
+                tab.push(row);
+            }
+            // Top to bottom in horizontal slices: the right side's samples from −90° to 90°
+            // and their mirrors on the left (segs is a multiple of 4: sample i mirrors
+            // segs/2 − i). A chunk is a band of slices, so a frame strip takes only the bands
+            // it meets (a fan from the centre made every chunk span the shape).
+            let right = |j: usize| (segs * 3 / 4 + j) % segs;
+            let left = |j: usize| (segs + segs / 2 - right(j)) % segs;
+            let mut s = m.begin();
+            for j in 0..segs / 2 {
+                let (r0, r1, l0, l1) = (right(j), right(j + 1), left(j), left(j + 1));
+                for k in 1..rings.len() {
+                    m.quad(tab[r0][k - 1], tab[r0][k], tab[r1][k], tab[r1][k - 1]);
+                    m.quad(tab[l1][k - 1], tab[l1][k], tab[l0][k], tab[l0][k - 1]);
+                }
+                if filled {
+                    m.quad(tab[r0][0], tab[r1][0], tab[l1][0], tab[l0][0]);
+                }
+                if (j + 1) % (RING_CHUNK / 2) == 0 {
+                    m.end(s);
+                    s = m.begin();
+                }
+            }
+            m.end(s);
+        }
+        Some((start, end)) => {
+            let sweep = libm::fmodf(libm::fmodf(end - start, 360.0) + 360.0, 360.0);
+            if sweep == 0.0 {
+                return oval(m, cx, cy, a, b, hole, None);
+            }
+            let (t0, t1) = (start * deg, (start + sweep) * deg);
+            let wide = sweep > 180.0;
+            let segs = libm::ceilf((4 * segments(a)) as f32 * sweep / 360.0).max(2.0) as usize;
+            // Where a ray's ramp crosses an edge's, coverage is a product (bilinear): a
+            // triangle across the whole 1 × 1 px corner was off by up to ¼. Rings and samples
+            // in the middle of each ramp too keep it under 1/16.
+            let mut arings = [(0.0f32, 0.0f32); 6];
+            let mut n = 0;
+            if let Some((ia, _)) = hole {
+                for (o, c) in [(-0.5, 0.0), (0.0, 0.5), (0.5, 1.0)] {
+                    arings[n] = (ia + o, c);
+                    n += 1;
+                }
+            }
+            for (o, c) in [(-0.5, 1.0), (0.0, 0.5), (0.5, 0.0)] {
+                arings[n] = (a + o, c);
+                n += 1;
+            }
+            let arings = &arings[..n];
+            // Samples along each ring: ½ px outside the start ray, on it, ½ px inside it,
+            // `segs` steps to ½ px inside the end ray, on it, ½ px outside it. Coverage across
+            // the rays as `Sector::cov` computes it (½ + the distance to each ray's line; the
+            // nearer for a sweep up to 180°, the further beyond).
+            let cols = segs + 5;
+            let v = |k: usize, j: usize| {
+                let (rho, c) = arings[k];
+                let rho = rho.max(0.0);
+                if rho <= 0.0 {
+                    return Vtx { x: cx, y: cy, a: c };
+                }
+                let al = libm::asinf((0.5 / rho).min(1.0));
+                let mid = (t0 + t1) * 0.5;
+                let (lo, hi) = ((t0 + al).min(mid), (t1 - al).max(mid));
+                let t = match j {
+                    0 => t0 - al,
+                    1 => t0.min(mid),
+                    _ if j == cols - 1 => t1 + al,
+                    _ if j == cols - 2 => t1.max(mid),
+                    _ => lo + (hi - lo) * (j - 2) as f32 / segs as f32,
+                };
+                let cs = (0.5 + rho * libm::sinf(t - t0)).clamp(0.0, 1.0);
+                let ce = (0.5 + rho * libm::sinf(t1 - t)).clamp(0.0, 1.0);
+                let sc = if wide { cs.max(ce) } else { cs.min(ce) };
+                Vtx { x: cx + rho * libm::cosf(t), y: cy + rho * libm::sinf(t), a: c * sc }
+            };
+            let centre = Vtx { x: cx, y: cy, a: 1.0 };
+            let mut s = m.begin();
+            for i in 0..cols - 1 {
+                if hole.is_none() {
+                    m.tri(centre, v(0, i), v(0, i + 1));
+                }
+                for k in 1..arings.len() {
+                    m.quad(v(k - 1, i), v(k, i), v(k, i + 1), v(k - 1, i + 1));
+                }
+                if (i + 1) % RING_CHUNK == 0 {
+                    m.end(s);
+                    s = m.begin();
+                }
+            }
+            m.end(s);
+        }
+    }
+}
+
+/// A tapered stroke with round ends from (`ax`, `ay`) to (`bx`, `by`) (continuous
+/// coordinates), radius `ra` at `a` and `rb` at `b` (px): as `smooth.rs` `Stroke::cov`
+/// covers it (radius + ½ − the distance to the segment, the radius interpolated along it;
+/// `draw_wedge`, `draw_line_thick` with radius = thickness / 2).
+pub fn wedge(m: &mut Mesh<'_>, ax: f32, ay: f32, bx: f32, by: f32, ra: f32, rb: f32) {
+    let (dx, dy) = (bx - ax, by - ay);
+    let l = libm::sqrtf(dx * dx + dy * dy);
+    // Unit direction and normal (a dot: any).
+    let (ux, uy) = if l > 1e-6 { (dx / l, dy / l) } else { (1.0, 0.0) };
+    let (nx, ny) = (-uy, ux);
+    // Across the stroke at radius r: (inner offset, its coverage), outer offset (coverage 0).
+    let prof = |r: f32| {
+        let o1 = (r - 0.5).max(0.0);
+        (o1, (r + 0.5 - o1).min(1.0), r + 0.5)
+    };
+    let (pa, pb) = (prof(ra), prof(rb));
+    let s = m.begin();
+    if l > 1e-6 {
+        let p = |cx: f32, cy: f32, off: f32, a: f32| Vtx { x: cx + nx * off, y: cy + ny * off, a };
+        for side in [1.0f32, -1.0] {
+            // Fringe, then the inner band up to the axis.
+            m.quad(p(ax, ay, side * pa.2, 0.0), p(bx, by, side * pb.2, 0.0), p(bx, by, side * pb.0, pb.1), p(ax, ay, side * pa.0, pa.1));
+            if pa.0 > 0.0 || pb.0 > 0.0 {
+                m.quad(p(ax, ay, side * pa.0, pa.1), p(bx, by, side * pb.0, pb.1), p(bx, by, 0.0, pb.1), p(ax, ay, 0.0, pa.1));
+            }
+        }
+    }
+    // Round ends: half disks beyond each end (a whole disk for a dot).
+    let half = |m: &mut Mesh<'_>, cx: f32, cy: f32, (o1, c1, o2): (f32, f32, f32), dir: f32, whole: bool| {
+        let n = if whole { 4 } else { 2 } * segments(o2);
+        let (span, base) = if whole { (core::f32::consts::TAU, 0.0) } else { (core::f32::consts::PI, libm::atan2f(ny * dir, nx * dir)) };
+        let at = |i: usize, r: f32, a: f32| {
+            // Exact ends on the normal, where the body's vertices are.
+            let (c, s) = if !whole && i == 0 {
+                (nx * dir, ny * dir)
+            } else if !whole && i == n {
+                (-nx * dir, -ny * dir)
+            } else {
+                let t = base + span * i as f32 / n as f32;
+                (libm::cosf(t), libm::sinf(t))
+            };
+            Vtx { x: cx + c * r, y: cy + s * r, a }
+        };
+        let centre = Vtx { x: cx, y: cy, a: c1 };
+        for i in 0..n {
+            if o1 > 0.0 {
+                m.tri(centre, at(i, o1, c1), at(i + 1, o1, c1));
+            }
+            m.quad(at(i, o1, c1), at(i, o2, 0.0), at(i + 1, o2, 0.0), at(i + 1, o1, c1));
+        }
+    };
+    if l > 1e-6 {
+        // From +normal through −u (behind a) to −normal, and the mirror at b.
+        half(m, ax, ay, pa, 1.0, false);
+        half(m, bx, by, pb, -1.0, false);
+    } else {
+        half(m, ax, ay, if ra >= rb { pa } else { pb }, 1.0, true);
+    }
+    m.end(s);
+}
+
 /// A fan around `c`: coverage 1 at the centre, 0 at radius 1.
 fn disk(m: &mut Mesh<'_>, c: (f32, f32)) {
     let centre = Vtx { x: c.0, y: c.1, a: 1.0 };
@@ -524,6 +755,17 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// A filled oval's chunks are horizontal bands, so a frame strip takes only the few it
+    /// meets (a fan from the centre made every chunk reach the middle).
+    #[test]
+    fn filled_ovals_chunk_into_bands() {
+        let (_, chunks) = mesh_of(|m| oval(m, 300.0, 300.0, 250.0, 250.0, None, None));
+        assert!(chunks.len() >= 6);
+        for c in &chunks {
+            assert!(c.y1 - c.y0 <= 100, "{c:?}");
         }
     }
 

@@ -9,7 +9,7 @@
 //! | `POST /flash` (or `/fs`, or `PUT`) | an FS image (or a whole `FLASH.BIN`): checked, saved as `FERRITE/FLASH.BIN`, then a restart |
 //! | `POST /restart` | restarts the board |
 //! | `GET /api/screen` | the screen as a 32-bit BMP (the LCD shadow, copied by CPU0 between passes) |
-//! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites |
+//! | `POST /api/compose?on=0\|1` | GPU compositor off/on (`gpu_compose`), then the whole screen is repainted; `?tess=0\|1` rounded boxes as triangles / `ui_round`; `?glyphs=0\|1` label text as atlas glyph quads / sprites; `?graphs=0\|1` graphs as fill columns + polyline / sprites; `?shapes=0\|1` circles, ellipses and gauges as triangles / sprites |
 //! | `POST /api/layerblit?on=0\|1` | G2D sprite blits inside layers off/on (`lcd::LAYER_BLITS`), for A/B measurements |
 //! | `POST /api/layercache?uncached=0\|1` | layer shadows drawn through the cached view or the uncached alias (`lcd::LAYER_UNCACHED`), for A/B measurements |
 //! | `POST /api/cpu?mhz=N` | wanted CPU clock, one of 200..1400 in steps of 100 (`cpuclock`), applied by CPU0 after the next pass under the thermal cap; without `mhz` the current one |
@@ -258,6 +258,15 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<bool> {
                 crate::compose::REPAINT.store(true, Ordering::Release);
                 text(socket, "200 OK", if on { "Graphs as fill columns + polyline
 " } else { "Graphs from sprites
+" }).await?;
+                return Ok(false);
+            }
+            if let Some(v @ (b"0" | b"1")) = query_param(query, b"shapes") {
+                let on = v == b"1";
+                crate::compose::SHAPES.store(on, Ordering::Relaxed);
+                crate::compose::REPAINT.store(true, Ordering::Release);
+                text(socket, "200 OK", if on { "Circles, ellipses and gauges as triangles
+" } else { "Circles, ellipses and gauges from sprites
 " }).await?;
                 return Ok(false);
             }
@@ -665,11 +674,12 @@ fn status_json() -> String {
     // is switched on, and why renders were composed or declined.
     let _ = write!(
         s,
-        ",\"compositor\":{{\"enabled\":{},\"tess\":{},\"glyphs\":{},\"graphs\":{},\"status\":\"{}\"",
+        ",\"compositor\":{{\"enabled\":{},\"tess\":{},\"glyphs\":{},\"graphs\":{},\"shapes\":{},\"status\":\"{}\"",
         crate::compose::ENABLED.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::TESS.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::GLYPHS.load(core::sync::atomic::Ordering::Relaxed),
         crate::compose::GRAPHS.load(core::sync::atomic::Ordering::Relaxed),
+        crate::compose::SHAPES.load(core::sync::atomic::Ordering::Relaxed),
         crate::gpu::status().replace('"', "'")
     );
     for (name, n) in crate::compose::COUNT_NAMES.iter().zip(&crate::compose::COUNTS) {

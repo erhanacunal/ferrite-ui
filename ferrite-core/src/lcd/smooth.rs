@@ -1332,6 +1332,83 @@ mod tests {
         }
     }
 
+    /// The GPU's triangles for ovals, rings, arcs and wedges (`tess::oval`, `tess::wedge`)
+    /// cover pixels as the CPU does.
+    #[test]
+    fn tessellated_ovals_arcs_and_wedges_match_the_cpu_coverage() {
+        use super::super::tess::{self, Mesh};
+        enum S {
+            Oval(i16, i16, u16, u16, u16),
+            Arc(i16, i16, i16, i16, i16, i16),
+            Wedge(i16, i16, i16, i16, i32, i32),
+        }
+        let cases = [
+            S::Oval(8, 8, 80, 80, 0),
+            S::Oval(8, 8, 41, 41, 3),
+            S::Oval(4, 20, 88, 50, 0),
+            S::Oval(4, 20, 88, 50, 4),
+            S::Oval(30, 4, 31, 88, 1),
+            S::Oval(40, 40, 7, 7, 0),
+            S::Arc(48, 48, 40, 34, 135, 45),
+            S::Arc(48, 48, 40, 34, 135, 200),
+            S::Arc(48, 48, 40, 34, 135, 137),
+            S::Arc(48, 48, 30, 20, 0, 90),
+            S::Arc(48, 48, 30, 26, 350, 10),
+            S::Wedge(48, 48, 80, 20, 896, 256),
+            S::Wedge(48, 48, 10, 60, 896, 256),
+            S::Wedge(20, 70, 23, 64, 256, 256),
+            S::Wedge(20, 20, 70, 20, 256, 256),
+            S::Wedge(48, 48, 48, 48, 896, 256),
+        ];
+        for (n, c) in cases.iter().enumerate() {
+            let (cpu, _) = draw(|l| match *c {
+                S::Oval(x, y, w, h, t) => l.draw_oval(x, y, w, h, t, 1),
+                S::Arc(cx, cy, r, ir, s, e) => l.fill_arc(cx, cy, r, ir, s, e, 1),
+                S::Wedge(ax, ay, bx, by, ra, rb) => l.draw_wedge(ax, ay, bx, by, ra, rb, 1),
+            });
+            let (mut verts, mut chunks) = (Vec::new(), Vec::new());
+            let mut m = Mesh { verts: &mut verts, chunks: &mut chunks };
+            match *c {
+                S::Oval(x, y, w, h, t) => {
+                    let (a, b) = (w as f32 / 2.0, h as f32 / 2.0);
+                    let hole = (t > 0).then(|| (a - t as f32, b - t as f32));
+                    tess::oval(&mut m, x as f32 + a, y as f32 + b, a, b, hole, None)
+                }
+                S::Arc(cx, cy, r, ir, s, e) => {
+                    let hole = (ir > 1).then(|| (ir as f32 - 0.5, ir as f32 - 0.5));
+                    let (fx, fy) = (cx as f32 + 0.5, cy as f32 + 0.5);
+                    tess::oval(&mut m, fx, fy, r as f32 + 0.5, r as f32 + 0.5, hole, Some((s as f32, e as f32)))
+                }
+                S::Wedge(ax, ay, bx, by, ra, rb) => tess::wedge(
+                    &mut m,
+                    ax as f32 + 0.5,
+                    ay as f32 + 0.5,
+                    bx as f32 + 0.5,
+                    by as f32 + 0.5,
+                    ra as f32 / 256.0,
+                    rb as f32 / 256.0,
+                ),
+            }
+            let gpu = tess::raster::coverage(&verts, N);
+            let (mut worst, mut sum) = ((0.0f32, 0, 0), 0.0f32);
+            for y in 0..N {
+                for x in 0..N {
+                    let (c, g) = (cpu[y * N + x] as f32 / 255.0, gpu[y * N + x]);
+                    assert!(g <= 1.0 + 1e-3, "case {n}: ({x},{y}) covered {g}");
+                    sum += (g - c).abs();
+                    if (g - c).abs() > worst.0 {
+                        worst = ((g - c).abs(), x, y);
+                    }
+                }
+            }
+            let ink: f32 = cpu.iter().map(|&c| c as f32 / 255.0).sum();
+            // Measured: at most 0.08 (chords of the edges, the ramps' products interpolated).
+            assert!(worst.0 < 0.09, "case {n}: ({}, {}) off by {}", worst.1, worst.2, worst.0);
+            // A 1 px ring has little ink: its mean is the largest (~5 %).
+            assert!(sum / ink < 0.06, "case {n}: mean {} of the ink", sum / ink);
+        }
+    }
+
     /// The GPU's triangles for a 1 px polyline (`tess::polyline`), blended "over" one another
     /// as the GPU does, cover pixels as the CPU's pen does: exactly along straight runs, close
     /// inside sharp turns (overlapping pieces combine instead of the strongest segment winning).
