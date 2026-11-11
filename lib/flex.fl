@@ -27,6 +27,13 @@
 // switching a container away from JUSTIFY_STRETCH or ITEMS_STRETCH.
 //
 // The ITEMS_* names avoid core.fl's ALIGN_* (text alignment).
+//
+// FLEX_AUTO (ferrite-ui-xl, boards with caps.native_flex): the firmware lays
+// the container out by itself whenever its box, a child's size / visibility /
+// flex_grow or its children change, before the next render and before a
+// position or size is read, so flexLayout() is not needed. Elsewhere the bit
+// is ignored: call flexLayout() as usual (code that does works on both).
+//   box.flex = FLEX_ROW | ITEMS_CENTER | FLEX_AUTO;
 
 // Direction (bits 0-1). 0 = not a flex container.
 const FLEX_ROW    = 1;
@@ -44,6 +51,9 @@ const ITEMS_START   = 0;
 const ITEMS_CENTER  = 32;
 const ITEMS_END     = 64;
 const ITEMS_STRETCH = 96;
+
+// Automatic layout (bit 7; see above)
+const FLEX_AUTO = 128;
 
 fn flexLayout(box: widget) {
     target(box);
