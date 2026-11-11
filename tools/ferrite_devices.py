@@ -17,7 +17,9 @@ in sync by hand:
     (ferrite-core/src/platform.rs); caps.jpeg also lets images use
     "mode": "jpeg" (FI mode 3); caps.superops <-> CAP_SUPEROPS (ferrite-core `superops`: the compiler
     emits superinstructions); caps.multi_program <-> CAP_MULTI_PROGRAM
-    (ferrite-core `multi_program` feature: the task builtins). A missing
+    (ferrite-core `multi_program` feature: the task builtins);
+    caps.native_flex <-> CAP_NATIVE_FLEX (ferrite-ui-xl: flexLayout() is
+    the FLEX_LAYOUT opcode instead of lib/flex.fl's function). A missing
     cap reads as false, so the fallback boards below leave it out.
 """
 

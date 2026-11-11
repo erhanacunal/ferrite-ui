@@ -345,6 +345,7 @@ Only in firmware built with the ferrite-core `multi_program` feature (`caps.mult
 | `0xD8` | `sendMessage` | pop `b`, pop `a`, pop `id`; queue `on_task_message(from, a, b)` for that task; push `1`, or `0` (no such task / queue full) |
 | `0xD9` | `setForeground` | pop `id`; push `1` if that task now gets the global input events |
 | `0xDA` | `foregroundTask` | push the foreground task's id |
+| `0xDB` | `flexLayout` | pop `box`; lay out its children exactly like `lib/flex.fl` `flexLayout(box)` (nested containers included); target = `box`; push `0`. Only emitted for devices with `caps.native_flex` (ferrite-ui-xl); elsewhere a bad opcode |
 
 ## Widget Properties
 

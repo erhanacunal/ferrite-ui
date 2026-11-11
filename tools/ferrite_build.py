@@ -152,10 +152,12 @@ def _write_debug_sidecar(source_path: str, image: bytes) -> str | None:
 # --- Program compilation ---
 
 def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
-                    widget_page=False, portrait=False, superops=False) -> bytes:
+                    widget_page=False, portrait=False, superops=False,
+                    native_flex=False) -> bytes:
     """Ferrite lang source → VM image (header + opcodes). With widget_page,
     static widget setup moves to the image's `.page` (RES_PAGE contents).
-    superops: emit superinstructions (the device's caps.superops)."""
+    superops: emit superinstructions (the device's caps.superops).
+    native_flex: flexLayout() as an opcode (the device's caps.native_flex)."""
     try:
         from ferrite_lang import build_image, CompileError
     except ImportError:
@@ -167,7 +169,8 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
     try:
         image = build_image(source, filename=source_path, include_dirs=include_dirs,
                             render_mode=render_mode, widget_page=widget_page,
-                            portrait=portrait, superops=superops)
+                            portrait=portrait, superops=superops,
+                            native_flex=native_flex)
         _write_debug_sidecar(source_path, image)
         return image
     except CompileError as e:
@@ -640,7 +643,8 @@ def build(project_path: str, output_path: str | None) -> dict:
                                      render_mode=render_mode,
                                      widget_page=prog.get("widget_page", widget_page),
                                      portrait=portrait,
-                                     superops=bool(device and device["caps"].get("superops")))
+                                     superops=bool(device and device["caps"].get("superops")),
+                                     native_flex=bool(device and device["caps"].get("native_flex")))
         exec_mode = prog.get("exec_mode", "ram")
         prog_flags = RES_FLAG_FLASH_EXEC if exec_mode == "flash" else 0
         resources.append((name, RES_PROGRAM, image_data, prog_flags))

@@ -213,6 +213,9 @@ class Op:
     TASK_SET_FG  = 0xD9  # pop id → push 1 if it now gets the global input events
     TASK_FG      = 0xDA  # push the foreground task's id
 
+    # Native flex layout (boards with caps.native_flex; ferrite-ui-xl)
+    FLEX_LAYOUT  = 0xDB  # pop box → lay out its children like lib/flex.fl flexLayout(box); target = box; push 0
+
 
 # Backwards compatibility -- Builtin constants map to method IDs (0-based).
 # Used by ferrite_lang.py via asm.builtin(Builtin.XXX)
@@ -285,6 +288,7 @@ class Builtin:
     TASK_SEND = 88         # (id, a, b) → 1 queued / 0
     TASK_SET_FG = 89       # (id) → 1 / 0
     TASK_FG = 90           # () → foreground task id
+    FLEX_LAYOUT = 91       # (box) → 0; native lib/flex.fl flexLayout (caps.native_flex)
 
 
 class Prop:
@@ -1252,7 +1256,7 @@ _NO_ARG_OPS = (
     {0xB0, 0xB1, 0xB2} |               # pinMode, pinWrite, pinRead
     set(range(0xB3, 0xC0)) |           # eepromSize .. strByte, playSound .. soundPlaying, runProgram .. programName
     set(range(0xC0, 0xCD)) |           # 0xC0-0xCC
-    set(range(0xD4, 0xDB))             # spawnProgram .. foregroundTask
+    set(range(0xD4, 0xDC))             # spawnProgram .. foregroundTask, flexLayout
 )
 
 

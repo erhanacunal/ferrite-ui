@@ -1176,10 +1176,13 @@ class CodeGen:
     # opt into strict checking.
     T_ANY = "any"
 
-    def __init__(self, wide=False, superops=False):
+    def __init__(self, wide=False, superops=False, native_flex=False):
         self.asm = Asm(wide=wide)
         # Emit superinstructions (device caps.superops; firmware `superops`).
         self.superops = superops
+        # flexLayout(box) as the FLEX_LAYOUT opcode instead of a call to
+        # lib/flex.fl's function (device caps.native_flex; ferrite-ui-xl).
+        self.native_flex = native_flex
         self.vars = {}          # name -> slot
         self.var_types = {}     # name -> T_INT | T_FLOAT
         self.global_vars = {}   # name -> slot (global variables visible to all functions)
@@ -3711,6 +3714,16 @@ class CodeGen:
             self.asm.stop_anim_prop()
             return
 
+        if name == 'flexLayout' and self.native_flex:
+            # Native lib/flex.fl: same result, target and return value (0)
+            # as the .fl function, which stays in the image unused.
+            if len(node.args) != 1:
+                raise CompileError("flexLayout() takes 1 argument: box", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.FLEX_LAYOUT)
+            self._current_target = None
+            return
+
         # --- User-defined function ---
         if name not in self.functions:
             raise CompileError(f"undefined function: {name}", node.line)
@@ -4102,7 +4115,7 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
 
 
 def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty",
-                widget_page=False, portrait=False, superops=False):
+                widget_page=False, portrait=False, superops=False, native_flex=False):
     """Compile source to VM image format (v4 header + opcodes).
 
     Image format (v4):
@@ -4127,6 +4140,9 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
 
     superops=True emits superinstructions (opcodes 0x45..0x4D): only for
     devices with caps.superops, whose firmware has the `superops` feature.
+
+    native_flex=True compiles flexLayout(box) to the FLEX_LAYOUT opcode
+    (0xDB): only for devices with caps.native_flex (ferrite-ui-xl).
     """
     try:
         # Extract #hint_widgets from raw source before preprocessing strips the directive.
@@ -4156,7 +4172,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         # Compact u16 jump targets unless the bytecode outgrows 64 KB; then
         # regenerate from a fresh parse with u32 targets (wide-address image).
         wide = False
-        codegen = CodeGen(superops=superops)
+        codegen = CodeGen(superops=superops, native_flex=native_flex)
         codegen.widget_page = widget_page
         try:
             bytecode = codegen.generate_image(parse_program())
@@ -4164,7 +4180,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         except AddrOverflow:
             wide = True
         if wide:
-            codegen = CodeGen(wide=True, superops=superops)
+            codegen = CodeGen(wide=True, superops=superops, native_flex=native_flex)
             codegen.widget_page = widget_page
             bytecode = codegen.generate_image(parse_program())
         debug_symbols = codegen.debug_info(filename)
