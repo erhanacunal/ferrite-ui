@@ -185,29 +185,13 @@ pub trait PlatformRuntime: Platform + Sized + 'static {
         ctx.lcd.flush_dirty();
     }
 
-    /// Free-running 32-bit cycle counter for the `perf` profiler (0 = none).
-    fn cycles() -> u32 {
-        0
-    }
-
-    /// Rate of `cycles` in Hz (0 = unknown: the report shows no times).
-    fn cycle_hz() -> u32 {
-        0
-    }
-
-    /// Cycles spent waiting for vsync since the last call, then reset to 0
-    /// (the profiler's `VSYNC_WAIT` row, part of `frame_end`).
-    fn perf_take_wait() -> u64 {
-        0
-    }
-
     /// Dirty mode: whether a render now would reach the screen any sooner.
     /// A BSP whose present runs in the background answers false while what
     /// was drawn since the last present is still waiting for it: drawing
     /// again then only moves pixels that are never shown. The dirty flags
     /// stay set, and the next due render draws the latest state once
     /// (property animations tick every pass, each changing a widget a
-    /// little: the exynos pull-down shade was moved ~7 times per present).
+    /// little).
     fn render_due() -> bool {
         true
     }
@@ -219,10 +203,8 @@ pub trait InputHandler<P: PlatformRuntime>: Sized {
     fn new() -> Self;
 
     /// Poll the touch device and dispatch the resulting event: mutate the tree,
-    /// enqueue VM callbacks (a widget's to the task that handles it, the
-    /// global ones to the foreground task), and render immediate press
-    /// feedback.
-    fn handle(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, touch: &mut TouchImpl<P::TouchB>);
+    /// enqueue VM callbacks, and render immediate press feedback.
+    fn handle(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, touch: &mut TouchImpl<P::TouchB>);
 
     /// Per-frame housekeeping unrelated to a touch event (cursor blink).
     fn tick(&mut self, _ctx: &mut Ctx<P>) {}
@@ -240,137 +222,24 @@ pub trait InputHandler<P: PlatformRuntime>: Sized {
     /// Reset input state when a new program is flashed at runtime.
     fn reset(&mut self, _ctx: &mut Ctx<P>) {}
 
-    /// Widgets were destroyed behind the handler's back (a task ended): drop
-    /// any focus / drag state that names a widget that is gone.
-    fn forget_dead(&mut self, _ctx: &mut Ctx<P>) {}
 }
 
 // ============================================================================
-//  Tasks — the program VMs input and render dispatch to
+//  Callback dispatch
 // ============================================================================
 
-/// The program VMs: `main`, plus with `multi_program` up to
-/// `task::MAX_TASKS - 1` children (slot = task id). Input handlers send a
-/// widget's events to the task that handles it and the global events to the
-/// foreground task; without `multi_program` both are `main`.
-pub struct Tasks {
-    main: Box<Vm>,
-    #[cfg(feature = "multi_program")]
-    kids: Vec<Option<Box<Vm>>>,
-    /// Foreground task (copied from `Ctx::tasks` before input handling).
-    #[cfg(feature = "multi_program")]
-    fg: u8,
-    /// A runtime-owned widget (the task-fault dialog's button) was clicked.
-    #[cfg(feature = "multi_program")]
-    sys_click: bool,
-}
-
-impl Tasks {
-    fn new(main: Box<Vm>) -> Self {
-        Self {
-            main,
-            #[cfg(feature = "multi_program")]
-            kids: (1..crate::task::MAX_TASKS).map(|_| None).collect(),
-            #[cfg(feature = "multi_program")]
-            fg: crate::task::TASK_MAIN,
-            #[cfg(feature = "multi_program")]
-            sys_click: false,
-        }
+/// on_click of widget `id` (it has `FLAG_HAS_ON_CLICK`): a modal overlay's
+/// click function, else the program's click dispatcher.
+fn widget_click(vm: &mut Vm, id: WidgetId) {
+    if !vm.has_code() {
+        return;
     }
-
-    /// The `main` program's VM.
-    pub fn main(&mut self) -> &mut Vm {
-        &mut self.main
-    }
-
-    pub fn main_ref(&self) -> &Vm {
-        &self.main
-    }
-
-    /// The main program's render mode holds for every task.
-    pub fn buffered(&self) -> bool {
-        self.main.render_mode == RenderMode::Buffered
-    }
-
-    /// VM of running task `id`.
-    pub fn get(&mut self, id: u8) -> Option<&mut Vm> {
-        if id == 0 {
-            return Some(&mut self.main);
+    if let Some(click_fn) = vm.modal_overlay_click_fn(id) {
+        if let Some(off) = vm.find_func(click_fn).map(|e| e.offset as CodeAddr) {
+            vm.enqueue_callback(off, &[id.0 as i32]);
         }
-        #[cfg(feature = "multi_program")]
-        {
-            self.kids.get_mut(id as usize - 1).and_then(|k| k.as_deref_mut())
-        }
-        #[cfg(not(feature = "multi_program"))]
-        None
-    }
-
-    /// The task that gets global input events.
-    fn fg(&mut self) -> &mut Vm {
-        #[cfg(feature = "multi_program")]
-        if self.fg != 0 && self.get(self.fg).is_some() {
-            return self.get(self.fg).unwrap();
-        }
-        &mut self.main
-    }
-
-    /// The task that handles widget `id`'s events (None: a runtime widget).
-    fn for_widget(&mut self, objs: &ObjPool, id: WidgetId) -> Option<&mut Vm> {
-        #[cfg(feature = "multi_program")]
-        {
-            self.get(objs.handler_of(id))
-        }
-        #[cfg(not(feature = "multi_program"))]
-        {
-            let _ = (objs, id);
-            Some(&mut self.main)
-        }
-    }
-
-    /// Queue a global callback (touch down/move/up, swipe, long press) on
-    /// the foreground task.
-    pub fn global_event(&mut self, kind: FunctionKind, args: &[i32]) {
-        send_kind(self.fg(), kind, args);
-    }
-
-    /// Queue `kind` on the task that handles widget `id`.
-    pub fn widget_event(&mut self, objs: &ObjPool, id: WidgetId, kind: FunctionKind, args: &[i32]) {
-        if let Some(vm) = self.for_widget(objs, id) {
-            send_kind(vm, kind, args);
-        }
-    }
-
-    /// on_click of widget `id` (it has `FLAG_HAS_ON_CLICK`): a modal
-    /// overlay's click function, else the handling task's click dispatcher.
-    pub fn widget_click(&mut self, objs: &ObjPool, id: WidgetId) {
-        #[cfg(feature = "multi_program")]
-        if objs.handler_of(id) == crate::task::TASK_SYSTEM {
-            self.sys_click = true;
-            return;
-        }
-        let Some(vm) = self.for_widget(objs, id) else {
-            return;
-        };
-        if !vm.has_code() {
-            return;
-        }
-        if let Some(click_fn) = vm.modal_overlay_click_fn(id) {
-            if let Some(off) = vm.find_func(click_fn).map(|e| e.offset as CodeAddr) {
-                vm.enqueue_callback(off, &[id.0 as i32]);
-            }
-        } else {
-            send_kind(vm, FunctionKind::OnClick, &[id.0 as i32]);
-        }
-    }
-
-    /// Drop every child task's VM (program switch / reload).
-    #[cfg(feature = "multi_program")]
-    fn drop_kids(&mut self) {
-        for k in self.kids.iter_mut() {
-            *k = None;
-        }
-        self.fg = crate::task::TASK_MAIN;
-        self.sys_click = false;
+    } else {
+        send_kind(vm, FunctionKind::OnClick, &[id.0 as i32]);
     }
 }
 
@@ -385,26 +254,6 @@ fn send_kind(vm: &mut Vm, kind: FunctionKind, args: &[i32]) -> bool {
             true
         }
         None => false,
-    }
-}
-
-/// Run `f` on every task's VM, `main` first, with the pool stamping new
-/// objects with that task.
-fn each_task<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, mut f: impl FnMut(&mut Ctx<P>, &mut Vm)) {
-    #[cfg(feature = "multi_program")]
-    {
-        ctx.objs.cur_task = crate::task::TASK_MAIN;
-    }
-    f(ctx, &mut tasks.main);
-    #[cfg(feature = "multi_program")]
-    {
-        for (i, slot) in tasks.kids.iter_mut().enumerate() {
-            if let Some(vm) = slot.as_deref_mut() {
-                ctx.objs.cur_task = i as u8 + 1;
-                f(ctx, vm);
-            }
-        }
-        ctx.objs.cur_task = crate::task::TASK_MAIN;
     }
 }
 
@@ -428,26 +277,18 @@ pub fn run<P: PlatformRuntime>(ctx: Box<Ctx<P>>, touch: TouchImpl<P::TouchB>) ->
 pub struct Runtime<P: PlatformRuntime> {
     ctx: Box<Ctx<P>>,
     touch: TouchImpl<P::TouchB>,
-    tasks: Tasks,
+    vm: Box<Vm>,
     input: P::Input,
     protocol: Protocol,
     error_code: u8,
     /// Time the last USART byte was taken from the RX ring (for resync).
     last_rx_ms: u32,
-    /// The open task-fault dialog (`multi_program`).
-    #[cfg(feature = "multi_program")]
-    fault_dialog: WidgetId,
-    /// Main-loop profile (`perf` feature).
-    #[cfg(feature = "perf")]
-    perf: crate::perf::Perf,
 }
 
 impl<P: PlatformRuntime> Runtime<P> {
     /// Runs the startup sequence: ROM font, `P::boot`, mount, syscfg, root
     /// widget, `main` + `setup()`, first frame or error screen.
     pub fn new(mut ctx: Box<Ctx<P>>, mut touch: TouchImpl<P::TouchB>) -> Self {
-        #[cfg(feature = "perf")]
-        crate::perf::set_clock(P::cycles);
         // --- Embedded ROM font (always font 0) ---
         ctx.fonts.add(font::Font::from_embedded(
             &crate::embedded_font::GLYPHS,
@@ -505,15 +346,11 @@ impl<P: PlatformRuntime> Runtime<P> {
         Self {
             ctx,
             touch,
-            tasks: Tasks::new(vm),
+            vm,
             input,
             protocol: Protocol::new(P::FS_BASE),
             error_code,
             last_rx_ms,
-            #[cfg(feature = "multi_program")]
-            fault_dialog: WidgetId::NONE,
-            #[cfg(feature = "perf")]
-            perf: crate::perf::Perf::new(),
         }
     }
 
@@ -530,11 +367,7 @@ impl<P: PlatformRuntime> Runtime<P> {
         let wants = |vm: &Vm| {
             matches!(vm.state, VmState::Running | VmState::Yielded | VmState::Exit) || vm.has_pending_callbacks()
         };
-        #[cfg(feature = "multi_program")]
-        if self.tasks.kids.iter().flatten().any(|vm| wants(vm)) {
-            return true;
-        }
-        (self.error_code == 0 && wants(&self.tasks.main)) || !self.protocol.is_idle()
+        (self.error_code == 0 && wants(&self.vm)) || !self.protocol.is_idle()
     }
 
     /// How long the runtime can go without a pass, for a BSP that sleeps
@@ -548,10 +381,6 @@ impl<P: PlatformRuntime> Runtime<P> {
         if self.busy() || !self.touch.is_idle() || !self.input.idle() || self.ctx.objs.render.maybe_dirty {
             return Some(0);
         }
-        #[cfg(feature = "layers")]
-        if self.ctx.objs.layers.placed {
-            return Some(0);
-        }
         #[cfg(feature = "audio")]
         if self.ctx.audio.playing() {
             return Some(0);
@@ -559,51 +388,21 @@ impl<P: PlatformRuntime> Runtime<P> {
         if self.error_code != 0 {
             return None;
         }
-        let now = self.ctx.systick.millis();
-        let mut left: Option<u32> = None;
-        #[cfg(feature = "multi_program")]
-        let kids = self.tasks.kids.iter().filter_map(|k| k.as_deref());
-        #[cfg(not(feature = "multi_program"))]
-        let kids = core::iter::empty::<&Vm>();
-        for vm in core::iter::once(&*self.tasks.main).chain(kids) {
-            if vm.animating() {
-                return Some(0);
-            }
-            if let Some(ms) = vm.wait_left(now) {
-                left = Some(left.map_or(ms, |l| l.min(ms)));
-            }
+        if self.vm.animating() {
+            return Some(0);
         }
-        left
+        self.vm.wait_left(self.ctx.systick.millis())
     }
 
     /// One main-loop pass: VM, USART protocol, input, animations, audio,
     /// render, callbacks, `P::frame_end`.
     pub fn step(&mut self) {
-        #[cfg(feature = "perf")]
-        let mut t = {
-            let now = P::cycles();
-            self.perf.pass_start(now);
-            now
-        };
-        // Ends the phase that started at `t` (`perf` feature; else nothing).
-        macro_rules! lap {
-            ($id:ident) => {
-                #[cfg(feature = "perf")]
-                {
-                    t = self.perf.add(crate::perf::phase::$id, t, P::cycles());
-                }
-            };
+        // `runProgram` ended the main program: load the next one.
+        if self.error_code == 0 && self.vm.state == VmState::Exit {
+            self.error_code = switch_program(&mut self.ctx, &mut self.vm, &mut self.input);
         }
 
-        // `runProgram` ended the main program: load the next one (every
-        // child task ends with it).
-        if self.error_code == 0 && self.tasks.main.state == VmState::Exit {
-            self.drop_children();
-            self.error_code = switch_program(&mut self.ctx, &mut self.tasks.main, &mut self.input);
-        }
-        lap!(MISC);
-
-        // --- VM step, each task in turn ---
+        // --- VM step ---
         // Resumes a suspended showModal whose result is now ready, then
         // continues a suspended callback whose delay expired, or runs a burst
         // of the program. On the GD32 the burst is 1 instruction (the loop
@@ -611,29 +410,18 @@ impl<P: PlatformRuntime> Runtime<P> {
         // VM_STEPS_PER_TICK so animation runs at hardware-like speed instead
         // of one instruction per presented frame.
         if self.error_code == 0 {
-            each_task(&mut self.ctx, &mut self.tasks, |ctx, vm| {
-                vm.try_resume_modal(ctx);
-                vm.tick(ctx, P::VM_STEPS_PER_TICK);
-            });
-            self.error_code = check_vm_fault(&mut self.ctx, &self.tasks.main);
+            self.vm.try_resume_modal(&mut self.ctx);
+            self.vm.tick(&mut self.ctx, P::VM_STEPS_PER_TICK);
+            self.error_code = check_vm_fault(&mut self.ctx, &self.vm);
         }
-        lap!(VM);
 
         self.service_usart();
-        lap!(USART);
 
         // --- Input ---
         if self.error_code == 0 {
-            #[cfg(feature = "multi_program")]
-            {
-                self.tasks.fg = self.ctx.tasks.fg;
-            }
-            self.input.handle(&mut self.ctx, &mut self.tasks, &mut self.touch);
+            self.input.handle(&mut self.ctx, &mut self.vm, &mut self.touch);
             self.input.tick(&mut self.ctx);
-            #[cfg(feature = "multi_program")]
-            self.close_fault_dialog_on_click();
         }
-        lap!(INPUT);
 
         // --- Advance property animations ---
         // Time-driven (millis), independent of VM state, so tweens keep running
@@ -642,99 +430,36 @@ impl<P: PlatformRuntime> Runtime<P> {
         // up by the callback drain below.
         if self.error_code == 0 {
             let now = self.ctx.systick.millis();
-            each_task(&mut self.ctx, &mut self.tasks, |ctx, vm| vm.tick_animations(ctx, now));
+            self.vm.tick_animations(&mut self.ctx, now);
         }
-        lap!(ANIM);
 
         // --- Stream the playing sound (if any) into the audio backend ---
         #[cfg(feature = "audio")]
         self.ctx.audio.pump(&self.ctx.flash);
-        lap!(AUDIO);
 
         // --- Render (on_paint runs inside, for the widgets it drew) ---
         if self.error_code == 0 {
-            render_phase(&mut self.ctx, &mut self.tasks, &mut self.input);
+            render_phase(&mut self.ctx, &mut self.vm, &mut self.input);
         }
-        lap!(RENDER);
 
         // --- Start queued callbacks, then re-render ---
         if self.error_code == 0 {
-            let mut ran = false;
-            each_task(&mut self.ctx, &mut self.tasks, |ctx, vm| {
-                if vm.has_pending_callbacks() {
-                    ran |= vm.drain_callbacks(ctx);
-                }
-            });
-            if ran {
-                render_phase(&mut self.ctx, &mut self.tasks, &mut self.input);
+            if self.vm.has_pending_callbacks() && self.vm.drain_callbacks(&mut self.ctx) {
+                render_phase(&mut self.ctx, &mut self.vm, &mut self.input);
             }
         }
 
         // --- A fault in a callback or on_paint stops the program too ---
         if self.error_code == 0 {
-            self.error_code = check_vm_fault(&mut self.ctx, &self.tasks.main);
-        }
-        lap!(CALLBACKS);
-
-        // --- Child tasks: end the ones that exited or faulted, act on
-        //     spawn / kill requests, deliver messages ---
-        #[cfg(feature = "multi_program")]
-        if self.error_code == 0 {
-            self.service_tasks();
+            self.error_code = check_vm_fault(&mut self.ctx, &self.vm);
         }
 
         // --- Commit EEPROM writes made this pass (one erase on flash-backed
         //     boards for a whole save; no-op on write-through chips) ---
         self.ctx.eeprom.flush();
-        lap!(MISC);
 
         // --- End-of-frame hook (host window pump / present; no-op on device) ---
         P::frame_end(&mut self.ctx);
-        lap!(FRAME_END);
-        #[cfg(feature = "perf")]
-        {
-            self.perf.add_cycles(crate::perf::phase::VSYNC_WAIT, P::perf_take_wait());
-            self.perf.pass_end(t);
-        }
-    }
-
-    /// Answers a `Perf` query: the profile since the last one, then resets it.
-    #[cfg(feature = "perf")]
-    fn send_perf(&mut self) {
-        use crate::perf::{phase, to_us};
-        let hz = P::cycle_hz();
-        let mut instructions = 0u64;
-        each_task(&mut self.ctx, &mut self.tasks, |_, vm| {
-            instructions += vm.instructions;
-            vm.instructions = 0;
-        });
-        use crate::perf::count;
-        let (sub, counts) = crate::perf::take_sub();
-        for (i, &c) in sub.iter().enumerate() {
-            self.perf.add_cycles(phase::DRAW + i as u8, c);
-        }
-        let p = &self.perf;
-        const MAXN: usize = crate::perf::MAX_PASS_PHASES.len();
-        let mut rows = [(0u8, 0u32); phase::COUNT + count::COUNT + MAXN];
-        for (i, row) in rows.iter_mut().take(phase::COUNT).enumerate() {
-            *row = (i as u8 + 1, to_us(p.phase[i], hz));
-        }
-        for (i, &n) in counts.iter().enumerate() {
-            rows[phase::COUNT + i] = (count::DRAWS + i as u8, n);
-        }
-        // Where the longest pass went.
-        for (i, &id) in crate::perf::MAX_PASS_PHASES.iter().enumerate() {
-            rows[phase::COUNT + count::COUNT + i] = (crate::perf::MAX_PASS + id, to_us(p.max_phase(id) as u64, hz));
-        }
-        let header = protocol::PerfHeader {
-            cycle_hz: hz,
-            window_us: to_us(p.window, hz),
-            passes: p.passes,
-            max_pass_us: to_us(p.max_pass as u64, hz),
-            vm_instructions: instructions,
-        };
-        protocol::send_perf(&self.ctx.usart, &header, &rows);
-        self.perf.reset();
     }
 
     /// USART protocol: always serviced, even after an error, so a new program
@@ -747,7 +472,7 @@ impl<P: PlatformRuntime> Runtime<P> {
             if matches!(ev, RxEvent::None) {
                 continue;
             }
-            if P::on_extra_rx(ev, &mut self.ctx, &mut self.tasks.main, &mut self.touch) {
+            if P::on_extra_rx(ev, &mut self.ctx, &mut self.vm, &mut self.touch) {
                 continue;
             }
             self.handle_event(ev);
@@ -794,32 +519,28 @@ impl<P: PlatformRuntime> Runtime<P> {
                 protocol::send_stackinfo(&self.ctx.usart, used, free, P::stack_peak());
             }
             RxEvent::MemDetail => {
-                let entries = mem_detail(&self.ctx, &self.tasks.main);
+                let entries = mem_detail(&self.ctx, &self.vm);
                 protocol::send_memdetail(&self.ctx.usart, &entries);
             }
-            #[cfg(feature = "perf")]
-            RxEvent::Perf => self.send_perf(),
             RxEvent::SetDateTime => {
                 let dt = self.protocol.datetime();
                 self.ctx.rtc.set_time(&dt);
                 protocol::send_pong(&self.ctx.usart);
             }
             RxEvent::ProgramReady => {
-                self.drop_children();
                 self.error_code =
-                    reload_program(&mut self.ctx, &mut self.tasks.main, &mut self.input, &mut self.protocol);
+                    reload_program(&mut self.ctx, &mut self.vm, &mut self.input, &mut self.protocol);
                 if self.error_code != 0 {
                     show_error(&mut self.ctx, self.error_code, None);
                 } else {
-                    P::initial_render(&mut self.ctx, &self.tasks.main);
+                    P::initial_render(&mut self.ctx, &self.vm);
                 }
             }
             RxEvent::ProgramTooLarge => {
                 protocol::send_error(&self.ctx.usart, ERR_INSUFFICIENT_MEMORY);
             }
             RxEvent::FsReady => {
-                self.drop_children();
-                self.tasks.main.reset();
+                self.vm.reset();
                 #[cfg(feature = "audio")]
                 self.ctx.audio.stop();
                 self.ctx.objs.clear();
@@ -861,17 +582,16 @@ impl<P: PlatformRuntime> Runtime<P> {
                 P::reset();
             }
             RxEvent::UserMessage => {
-                if self.tasks.main.has_code() {
+                if self.vm.has_code() {
                     if let Some(offset) = self
-                        .tasks
-                        .main
+                        .vm
                         .find_by_kind(FunctionKind::OnUserMessage)
                         .map(|e| e.offset as CodeAddr)
                     {
                         let msg = self.protocol.user_message();
                         if !msg.is_empty() {
                             if let Some(arr_id) = self.ctx.objs.arr_from_bytes(msg) {
-                                self.tasks.main.enqueue_callback(offset, &[arr_id as i32]);
+                                self.vm.enqueue_callback(offset, &[arr_id as i32]);
                             }
                         }
                     }
@@ -1144,299 +864,18 @@ fn check_vm_fault<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &Vm) -> u8 {
     ERR_PROGRAM_ERROR
 }
 
-/// Run the on_paint dispatchers for the widgets in `paint`: each task paints
-/// the widgets it handles.
-fn run_paint<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, paint: &render::PaintList) {
-    #[cfg(not(feature = "multi_program"))]
-    tasks.main.run_paint(ctx, paint);
-    #[cfg(feature = "multi_program")]
-    each_task(ctx, tasks, |ctx, vm| {
-        let me = ctx.objs.cur_task;
-        let mut mine = render::PaintList::new();
-        for &id in paint.ids() {
-            if ctx.objs.handler_of(id) == me {
-                mine.push(id);
-            }
-        }
-        vm.run_paint(ctx, &mine);
-    });
-}
-
-// ============================================================================
-//  Child tasks (`multi_program`)
-// ============================================================================
-
-impl<P: PlatformRuntime> Runtime<P> {
-    /// End every child task (main program switch, reload, filesystem write).
-    fn drop_children(&mut self) {
-        #[cfg(feature = "multi_program")]
-        {
-            self.tasks.drop_kids();
-            self.ctx.tasks.reset();
-            self.fault_dialog = WidgetId::NONE;
-        }
-    }
-}
-
-#[cfg(feature = "multi_program")]
-impl<P: PlatformRuntime> Runtime<P> {
-    /// Once per pass, after the bursts and callbacks: end the children that
-    /// exited or faulted, act on kill / spawn requests, deliver messages.
-    fn service_tasks(&mut self) {
-        use crate::task::{MAX_TASKS, SlotState, mask_slots};
-        for id in 1..MAX_TASKS as u8 {
-            let Some(vm) = self.tasks.get(id) else {
-                continue;
-            };
-            match vm.state {
-                VmState::Error => {
-                    let (fault, pc) = (vm.fault(), vm.fault_pc());
-                    self.end_task(id, fault as i32, Some(pc));
-                }
-                VmState::Exit => match vm.next_program.take() {
-                    Some(next) => self.restart_task(id, next),
-                    None => self.end_task(id, 0, None),
-                },
-                _ => {}
-            }
-        }
-        let kills = core::mem::take(&mut self.ctx.tasks.kills);
-        for id in mask_slots(kills) {
-            if self.ctx.tasks.alive(id as i32) {
-                self.end_task(id, 0, None);
-            }
-        }
-        for id in 1..MAX_TASKS as u8 {
-            if self.ctx.tasks.slots[id as usize].state == SlotState::Starting {
-                self.start_task(id);
-            }
-        }
-        while let Some(m) = self.ctx.tasks.mail.pop_front() {
-            if let Some(vm) = self.tasks.get(m.to) {
-                send_kind(vm, FunctionKind::OnTaskMessage, &[m.from as i32, m.a, m.b]);
-            }
-        }
-    }
-
-    /// Start the program a `spawnProgram` reserved slot `id` for: a VM sized
-    /// like main's, its code + widget page, `setup()` / `on_program_start()`,
-    /// then its `loop()` runs from the next pass.
-    fn start_task(&mut self, id: u8) {
-        use crate::task::{SlotState, TASK_MAIN};
-        let program = self.ctx.tasks.slots[id as usize].program;
-        let Some(vm) = self.tasks.main.sibling() else {
-            return self.end_task(id, -1, None);
-        };
-        let mut vm = Box::new(vm);
-        self.ctx.tasks.slots[id as usize].state = SlotState::Running;
-        self.ctx.objs.cur_task = id;
-        let mut err = load_program_code(&mut self.ctx, &mut vm, program);
-        if err == 0 && vm.has_code() {
-            err = start_program(&mut self.ctx, &mut vm);
-        }
-        self.ctx.objs.cur_task = TASK_MAIN;
-        let fault = (vm.state == VmState::Error).then(|| (vm.fault(), vm.fault_pc()));
-        self.tasks.kids[id as usize - 1] = Some(vm);
-        if let Some((fault, pc)) = fault {
-            self.end_task(id, fault as i32, Some(pc));
-        } else if err != 0 {
-            self.end_task(id, -1, None);
-        }
-    }
-
-    /// Free what task `id` holds: its VM (callbacks, animations, dialogs),
-    /// its objects, the input focus on its widgets; repaint the screen.
-    fn clear_task(&mut self, id: u8) {
-        self.tasks.kids[id as usize - 1] = None;
-        self.ctx.objs.free_task(id);
-        let root = self.ctx.objs.root;
-        self.ctx.objs.mark_dirty(root);
-        self.input.forget_dead(&mut self.ctx);
-    }
-
-    /// End task `id`: `code` 0 = exited or killed, > 0 = VM fault (at
-    /// `fault_pc`), -1 = could not start. Its parent (main when gone) gets
-    /// `on_task_exit(id, code)`; a fault nobody handles opens the fault dialog.
-    fn end_task(&mut self, id: u8, code: i32, fault_pc: Option<CodeAddr>) {
-        use crate::task::TASK_MAIN;
-        self.clear_task(id);
-        let info = self.ctx.tasks.release(id);
-        let parent = if self.ctx.tasks.alive(info.parent as i32) { info.parent } else { TASK_MAIN };
-        let handled = self
-            .tasks
-            .get(parent)
-            .is_some_and(|vm| send_kind(vm, FunctionKind::OnTaskExit, &[id as i32, code]));
-        if let Some(pc) = fault_pc {
-            protocol::send_vm_error(&self.ctx.usart, ERR_PROGRAM_ERROR, code as u8, pc as u32);
-            if !handled {
-                self.show_fault_dialog(info.program.name(), code as u8, pc);
-            }
-        }
-    }
-
-    /// `runProgram` in a child: the same slot (id, parent, foreground) starts
-    /// `next` from scratch later in this pass.
-    fn restart_task(&mut self, id: u8, next: ProgramRef) {
-        self.clear_task(id);
-        let slot = &mut self.ctx.tasks.slots[id as usize];
-        slot.program = next;
-        slot.state = crate::task::SlotState::Starting;
-        self.ctx.tasks.mail.retain(|m| m.to != id);
-    }
-
-    /// "Program <name> stopped" over everything, with the fault and its PC
-    /// and an OK button. Runtime-owned widgets (`TASK_SYSTEM`): no task frees
-    /// them, and their click comes back through `Tasks::sys_click`.
-    fn show_fault_dialog(&mut self, name: &[u8], fault: u8, pc: CodeAddr) {
-        use crate::task::{TASK_MAIN, TASK_SYSTEM};
-        self.close_fault_dialog();
-        self.ctx.objs.cur_task = TASK_SYSTEM;
-        let built = build_fault_dialog(&mut self.ctx, name, fault, pc);
-        self.ctx.objs.cur_task = TASK_MAIN;
-        match built {
-            Some(d) => self.fault_dialog = d,
-            // Out of objects: drop whatever got built.
-            None => self.ctx.objs.free_task(TASK_SYSTEM),
-        }
-    }
-
-    fn close_fault_dialog(&mut self) {
-        let d = self.fault_dialog;
-        self.fault_dialog = WidgetId::NONE;
-        if self.ctx.objs.is_live(d) && self.ctx.objs.owner_of(d.0) == crate::task::TASK_SYSTEM {
-            self.ctx.objs.free_task(crate::task::TASK_SYSTEM);
-            let root = self.ctx.objs.root;
-            self.ctx.objs.mark_dirty(root);
-        }
-    }
-
-    /// The fault dialog's OK button was clicked.
-    fn close_fault_dialog_on_click(&mut self) {
-        if core::mem::take(&mut self.tasks.sys_click) {
-            self.close_fault_dialog();
-        }
-    }
-}
-
-/// A line of text assembled from parts (cut at 64 bytes).
-#[cfg(feature = "multi_program")]
-struct Line {
-    buf: [u8; 64],
-    len: usize,
-}
-
-#[cfg(feature = "multi_program")]
-impl Line {
-    fn new() -> Self {
-        Self { buf: [0; 64], len: 0 }
-    }
-    fn put(&mut self, s: &[u8]) -> &mut Self {
-        let n = s.len().min(self.buf.len() - self.len);
-        self.buf[self.len..self.len + n].copy_from_slice(&s[..n]);
-        self.len += n;
-        self
-    }
-    fn dec(&mut self, v: u32) -> &mut Self {
-        let mut d = [0u8; 10];
-        let (mut v, mut n) = (v, 0);
-        loop {
-            d[9 - n] = b'0' + (v % 10) as u8;
-            n += 1;
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
-        self.put(&d[10 - n..])
-    }
-    /// Upper-case hex, 4 digits (8 past 0xFFFF).
-    fn hex(&mut self, v: u32) -> &mut Self {
-        let digits = if v > 0xFFFF { 8 } else { 4 };
-        for i in (0..digits).rev() {
-            self.put(&[b"0123456789ABCDEF"[((v >> (4 * i)) & 0xF) as usize]]);
-        }
-        self
-    }
-    fn text(&self) -> &[u8] {
-        &self.buf[..self.len]
-    }
-}
-
-/// A runtime widget under `parent`, with centred `text` (if any).
-#[cfg(feature = "multi_program")]
-#[allow(clippy::too_many_arguments)]
-fn sys_widget<P: PlatformRuntime>(
-    ctx: &mut Ctx<P>,
-    parent: WidgetId,
-    kind: u8,
-    x: i16,
-    y: i16,
-    w: u16,
-    h: u16,
-    text: &[u8],
-) -> Option<WidgetId> {
-    let id = ctx.objs.alloc_widget()?;
-    ctx.objs.add_child(parent, id);
-    let wd = ctx.objs.get_mut(id);
-    wd.kind = kind;
-    wd.location = crate::types::Offset { x, y };
-    wd.size = Size { w, h };
-    if !text.is_empty() {
-        let s = ctx.objs.str_alloc(text)?;
-        ctx.objs.update_ext(id, |e| {
-            e.text_id = s;
-            e.text_color = P::FG_COLOR;
-            e.text_align = widget::ALIGN_CENTER;
-        });
-    }
-    Some(id)
-}
-
-/// The task-fault dialog (see `Runtime::show_fault_dialog`).
-#[cfg(feature = "multi_program")]
-fn build_fault_dialog<P: PlatformRuntime>(
-    ctx: &mut Ctx<P>,
-    name: &[u8],
-    fault: u8,
-    pc: CodeAddr,
-) -> Option<WidgetId> {
-    use widget::{FLAG_CLICKABLE, FLAG_HAS_ON_CLICK, KIND_BASE, KIND_BUTTON, KIND_LABEL};
-    let root = ctx.objs.root;
-    let screen = ctx.objs.get(root).size;
-    let (bw, bh) = (480u16.min(screen.w), 170u16.min(screen.h));
-    let (x, y) = ((screen.w - bw) as i16 / 2, (screen.h - bh) as i16 / 2);
-    let dialog = sys_widget(ctx, root, KIND_BASE, x, y, bw, bh, b"")?;
-    let w = ctx.objs.get_mut(dialog);
-    w.background_color = P::BG_COLOR;
-    w.border_color = COLOR_RED;
-    ctx.objs.update_ext(dialog, |e| e.border = crate::types::Edges::uniform(2));
-    let mut lines = [Line::new(), Line::new(), Line::new()];
-    lines[0].put(b"Program '").put(name).put(b"' stopped");
-    lines[1].put(b"VM ").dec(fault as u32).put(b": ").put(crate::vm::fault::name(fault));
-    lines[2].put(b"PC 0x").hex(pc as u32);
-    for (i, l) in lines.iter().enumerate() {
-        sys_widget(ctx, dialog, KIND_LABEL, 8, 12 + 28 * i as i16, bw - 20, 24, l.text())?;
-    }
-    let ok = sys_widget(ctx, dialog, KIND_BUTTON, (bw as i16 - 120) / 2, bh as i16 - 56, 120, 40, b"OK")?;
-    let w = ctx.objs.get_mut(ok);
-    w.flags |= FLAG_CLICKABLE | FLAG_HAS_ON_CLICK;
-    w.background_color = 0x4208;
-    ctx.objs.update_ext(ok, |e| e.press_color = COLOR_RED);
-    Some(dialog)
-}
-
 // ============================================================================
 //  Render phase
 // ============================================================================
 
-fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, input: &mut P::Input) {
-    match tasks.main.render_mode {
+fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, vm: &mut Vm, input: &mut P::Input) {
+    match vm.render_mode {
         RenderMode::Buffered => {
             if render::buffered_has_dirty(ctx) {
                 ctx.lcd.begin_frame();
                 let paint = render::render_buffered_content(ctx);
                 // on_paint into this back buffer, before the overlay + swap.
-                run_paint(ctx, tasks, &paint);
+                vm.run_paint(ctx, &paint);
                 input.draw_overlay(ctx, true);
                 // Rasterization is done (UI thread). Hand off the present
                 // (vsync wait + buffer flip) — synchronous by default, or
@@ -1450,10 +889,8 @@ fn render_phase<P: PlatformRuntime>(ctx: &mut Ctx<P>, tasks: &mut Tasks, input: 
             }
             let mut paint = render::PaintList::new();
             render::collect_dirty_paint(ctx, &mut paint);
-            // The board renderer may keep on_paint drawing in captures it draws itself.
-            let paint = render::capture_paint(ctx, &paint, |ctx, one| run_paint(ctx, tasks, one));
             render::render_dirty(ctx);
-            run_paint(ctx, tasks, &paint);
+            vm.run_paint(ctx, &paint);
             input.draw_overlay(ctx, false);
             ctx.lcd.flush_dirty();
         }
@@ -1707,8 +1144,7 @@ pub fn set_dropdown_options_visible<P: Platform>(
 /// input, checkbox, radio, dropdown…), or its `on_paint` might. A plain box,
 /// label, button, image or shape without a press colour looks the same:
 /// redrawing it is wasted, and costly for a big one (a full-screen
-/// clickable scrim, or a layer's root, whose whole surface is redrawn and
-/// copied).
+/// clickable scrim).
 fn press_shows(objs: &ObjPool, id: WidgetId) -> bool {
     let w = objs.get(id);
     let plain = matches!(
@@ -1794,7 +1230,7 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
     }
 
     #[inline(never)]
-    fn handle(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, touch: &mut TouchImpl<P::TouchB>) {
+    fn handle(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, touch: &mut TouchImpl<P::TouchB>) {
         let mut event = match touch.poll() {
             Some(e) => e,
             None => return,
@@ -1820,13 +1256,13 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
                     ctx.objs.mark_dirty(hit);
                 }
                 if ctx.objs.get(hit).flags & widget::FLAG_HAS_ON_CLICK != 0 {
-                    tasks.widget_click(&ctx.objs, hit);
+                    widget_click(vm, hit);
                 }
                 if ctx.objs.get(hit).flags & widget::FLAG_HAS_ON_TAP != 0
                     && ctx.objs.get(hit).kind != widget::KIND_INPUT
                 {
                     let packed = ((event.x as u32) << 16 | event.y as u32) as i32;
-                    tasks.widget_event(&ctx.objs, hit, FunctionKind::OnTap, &[hit.0 as i32, packed]);
+                    send_kind(vm, FunctionKind::OnTap, &[hit.0 as i32, packed]);
                 }
             }
             TouchEventKind::Hold => {}
@@ -1866,16 +1302,16 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
     }
 
     #[inline(never)]
-    fn handle(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, touch: &mut TouchImpl<P::TouchB>) {
+    fn handle(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, touch: &mut TouchImpl<P::TouchB>) {
         let mut event = match touch.poll() {
             Some(e) => e,
             None => return,
         };
         (event.x, event.y) = ctx.lcd.touch_to_logical(event.x, event.y);
         match event.kind {
-            TouchEventKind::Press => self.on_press(ctx, tasks, event.x, event.y),
-            TouchEventKind::Hold => self.on_hold(ctx, tasks, event.x, event.y),
-            TouchEventKind::Release => self.on_release(ctx, tasks, event.x, event.y),
+            TouchEventKind::Press => self.on_press(ctx, vm, event.x, event.y),
+            TouchEventKind::Hold => self.on_hold(ctx, vm, event.x, event.y),
+            TouchEventKind::Release => self.on_release(ctx, vm, event.x, event.y),
         }
     }
 
@@ -1903,7 +1339,6 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
 
     fn reset(&mut self, ctx: &mut Ctx<P>) {
         self.kb.visible = false;
-        ctx.objs.overlay = None;
         self.kb.focused = WidgetId::NONE;
         self.scroll_id = WidgetId::NONE;
         self.scroll_active = false;
@@ -1913,24 +1348,14 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
     fn idle(&self) -> bool {
         !self.kb.visible
     }
-
-    fn forget_dead(&mut self, ctx: &mut Ctx<P>) {
-        if self.kb.focused.is_some() && !ctx.objs.is_live(self.kb.focused) {
-            self.dismiss_keyboard(ctx);
-        }
-        if !ctx.objs.is_live(self.scroll_id) {
-            self.scroll_id = WidgetId::NONE;
-            self.scroll_active = false;
-        }
-    }
 }
 
 impl FullInput {
-    fn on_press<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, x: u16, y: u16) {
+    fn on_press<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, x: u16, y: u16) {
         // Keyboard intercept.
         if self.kb.visible && y >= self.kb.top() {
             self.kb.handle_press(x, y);
-            if !tasks.buffered() {
+            if !(vm.render_mode == RenderMode::Buffered) {
                 self.kb
                     .draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, self.kb.pressed_key, true);
             }
@@ -1997,22 +1422,22 @@ impl FullInput {
                 // is already stored, and the dispatcher passes it on to
                 // handlers declared as `fn h(wid, val)`.
                 if ctx.objs.get(hit).flags & widget::FLAG_HAS_ON_CLICK != 0 {
-                    tasks.widget_event(&ctx.objs, hit, FunctionKind::OnClick, &[hit.0 as i32]);
+                    send_kind(vm, FunctionKind::OnClick, &[hit.0 as i32]);
                 }
             }
 
             if press_shows(&ctx.objs, hit) {
                 ctx.objs.mark_dirty(hit);
-                if !tasks.buffered() {
+                if !(vm.render_mode == RenderMode::Buffered) {
                     render::render_dirty(ctx);
                 }
             }
         }
 
-        tasks.global_event(FunctionKind::OnTouchDown, &[x as i32, y as i32]);
+        send_kind(vm, FunctionKind::OnTouchDown, &[x as i32, y as i32]);
     }
 
-    fn on_hold<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, x: u16, y: u16) {
+    fn on_hold<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, x: u16, y: u16) {
         if self.kb.pressed_key != keyboard::KEY_NONE {
             return;
         }
@@ -2020,7 +1445,7 @@ impl FullInput {
         // Scrollbar drag.
         if self.scroll_active && self.scroll_id.is_some() {
             scrollbar_set_position(ctx, self.scroll_id, y);
-            if !tasks.buffered() {
+            if !(vm.render_mode == RenderMode::Buffered) {
                 render::render_dirty(ctx);
             }
         }
@@ -2037,12 +1462,12 @@ impl FullInput {
                     ext.value = new_val as WValue;
                 });
                 ctx.objs.mark_dirty(id);
-                if !tasks.buffered() {
+                if !(vm.render_mode == RenderMode::Buffered) {
                     render::render_dirty(ctx);
                 }
                 if ctx.objs.get(id).flags & widget::FLAG_HAS_ON_CLICK != 0 {
                     // One argument — see the slider press path.
-                    tasks.widget_event(&ctx.objs, id, FunctionKind::OnClick, &[id.0 as i32]);
+                    send_kind(vm, FunctionKind::OnClick, &[id.0 as i32]);
                 }
                 break;
             }
@@ -2064,22 +1489,22 @@ impl FullInput {
                         pressed_id = id;
                     }
                 }
-                tasks.global_event(FunctionKind::OnLongPress, &[pressed_id.0 as i32, x as i32, y as i32]);
+                send_kind(vm, FunctionKind::OnLongPress, &[pressed_id.0 as i32, x as i32, y as i32]);
                 self.long_press_fired = true;
             }
         }
 
-        tasks.global_event(FunctionKind::OnTouchMove, &[x as i32, y as i32]);
+        send_kind(vm, FunctionKind::OnTouchMove, &[x as i32, y as i32]);
     }
 
-    fn on_release<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, tasks: &mut Tasks, x: u16, y: u16) {
+    fn on_release<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, x: u16, y: u16) {
         // Keyboard key release.
         if self.kb.pressed_key != keyboard::KEY_NONE {
             let prev_key = self.kb.pressed_key;
             if let Some(action) = self.kb.handle_release(x, y) {
-                self.handle_key_action(ctx, tasks, action);
+                self.handle_key_action(ctx, vm, action);
             }
-            if !tasks.buffered() && !self.kb.dirty && self.kb.visible {
+            if !(vm.render_mode == RenderMode::Buffered) && !self.kb.dirty && self.kb.visible {
                 self.kb
                     .draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, prev_key, false);
             }
@@ -2148,7 +1573,7 @@ impl FullInput {
             ctx.objs.mark_dirty(clicked_id);
         }
 
-        if !tasks.buffered() {
+        if !(vm.render_mode == RenderMode::Buffered) {
             render::render_dirty(ctx);
         }
 
@@ -2165,13 +1590,13 @@ impl FullInput {
             };
             if direction >= 0 {
                 let dominant = if direction <= 1 { dx } else { dy };
-                tasks.global_event(FunctionKind::OnSwipe, &[direction, swipe_widget_id.0 as i32, dominant]);
+                send_kind(vm, FunctionKind::OnSwipe, &[direction, swipe_widget_id.0 as i32, dominant]);
             }
         }
 
         // on_click (modal overlay func id first, else the click dispatcher).
         if clicked_id.is_some() && ctx.objs.get(clicked_id).flags & widget::FLAG_HAS_ON_CLICK != 0 {
-            tasks.widget_click(&ctx.objs, clicked_id);
+            widget_click(vm, clicked_id);
         }
 
         // on_tap (skip KIND_INPUT).
@@ -2180,10 +1605,10 @@ impl FullInput {
             && ctx.objs.get(clicked_id).flags & widget::FLAG_HAS_ON_TAP != 0
         {
             let packed = ((x as u32) << 16 | y as u32) as i32;
-            tasks.widget_event(&ctx.objs, clicked_id, FunctionKind::OnTap, &[clicked_id.0 as i32, packed]);
+            send_kind(vm, FunctionKind::OnTap, &[clicked_id.0 as i32, packed]);
         }
 
-        tasks.global_event(FunctionKind::OnTouchUp, &[]);
+        send_kind(vm, FunctionKind::OnTouchUp, &[]);
     }
 
     // --- Input-widget / keyboard helpers ---
@@ -2198,8 +1623,6 @@ impl FullInput {
         ctx.objs.mark_dirty(id);
         self.kb.set_screen(ctx.lcd.width(), ctx.lcd.height());
         self.kb.visible = true;
-        let top = self.kb.top();
-        ctx.objs.overlay = Some(crate::types::Rect::new(0, top as i16, ctx.lcd.width(), ctx.lcd.height().saturating_sub(top)));
         self.kb.dirty = true;
         let now = ctx.systick.millis();
         self.kb.reset_blink(now);
@@ -2213,7 +1636,6 @@ impl FullInput {
         }
         self.kb.focused = WidgetId::NONE;
         self.kb.visible = false;
-        ctx.objs.overlay = None;
         ctx.cursor_visible = false;
 
         // The widgets under the keyboard redraw in full, not incrementally.
@@ -2358,7 +1780,7 @@ impl FullInput {
     fn handle_key_action<P: PlatformRuntime>(
         &mut self,
         ctx: &mut Ctx<P>,
-        tasks: &mut Tasks,
+        vm: &mut Vm,
         action: keyboard::KeyAction,
     ) {
         let id = self.kb.focused;
@@ -2373,24 +1795,22 @@ impl FullInput {
                 if text_id != crate::pool::PTR_NONE {
                     // A shared literal is edited as a private copy: store its id.
                     if let Some(new_id) = ctx.objs.str_insert_byte(text_id, cursor, ch, max_len) {
-                        ctx.objs.adopt(new_id, id.0);
                         ctx.objs.update_ext(id, |ext| {
                             ext.text_id = new_id;
                             ext.value = (cursor + 1) as WValue;
                         });
                         ctx.objs.mark_dirty(id);
-                        self.fire_on_change(ctx, tasks, id);
+                        self.fire_on_change(ctx, vm, id);
                     }
                 } else {
                     let data = [ch];
                     if let Some(new_id) = ctx.objs.str_alloc(&data) {
-                        ctx.objs.adopt(new_id, id.0);
                         ctx.objs.update_ext(id, |ext| {
                             ext.text_id = new_id;
                             ext.value = 1;
                         });
                         ctx.objs.mark_dirty(id);
-                        self.fire_on_change(ctx, tasks, id);
+                        self.fire_on_change(ctx, vm, id);
                     }
                 }
                 let now = ctx.systick.millis();
@@ -2402,13 +1822,12 @@ impl FullInput {
                 let cursor = ctx.objs.value(id).max(0) as usize;
                 if text_id != crate::pool::PTR_NONE && cursor > 0 {
                     if let Some(new_id) = ctx.objs.str_delete_byte(text_id, cursor - 1) {
-                        ctx.objs.adopt(new_id, id.0);
                         ctx.objs.update_ext(id, |ext| {
                             ext.text_id = new_id;
                             ext.value = (cursor - 1) as WValue;
                         });
                         ctx.objs.mark_dirty(id);
-                        self.fire_on_change(ctx, tasks, id);
+                        self.fire_on_change(ctx, vm, id);
                     }
                 }
                 let now = ctx.systick.millis();
@@ -2419,10 +1838,10 @@ impl FullInput {
                 // A multi-line input takes the newline; tapping outside
                 // it closes the keyboard.
                 if ctx.objs.get(id).flags & widget::FLAG_MULTI_LINE != 0 {
-                    self.handle_key_action(ctx, tasks, keyboard::KeyAction::Char(b'\n'));
+                    self.handle_key_action(ctx, vm, keyboard::KeyAction::Char(b'\n'));
                     return;
                 }
-                self.fire_on_change(ctx, tasks, id);
+                self.fire_on_change(ctx, vm, id);
                 self.dismiss_keyboard(ctx);
             }
             keyboard::KeyAction::Shift
@@ -2433,11 +1852,11 @@ impl FullInput {
         }
     }
 
-    fn fire_on_change<P: PlatformRuntime>(&self, ctx: &Ctx<P>, tasks: &mut Tasks, id: WidgetId) {
+    fn fire_on_change<P: PlatformRuntime>(&self, ctx: &Ctx<P>, vm: &mut Vm, id: WidgetId) {
         if ctx.objs.get(id).flags & widget::FLAG_HAS_ON_TAP == 0 {
             return;
         }
-        tasks.widget_event(&ctx.objs, id, FunctionKind::OnTap, &[id.0 as i32, 0]);
+        send_kind(vm, FunctionKind::OnTap, &[id.0 as i32, 0]);
     }
 }
 
@@ -2504,8 +1923,6 @@ mod mem_detail_tests {
             gpio: GpioImpl::with_backend(MockGpio::default()),
             eeprom: crate::eeprom::EepromImpl::with_backend(crate::mock::MockEeprom::default()),
             cursor_visible: false,
-            #[cfg(feature = "multi_program")]
-            tasks: crate::task::TaskTable::new(),
         }
     }
 
@@ -2547,307 +1964,3 @@ mod mem_detail_tests {
     }
 }
 
-#[cfg(all(test, feature = "mock", feature = "multi_program"))]
-mod multi_tests {
-    //! Several programs on one tree, through `Runtime::new` + `step` on a
-    //! mock filesystem with hand-assembled programs.
-    use super::*;
-    use crate::mock::MockPlatform;
-    use crate::proto::{PROP_ON_CLICK, PROP_SIZE_H, PROP_SIZE_W};
-    use crate::task::{SlotState, TASK_SYSTEM};
-    use crate::touch::TouchImpl;
-
-    // Opcodes (vm.rs).
-    const HALT: u8 = 0x00;
-    const POP: u8 = 0x01;
-    const DUP: u8 = 0x02;
-    const RET: u8 = 0x13;
-    const YIELD: u8 = 0x14;
-    const W_ALLOC: u8 = 0x1A;
-    const PUSH_0: u8 = 0x20;
-    const PUSH_1: u8 = 0x21;
-    const PUSH_I8: u8 = 0x30;
-    const LOAD: u8 = 0x33;
-    const STORE: u8 = 0x34;
-    const JMP: u8 = 0x35;
-    const W_SET: u8 = 0x3A;
-    const W_TARGET_S: u8 = 0x42;
-    const W_PARENT_S: u8 = 0x43;
-    const STR_LIT: u8 = 0x88;
-    const RUN_PROGRAM: u8 = 0xBD;
-    const PROGRAM_ARG: u8 = 0xBE;
-    const SPAWN: u8 = 0xD4;
-    const TASK_ID: u8 = 0xD6;
-    const SEND: u8 = 0xD8;
-    const BAD: u8 = 0xFF;
-
-    const SETUP: u8 = FunctionKind::Setup as u8;
-    const LOOP: u8 = FunctionKind::Loop as u8;
-    const ON_CLICK: u8 = FunctionKind::OnClick as u8;
-    const ON_TOUCH_DOWN: u8 = FunctionKind::OnTouchDown as u8;
-    const ON_MSG: u8 = FunctionKind::OnTaskMessage as u8;
-    const ON_EXIT: u8 = FunctionKind::OnTaskExit as u8;
-
-    /// `loop() { yield; }`: the first function, so its jump target is 0.
-    const IDLE: &[u8] = &[YIELD, JMP, 0, 0];
-
-    fn lit(s: &[u8]) -> Vec<u8> {
-        let mut v = alloc::vec![STR_LIT, s.len() as u8];
-        v.extend_from_slice(s);
-        v
-    }
-
-    /// Alloc a widget under the root, keep its id in global 0, target it.
-    const NEW_WIDGET: &[u8] = &[W_ALLOC, DUP, STORE, 0, W_TARGET_S, PUSH_0, W_PARENT_S];
-    /// Target the widget in global 0.
-    const MY_WIDGET: &[u8] = &[LOAD, 0, W_TARGET_S];
-
-    fn cat(parts: &[&[u8]]) -> Vec<u8> {
-        parts.concat()
-    }
-
-    /// v4 image with 8 globals; functions laid out in order.
-    fn prog(funcs: &[(u8, Vec<u8>)]) -> Vec<u8> {
-        let mut img = alloc::vec![4, funcs.len() as u8, 0, 8, 0, 0, 0, 0, 0];
-        let mut off = 0u32;
-        for (i, (kind, code)) in funcs.iter().enumerate() {
-            img.extend_from_slice(&(i as u16).to_le_bytes());
-            img.extend_from_slice(&[*kind, 0]);
-            img.extend_from_slice(&off.to_le_bytes());
-            img.extend_from_slice(&(code.len() as u32).to_le_bytes());
-            off += code.len() as u32;
-        }
-        for (_, code) in funcs {
-            img.extend_from_slice(code);
-        }
-        img
-    }
-
-    /// Filesystem at the default base with these programs; returns a
-    /// runtime booted into `main`.
-    fn boot(progs: &[(&[u8], Vec<u8>)]) -> Runtime<MockPlatform> {
-        const BASE: usize = crate::fs::DEFAULT_FS_BASE as usize;
-        const DATA: usize = BASE + 0x1000;
-        let mut img = alloc::vec![0u8; DATA];
-        img[BASE..BASE + 4].copy_from_slice(b"FERR");
-        img[BASE + 4..BASE + 6].copy_from_slice(&3u16.to_le_bytes());
-        img[BASE + 10..BASE + 12].copy_from_slice(&(progs.len() as u16).to_le_bytes());
-        for (i, (name, code)) in progs.iter().enumerate() {
-            let e = BASE + 16 + 32 * i;
-            let at = img.len() as u32;
-            img[e..e + name.len()].copy_from_slice(name);
-            img[e + 16] = crate::fs::RES_PROGRAM;
-            img[e + 20..e + 24].copy_from_slice(&at.to_le_bytes());
-            img[e + 24..e + 28].copy_from_slice(&(code.len() as u32).to_le_bytes());
-            img.extend_from_slice(code);
-        }
-        crate::mock::set_flash_image(img);
-        let ctx = alloc::boxed::Box::new(super::mem_detail_tests::ctx());
-        let rt = Runtime::<MockPlatform>::new(ctx, TouchImpl::with_backend(crate::mock::MockTouch));
-        assert_eq!(rt.error_code, 0);
-        rt
-    }
-
-    fn widgets_of(rt: &Runtime<MockPlatform>, task: u8) -> Vec<WidgetId> {
-        let objs = &rt.ctx.objs;
-        (0..objs.ptr_count() as crate::pool::ObjPtr)
-            .map(WidgetId)
-            .filter(|&w| objs.is_live(w) && objs.owner_of(w.0) == task && w != objs.root)
-            .collect()
-    }
-
-    fn size(rt: &Runtime<MockPlatform>, w: WidgetId) -> (u16, u16) {
-        let s = rt.ctx.objs.get(w).size;
-        (s.w, s.h)
-    }
-
-    /// main: a widget sized (spawnProgram(kid, 5), 99), idle loop, and with
-    /// `exit_handler` an `on_task_exit(task, code)` that sizes it (task, code).
-    fn main_spawning(kid: &[u8], exit_handler: bool) -> Vec<u8> {
-        let setup = cat(&[
-            NEW_WIDGET,
-            &lit(kid),
-            &[PUSH_I8, 5, SPAWN, DUP, STORE, 1, W_SET, PROP_SIZE_W],
-            &[PUSH_I8, 99, W_SET, PROP_SIZE_H, PUSH_0, RET],
-        ]);
-        let on_exit = cat(&[MY_WIDGET, &[W_SET, PROP_SIZE_H, W_SET, PROP_SIZE_W, RET]]);
-        let mut funcs = alloc::vec![(LOOP, IDLE.to_vec()), (SETUP, setup)];
-        if exit_handler {
-            funcs.push((ON_EXIT, on_exit));
-        }
-        prog(&funcs)
-    }
-
-    /// kid: a widget sized (programArg(), taskId()), idle loop, plus `extra`.
-    fn kid(extra: &[(u8, Vec<u8>)]) -> Vec<u8> {
-        let setup = cat(&[
-            NEW_WIDGET,
-            &[PROGRAM_ARG, W_SET, PROP_SIZE_W, TASK_ID, W_SET, PROP_SIZE_H, PUSH_0, RET],
-        ]);
-        let mut funcs = alloc::vec![(LOOP, IDLE.to_vec()), (SETUP, setup)];
-        funcs.extend_from_slice(extra);
-        prog(&funcs)
-    }
-
-    #[test]
-    fn spawned_task_runs_with_its_own_objects() {
-        let mut rt = boot(&[(b"main", main_spawning(b"kid", false)), (b"kid", kid(&[]))]);
-        assert_eq!(rt.ctx.tasks.slots[1].state, SlotState::Starting);
-        rt.step();
-        assert_eq!(rt.ctx.tasks.slots[1].state, SlotState::Running);
-        let main_w = widgets_of(&rt, 0);
-        let kid_w = widgets_of(&rt, 1);
-        assert_eq!((main_w.len(), kid_w.len()), (1, 1));
-        assert_eq!(size(&rt, main_w[0]), (1, 99), "spawnProgram returned task 1");
-        assert_eq!(size(&rt, kid_w[0]), (5, 1), "programArg 5, taskId 1");
-        assert!(rt.ctx.objs.get(kid_w[0]).parent == rt.ctx.objs.root, "on the shared tree");
-        for _ in 0..5 {
-            rt.step();
-        }
-        assert!(rt.tasks.get(1).is_some_and(|vm| vm.state != VmState::Error));
-    }
-
-    #[test]
-    fn spawn_of_a_missing_program_returns_minus_one() {
-        let mut rt = boot(&[(b"main", main_spawning(b"nope", false))]);
-        rt.step();
-        let w = widgets_of(&rt, 0)[0];
-        assert_eq!(size(&rt, w).0, u16::MAX, "-1");
-        assert!(!rt.ctx.tasks.alive(1));
-    }
-
-    #[test]
-    fn kill_frees_the_task_and_tells_its_parent() {
-        let mut rt = boot(&[(b"main", main_spawning(b"kid", true)), (b"kid", kid(&[]))]);
-        rt.step();
-        let kid_w = widgets_of(&rt, 1)[0];
-        assert!(rt.ctx.tasks.request_kill(1));
-        rt.step();
-        assert!(!rt.ctx.objs.is_live(kid_w));
-        assert_eq!(rt.ctx.objs.task_objects(1), [0; 4]);
-        assert!(!rt.ctx.tasks.alive(1) && rt.tasks.get(1).is_none());
-        rt.step(); // on_task_exit runs in main
-        assert_eq!(size(&rt, widgets_of(&rt, 0)[0]), (1, 0), "on_task_exit(1, 0)");
-        assert!(rt.fault_dialog.is_none());
-    }
-
-    #[test]
-    fn a_faulting_child_ends_alone_and_opens_the_dialog() {
-        let bad = prog(&[(LOOP, alloc::vec![BAD]), (SETUP, alloc::vec![PUSH_0, RET])]);
-        let mut rt = boot(&[(b"main", main_spawning(b"bad", false)), (b"bad", bad)]);
-        rt.step(); // starts
-        rt.step(); // its loop faults; the pass ends it
-        assert_eq!(rt.error_code, 0, "main keeps running");
-        assert!(!rt.ctx.tasks.alive(1));
-        assert!(rt.ctx.objs.is_live(rt.fault_dialog));
-        // OK closes it.
-        let ok = widgets_of(&rt, TASK_SYSTEM)
-            .into_iter()
-            .find(|&w| rt.ctx.objs.get(w).flags & widget::FLAG_HAS_ON_CLICK != 0)
-            .unwrap();
-        rt.tasks.widget_click(&rt.ctx.objs, ok);
-        rt.close_fault_dialog_on_click();
-        assert!(widgets_of(&rt, TASK_SYSTEM).is_empty());
-        rt.step();
-        assert_eq!(rt.error_code, 0);
-    }
-
-    #[test]
-    fn a_parent_with_on_task_exit_gets_the_fault_instead() {
-        let bad = prog(&[(LOOP, alloc::vec![BAD]), (SETUP, alloc::vec![PUSH_0, RET])]);
-        let mut rt = boot(&[(b"main", main_spawning(b"bad", true)), (b"bad", bad)]);
-        for _ in 0..3 {
-            rt.step();
-        }
-        assert!(rt.fault_dialog.is_none());
-        let fault = crate::vm::fault::BAD_OPCODE as u16;
-        assert_eq!(size(&rt, widgets_of(&rt, 0)[0]), (1, fault));
-    }
-
-    #[test]
-    fn messages_reach_on_task_message() {
-        // main: spawn kid, sendMessage(kid, 7, 9).
-        let setup = cat(&[&lit(b"kid"), &[PUSH_0, SPAWN, PUSH_I8, 7, PUSH_I8, 9, SEND, POP, PUSH_0, RET]]);
-        let main = prog(&[(LOOP, IDLE.to_vec()), (SETUP, setup)]);
-        // kid: on_task_message(from, a, b) sizes its widget (a, b), keeps from in g1.
-        let on_msg = cat(&[MY_WIDGET, &[W_SET, PROP_SIZE_H, W_SET, PROP_SIZE_W, STORE, 1, RET]]);
-        let mut rt = boot(&[(b"main", main), (b"kid", kid(&[(ON_MSG, on_msg)]))]);
-        rt.step(); // start + deliver
-        rt.step(); // handler runs
-        assert_eq!(size(&rt, widgets_of(&rt, 1)[0]), (7, 9));
-    }
-
-    #[test]
-    fn widget_events_go_to_the_handler_and_global_ones_to_the_foreground() {
-        // kid: its widget gets on_click; click: size_h = 77; touch down: size_w = x.
-        let setup = cat(&[NEW_WIDGET, &[PUSH_1, W_SET, PROP_ON_CLICK, PUSH_0, RET]]);
-        let on_click = cat(&[MY_WIDGET, &[POP, PUSH_I8, 77, W_SET, PROP_SIZE_H, RET]]);
-        let on_down = cat(&[MY_WIDGET, &[POP, W_SET, PROP_SIZE_W, RET]]);
-        let kid = prog(&[
-            (LOOP, IDLE.to_vec()),
-            (SETUP, setup),
-            (ON_CLICK, on_click),
-            (ON_TOUCH_DOWN, on_down),
-        ]);
-        let mut rt = boot(&[(b"main", main_spawning(b"kid", false)), (b"kid", kid)]);
-        rt.step();
-        let w = widgets_of(&rt, 1)[0];
-        assert_eq!(rt.ctx.objs.handler_of(w), 1);
-        rt.tasks.widget_click(&rt.ctx.objs, w);
-        rt.step();
-        assert_eq!(size(&rt, w).1, 77, "the kid's click dispatcher ran");
-
-        // Global events: main is the foreground (it has no handler: nothing).
-        rt.tasks.global_event(FunctionKind::OnTouchDown, &[40, 50]);
-        rt.step();
-        assert_eq!(size(&rt, w).0, 0);
-        assert!(rt.ctx.tasks.set_fg(1));
-        rt.step(); // fg synced
-        rt.tasks.global_event(FunctionKind::OnTouchDown, &[40, 50]);
-        rt.step();
-        assert_eq!(size(&rt, w).0, 40);
-        // The foreground goes back to main when the kid ends.
-        rt.ctx.tasks.request_kill(1);
-        rt.step();
-        assert_eq!(rt.ctx.tasks.fg, 0);
-    }
-
-    #[test]
-    fn run_program_in_a_child_restarts_its_slot() {
-        // other: setup runs runProgram("kid", 3).
-        let other = prog(&[
-            (LOOP, IDLE.to_vec()),
-            (SETUP, cat(&[NEW_WIDGET, &lit(b"kid"), &[PUSH_I8, 3, RUN_PROGRAM, HALT]])),
-        ]);
-        let mut rt = boot(&[
-            (b"main", main_spawning(b"other", false)),
-            (b"other", other),
-            (b"kid", kid(&[])),
-        ]);
-        rt.step(); // other starts, setup switches
-        rt.step(); // the slot restarts as kid
-        assert_eq!(rt.ctx.tasks.slots[1].program.name(), b"kid");
-        let kid_w = widgets_of(&rt, 1);
-        assert_eq!(kid_w.len(), 1, "the widget of other is gone");
-        assert_eq!(size(&rt, kid_w[0]), (3, 1));
-    }
-
-    #[test]
-    fn main_run_program_ends_every_child() {
-        // main: spawn kid in setup; its loop runs runProgram("solo").
-        let loop_ = cat(&[&[YIELD], &lit(b"solo"), &[PUSH_0, RUN_PROGRAM, JMP, 0, 0]]);
-        let setup = cat(&[&lit(b"kid"), &[PUSH_0, SPAWN, POP, PUSH_0, RET]]);
-        let main = prog(&[(LOOP, loop_), (SETUP, setup)]);
-        let solo = prog(&[(LOOP, IDLE.to_vec()), (SETUP, alloc::vec![PUSH_0, RET])]);
-        let mut rt = boot(&[(b"main", main), (b"kid", kid(&[])), (b"solo", solo)]);
-        rt.step();
-        assert!(rt.ctx.tasks.alive(1));
-        // The mock runs one instruction per pass.
-        for _ in 0..10 {
-            rt.step();
-        }
-        assert_eq!(rt.tasks.main.program.name(), b"solo");
-        assert!(!rt.ctx.tasks.alive(1) && rt.tasks.get(1).is_none());
-        assert!(widgets_of(&rt, 1).is_empty());
-    }
-}

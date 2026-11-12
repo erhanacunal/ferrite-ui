@@ -4,6 +4,3 @@
 [submodule "vendor/n32903_rs"]
 	path = vendor/n32903_rs
 	url = https://github.com/erhanacunal/n32903_rs.git
-[submodule "vendor/exynos_4412_rs"]
-	path = vendor/exynos_4412_rs
-	url = https://github.com/erhanacunal/exynos-4412-rs.git

@@ -66,7 +66,7 @@ pub const PROP_GROUP_ID: u8 = 0x32; // KIND_BUTTON_GROUP selection group
 pub const PROP_FLEX: u8 = 0x33; // container: direction | justify | align bits
 pub const PROP_FLEX_GAP: u8 = 0x34; // container: px between children
 pub const PROP_FLEX_GROW: u8 = 0x35; // child: share of the leftover main-axis space
-// Retained layers (`layer.rs`, `layers` feature; elsewhere ignored, read 0 / 255).
+// ferrite-ui-xl's retained layers: ignored here, read 0 / 255.
 pub const PROP_LAYER: u8 = 0x36; // subtree root: layer 1..=4 it is drawn into, 0 = none
 pub const PROP_LAYER_ALPHA: u8 = 0x37; // layer root: plane alpha 0..255
 

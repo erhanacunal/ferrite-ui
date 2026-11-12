@@ -7,7 +7,6 @@ use crate::types::{Offset, Rect};
 /// Anti-aliased variants of the shape primitives, used on blend-capable
 /// backends (`LcdBackend::HAS_ALPHA`).
 mod smooth;
-pub mod tess;
 
 /// Maximum vertices a polygon shape can hold (bounds the scanline-fill
 /// intersection buffer and the point parser; 16 × 4 B = 64 B of stack).
@@ -64,26 +63,6 @@ pub trait LcdBackend {
     /// Optional: flush dirty region (e-paper panels).
     fn flush_dirty(&self) {}
 
-    /// The backend can move pixels on screen ([`move_rects`]). Lets the
-    /// renderer skip working out what to move on boards that can't.
-    ///
-    /// [`move_rects`]: LcdBackend::move_rects
-    const CAN_MOVE: bool = false;
-    /// Smallest box (pixels) the renderer moves with `move_rects` instead
-    /// of redrawing it.
-    const MOVE_MIN_PX: u32 = 0;
-
-    /// Moves the pixels of every rect in `rects` by (`dx`, `dy`), as if all
-    /// were read first and then written: a destination may overlap any
-    /// source. Every source and destination lies inside the screen. False =
-    /// not done (nothing changed); the caller then draws instead. Readback
-    /// backends only; the renderer uses it to shift a moved opaque panel's
-    /// pixels and draw only the strip that comes into view.
-    fn move_rects(&self, rects: &[Rect], dx: i16, dy: i16) -> bool {
-        let _ = (rects, dx, dy);
-        false
-    }
-
     /// Optional hook fired before a full redraw. E-paper panels override this to
     /// ghost-erase (drive all pixels white) so prior dark content does not bleed
     /// through. No-op on framebuffer panels.
@@ -136,65 +115,6 @@ pub trait LcdBackend {
         }
     }
 
-    /// Retained layers the display composites over the screen (`layers`
-    /// feature, `layer.rs`): 0 = none, the renderer then never uses them.
-    /// Layer `n` is stacked above layers `0..n`.
-    #[cfg(feature = "layers")]
-    const LAYERS: usize = 0;
-
-    /// A surface for layer `n` (0-based), `w` x `h` pixels of premultiplied
-    /// ARGB, all transparent, hidden. Replaces any it had. False = can't.
-    #[cfg(feature = "layers")]
-    fn layer_alloc(&self, n: usize, w: u16, h: u16) -> bool {
-        let _ = (n, w, h);
-        false
-    }
-
-    /// Hide layer `n` and drop its surface.
-    #[cfg(feature = "layers")]
-    fn layer_free(&self, n: usize) {
-        let _ = n;
-    }
-
-    /// Every primitive (fills, blends, pixel streams) draws into layer `n`'s
-    /// surface, in its coordinates (0, 0 = its top-left; clipped to its
-    /// size), until `None`: the screen again. A blend composites "over" what
-    /// the surface holds. `move_rects` is not used meanwhile.
-    #[cfg(feature = "layers")]
-    fn layer_target(&self, n: Option<usize>) {
-        let _ = n;
-    }
-
-    /// Make a rect of the targeted surface transparent.
-    #[cfg(feature = "layers")]
-    fn layer_clear(&self, x: u16, y: u16, w: u16, h: u16) {
-        let _ = (x, y, w, h);
-    }
-
-    /// Show layer `n` from the next presented frame with its top-left at
-    /// screen (`x`, `y`) (off-screen parts cut off), every pixel's alpha
-    /// times `alpha`; or hide it (`visible` false).
-    #[cfg(feature = "layers")]
-    fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
-        let _ = (n, x, y, alpha, visible);
-    }
-
-    /// [`layer_compose`](Self::layer_compose) works: a layer something is
-    /// drawn over keeps its surface and is blended into the screen
-    /// (`layer.rs`, composed layers). False = such a layer is drawn in the
-    /// tree.
-    #[cfg(feature = "layers")]
-    const LAYER_COMPOSE: bool = false;
-
-    /// Blends rect (`sx`, `sy`, `w`, `h`) of layer `n`'s surface over the
-    /// screen at (`dx`, `dy`), every pixel's alpha times `alpha`
-    /// (premultiplied "over"). Only while the screen is targeted; the rect is
-    /// inside both.
-    #[cfg(feature = "layers")]
-    #[allow(clippy::too_many_arguments)]
-    fn layer_compose(&self, n: usize, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16, alpha: u8) {
-        let _ = (n, sx, sy, w, h, dx, dy, alpha);
-    }
 }
 
 /// Generic LCD wrapper — backend-agnostic drawing primitives.
@@ -216,13 +136,6 @@ pub struct LcdImpl<B: LcdBackend> {
     /// Portrait `begin_pixels` stream: each logical row is one panel column,
     /// opened as its own 1 px wide window when the row starts.
     stream: Cell<RotStream>,
-    /// Layer surface the primitives draw into (`layers`): number and size,
-    /// which `width`/`height` report meanwhile.
-    #[cfg(feature = "layers")]
-    target: Cell<Option<(u8, u16, u16)>>,
-    /// Layers currently allocated (bit n).
-    #[cfg(feature = "layers")]
-    layers_alloc: Cell<u8>,
 }
 
 /// Portrait pixel-stream cursor (see `LcdImpl::stream`).
@@ -258,47 +171,6 @@ impl Underlay {
     }
 }
 
-/// Splits a move of `rects` by (`dx`, `dy`) (`LcdBackend::move_rects`:
-/// every source read before any destination written) into pieces a plain
-/// copier (which may not handle overlap) can copy one by one, in the
-/// returned order, straight from source to destination: bands no taller
-/// than `|dy|` (no wider than `|dx|` for a horizontal move), the ones
-/// furthest along the move first. A piece's destination then only covers
-/// source pixels of pieces copied before it. None if more than `max`
-/// pieces would be needed (a short move: copy through a buffer instead).
-pub fn move_bands(rects: &[Rect], dx: i16, dy: i16, max: usize) -> Option<alloc::vec::Vec<Rect>> {
-    let mut out = alloc::vec::Vec::new();
-    let vertical = dy != 0;
-    let step = if vertical { dy.unsigned_abs() } else { dx.unsigned_abs() };
-    if step == 0 {
-        return Some(out);
-    }
-    for r in rects {
-        let len = if vertical { r.h } else { r.w };
-        let mut at = 0u16;
-        while at < len {
-            let n = step.min(len - at);
-            if out.len() == max {
-                return None;
-            }
-            out.push(if vertical {
-                Rect::new(r.x, r.y + at as i16, r.w, n)
-            } else {
-                Rect::new(r.x + at as i16, r.y, n, r.h)
-            });
-            at += n;
-        }
-    }
-    let ahead = if vertical { dy > 0 } else { dx > 0 };
-    let key = |b: &Rect| if vertical { b.y } else { b.x };
-    if ahead {
-        out.sort_unstable_by_key(|b| core::cmp::Reverse(key(b)));
-    } else {
-        out.sort_unstable_by_key(key);
-    }
-    Some(out)
-}
-
 impl<B: LcdBackend> LcdImpl<B> {
     pub fn with_backend(be: B) -> Self {
         Self {
@@ -307,104 +179,7 @@ impl<B: LcdBackend> LcdImpl<B> {
             underlay: Cell::new(None),
             portrait: Cell::new(false),
             stream: Cell::new(RotStream::default()),
-            #[cfg(feature = "layers")]
-            target: Cell::new(None),
-            #[cfg(feature = "layers")]
-            layers_alloc: Cell::new(0),
         }
-    }
-
-    /// Layers the backend composites (`LcdBackend::LAYERS`, at most
-    /// `layer::MAX_LAYERS`); 0 in portrait (not remapped).
-    #[cfg(feature = "layers")]
-    pub fn layer_count(&self) -> usize {
-        if self.portrait.get() { 0 } else { B::LAYERS.min(crate::layer::MAX_LAYERS) }
-    }
-
-    /// See `LcdBackend::layer_alloc`.
-    #[cfg(feature = "layers")]
-    pub fn layer_alloc(&self, n: usize, w: u16, h: u16) -> bool {
-        if n >= self.layer_count() || w == 0 || h == 0 || !self.be.layer_alloc(n, w, h) {
-            return false;
-        }
-        self.layers_alloc.set(self.layers_alloc.get() | 1 << n);
-        true
-    }
-
-    /// See `LcdBackend::layer_free`.
-    #[cfg(feature = "layers")]
-    pub fn layer_free(&self, n: usize) {
-        if self.layers_alloc.get() & 1 << n != 0 {
-            self.layers_alloc.set(self.layers_alloc.get() & !(1 << n));
-            self.be.layer_free(n);
-        }
-    }
-
-    /// Layers with a surface (bit n).
-    #[cfg(feature = "layers")]
-    pub fn layers_allocated(&self) -> u8 {
-        self.layers_alloc.get()
-    }
-
-    /// Hide and free every layer (error screens, buffered mode).
-    #[cfg(feature = "layers")]
-    pub fn layers_off(&self) {
-        for n in 0..crate::layer::MAX_LAYERS {
-            self.layer_free(n);
-        }
-    }
-
-    /// Draw into layer `n`'s `w` x `h` surface (`Some`), or the screen.
-    #[cfg(feature = "layers")]
-    pub fn layer_target(&self, t: Option<(usize, u16, u16)>) {
-        self.target.set(t.map(|(n, w, h)| (n as u8, w, h)));
-        self.be.layer_target(t.map(|(n, _, _)| n));
-    }
-
-    /// Make `r` of the targeted surface transparent (clipped to it).
-    #[cfg(feature = "layers")]
-    pub fn layer_clear(&self, r: &Rect) {
-        let Some((_, w, h)) = self.target.get() else { return };
-        if let Some(c) = r.intersection(&Rect::new(0, 0, w, h)) {
-            self.be.layer_clear(c.x as u16, c.y as u16, c.w, c.h);
-        }
-    }
-
-    /// See `LcdBackend::layer_place`.
-    #[cfg(feature = "layers")]
-    pub fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
-        if self.layers_alloc.get() & 1 << n != 0 {
-            self.be.layer_place(n, x, y, alpha, visible);
-        }
-    }
-
-    /// See `LcdBackend::LAYER_COMPOSE`.
-    #[cfg(feature = "layers")]
-    pub fn can_compose(&self) -> bool {
-        B::LAYER_COMPOSE
-    }
-
-    /// Blends layer `n`'s surface, shown with its top-left at `at` (screen,
-    /// signed), over the screen inside `r` (cut to the surface, the screen
-    /// and the scissor). Screen targeted only.
-    #[cfg(feature = "layers")]
-    pub fn layer_compose(&self, n: usize, at: Offset, size: crate::types::Size, r: &Rect, alpha: u8) {
-        if self.layers_alloc.get() & 1 << n == 0 || self.target.get().is_some() || alpha == 0 {
-            return;
-        }
-        let surface = Rect::new(at.x, at.y, size.w, size.h);
-        let mut c = match r.intersection(&surface).and_then(|c| c.intersection(&Rect::new(0, 0, B::WIDTH, B::HEIGHT))) {
-            Some(c) => c,
-            None => return,
-        };
-        if let Some(s) = self.scissor.get() {
-            c = match c.intersection(&s) {
-                Some(c) => c,
-                None => return,
-            };
-        }
-        let (sx, sy) = ((c.x as i32 - at.x as i32) as u16, (c.y as i32 - at.y as i32) as u16);
-        self.be.layer_compose(n, sx, sy, c.w, c.h, c.x as u16, c.y as u16, alpha);
     }
 
     /// Switch between landscape (panel orientation) and portrait (rotated
@@ -419,40 +194,15 @@ impl<B: LcdBackend> LcdImpl<B> {
         self.portrait.get()
     }
 
-    /// Moves the pixels of `rects` (logical coordinates, all inside the
-    /// screen, destinations too) by (`dx`, `dy`): see
-    /// [`LcdBackend::move_rects`]. False if not done (portrait: not
-    /// remapped).
-    pub fn move_rects(&self, rects: &[Rect], dx: i16, dy: i16) -> bool {
-        if !B::CAN_MOVE || self.portrait.get() {
-            return false;
-        }
-        let screen = Rect::new(0, 0, B::WIDTH, B::HEIGHT);
-        let inside = |r: &Rect| r.intersection(&screen) == Some(*r);
-        let moved = |r: &Rect| Rect::new(r.x + dx, r.y + dy, r.w, r.h);
-        if !rects.iter().all(|r| !r.is_empty() && inside(r) && inside(&moved(r))) {
-            return false;
-        }
-        self.be.move_rects(rects, dx, dy)
-    }
-
     /// Logical screen width (the panel's height in portrait).
     #[inline]
     pub fn width(&self) -> u16 {
-        #[cfg(feature = "layers")]
-        if let Some((_, w, _)) = self.target.get() {
-            return w;
-        }
         if self.portrait.get() { B::HEIGHT } else { B::WIDTH }
     }
 
     /// Logical screen height (the panel's width in portrait).
     #[inline]
     pub fn height(&self) -> u16 {
-        #[cfg(feature = "layers")]
-        if let Some((_, _, h)) = self.target.get() {
-            return h;
-        }
         if self.portrait.get() { B::WIDTH } else { B::HEIGHT }
     }
 
@@ -1925,51 +1675,6 @@ mod tests {
     use std::vec::Vec;
 
     const N: usize = 64;
-
-    /// Copying `move_bands`' pieces one by one, straight, gives what reading
-    /// every source first gives.
-    #[test]
-    fn move_bands_match_a_buffered_move() {
-        // A panel's region: a body plus side strips (corners cut), as
-        // `plan_moves` makes them.
-        let shapes: [&[Rect]; 3] = [
-            &[Rect::new(10, 12, 30, 20)],
-            &[Rect::new(14, 10, 22, 4), Rect::new(10, 14, 30, 16), Rect::new(14, 30, 22, 4)],
-            &[Rect::new(5, 5, 8, 40), Rect::new(20, 5, 8, 40), Rect::new(13, 20, 7, 6)],
-        ];
-        let moves = [(0i16, 7i16), (0, -3), (5, 0), (-9, 0), (4, 6), (-6, -11), (3, 1), (0, 25), (-2, 30)];
-        for rects in shapes {
-            for &(dx, dy) in &moves {
-                let fits = |r: &Rect| r.x + dx >= 0 && r.y + dy >= 0 && r.right() + dx <= N as i16 && r.bottom() + dy <= N as i16;
-                if !rects.iter().all(fits) {
-                    continue;
-                }
-                let start: Vec<u16> = (0..N * N).map(|i| i as u16).collect();
-                let mut want = start.clone();
-                for r in rects {
-                    for y in r.y..r.bottom() {
-                        for x in r.x..r.right() {
-                            want[(y + dy) as usize * N + (x + dx) as usize] = start[y as usize * N + x as usize];
-                        }
-                    }
-                }
-                let bands = move_bands(rects, dx, dy, 1000).unwrap();
-                let area = |v: &[Rect]| v.iter().map(|r| r.w as u32 * r.h as u32).sum::<u32>();
-                assert_eq!(area(&bands), area(rects));
-                let mut got = start.clone();
-                for b in &bands {
-                    for y in b.y..b.bottom() {
-                        for x in b.x..b.right() {
-                            got[(y + dy) as usize * N + (x + dx) as usize] = got[y as usize * N + x as usize];
-                        }
-                    }
-                }
-                assert!(got == want, "shape {} by ({dx}, {dy})", rects.len());
-            }
-        }
-        // Too many pieces for a short move.
-        assert!(move_bands(&[Rect::new(0, 0, 10, 40)], 0, 1, 16).is_none());
-    }
 
     /// Records which pixels `fill_rect` touched (N×N grid).
     struct Grid(RefCell<Vec<u8>>);

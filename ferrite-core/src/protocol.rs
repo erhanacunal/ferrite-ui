@@ -10,7 +10,6 @@
 ///   Field 6, Payload = MemDetail (per-pool memory usage, see `send_memdetail`)
 ///   Field 7, Payload = FsCaps (1B flags, bit 0 = CRC chunks): ACK of a
 ///                      WriteFs header that asked for CRC chunks
-///   Field 9, Payload = Perf (main-loop profile, see `send_perf`)
 ///
 /// Device receives (RX):
 ///   Field 1, Varint  = Ping
@@ -37,8 +36,6 @@
 ///   Field 9, Varint  = StackInfo (query current stack usage)
 ///   Field 10, Payload = SetDateTime (7B: year(0-99) + month + day + weekday + hour + minute + second)
 ///   Field 11, Varint  = MemDetail (query per-pool memory usage)
-///   Field 12, Varint  = Perf (query + reset the main-loop profile; answered
-///                       only by firmware built with the `perf` feature)
 extern crate alloc;
 
 use crate::flash::{FlashBackend, FlashImpl};
@@ -385,8 +382,6 @@ pub enum RxEvent {
     ProgramTooLarge,
     /// Per-pool memory usage query — respond with `send_memdetail`
     MemDetail,
-    /// Main-loop profile query (field 12, `perf` feature).
-    Perf,
 }
 
 // --- Protocol ---
@@ -553,7 +548,6 @@ impl Protocol {
                         8 => RxEvent::TouchCalibrate,
                         9 => RxEvent::StackInfo,
                         11 => RxEvent::MemDetail,
-                        12 => RxEvent::Perf,
                         _ => RxEvent::None,
                     },
                     // Payload type: tag + length varint + payload
@@ -869,55 +863,6 @@ pub fn send_memdetail<U: UsartBackend>(usart: &UsartImpl<U>, entries: &[MemEntry
         usart.write(&e.used.to_le_bytes());
         usart.write(&e.capacity.to_le_bytes());
         usart.write(&e.extra.to_le_bytes());
-    }
-}
-
-/// Perf payload version.
-pub const PERF_VERSION: u8 = 1;
-
-/// Main-loop profile header (`send_perf`).
-pub struct PerfHeader {
-    /// Cycle counter rate (Hz); 0 = unknown.
-    pub cycle_hz: u32,
-    /// Window length, microseconds.
-    pub window_us: u32,
-    /// Main-loop passes in the window.
-    pub passes: u32,
-    /// Longest pass, microseconds.
-    pub max_pass_us: u32,
-    /// VM instructions executed in the window (all tasks).
-    pub vm_instructions: u64,
-}
-
-/// Send the main-loop profile: Field 9, Payload type — tag 0x4A + length
-/// varint + version u8 + count u8 + cycle_hz u32 + window_us u32 + passes u32
-/// + max_pass_us u32 + vm_instructions u64 + count × [phase id u8, us u32]
-/// (all LE). Phase ids: `perf::phase`. Mirrored in `tools/ferrite_cli.py`
-/// (`TAG_PERF_RESP`) — keep in sync.
-pub fn send_perf<U: UsartBackend>(usart: &UsartImpl<U>, h: &PerfHeader, phases: &[(u8, u32)]) {
-    usart.write_byte(0x4A);
-    let mut len = 26 + phases.len() as u32 * 5;
-    loop {
-        let mut b = (len & 0x7F) as u8;
-        len >>= 7;
-        if len != 0 {
-            b |= 0x80;
-        }
-        usart.write_byte(b);
-        if len == 0 {
-            break;
-        }
-    }
-    usart.write_byte(PERF_VERSION);
-    usart.write_byte(phases.len() as u8);
-    usart.write(&h.cycle_hz.to_le_bytes());
-    usart.write(&h.window_us.to_le_bytes());
-    usart.write(&h.passes.to_le_bytes());
-    usart.write(&h.max_pass_us.to_le_bytes());
-    usart.write(&h.vm_instructions.to_le_bytes());
-    for &(id, us) in phases {
-        usart.write_byte(id);
-        usart.write(&us.to_le_bytes());
     }
 }
 

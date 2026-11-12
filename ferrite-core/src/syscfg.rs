@@ -17,8 +17,8 @@
 ///   4  u32  arena_bytes     object pool arena (widgets, strings, arrays)
 ///   8  u16  max_objects     object pool pointers, low half (≤ pool::MAX_OBJECTS)
 ///  10  u16  uart_rx_bytes   USART RX ring (rounded up to a power of two)
-///  12  u16  max_objects_hi  high half of max_objects (0 below 64K; only
-///                           `wide_obj` firmware reaches past 0x3FFF)
+///  12  u16  max_objects_hi  high half of max_objects (0 below 64K; this
+///                           firmware caps it at pool::MAX_OBJECTS anyway)
 ///  14  ..   reserved (0)
 ///  16  u8   eval_stack      VM evaluation stack depth
 ///  17  u8   call_stack      VM call stack depth

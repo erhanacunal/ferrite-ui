@@ -97,14 +97,6 @@ unsafe impl Send for Font {}
 unsafe impl Sync for Font {}
 
 impl Font {
-    /// Where its glyph bitmaps are in flash: with `font_id` and `bpp`, what tells two loaded
-    /// fonts apart (a board renderer keying cached drawings by appearance).
-    pub fn bitmap_addr(&self) -> u32 {
-        self.bitmap_addr
-    }
-}
-
-impl Font {
     fn empty() -> Self {
         Font {
             font_id: 0xFF,
@@ -294,64 +286,6 @@ impl Font {
         match self.glyphs.codepoints().binary_search(&cp) {
             Ok(idx) => Some(self.glyphs.glyph(idx)),
             Err(_) => None,
-        }
-    }
-
-    /// The glyph of a BMP codepoint, if the font has it.
-    pub fn glyph(&self, cp: u16) -> Option<GfxGlyph> {
-        self.find_glyph(cp).copied()
-    }
-
-    /// Where `draw_str` puts each glyph of `text` at pen (`x`, baseline `y`): `f(cp, glyph,
-    /// left, top)` for every glyph with pixels (no culling). Returns the pen's x after the text.
-    pub fn for_each_glyph(&self, text: &[u8], mut x: i16, y: i16, mut f: impl FnMut(u16, &GfxGlyph, i16, i16)) -> i16 {
-        let mut pos = 0;
-        while let Some(cp) = utf8_next(text, &mut pos) {
-            if cp == 0xFFFF {
-                continue;
-            }
-            let Some(g) = self.find_glyph(cp) else { continue };
-            if g.width != 0 && g.height != 0 {
-                f(cp, g, x + g.x_offset as i16, y + g.y_offset as i16);
-            }
-            x += g.x_advance as i16;
-        }
-        x
-    }
-
-    /// Glyph `g`'s coverage, one byte a pixel (0 = none … 255 = full, as the blending draws
-    /// weigh it), row by row into `out[..width * height]`.
-    pub fn glyph_coverage<F: FlashBackend>(&self, flash: &FlashImpl<F>, g: &GfxGlyph, out: &mut [u8]) {
-        const LEVELS: [u8; 4] = [0, 85, 170, 255];
-        let n = g.width as usize * g.height as usize;
-        let per_byte = if self.bpp == 1 { 8 } else { 4 };
-        let total = n.div_ceil(per_byte);
-        let mut i = 0;
-        let mut read = 0;
-        while read < total {
-            let chunk = (total - read).min(BITMAP_BUF_SIZE);
-            let mut buf = [0u8; BITMAP_BUF_SIZE];
-            self.read_bitmap(flash, g.bitmap_offset, read as u32, &mut buf[..chunk]);
-            for &byte in &buf[..chunk] {
-                if self.bpp == 1 {
-                    for bit in (0..8).rev() {
-                        if i >= n {
-                            return;
-                        }
-                        out[i] = if byte & (1 << bit) != 0 { 255 } else { 0 };
-                        i += 1;
-                    }
-                } else {
-                    for shift in [6u8, 4, 2, 0] {
-                        if i >= n {
-                            return;
-                        }
-                        out[i] = LEVELS[((byte >> shift) & 3) as usize];
-                        i += 1;
-                    }
-                }
-            }
-            read += chunk;
         }
     }
 
@@ -974,67 +908,5 @@ mod tests {
         // A word longer than a line is cut.
         assert_eq!(lines("aaaaaaa", "aaa"), ["aaa", "aaa", "a"]);
         assert_eq!(lines("", "aaa"), [""]);
-    }
-
-    /// A readback panel that keeps each pixel's last coverage (fills = 255).
-    struct Cover(core::cell::RefCell<alloc::vec::Vec<u8>>);
-    const CW: usize = 96;
-    impl crate::lcd::LcdBackend for Cover {
-        const WIDTH: u16 = CW as u16;
-        const HEIGHT: u16 = CW as u16;
-        const HAS_ALPHA: bool = true;
-        fn begin_frame(&mut self) {}
-        fn end_frame(&mut self) {}
-        fn back_buf(&self) -> u8 {
-            0
-        }
-        fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, _: u16) {
-            for yy in y as usize..y as usize + h as usize {
-                for xx in x as usize..x as usize + w as usize {
-                    self.0.borrow_mut()[yy * CW + xx] = 255;
-                }
-            }
-        }
-        fn blend_pixel(&self, x: u16, y: u16, _: u16, alpha: u8) {
-            self.0.borrow_mut()[y as usize * CW + x as usize] = alpha;
-        }
-        fn begin_pixels(&self, _: u16, _: u16, _: u16, _: u16) {}
-        fn write_pixel(&self, _: u16) {}
-        fn send_command(&self, _: u16) {}
-        fn send_data(&self, _: u16) {}
-    }
-
-    /// A 2bpp font: 'A' 3×2 (coverage 3 2 1 / 0 1 3), 'B' without pixels.
-    static AA_GLYPHS: [GfxGlyph; 2] = [GfxGlyph::new(0, 3, 2, 4, 1, -2), GfxGlyph::new(0, 0, 0, 2, 0, 0)];
-    static AA_CODEPOINTS: [u16; 2] = [b'A' as u16, b'B' as u16];
-    static AA_BITMAP: [u8; 2] = [0b11_10_01_00, 0b01_11_0000];
-
-    /// `for_each_glyph` + `glyph_coverage` (what a GPU compositor draws text from) put the
-    /// same coverage where `draw_str` blends it, for 1bpp and 2bpp fonts, and end at its pen.
-    #[test]
-    fn glyph_walk_matches_draw_str() {
-        let aa = Font::from_embedded(&AA_GLYPHS, &AA_CODEPOINTS, &AA_BITMAP, 4, 2);
-        let flash = crate::flash::FlashImpl::with_backend(crate::mock::MockFlash);
-        for (font, text) in [(rom(), "Hi, gy!"), (aa, "ABxAA")] {
-            let lcd = crate::lcd::LcdImpl::with_backend(Cover(core::cell::RefCell::new(alloc::vec![0; CW * CW])));
-            let end = font.draw_str(&lcd, &flash, text.as_bytes(), 5, 30, 0xFFFF, None);
-            let mut want = alloc::vec![0u8; CW * CW];
-            let mut cov = alloc::vec::Vec::new();
-            let walked = font.for_each_glyph(text.as_bytes(), 5, 30, |_, g, x, y| {
-                cov.resize(g.width as usize * g.height as usize, 0);
-                font.glyph_coverage(&flash, g, &mut cov);
-                for row in 0..g.height as usize {
-                    for col in 0..g.width as usize {
-                        let c = cov[row * g.width as usize + col];
-                        if c != 0 {
-                            want[(y as usize + row) * CW + x as usize + col] = c;
-                        }
-                    }
-                }
-            });
-            assert_eq!(walked, end, "pen of {text:?}");
-            assert!(want.iter().any(|&c| c != 0));
-            assert!(*lcd.backend().0.borrow() == want, "pixels of {text:?}");
-        }
     }
 }

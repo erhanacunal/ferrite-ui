@@ -42,8 +42,6 @@ pub mod geo;
 pub mod heap;
 pub mod image;
 pub mod keyboard;
-#[cfg(feature = "layers")]
-pub mod layer;
 pub mod proto;
 pub mod protocol;
 pub mod render;
@@ -52,13 +50,8 @@ pub mod runtime;
 #[cfg(feature = "sdboot")]
 pub mod sdboot;
 pub mod pool;
-#[cfg(feature = "perf")]
-pub mod perf;
 pub mod strpool;
 pub mod syscfg;
-pub mod sysinfo;
-#[cfg(feature = "multi_program")]
-pub mod task;
 pub mod types;
 pub mod vm;
 pub mod widget;

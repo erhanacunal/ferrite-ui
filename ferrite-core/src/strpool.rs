@@ -54,10 +54,9 @@ impl ObjPool {
     /// The result may be shared: `str_free` ignores it and the byte edits
     /// work on a private copy.
     pub fn str_intern(&mut self, data: &[u8]) -> Option<ObjPtr> {
-        // Only this task's literals: another task's copy dies with it.
         let found = self
             .ptrs_of(T_STRING)
-            .find(|&p| self.str_interned(p) && self.mine(p) && self.str_get(p) == data);
+            .find(|&p| self.str_interned(p) && self.str_get(p) == data);
         found.or_else(|| self.str_new(data, true))
     }
 
@@ -179,8 +178,7 @@ impl ObjPool {
     }
 
     /// `strClear()`: free every string that no live widget shows. Widget text
-    /// that became empty is dropped too (the widget then has no text). With
-    /// `multi_program` only the running task's strings are freed.
+    /// that became empty is dropped too (the widget then has no text).
     pub fn str_sweep(&mut self) {
         // Pass 1: mark the strings live widgets show.
         for p in 0..self.ptr_count() as ObjPtr {
@@ -201,10 +199,9 @@ impl ObjPool {
         }
         // Pass 2: free the unmarked strings, unmark the kept ones.
         for p in 0..self.ptr_count() as ObjPtr {
-            let mine = self.mine(p);
             match self.payload_mut(p, T_STRING) {
                 Some(w) if w[0] & KEEP != 0 => w[0] &= !KEEP,
-                Some(_) if mine => self.free_obj(p, T_STRING),
+                Some(_) => self.free_obj(p, T_STRING),
                 _ => {}
             }
         }

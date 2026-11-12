@@ -31,53 +31,12 @@ external_alloc = []
 # arena offsets instead of the default 8 KB / 320 with u16. Enabled by BSPs like
 # `bsp-tdo-y13` (32 MB DRAM).
 pool_large = []
-# Retained layers (`layer.rs`): widget subtrees drawn into their own surfaces,
-# composited by the display (exynos4412 FIMD windows; sim in software). Moving
-# or fading a layer redraws nothing. Off = the code is not compiled.
-layers = []
 # 32-bit VM code addresses (`vm::CodeAddr = u32`): pc, call frames and callback
 # offsets widen so programs past 64 KB of bytecode run. Required to load images
 # with the wide-address header flag (32-bit jump/call targets). Costs ~4 B per
 # call frame / queued callback, so the GD32 build leaves it off. Enabled by the
 # RAM-rich BSPs (`bsp-tdo-y13`, `bsp-n32903`) and the sim.
 wide_code = []
-# 32-bit object pointers (`pool::ObjPtr` / `WidgetId` = u32): past the 0x3FFF
-# objects a 14-bit block header can name. Live blocks get a second header word
-# (the pointer), widget tree links and `text_id` widen (widget header 24 -> 32
-# B), and `Widget::value` becomes i32 (it holds the graph's array id). Needs
-# `pool_large` (u32 table entries). Enabled by `bsp-exynos4412`.
-wide_obj = ["pool_large"]
-# Several programs at once on one widget tree (`task` module): `main` spawns
-# child programs (`spawnProgram`), each with its own VM; objects are owned by
-# the task that allocated them and freed when it ends; widget events go to the
-# task that set the handler. Costs 2 B per object pointer. Enabled by
-# `bsp-exynos4412`.
-multi_program = []
-# Faster interpreter for RAM-rich boards: a dense 2 KB variable table instead
-# of the sparse list, RAM code read and stack ops inlined, and `tick` runs its
-# burst with the instruction body inlined (one `step` prologue per burst, not
-# per instruction). Costs ~2 KB RAM per VM and some flash, so the GD32 build
-# leaves it off. Enabled by `bsp-exynos4412`.
-fast_vm = []
-# Main-loop profiler (`perf` module): CPU cycles per `Runtime::step` phase and
-# VM instruction count, reported over USART (`ferrite_cli.py perf`). Needs a
-# cycle counter from the BSP (`PlatformRuntime::cycles` / `cycle_hz`). Enabled
-# by `bsp-exynos4412`.
-perf = []
-# Render passes read widget geometry (absolute rect, visibility, scroll parent,
-# subtree end) from a table built once per pass (`geo.rs`) instead of walking
-# the parent chain for every lookup: the occluder search is O(n^2) lookups.
-# Costs ~24 B of heap per widget, so the GD32 build leaves it off. Enabled by
-# `bsp-exynos4412` and the sim.
-render_cache = []
-# Superinstructions (`docs/bytecode.md`, opcodes 0x45..=0x4D): fused
-# compare-and-branch, binary op with an immediate / variable operand,
-# `var += k` and array load from a variable, emitted by the compiler for
-# devices with `caps.superops` (CAP_SUPEROPS). Fewer dispatches and no stack
-# traffic between the fused parts. Enabled by `bsp-exynos4412` and the sim;
-# elsewhere they are bad opcodes.
-superops = []
-
 # --- Optional device features, selected by the BSP that has the hardware ---
 # Off = the module, its `Platform` backend slot, its `Ctx` field and its VM
 # opcodes are not compiled at all (programs using them fault with

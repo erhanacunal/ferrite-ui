@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use crate::pool::{CHANGED_MAX, ObjPool, ObjPtr, PTR_NONE, T_WIDGET};
+use crate::pool::{ObjPool, ObjPtr, PTR_NONE, T_WIDGET};
 use crate::render::SCROLLBAR_W;
 use crate::types::{Color, Edges, Offset, Rect, Size};
 use alloc::vec::Vec;
@@ -71,10 +71,8 @@ pub const KIND_ELLIPSE: u8 = 16;
 /// `group_id` form one group, and at most one of them is CHECKED (drawn with
 /// `press_color`). See `ObjPool::select_in_group`.
 pub const KIND_BUTTON_GROUP: u8 = 17;
-/// A 3D model view: the board's renderer draws it (exynos4412: the Mali GPU,
-/// `bsp/exynos4412/src/model3d.rs`); elsewhere only its background shows.
-/// What it shows is set through board syscalls (`lib/model3d.fl`).
-pub const KIND_MODEL3D: u8 = 18;
+// Kind 18 is taken by ferrite-ui-xl's 3D model view (KIND_MODEL3D in the
+// tools): drawn here as a plain base widget.
 
 // --- Text Alignment ---
 
@@ -119,15 +117,11 @@ impl WidgetId {
 
 /// `Widget::value`: progress/slider value, input cursor, scroll offset, and
 /// the graph's array id -- so it is as wide as an object pointer.
-#[cfg(not(feature = "wide_obj"))]
 pub type WValue = i16;
-#[cfg(feature = "wide_obj")]
-pub type WValue = i32;
 
 // --- Widget object layout ---
 //
-// A widget is one pool object: the `Widget` header (6 words, 8 with
-// `wide_obj`) followed by the optional sections its `sections` mask names, in
+// A widget is one pool object: the `Widget` header (6 words) followed by the optional sections its `sections` mask names, in
 // bit order. A section is added (the object grows) the first time one of its
 // fields gets a non-default value.
 
@@ -178,10 +172,7 @@ pub struct Widget {
     pub value: WValue,
 }
 
-#[cfg(not(feature = "wide_obj"))]
 const _: () = assert!(size_of::<Widget>() == 24 && align_of::<Widget>() <= 4);
-#[cfg(feature = "wide_obj")]
-const _: () = assert!(size_of::<Widget>() == 32 && align_of::<Widget>() <= 4);
 
 impl Widget {
     /// Placeholder for an id that names no live widget.
@@ -559,7 +550,6 @@ impl ObjPool {
         self.dfs_valid = false;
         // A new widget starts dirty (Widget::NEW).
         self.render.maybe_dirty = true;
-        self.note_changed(WidgetId(p));
         Some(WidgetId(p))
     }
 
@@ -832,11 +822,6 @@ impl ObjPool {
         if !self.is_live(id) || self.get(id).flags & FLAG_RENDERED == 0 {
             return;
         }
-        // An active layer's root only moves its surface.
-        #[cfg(feature = "layers")]
-        if self.is_active_layer_root(id) {
-            return;
-        }
         if !self.prev_rect(id, 0).is_empty() {
             return;
         }
@@ -939,12 +924,6 @@ impl ObjPool {
             pid = p.parent;
         }
 
-        // A layer pass draws in its surface's coordinates.
-        #[cfg(feature = "layers")]
-        {
-            x = x.wrapping_sub(self.layers.origin.x);
-            y = y.wrapping_sub(self.layers.origin.y);
-        }
         Rect::new(x, y, w.size.w, w.size.h)
     }
 
@@ -1150,24 +1129,8 @@ impl ObjPool {
     }
 
     /// Mark widget and all descendants as dirty in both buffers. The only
-    /// way (with `alloc_widget` and `mark_moved`) to set a dirty bit: it
-    /// raises `maybe_dirty`. `id` is listed as changed (see `changed`).
+    /// way (with `alloc_widget`) to set a dirty bit: it raises `maybe_dirty`.
     pub fn mark_dirty(&mut self, id: WidgetId) {
-        if !self.is_live(id) {
-            return;
-        }
-        self.note_changed(id);
-        self.dirty_subtree(id);
-    }
-
-    /// `mark_dirty` for a widget whose location changed and nothing else: not
-    /// listed as changed, so the renderer may shift its pixels instead of
-    /// redrawing it (`render::shift_moved`). Call `will_move` first.
-    pub fn mark_moved(&mut self, id: WidgetId) {
-        #[cfg(feature = "layers")]
-        if self.layer_placement_changed(id) {
-            return;
-        }
         if self.is_live(id) {
             self.dirty_subtree(id);
         }
@@ -1181,44 +1144,6 @@ impl ObjPool {
             self.dirty_subtree(child);
             child = self.get(child).next_sibling;
         }
-    }
-
-    fn note_changed(&mut self, id: WidgetId) {
-        let n = self.render.changed_n as usize;
-        if n < CHANGED_MAX {
-            if !self.render.changed[..n].contains(&id) {
-                self.render.changed[n] = id;
-                self.render.changed_n += 1;
-            }
-        } else {
-            self.render.changed_n = CHANGED_MAX as u8 + 1;
-        }
-    }
-
-    /// Whether anything in `root`'s subtree was listed as changed since the
-    /// last render (or more than the list holds changed).
-    pub(crate) fn changed_within(&self, root: WidgetId) -> bool {
-        let n = self.render.changed_n as usize;
-        if n > CHANGED_MAX {
-            return true;
-        }
-        self.render.changed[..n].iter().any(|&c| {
-            let mut w = c;
-            let mut depth = 0;
-            while w.is_some() && depth <= self.count() {
-                if w == root {
-                    return true;
-                }
-                w = self.get(w).parent;
-                depth += 1;
-            }
-            false
-        })
-    }
-
-    /// Forget the changed list (a render consumed it).
-    pub(crate) fn clear_changed(&mut self) {
-        self.render.changed_n = 0;
     }
 
     /// Rebuild DFS cache if invalidated.

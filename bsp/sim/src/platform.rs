@@ -42,9 +42,6 @@ impl Platform for SimPlatform {
     // Software JPEG decoder (sim/src/jpeg.rs) + silent real-time audio
     // output (sim/src/audio.rs).
     const CAPS: u32 = CAP_AUDIO | CAP_JPEG;
-    // The tablet demo animates more widgets at once (exynos4412 has 64).
-    #[cfg(feature = "tablet")]
-    const ANIM_SLOTS: usize = 64;
 
     const VERIFY_FS_ON_BOOT: bool = true;
 }
@@ -84,10 +81,6 @@ impl ScriptedTap {
 /// How long a scripted tap holds the press (well under long-press timing).
 pub const TAP_HOLD_MS: u32 = 150;
 
-/// Main-loop passes (`sysinfo::SYS_PASSES`).
-static PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-use std::sync::atomic::Ordering;
-
 thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
 }
@@ -114,26 +107,14 @@ impl PlatformRuntime for SimPlatform {
         std::process::exit(0)
     }
 
-    fn syscall(id: u8, args: &[i32], objs: &mut ObjPool) -> Option<i32> {
+    fn syscall(id: u8, _args: &[i32], _objs: &mut ObjPool) -> Option<i32> {
         match id {
             0x00 => Some(systick::millis() as i32), // SYS_UPTIME
-            // Battery (lib/battery.fl): none on the host (-1 = unknown, charger 2 = powered),
-            // unless `FERRITE_SIM_BATTERY=PERCENT,CHARGER` fakes one.
-            0x05 | 0x08 | 0x09 => Some(sim_battery(id)),
-            // 3D model syscalls (lib/model3d.fl, exynos4412 model3d.rs): the sim has no GPU,
-            // so a model widget shows its background; setters succeed, stats are 0.
-            0x60..=0x63 | 0x65 => Some(1),
-            0x64 => Some(0),
-            // No heap figures on the host; frames = passes.
-            _ => ferrite_core::sysinfo::syscall(id, args, objs, || {
-                let passes = PASSES.load(Ordering::Relaxed);
-                ferrite_core::sysinfo::Info { passes, frames: passes, heap_used: 0, heap_total: 0, cpu_mhz: 0 }
-            }),
+            _ => None,
         }
     }
 
     fn frame_end(_ctx: &mut Ctx<Self>) {
-        PASSES.fetch_add(1, Ordering::Relaxed);
         HOST.with(|h| {
             let mut guard = h.borrow_mut();
             let host = match guard.as_mut() {
@@ -168,27 +149,8 @@ impl PlatformRuntime for SimPlatform {
             // for pacing). In buffered mode this is whichever buffer the last
             // end_frame published; in dirty mode it is always buffer 0.
             let window = &mut host.window;
-            host.fb.with_shown(|buf| {
-                let _ = window.update_with_buffer(buf, WIDTH as usize, HEIGHT as usize);
-            });
+            let buf = host.fb.front_buffer();
+            let _ = window.update_with_buffer(&buf, WIDTH as usize, HEIGHT as usize);
         });
-    }
-}
-
-/// `FERRITE_SIM_BATTERY=PERCENT,CHARGER` (e.g. `64,1`): a fake battery for the battery
-/// syscalls (millivolts from a 3.0-4.2 V line); unset = none.
-fn sim_battery(id: u8) -> i32 {
-    static FAKE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
-    let fake = FAKE.get_or_init(|| {
-        let v = std::env::var("FERRITE_SIM_BATTERY").ok()?;
-        let (p, c) = v.split_once(',')?;
-        Some((p.trim().parse().ok()?, c.trim().parse().ok()?))
-    });
-    match (id, fake) {
-        (0x05, Some((p, _))) => 3000 + 12 * p,
-        (0x08, Some((p, _))) => *p,
-        (0x09, Some((_, c))) => *c,
-        (0x09, None) => 2,
-        _ => -1,
     }
 }

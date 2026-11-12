@@ -4,7 +4,6 @@ use std::vec;
 use std::vec::Vec;
 
 use super::{HEIGHT, LcdBackend, WIDTH};
-use ferrite_core::layer::SoftLayers;
 use ferrite_core::types::Rect;
 
 /// Two 32-bit ARGB (0xAARRGGBB) framebuffers with hardware-style front/back
@@ -23,9 +22,6 @@ pub struct DoubleBuffer {
     front: Cell<u8>,
     /// Index draw primitives write to.
     back: Cell<u8>,
-    /// Retained layers, composited over the front buffer when shown
-    /// (`ferrite_core::layer`; FIMD windows on the exynos4412).
-    pub layers: SoftLayers,
 }
 
 /// Shared handle to the double framebuffer. Cloned into both the LCD backend
@@ -41,7 +37,6 @@ pub fn new_framebuffer() -> Framebuffer {
         ],
         front: Cell::new(0),
         back: Cell::new(0),
-        layers: SoftLayers::new(),
     })
 }
 
@@ -56,18 +51,6 @@ impl DoubleBuffer {
     #[inline]
     pub fn front_buffer(&self) -> Ref<'_, Vec<u32>> {
         self.bufs[self.front.get() as usize].borrow()
-    }
-
-    /// What the display shows: the front buffer with the layers over it.
-    pub fn with_shown<R>(&self, f: impl FnOnce(&[u32]) -> R) -> R {
-        let front = self.front_buffer();
-        if !self.layers.any_visible() {
-            return f(&front);
-        }
-        let mut shown = front.clone();
-        drop(front);
-        self.layers.composite(&mut shown, WIDTH as usize, HEIGHT as usize);
-        f(&shown)
     }
 
     /// Borrow the back buffer for drawing.
@@ -99,9 +82,6 @@ pub struct SimLcd {
     fb: Framebuffer,
     cursor_x: Cell<u16>,
     cursor_y: Cell<u16>,
-    /// Layers blended into the screen since their window last showed (bit n),
-    /// for the console line.
-    composed: Cell<u8>,
     rect_x_start: Cell<u16>,
     rect_x_end: Cell<u16>,
     rect_y_end: Cell<u16>,
@@ -113,7 +93,6 @@ impl SimLcd {
             fb,
             cursor_x: Cell::new(0),
             cursor_y: Cell::new(0),
-            composed: Cell::new(0),
             rect_x_start: Cell::new(0),
             rect_x_end: Cell::new(0),
             rect_y_end: Cell::new(0),
@@ -155,39 +134,6 @@ impl LcdBackend for SimLcd {
     // the Nextion instead (no blending; underlay anti-aliasing).
     const HAS_ALPHA: bool = !cfg!(feature = "no-readback");
     const AA_UNDERLAY: bool = cfg!(feature = "no-readback");
-    // Moving pixels needs readback too.
-    const CAN_MOVE: bool = !cfg!(feature = "no-readback");
-
-    fn move_rects(&self, rects: &[Rect], dx: i16, dy: i16) -> bool {
-        if self.fb.layers.target().is_some() {
-            return false;
-        }
-        // `FERRITE_SIM_NO_MOVE=1`: redraw instead (A/B against the shift).
-        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *OFF.get_or_init(|| std::env::var_os("FERRITE_SIM_NO_MOVE").is_some()) {
-            return false;
-        }
-        let mut fb = self.fb.draw();
-        let stride = WIDTH as usize;
-        // All read before any is written: a destination may overlap any
-        // source.
-        let mut saved = Vec::new();
-        for r in rects {
-            for y in r.y..r.bottom() {
-                let row = y as usize * stride;
-                saved.extend_from_slice(&fb[row + r.x as usize..row + r.right() as usize]);
-            }
-        }
-        let mut at = 0;
-        for r in rects {
-            for y in r.y..r.bottom() {
-                let row = (y + dy) as usize * stride + (r.x + dx) as usize;
-                fb[row..row + r.w as usize].copy_from_slice(&saved[at..at + r.w as usize]);
-                at += r.w as usize;
-            }
-        }
-        true
-    }
 
     fn begin_frame(&mut self) {
         self.fb.begin();
@@ -202,9 +148,6 @@ impl LcdBackend for SimLcd {
     }
 
     fn fill_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16) {
-        if self.fb.layers.target().is_some() {
-            return self.fb.layers.fill_rect(x, y, w, h, color);
-        }
         if w == 0 || h == 0 {
             return;
         }
@@ -222,9 +165,6 @@ impl LcdBackend for SimLcd {
     }
 
     fn begin_pixels(&self, x: u16, y: u16, w: u16, h: u16) {
-        if self.fb.layers.target().is_some() {
-            return self.fb.layers.begin_pixels(x, y, w, h);
-        }
         self.cursor_x.set(x);
         self.cursor_y.set(y);
         self.rect_x_start.set(x);
@@ -233,9 +173,6 @@ impl LcdBackend for SimLcd {
     }
 
     fn write_pixel(&self, color: u16) {
-        if self.fb.layers.target().is_some() {
-            return self.fb.layers.write_pixel(color);
-        }
         let mut x = self.cursor_x.get();
         let mut y = self.cursor_y.get();
         let xe = self.rect_x_end.get();
@@ -259,66 +196,13 @@ impl LcdBackend for SimLcd {
 
     fn send_data(&self, _data: u16) {}
 
-    // Retained layers in software (`DoubleBuffer::layers`), up to 4.
-    const LAYERS: usize = 4;
-
-    fn layer_alloc(&self, n: usize, w: u16, h: u16) -> bool {
-        let ok = self.fb.layers.alloc(n, w, h);
-        println!("sim: layer {n} {w}x{h} {}", if ok { "allocated" } else { "refused" });
-        ok
-    }
-
-    fn layer_free(&self, n: usize) {
-        self.composed.set(self.composed.get() & !(1 << n));
-        if self.fb.layers.is_allocated(n) {
-            println!("sim: layer {n} freed");
-        }
-        self.fb.layers.free(n);
-    }
-
-    fn layer_target(&self, n: Option<usize>) {
-        self.fb.layers.set_target(n);
-    }
-
-    fn layer_clear(&self, x: u16, y: u16, w: u16, h: u16) {
-        self.fb.layers.clear(x, y, w, h);
-    }
-
-    fn layer_place(&self, n: usize, x: i32, y: i32, alpha: u8, visible: bool) {
-        if visible && self.composed.get() & 1 << n != 0 {
-            self.composed.set(self.composed.get() & !(1 << n));
-            println!("sim: layer {n} in its window again");
-        }
-        self.fb.layers.place(n, x, y, alpha, visible);
-    }
-
-    // A layer something is drawn over is blended into the screen from its
-    // kept surface (`ferrite_core::layer`, composed layers).
-    const LAYER_COMPOSE: bool = true;
-
-    fn layer_compose(&self, n: usize, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16, alpha: u8) {
-        if self.composed.get() & 1 << n == 0 {
-            self.composed.set(self.composed.get() | 1 << n);
-            println!("sim: layer {n} composed into the screen");
-        }
-        let src = (sx as usize, sy as usize, w as usize, h as usize);
-        let mut fb = self.fb.draw();
-        self.fb.layers.compose_onto(n, src, &mut fb, WIDTH as usize, (dx as usize, dy as usize), alpha);
-    }
-
     fn draw_pixel(&self, x: u16, y: u16, color: u16) {
-        if self.fb.layers.target().is_some() {
-            return self.fb.layers.fill_rect(x, y, 1, 1, color);
-        }
         if x < WIDTH && y < HEIGHT {
             self.fb.draw()[y as usize * WIDTH as usize + x as usize] = rgb565_to_argb(color);
         }
     }
 
     fn blend_rect(&self, x: u16, y: u16, w: u16, h: u16, color: u16, alpha: u8) {
-        if self.fb.layers.target().is_some() {
-            return self.fb.layers.blend_rect(x, y, w, h, color, alpha);
-        }
         if alpha == 0 {
             return;
         }
@@ -345,9 +229,6 @@ impl LcdBackend for SimLcd {
     }
 
     fn blend_pixel(&self, x: u16, y: u16, color: u16, alpha: u8) {
-        if self.fb.layers.target().is_some() {
-            return self.fb.layers.blend_rect(x, y, 1, 1, color, alpha);
-        }
         if alpha == 0 || x >= WIDTH || y >= HEIGHT {
             return;
         }
@@ -363,9 +244,6 @@ impl LcdBackend for SimLcd {
 
     // One frame-buffer borrow per row, not per pixel.
     fn blend_span(&self, x: u16, y: u16, color: u16, alphas: &[u8]) {
-        if self.fb.layers.target().is_some() {
-            return self.fb.layers.blend_span(x, y, color, alphas);
-        }
         if x >= WIDTH || y >= HEIGHT {
             return;
         }
@@ -383,9 +261,6 @@ impl LcdBackend for SimLcd {
     }
 
     fn blend_row(&self, x: u16, y: u16, colors: &[u16], alphas: &[u8]) {
-        if self.fb.layers.target().is_some() {
-            return self.fb.layers.blend_row(x, y, colors, alphas);
-        }
         if x >= WIDTH || y >= HEIGHT {
             return;
         }

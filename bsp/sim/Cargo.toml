@@ -11,10 +11,8 @@ path = "src/main.rs"
 # Render like the write-only Nextion: no alpha blending, anti-aliasing mixed
 # against renderer-known underlay colours (LcdBackend::AA_UNDERLAY).
 no-readback = []
-# 1280×800 screen (the Exynos 4412 tablet) instead of 800×480.
-tablet = []
 
 [dependencies]
-ferrite-core = { path = "../../ferrite-core", features = ["host", "wide_code", "audio", "jpeg", "render_cache", "superops", "layers"] }
+ferrite-core = { path = "../../ferrite-core", features = ["host", "wide_code", "audio", "jpeg"] }
 jpeg-decoder = { version = "0.3", default-features = false }
 minifb = "0.27"
