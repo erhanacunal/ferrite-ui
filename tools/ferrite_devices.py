@@ -19,7 +19,9 @@ in sync by hand:
     emits superinstructions); caps.multi_program <-> CAP_MULTI_PROGRAM
     (ferrite-core `multi_program` feature: the task builtins);
     caps.native_flex <-> CAP_NATIVE_FLEX (ferrite-ui-xl: flexLayout() is
-    the FLEX_LAYOUT opcode instead of lib/flex.fl's function). A missing
+    the FLEX_LAYOUT opcode instead of lib/flex.fl's function);
+    caps.storage <-> CAP_STORAGE (ferrite-ui-xl: the diskOpen / fileWrite /
+    diskMkdir ... builtins, ferrite-core storage.rs). A missing
     cap reads as false, so the fallback boards below leave it out.
 """
 

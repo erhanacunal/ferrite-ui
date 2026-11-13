@@ -986,6 +986,21 @@ NO_VALUE_BUILTINS = {
     'stopSound', 'setVolume',
 }
 
+# Storage builtins (caps.storage): name -> (Builtin, parameter names). Each
+# leaves one value; 'arr' parameters take an array variable.
+_STORAGE_CALLS = {
+    'diskOpen': (Builtin.DISK_OPEN, ('path', 'mode')),
+    'diskDelete': (Builtin.DISK_DELETE, ('path',)),
+    'diskMkdir': (Builtin.DISK_MKDIR, ('path',)),
+    'diskRmdir': (Builtin.DISK_RMDIR, ('path',)),
+    'diskExists': (Builtin.DISK_EXISTS, ('path',)),
+    'diskList': (Builtin.DISK_LIST, ('dir', 'index')),
+    'fileWrite': (Builtin.FILE_WRITE, ('handle', 'byte')),
+    'fileWriteArr': (Builtin.FILE_WRITE_ARR, ('handle', 'arr', 'count')),
+    'fileWriteStr': (Builtin.FILE_WRITE_STR, ('handle', 'str')),
+    'fileReadArr': (Builtin.FILE_READ_ARR, ('handle', 'arr', 'count')),
+}
+
 # Builtins whose return value is an array ID (so the variable must be in array_vars)
 _ARRAY_RETURNING_BUILTINS = {'rtcRead'}
 
@@ -1742,13 +1757,15 @@ class CodeGen:
         'playSound', 'soundPlaying', 'runProgram', 'programArg',
         'spawnProgram', 'killProgram', 'taskId', 'taskAlive', 'sendMessage',
         'setForeground', 'foregroundTask',
+        'diskOpen', 'diskDelete', 'diskMkdir', 'diskRmdir', 'diskExists',
+        'fileWrite', 'fileWriteArr', 'fileWriteStr', 'fileReadArr',
         'arrFree', 'strFree', 'arrLen',
         'syscall',
     }
     # Builtins that return string IDs
     _STRING_RETURNING = {
         'str', 'itos', 'ftos', 'concat', 'strcat', 'sprintf', 'strClear', 'arrToStr',
-        'syscallStr', 'programName',
+        'syscallStr', 'programName', 'diskList',
     }
     # Builtins that return array IDs
     _ARRAY_RETURNING = {
@@ -3617,6 +3634,21 @@ class CodeGen:
             self._gen_expr(node.args[0])
             self._gen_expr(node.args[1])
             self.asm.builtin(Builtin.FILE_SEEK)
+            return
+
+        # --- Writable storage (caps.storage): paths are strings, negative
+        #     results lib/storage.fl's DISK_ERR_* ---
+        if name in _STORAGE_CALLS:
+            builtin, params = _STORAGE_CALLS[name]
+            if len(node.args) != len(params):
+                raise CompileError(f"{name}() takes {len(params)} argument(s): {', '.join(params)}",
+                                   node.line)
+            for p, arg in zip(params, node.args):
+                if p == 'arr' and isinstance(arg, VarRef) and arg.name in self.array_vars:
+                    self.asm.load(self._var_slot(arg.name, node.line))
+                else:
+                    self._gen_expr(arg)
+            self.asm.builtin(builtin)
             return
 
         if name == 'syscall' or name == 'syscallStr':

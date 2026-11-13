@@ -185,6 +185,11 @@ AUDIO_BUILTINS = ("playSound", "stopSound", "setVolume", "soundPlaying")
 TASK_BUILTINS = ("spawnProgram", "killProgram", "taskId", "taskAlive", "sendMessage",
                  "setForeground", "foregroundTask")
 
+# Builtins whose opcodes exist only in firmware with writable storage
+# (ferrite-ui-xl `storage.rs`, caps.storage).
+STORAGE_BUILTINS = ("diskOpen", "diskDelete", "diskMkdir", "diskRmdir", "diskExists", "diskList",
+                    "fileWrite", "fileWriteArr", "fileWriteStr", "fileReadArr")
+
 
 def used_builtins(source_path: str, include_dirs, names) -> set[str]:
     """Which of `names` the program calls (after `#include` expansion)."""
@@ -637,6 +642,14 @@ def build(project_path: str, output_path: str | None) -> dict:
                 print(f"Error: {prog['source']}: {', '.join(sorted(used))} need a "
                       f"device that runs several programs at once "
                       f"(caps.multi_program); the firmware has no task opcodes",
+                      file=sys.stderr)
+                sys.exit(1)
+        if device and not device["caps"].get("storage"):
+            used = used_builtins(str(source), include_dirs, STORAGE_BUILTINS)
+            if used:
+                print(f"Error: {prog['source']}: {', '.join(sorted(used))} need a "
+                      f"device with writable storage (caps.storage); "
+                      f"the firmware has no storage opcodes",
                       file=sys.stderr)
                 sys.exit(1)
         image_data = compile_program(str(source), include_dirs=include_dirs,

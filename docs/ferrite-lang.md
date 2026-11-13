@@ -1562,6 +1562,60 @@ Passing `arrToStr(buf)` without a length uses the full array — any unused
 slots contribute NUL bytes, so prefer the two-argument form when the valid
 byte count is known (as it is after a `fileRead` loop).
 
+## Writable Storage (Files and Directories)
+
+Devices with `caps.storage` (the Exynos 4412 tablet, ferrite-ui-xl) let a program create, write, read and delete files and make and remove directories. `#include "storage.fl"` for the constants. Unlike the resource files above, these live on the board's storage and survive reboots and new uploads: on the tablet in `FERRITE/USER` on the eMMC. The sim keeps them in RAM, or in a host directory with `--storage DIR`. Building a program that calls these for a device without `caps.storage` fails.
+
+The program's `/` is its own root, so the firmware's files (`FERRITE.BIN`, `FLASH.BIN`, the WiFi config, the EEPROM file) can't be reached, written or deleted.
+
+**Paths:** `"/logs/day1.txt"` or `"logs/day1.txt"` (the same). Components are separated by `/`, each an 8.3 name made of `A-Z 0-9 _ - ~` (lower case is folded to upper case, so `diskList` shows `DAY1.TXT`), no `.` or `..`, at most 8 deep.
+
+**Results:** negative numbers are errors (`DISK_ERR_NOT_FOUND` -1, `EXISTS` -2, `BAD_PATH` -3, `NOT_EMPTY` -4, `FULL` -5, `IO` -6, `NO_STORAGE` -7, `WRONG_KIND` -8, `BUSY` -9).
+
+**Handles:** `diskOpen` returns 16 or more. `fileRead`, `fileSize`, `fileSeek` and `fileClose` take these handles as well as `fileOpen`'s. At most 8 files are open at once (all programs together), each file once. A program's files are closed when it ends or another program starts. A handle that isn't open (or another task's) stops the program with fault 11, as for resource files.
+
+**When data is stored:** on `fileClose`, about 1 s after the last write, and before a restart. `diskMkdir` / `diskRmdir` / `diskDelete` are stored at once.
+
+| Call | Result |
+| --- | --- |
+| `diskOpen(path, mode)` | handle, or an error. `DISK_READ` (0) an existing file; `DISK_WRITE` (1) created if missing, emptied if not; `DISK_APPEND` (2) created if missing, written at its end |
+| `fileWrite(h, byte)` | `1`, or an error (`DISK_ERR_BAD_PATH` for a file opened with `DISK_READ`) |
+| `fileWriteStr(h, str)` | bytes written, or an error |
+| `fileWriteArr(h, arr, count)` | bytes written (the low byte of each of `arr[0..count]`), or an error |
+| `fileReadArr(h, arr, count)` | bytes read into `arr[0..]`, `0` at the end, or an error. Also takes `fileOpen`'s handles |
+| `diskExists(path)` | `DISK_NONE` 0, `DISK_FILE` 1, `DISK_DIR` 2, or an error |
+| `diskList(dir, i)` | name of entry `i` of `dir` as a string, a directory's ending in `/`; `""` past the last entry |
+| `diskDelete(path)` | `0`, or an error (`DISK_ERR_BUSY` while open, `DISK_ERR_WRONG_KIND` for a directory) |
+| `diskMkdir(path)` | `0`, or an error (`DISK_ERR_EXISTS`) |
+| `diskRmdir(path)` | `0`, or an error (`DISK_ERR_NOT_EMPTY`) |
+
+```c
+#include "storage.fl"
+
+fn log_line(text) {
+    var r = diskMkdir("/logs");
+    if (r != 0 && r != DISK_ERR_EXISTS) { return r; }
+    var h = diskOpen("/logs/app.txt", DISK_APPEND);
+    if (h < 0) { return h; }
+    r = fileWriteStr(h, text);
+    fileClose(h);
+    return r;
+}
+
+fn list(dir) {
+    var i = 0;
+    var name = diskList(dir, 0);
+    while (strLen(name) > 0) {
+        // a name ending in "/" is a directory
+        i = i + 1;
+        name = diskList(dir, i);
+    }
+    return i;
+}
+```
+
+On the tablet the EEPROM builtins (`eepromRead` / `eepromWrite`…) work too: 4096 bytes kept in `FERRITE/EEPROM.BIN`, saved about 0.5 s after the last write and before a restart.
+
 ## Animation
 
 Tween a widget's scalar property from its current value to a target over time.

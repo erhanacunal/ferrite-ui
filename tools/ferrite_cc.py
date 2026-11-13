@@ -216,6 +216,19 @@ class Op:
     # Native flex layout (boards with caps.native_flex; ferrite-ui-xl)
     FLEX_LAYOUT  = 0xDB  # pop box → lay out its children like lib/flex.fl flexLayout(box); target = box; push 0
 
+    # Writable storage (boards with caps.storage; ferrite-ui-xl). Negative
+    # results are lib/storage.fl's DISK_ERR_*.
+    DISK_OPEN      = 0xDC  # pop mode, pop path str_id → push handle (16..) or error
+    DISK_DELETE    = 0xDD  # pop path → push 0 or error (files)
+    DISK_MKDIR     = 0xDE  # pop path → push 0 or error
+    DISK_RMDIR     = 0xDF  # pop path → push 0 or error (empty directories)
+    DISK_EXISTS    = 0xE0  # pop path → push 0 none / 1 file / 2 directory, or error
+    DISK_LIST      = 0xE1  # pop index, pop dir → push entry name str_id ("" past the last; dirs end in /)
+    FILE_WRITE     = 0xE2  # pop byte, pop handle → push 1 or error
+    FILE_WRITE_ARR = 0xE3  # pop count, pop arr, pop handle → push bytes written or error
+    FILE_WRITE_STR = 0xE4  # pop str_id, pop handle → push bytes written or error
+    FILE_READ_ARR  = 0xE5  # pop count, pop arr, pop handle → push bytes read (0 at the end) or error
+
 
 # Backwards compatibility -- Builtin constants map to method IDs (0-based).
 # Used by ferrite_lang.py via asm.builtin(Builtin.XXX)
@@ -289,6 +302,16 @@ class Builtin:
     TASK_SET_FG = 89       # (id) → 1 / 0
     TASK_FG = 90           # () → foreground task id
     FLEX_LAYOUT = 91       # (box) → 0; native lib/flex.fl flexLayout (caps.native_flex)
+    DISK_OPEN = 92         # (path, mode) → handle or error (caps.storage)
+    DISK_DELETE = 93       # (path) → 0 / error
+    DISK_MKDIR = 94        # (path) → 0 / error
+    DISK_RMDIR = 95        # (path) → 0 / error
+    DISK_EXISTS = 96       # (path) → 0 / 1 / 2 / error
+    DISK_LIST = 97         # (dir, index) → str_id
+    FILE_WRITE = 98        # (handle, byte) → 1 / error
+    FILE_WRITE_ARR = 99    # (handle, arr, count) → bytes / error
+    FILE_WRITE_STR = 100   # (handle, str) → bytes / error
+    FILE_READ_ARR = 101    # (handle, arr, count) → bytes / error
 
 
 class Prop:
@@ -1202,6 +1225,10 @@ OP_NAMES = {
     0xD0: 'fabs', 0xD1: 'fatan2', 0xD2: 'ffloor', 0xD3: 'fceil',
     0xD4: 'spawnProgram', 0xD5: 'killProgram', 0xD6: 'taskId', 0xD7: 'taskAlive',
     0xD8: 'sendMessage', 0xD9: 'setForeground', 0xDA: 'foregroundTask',
+    0xDB: 'flexLayout',
+    0xDC: 'diskOpen', 0xDD: 'diskDelete', 0xDE: 'diskMkdir', 0xDF: 'diskRmdir',
+    0xE0: 'diskExists', 0xE1: 'diskList',
+    0xE2: 'fileWrite', 0xE3: 'fileWriteArr', 0xE4: 'fileWriteStr', 0xE5: 'fileReadArr',
 }
 
 PROP_NAMES = {
@@ -1256,7 +1283,7 @@ _NO_ARG_OPS = (
     {0xB0, 0xB1, 0xB2} |               # pinMode, pinWrite, pinRead
     set(range(0xB3, 0xC0)) |           # eepromSize .. strByte, playSound .. soundPlaying, runProgram .. programName
     set(range(0xC0, 0xCD)) |           # 0xC0-0xCC
-    set(range(0xD4, 0xDC))             # spawnProgram .. foregroundTask, flexLayout
+    set(range(0xD4, 0xE6))             # spawnProgram .. foregroundTask, flexLayout, diskOpen .. fileReadArr
 )
 
 

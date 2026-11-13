@@ -1,0 +1,52 @@
+// storage.fl — writable files and directories (devices with caps.storage:
+// the Exynos 4412 tablet, ferrite-ui-xl; the sim with --storage DIR keeps
+// them in a host directory, else in RAM)
+// Usage: #include "storage.fl"
+//
+//   diskOpen(path, mode)          — handle, or DISK_ERR_* (< 0)
+//   fileRead(h) / fileSize(h) / fileSeek(h, pos) / fileClose(h)
+//                                 — as for fileOpen's resource files
+//   fileReadArr(h, arr, count)    — bytes read into arr[0..] (0 at the end)
+//   fileWrite(h, byte)            — 1, or DISK_ERR_*
+//   fileWriteStr(h, str)          — bytes written, or DISK_ERR_*
+//   fileWriteArr(h, arr, count)   — low byte of each of arr[0..count]
+//   diskExists(path)              — DISK_NONE / DISK_FILE / DISK_DIR, or DISK_ERR_*
+//   diskList(dir, i)              — name of entry i ("" past the last;
+//                                   a directory's name ends in "/")
+//   diskDelete(path)              — a file that is not open; 0 or DISK_ERR_*
+//   diskMkdir(path)               — 0 or DISK_ERR_*
+//   diskRmdir(path)               — an empty directory; 0 or DISK_ERR_*
+//
+// Paths: "/logs/day1.txt" or "logs/day1.txt" (the same), components
+// separated by "/", each an 8.3 name of A-Z 0-9 _ - ~ (lower case is turned
+// to upper case: diskList shows "DAY1.TXT"), no "." or "..", at most 8 deep.
+// "/" is the program's own root: on the tablet FERRITE/USER on the eMMC, so
+// the firmware's files (FERRITE.BIN, FLASH.BIN, the EEPROM) are out of reach.
+//
+// At most 8 files are open at once (all programs together); a file is open
+// once. A program's files are closed when it ends or another starts.
+// Written data reaches the card on fileClose, about 1 s after the last
+// write, and before a restart.
+//
+// A handle that is not open (or a resource file's handle given to a write)
+// stops the program with VM fault 11, as fileRead does.
+
+const DISK_READ   = 0; // an existing file, from its start
+const DISK_WRITE  = 1; // made if missing, emptied if not
+const DISK_APPEND = 2; // made if missing, written at its end
+
+// diskExists
+const DISK_NONE = 0;
+const DISK_FILE = 1;
+const DISK_DIR  = 2;
+
+// Negative results. Keep in sync with ferrite-ui-xl ferrite-core/src/storage.rs (err).
+const DISK_ERR_NOT_FOUND  = -1; // no such file or directory (or a directory on the way)
+const DISK_ERR_EXISTS     = -2; // diskMkdir: already there
+const DISK_ERR_BAD_PATH   = -3; // not a valid path; or a write to a file opened with DISK_READ
+const DISK_ERR_NOT_EMPTY  = -4; // diskRmdir: the directory holds something
+const DISK_ERR_FULL       = -5; // no space left, or 8 files open
+const DISK_ERR_IO         = -6; // the card or file system failed
+const DISK_ERR_NO_STORAGE = -7; // the board has no writable storage
+const DISK_ERR_WRONG_KIND = -8; // a file where a directory was expected, or the other way round
+const DISK_ERR_BUSY       = -9; // the file is open (diskDelete, or diskOpen twice)

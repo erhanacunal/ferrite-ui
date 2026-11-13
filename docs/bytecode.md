@@ -347,6 +347,21 @@ Only in firmware built with the ferrite-core `multi_program` feature (`caps.mult
 | `0xDA` | `foregroundTask` | push the foreground task's id |
 | `0xDB` | `flexLayout` | pop `box`; lay out its children exactly like `lib/flex.fl` `flexLayout(box)` (nested containers included); target = `box`; push `0`. Only emitted for devices with `caps.native_flex` (ferrite-ui-xl); elsewhere a bad opcode |
 
+Writable storage (`caps.storage`, ferrite-ui-xl `storage.rs`; elsewhere bad opcodes). Paths are string ids (8.3 components, `/` separated, checked by the firmware); negative results are `lib/storage.fl`'s `DISK_ERR_*`. Storage handles are 16 and up and also work with `fileRead` / `fileSize` / `fileSeek` / `fileClose`; one not open, or a resource file's handle given to a write, faults 11 (`BAD_FILE`).
+
+| Opcode | Name | Stack effect |
+| --- | --- | --- |
+| `0xDC` | `diskOpen` | pop `mode` (0 read, 1 write: create/truncate, 2 append: create/append), pop `path`; push a handle or an error |
+| `0xDD` | `diskDelete` | pop `path`; delete a file that is not open; push `0` or an error |
+| `0xDE` | `diskMkdir` | pop `path`; push `0` or an error |
+| `0xDF` | `diskRmdir` | pop `path`; delete an empty directory; push `0` or an error |
+| `0xE0` | `diskExists` | pop `path`; push `0` nothing, `1` a file, `2` a directory, or an error |
+| `0xE1` | `diskList` | pop `index`, pop `dir`; push the name of entry `index` as a new string (a directory's ends in `/`; `""` past the last or on an error) |
+| `0xE2` | `fileWrite` | pop `byte`, pop `handle`; write its low byte; push `1` or an error |
+| `0xE3` | `fileWriteArr` | pop `count`, pop `arr`, pop `handle`; write the low byte of each of `arr[0..count]`; push the bytes written or an error |
+| `0xE4` | `fileWriteStr` | pop `str_id`, pop `handle`; write the string's bytes; push the bytes written or an error |
+| `0xE5` | `fileReadArr` | pop `count`, pop `arr`, pop `handle`; read up to `count` bytes into `arr[0..]`; push the bytes read (`0` at the end) or an error. Takes a resource file's handle too |
+
 ## Widget Properties
 
 Scalar properties are used by `W_SET` and `W_GET`.
