@@ -1015,7 +1015,7 @@ fn on_home(wid) {
 }
 ```
 
-See [`examples/exynos4412/launcher`](https://github.com/erhanacunal/ferrite-ui-xl/tree/cpu2-render-perf/examples/exynos4412/launcher) in ferrite-ui-xl (a launcher listing its apps with
+See [`examples/exynos4412/launcher`](https://github.com/erhanacunal/ferrite-ui-xl/tree/main/examples/exynos4412/launcher) in ferrite-ui-xl (a launcher listing its apps with
 `programName`, and two apps).
 
 ### Tasks: several programs at once
@@ -1048,7 +1048,7 @@ fault shows a dialog with the reason (OK closes it). `runProgram` in a child
 restarts that task with the other program; in main it ends every child and
 switches as before. A fault in main still shows the Code 6 screen.
 
-See [`examples/exynos4412/multitask`](https://github.com/erhanacunal/ferrite-ui-xl/tree/cpu2-render-perf/examples/exynos4412/multitask) in ferrite-ui-xl (main with a ticker panel task and a
+See [`examples/exynos4412/multitask`](https://github.com/erhanacunal/ferrite-ui-xl/tree/main/examples/exynos4412/multitask) in ferrite-ui-xl (main with a ticker panel task and a
 messaging worker task).
 
 ### Sound: playSound / stopSound / setVolume / soundPlaying
