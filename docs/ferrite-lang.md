@@ -1282,7 +1282,7 @@ strFree(s);
 
 ### sprintf(fmt, ...)
 
-Format one or more values into a new string using printf-style format specifiers. Returns a string ID. Supports up to 8 format arguments. Output is capped at 128 bytes.
+Format one or more values into a new string using printf-style format specifiers. Returns a string ID. Supports up to 8 format arguments. On ferrite-ui boards the output is capped at 128 bytes and each `%s` at 64; ferrite-ui-xl (Exynos 4412) has no limit.
 
 ```c
 var s = sprintf("Temp: %d C", temp);
