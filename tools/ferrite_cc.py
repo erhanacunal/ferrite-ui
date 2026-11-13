@@ -230,6 +230,10 @@ class Op:
     FILE_WRITE_STR = 0xE4  # pop str_id, pop handle → push bytes written or error
     FILE_READ_ARR  = 0xE5  # pop count, pop arr, pop handle → push bytes read (0 at the end) or error
 
+    # Gesture recognizers (boards with caps.gestures; ferrite-ui-xl gesture.rs)
+    ON_GESTURE     = 0xE6  # pop func_id, pop mask, pop widget → (nothing); mask 0 removes
+    GESTURE_INFO   = 0xE7  # pop field → push the running gesture event's field (0 outside one)
+
 
 # Backwards compatibility -- Builtin constants map to method IDs (0-based).
 # Used by ferrite_lang.py via asm.builtin(Builtin.XXX)
@@ -313,6 +317,8 @@ class Builtin:
     FILE_WRITE_ARR = 99    # (handle, arr, count) → bytes / error
     FILE_WRITE_STR = 100   # (handle, str) → bytes / error
     FILE_READ_ARR = 101    # (handle, arr, count) → bytes / error
+    ON_GESTURE = 102       # (widget, mask, @handler) → nothing (caps.gestures)
+    GESTURE_INFO = 103     # (field) → value of the running gesture event
 
 
 class Prop:
@@ -1252,6 +1258,7 @@ OP_NAMES = {
     0xDC: 'diskOpen', 0xDD: 'diskDelete', 0xDE: 'diskMkdir', 0xDF: 'diskRmdir',
     0xE0: 'diskExists', 0xE1: 'diskList',
     0xE2: 'fileWrite', 0xE3: 'fileWriteArr', 0xE4: 'fileWriteStr', 0xE5: 'fileReadArr',
+    0xE6: 'onGesture', 0xE7: 'gestureInfo',
 }
 
 PROP_NAMES = {
@@ -1306,7 +1313,7 @@ _NO_ARG_OPS = (
     {0xB0, 0xB1, 0xB2} |               # pinMode, pinWrite, pinRead
     set(range(0xB3, 0xC0)) |           # eepromSize .. strByte, playSound .. soundPlaying, runProgram .. programName
     set(range(0xC0, 0xCD)) |           # 0xC0-0xCC
-    set(range(0xD4, 0xE6))             # spawnProgram .. foregroundTask, flexLayout, diskOpen .. fileReadArr
+    set(range(0xD4, 0xE8))             # spawnProgram .. foregroundTask, flexLayout, diskOpen .. fileReadArr, onGesture, gestureInfo
 )
 
 

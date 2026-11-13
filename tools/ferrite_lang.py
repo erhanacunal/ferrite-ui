@@ -984,6 +984,7 @@ NO_VALUE_BUILTINS = {
     'pinMode', 'pinWrite',
     'eepromWrite', 'eepromReadArr', 'eepromWriteArr',
     'stopSound', 'setVolume',
+    'onGesture',
 }
 
 # Storage builtins (caps.storage): name -> (Builtin, parameter names). Each
@@ -1759,6 +1760,7 @@ class CodeGen:
         'setForeground', 'foregroundTask',
         'diskOpen', 'diskDelete', 'diskMkdir', 'diskRmdir', 'diskExists',
         'fileWrite', 'fileWriteArr', 'fileWriteStr', 'fileReadArr',
+        'gestureInfo',
         'arrFree', 'strFree', 'arrLen',
         'syscall',
     }
@@ -3649,6 +3651,27 @@ class CodeGen:
                 else:
                     self._gen_expr(arg)
             self.asm.builtin(builtin)
+            return
+
+        # --- Gesture recognizers (caps.gestures) ---
+        if name == 'onGesture':
+            # onGesture(widget, mask, @handler): the widget takes part in the
+            # recognizers of `mask` (lib/gesture.fl GESTURE_*), reporting to
+            # handler(widget, event); mask 0 removes them.
+            if len(node.args) != 3:
+                raise CompileError("onGesture() takes 3 arguments: widget, mask, @handler", node.line)
+            for arg in node.args:
+                self._gen_expr(arg)
+            self.asm.builtin(Builtin.ON_GESTURE)
+            return
+
+        if name == 'gestureInfo':
+            # gestureInfo(field) → a detail (lib/gesture.fl GI_*) of the event
+            # the running gesture handler was called for.
+            if len(node.args) != 1:
+                raise CompileError("gestureInfo() takes 1 argument: field", node.line)
+            self._gen_expr(node.args[0])
+            self.asm.builtin(Builtin.GESTURE_INFO)
             return
 
         if name == 'syscall' or name == 'syscallStr':

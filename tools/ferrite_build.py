@@ -190,6 +190,10 @@ TASK_BUILTINS = ("spawnProgram", "killProgram", "taskId", "taskAlive", "sendMess
 STORAGE_BUILTINS = ("diskOpen", "diskDelete", "diskMkdir", "diskRmdir", "diskExists", "diskList",
                     "fileWrite", "fileWriteArr", "fileWriteStr", "fileReadArr")
 
+# Builtins whose opcodes exist only in firmware with the gesture recognizers
+# (ferrite-ui-xl `gesture.rs`, caps.gestures).
+GESTURE_BUILTINS = ("onGesture", "gestureInfo")
+
 
 def used_builtins(source_path: str, include_dirs, names) -> set[str]:
     """Which of `names` the program calls (after `#include` expansion)."""
@@ -650,6 +654,14 @@ def build(project_path: str, output_path: str | None) -> dict:
                 print(f"Error: {prog['source']}: {', '.join(sorted(used))} need a "
                       f"device with writable storage (caps.storage); "
                       f"the firmware has no storage opcodes",
+                      file=sys.stderr)
+                sys.exit(1)
+        if device and not device["caps"].get("gestures"):
+            used = used_builtins(str(source), include_dirs, GESTURE_BUILTINS)
+            if used:
+                print(f"Error: {prog['source']}: {', '.join(sorted(used))} need a "
+                      f"device with gesture recognizers (caps.gestures); "
+                      f"the firmware has no gesture opcodes",
                       file=sys.stderr)
                 sys.exit(1)
         image_data = compile_program(str(source), include_dirs=include_dirs,

@@ -579,6 +579,8 @@ BUILTIN_SIGNATURES = {
     'fileWriteStr': {'sig': 'fileWriteStr(handle, str) -> int', 'desc': 'Write the bytes of a string to a diskOpen file. Bytes written or DISK_ERR_*.'},
     'fileWriteArr': {'sig': 'fileWriteArr(handle, arr, count) -> int', 'desc': 'Write the low byte of each of arr[0..count]. Bytes written or DISK_ERR_*.'},
     'fileReadArr': {'sig': 'fileReadArr(handle, arr, count) -> int', 'desc': 'Read up to `count` bytes into arr[0..] (diskOpen or fileOpen handles). Bytes read, 0 at the end.'},
+    'onGesture':   {'sig': 'onGesture(widget, mask, @handler)', 'desc': 'Flutter-style gesture recognizers (caps.gestures, lib/gesture.fl): the widget takes part in the GESTURE_* recognizers of `mask`, which compete in an arena per touch and report to handler(widget, event) with GE_* events. mask 0 removes them.'},
+    'gestureInfo': {'sig': 'gestureInfo(field) -> int', 'desc': 'Inside a gesture handler: a detail (GI_*) of the event it was called for (position, deltas, velocity, scale x1000, rotation in milliradians...). 0 elsewhere.'},
 }
 
 PROP_DOCS = {

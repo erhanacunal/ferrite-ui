@@ -1,0 +1,77 @@
+// gesture.fl — Flutter-style gesture recognizers (devices with caps.gestures:
+// the Exynos 4412 tablet and the sim, ferrite-ui-xl gesture.rs)
+// Usage: #include "gesture.fl"
+//
+//   onGesture(widget, mask, @handler)  — the widget takes part in the
+//                                        recognizers of `mask` (GESTURE_*
+//                                        or-ed), reporting to
+//                                        fn handler(widget, event); 0 removes
+//   gestureInfo(field)                 — inside the handler: a GI_* detail
+//                                        of the event it was called for
+//
+// Every finger that goes down opens an arena: the recognizers of the widget
+// under it and of each of its ancestors compete (the deepest widget first,
+// as Flutter's hit test). A recognizer wins by accepting (a drag past its
+// slop, a long press after 500 ms, a second finger for scale) or as the
+// last one left; at the finger's release the deepest still in wins. The
+// others get their cancel. on_click / on_tap take part as a tap, and a
+// scroll container (clip_children) as a vertical drag, so a drag on a list
+// row scrolls the list and the row's click is cancelled.
+//
+// Slops (px): tap / drag / scale 18, pan 36. Times (ms): long press 500,
+// double tap 300 between the taps (and the second within 100 px).
+// Velocities (px/s) are given at drag / scale / long-press ends: 0 = below
+// the fling minimum (50).
+
+// --- Recognizers (mask bits). Keep in sync with ferrite-core gesture.rs G_* ---
+const GESTURE_TAP        = 1;   // GE_TAP_DOWN, GE_TAP_UP, GE_TAP, GE_TAP_CANCEL
+const GESTURE_DOUBLE_TAP = 2;   // GE_DOUBLE_TAP (delays a single GESTURE_TAP's GE_TAP)
+const GESTURE_LONG_PRESS = 4;   // GE_LONG_PRESS_START / _MOVE / _END
+const GESTURE_PAN        = 8;   // GE_DRAG_* in any direction
+const GESTURE_HDRAG      = 16;  // GE_DRAG_* along x only
+const GESTURE_VDRAG      = 32;  // GE_DRAG_* along y only
+const GESTURE_SCALE      = 64;  // GE_SCALE_*: one finger pans, two scale and rotate
+const GESTURE_TAP_DRAG   = 128; // GE_TAP_DRAG_*: tap, double tap, then drag (text selection)
+const GESTURE_ALL        = 255;
+
+// --- Events (the handler's 2nd argument). Keep in sync with gesture.rs ev ---
+const GE_TAP_DOWN         = 1;  // a finger may be tapping (after 100 ms, or at once on release)
+const GE_TAP_UP           = 2;
+const GE_TAP              = 3;  // after GE_TAP_UP
+const GE_TAP_CANCEL       = 4;  // after GE_TAP_DOWN, the tap lost
+const GE_DOUBLE_TAP       = 5;
+const GE_LONG_PRESS_START = 6;
+const GE_LONG_PRESS_MOVE  = 7;
+const GE_LONG_PRESS_END   = 8;  // GI_VX / GI_VY
+const GE_DRAG_START       = 9;
+const GE_DRAG_UPDATE      = 10; // GI_DX / GI_DY since the last, GI_TOTAL_X / _Y
+const GE_DRAG_END         = 11; // GI_VX / GI_VY
+const GE_SCALE_START      = 12;
+const GE_SCALE_UPDATE     = 13; // GI_SCALE, GI_ROTATION, focal point GI_X / GI_Y
+const GE_SCALE_END        = 14;
+const GE_TAP_DRAG_DOWN    = 15; // GI_TAPS = consecutive taps
+const GE_TAP_DRAG_UP      = 16;
+const GE_TAP_DRAG_START   = 17;
+const GE_TAP_DRAG_UPDATE  = 18;
+const GE_TAP_DRAG_END     = 19;
+const GE_TAP_DRAG_CANCEL  = 20;
+
+// --- Details (gestureInfo). Keep in sync with gesture.rs field ---
+const GI_X        = 0;  // screen position (scale: the focal point)
+const GI_Y        = 1;
+const GI_LOCAL_X  = 2;  // position in the widget's box
+const GI_LOCAL_Y  = 3;
+const GI_DX       = 4;  // movement since the last update
+const GI_DY       = 5;
+const GI_TOTAL_X  = 6;  // offset from where the gesture started
+const GI_TOTAL_Y  = 7;
+const GI_VX       = 8;  // velocity in px/s at the end (0 = no fling)
+const GI_VY       = 9;
+const GI_SCALE    = 10; // x 1000 (1000 = the size at the start)
+const GI_HSCALE   = 11; // horizontal span only, x 1000
+const GI_VSCALE   = 12; // vertical span only, x 1000
+const GI_ROTATION = 13; // milliradians since the start, -3141..3141 (clockwise > 0)
+const GI_POINTERS = 14; // fingers down (scale)
+const GI_TAPS     = 15; // consecutive taps (tap and drag)
+const GI_KIND     = 16; // the GESTURE_* that sent the event
+const GI_TIME     = 17; // ms since the first finger went down

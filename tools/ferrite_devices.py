@@ -21,7 +21,9 @@ in sync by hand:
     caps.native_flex <-> CAP_NATIVE_FLEX (ferrite-ui-xl: flexLayout() is
     the FLEX_LAYOUT opcode instead of lib/flex.fl's function);
     caps.storage <-> CAP_STORAGE (ferrite-ui-xl: the diskOpen / fileWrite /
-    diskMkdir ... builtins, ferrite-core storage.rs). A missing
+    diskMkdir ... builtins, ferrite-core storage.rs); caps.gestures <->
+    CAP_GESTURES (ferrite-ui-xl: onGesture / gestureInfo, ferrite-core
+    gesture.rs). A missing
     cap reads as false, so the fallback boards below leave it out.
 """
 

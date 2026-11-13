@@ -1616,6 +1616,61 @@ fn list(dir) {
 
 On the tablet the EEPROM builtins (`eepromRead` / `eepromWrite`…) work too: 4096 bytes kept in `FERRITE/EEPROM.BIN`, saved about 0.5 s after the last write and before a restart.
 
+## Gestures
+
+Devices with `caps.gestures` (the Exynos 4412 tablet and the sim, ferrite-ui-xl) recognize gestures the way Flutter does. `#include "gesture.fl"` for the constants. Building a program that calls these for a device without `caps.gestures` fails.
+
+```c
+onGesture(widget, mask, @handler);   // fn handler(widget, event)
+gestureInfo(field)                   // inside the handler: a detail of that event
+```
+
+`mask` or-s the recognizers the widget takes part in; `onGesture(w, 0, @h)` removes them. A handler takes exactly two parameters, the widget and the event (`GE_*`), and reads the event's details with `gestureInfo(GI_*)`: each queued event keeps its own, so a handler always sees the values of the event it was called for. It runs in the task that called `onGesture`.
+
+| Recognizer | Events | Wins |
+| --- | --- | --- |
+| `GESTURE_TAP` | `GE_TAP_DOWN`, `GE_TAP_UP` + `GE_TAP`, or `GE_TAP_CANCEL` | at release, if nothing else won and the finger stayed within 18 px |
+| `GESTURE_DOUBLE_TAP` | `GE_DOUBLE_TAP` | a second tap within 300 ms and 100 px; it holds the first tap's result back until then |
+| `GESTURE_LONG_PRESS` | `GE_LONG_PRESS_START`, `_MOVE`, `_END` (`GI_VX`/`GI_VY`) | held 500 ms within 18 px |
+| `GESTURE_PAN` / `GESTURE_HDRAG` / `GESTURE_VDRAG` | `GE_DRAG_START`, `GE_DRAG_UPDATE` (`GI_DX`/`GI_DY`, `GI_TOTAL_X`/`_Y`), `GE_DRAG_END` (`GI_VX`/`GI_VY`, 0 below a fling) | moved past 36 px (pan) / 18 px along its axis |
+| `GESTURE_SCALE` | `GE_SCALE_START`, `GE_SCALE_UPDATE` (`GI_SCALE`, `GI_HSCALE`, `GI_VSCALE` ×1000, `GI_ROTATION` in milliradians, focal point `GI_X`/`GI_Y`, `GI_DX`/`GI_DY`, `GI_POINTERS`), `GE_SCALE_END` | moved 18 px, or a second finger; with one finger it is a pan |
+| `GESTURE_TAP_DRAG` | `GE_TAP_DRAG_DOWN` (`GI_TAPS`: 1, 2 = double tap, …), `_UP`, `_START`, `_UPDATE`, `_END`, `_CANCEL` | as a tap, or a drag after it (text-selection style) |
+
+Every detail also has `GI_X`/`GI_Y` (screen), `GI_LOCAL_X`/`GI_LOCAL_Y` (in the widget's box), `GI_KIND` (the `GESTURE_*` that sent it) and `GI_TIME` (ms since the first finger went down).
+
+**The arena:** each finger that goes down collects the recognizers of the widget under it and of all its ancestors, the deepest first. They compete for that finger: one that accepts (a drag past its slop, a long press after 500 ms) wins and the others are cancelled; at release the deepest one still in wins. `on_click`/`on_tap` take part as a tap, and a scroll container (`clip_children`) as a vertical drag that scrolls it and keeps going (a fling) when let go with speed; touching a flinging list stops it. So a drag that starts on a list row scrolls the list, and the row's press is cancelled.
+
+```c
+#include "gesture.fl"
+
+var photo;
+var zoom = 1000;
+
+fn photo_gesture(w, e) {
+    if (e == GE_SCALE_UPDATE) {
+        var s = zoom * gestureInfo(GI_SCALE) / 1000;
+        target(w);
+        set(size_w, 320 * s / 1000);
+        // GI_ROTATION, GI_DX / GI_DY are there too
+    } else if (e == GE_SCALE_END) {
+        target(photo);
+        zoom = get(size_w) * 1000 / 320;
+    } else if (e == GE_DOUBLE_TAP) {
+        zoom = 1000;
+        target(photo);
+        set(size_w, 320);
+    }
+}
+
+fn setup() {
+    photo = alloc(KIND_IMAGE);
+    // ...
+    onGesture(photo, GESTURE_SCALE | GESTURE_DOUBLE_TAP, @photo_gesture);
+}
+```
+
+The global `on_swipe` / `on_long_press` / `on_touch_*` callbacks are unchanged and run next to the recognizers.
+
 ## Animation
 
 Tween a widget's scalar property from its current value to a target over time.

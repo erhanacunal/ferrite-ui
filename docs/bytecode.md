@@ -363,6 +363,13 @@ Writable storage (`caps.storage`, ferrite-ui-xl `storage.rs`; elsewhere bad opco
 | `0xE4` | `fileWriteStr` | pop `str_id`, pop `handle`; write the string's bytes; push the bytes written or an error |
 | `0xE5` | `fileReadArr` | pop `count`, pop `arr`, pop `handle`; read up to `count` bytes into `arr[0..]`; push the bytes read (`0` at the end) or an error. Takes a resource file's handle too |
 
+Gesture recognizers (`caps.gestures`, ferrite-ui-xl `gesture.rs`; elsewhere bad opcodes). Constants in `lib/gesture.fl`.
+
+| Opcode | Name | Stack effect |
+| --- | --- | --- |
+| `0xE6` | `onGesture` | pop `func_id` (1-based, as `@fn` pushes), pop `mask` (`GESTURE_*` bits), pop `widget`; register the widget's recognizers for the running task (`mask` 0, a dead widget or `func_id` ≤ 0 removes them). Pushes nothing. The handler is called as `handler(widget, event)` |
+| `0xE7` | `gestureInfo` | pop `field` (`GI_*`); push that detail of the gesture event the running handler was called for (`0` outside a gesture handler or for an unknown field) |
+
 ## Widget Properties
 
 Scalar properties are used by `W_SET` and `W_GET`.
