@@ -200,6 +200,7 @@ A missing page, a block past its end or a malformed op is VM fault 15
 | `0x19` | `ARR_LEN` | - | pop array id, push length |
 | `0x1B` | `ARR_FREE` | - | pop array id and free it |
 | `0x3E` | `ARR_ALLOC` | `u8 size` | allocate zero-filled array, push array id |
+| `0x2E` | `ARR_ALLOC_S` | — | pop `size`, allocate a zero-filled array, push array id (a negative size or a full pool faults 17). Emitted for arrays of more than 255 elements (and constant initializer lists that long: allocated, then the non-zero values stored); smaller ones use `ARR_ALLOC` / `ARR_INIT` |
 | `0x3F` | `ARR_INIT` | `u8 count, count*i32 LE` | allocate initialized array, push array id |
 | `0x40` | `F_READ` | `u32 addr, u16 len` | read flash bytes into array, push array id |
 | `0x41` | `F_WRITE` | `u32 addr, u8 len, bytes` | write inline bytes to flash |

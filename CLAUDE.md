@@ -154,7 +154,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - **37 opcodes:** stack ops (PUSH/POP/DUP/SWAP), arithmetic (ADD/SUB/MUL/DIV/MOD/NEG), comparison (EQ/NE/LT/LE/GT/GE), logic (AND/OR/NOT), control (JMP/JZ/JNZ/CALL/RET/YIELD/HALT), widget (W_TARGET/W_SET/W_GET/W_DIRTY/W_RENDER/W_ALLOC/W_PARENT), flash (F_READ/F_WRITE)
 - **Opcode 0–15:** 1-byte tag (frequent), **16+:** 2-byte tag (rare)
 - **W_ALLTAR opcode (0x1C):** combined alloc + store + target (saves 5 bytes per widget)
-- **Vm struct:** eval stack (32-deep), vars (sparse Vec, max 256), call stack (16-deep). Arrays are `T_ARRAY` objects in `ctx.objs` (array id = pointer); pool full → fault 17 (`ARR_ALLOC`)
+- **Vm struct:** eval stack (32-deep), vars (sparse Vec, max 256), call stack (16-deep). Arrays are `T_ARRAY` objects in `ctx.objs` (array id = pointer); pool full → fault 17 (`ARR_ALLOC`). `ARR_ALLOC` takes a u8 size: bigger arrays compile to `PUSH size; ARR_ALLOC_S` (0x2E), and a constant initializer over 255 elements to that + stores of its non-zero values (`ARR_INIT`'s count is a u8 too)
 - **Property R/W:** scalar (W_SET wt=0, single value from stack) and compound (W_SET wt=2, LEN payload with multiple zigzag varints)
 - **Builder:** builds bytecode in RAM, forward jump patching, writes to `&mut [u8]` buffer
 - **Execution:** `vm.run(&code[..len], &mut tree, &mut lcd, &flash)` — F_READ/F_WRITE operate via flash

@@ -332,6 +332,8 @@ const OP_W_GET: u8 = 0x3B; // + u8 prop_id
 const OP_W_PARENT: u8 = 0x3C; // + u8 parent_id
 const OP_W_SET_LEN: u8 = 0x3D; // + u8 prop_id + u8 len + data
 const OP_ARR_ALLOC: u8 = 0x3E; // + u8 size
+/// Pop size, push a zero-filled array (sizes over 255; `ARR_ALLOC` takes a u8).
+const OP_ARR_ALLOC_S: u8 = 0x2E;
 const OP_ARR_INIT: u8 = 0x3F; // + u8 count + i32 values LE
 const OP_F_READ: u8 = 0x40; // + u32 addr + u16 len
 const OP_F_WRITE: u8 = 0x41; // + u32 addr + u8 len + data
@@ -2013,6 +2015,13 @@ impl Vm {
             OP_ARR_ALLOC => {
                 let size = self.read_u8() as usize;
                 match ctx.objs.arr_alloc(size) {
+                    Some(id) => self.push(id as i32),
+                    None => self.fail(fault::ARR_ALLOC),
+                }
+            }
+            OP_ARR_ALLOC_S => {
+                let size = self.pop();
+                match usize::try_from(size).ok().and_then(|n| ctx.objs.arr_alloc(n)) {
                     Some(id) => self.push(id as i32),
                     None => self.fail(fault::ARR_ALLOC),
                 }

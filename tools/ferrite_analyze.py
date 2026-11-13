@@ -116,7 +116,7 @@ OPCODE_CATEGORIES = {
     Op.W_SET_LEN: CATEGORY_WIDGET, Op.W_LOAD: CATEGORY_WIDGET,
     Op.W_DIRTY: CATEGORY_WIDGET, Op.W_RENDER: CATEGORY_WIDGET,
     # Array
-    Op.ARR_ALLOC: CATEGORY_ARRAY, Op.ARR_INIT: CATEGORY_ARRAY,
+    Op.ARR_ALLOC: CATEGORY_ARRAY, Op.ARR_ALLOC_S: CATEGORY_ARRAY, Op.ARR_INIT: CATEGORY_ARRAY,
     Op.ARR_LOAD: CATEGORY_ARRAY, Op.ARR_STORE: CATEGORY_ARRAY,
     Op.ARR_LEN: CATEGORY_ARRAY, Op.ARR_FREE: CATEGORY_ARRAY,
     # Drawing builtins
@@ -804,7 +804,7 @@ def analyze_bytecode(data, opcode_start=0, opcode_end=None, wide=False):
                 result.max_local_frame = frame_size
 
         # Array tracking
-        if op in (Op.ARR_ALLOC, Op.ARR_INIT):
+        if op in (Op.ARR_ALLOC, Op.ARR_ALLOC_S, Op.ARR_INIT):
             result.arr_allocs += 1
         if op == Op.ARR_FREE:
             result.arr_frees += 1

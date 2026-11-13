@@ -94,6 +94,7 @@ class Op:
     W_PARENT   = 0x3C  # + u8 parent_id
     W_SET_LEN  = 0x3D  # + u8 prop_id + u8 len + data (compound prop)
     ARR_ALLOC  = 0x3E  # + u8 size
+    ARR_ALLOC_S = 0x2E  # pop size, push array id (sizes over 255)
     ARR_INIT   = 0x3F  # + u8 count + i32 values (LE)
     F_READ     = 0x40  # + u32 addr + u16 len
     F_WRITE    = 0x41  # + u32 addr + u8 len + data
@@ -868,12 +869,33 @@ class Asm:
     # --- Array ops ---
 
     def arr_alloc(self, size):
-        """Allocate zero-filled array. Pushes array_id."""
+        """Allocate zero-filled array. Pushes array_id.
+
+        ARR_ALLOC's size is one byte; bigger arrays push the size and use
+        ARR_ALLOC_S (smaller ones compile as before)."""
+        if not 0 <= size <= 0xFF:
+            if size < 0:
+                raise ValueError(f"negative array size {size}")
+            self.push(size)
+            self._emit(Op.ARR_ALLOC_S)
+            return
         self._emit(Op.ARR_ALLOC)
         self._emit_u8(size)
 
     def arr_alloc_init(self, values):
-        """Allocate and init array from values. Pushes array_id."""
+        """Allocate and init array from values. Pushes array_id.
+
+        ARR_INIT's count is one byte: a longer list is allocated zero-filled
+        and its non-zero values stored one by one."""
+        if len(values) > 0xFF:
+            self.arr_alloc(len(values))
+            for i, v in enumerate(values):
+                if v:
+                    self.dup()
+                    self.push(i)
+                    self.push(v)
+                    self.arr_store()
+            return
         self._emit(Op.ARR_INIT)
         self._emit_u8(len(values))
         for v in values:
@@ -1184,6 +1206,7 @@ OP_NAMES = {
     0x33: 'LOAD', 0x34: 'STORE',
     0x35: 'JMP', 0x36: 'JZ', 0x37: 'JNZ', 0x38: 'CALL',
     0x39: 'W_TARGET', 0x3A: 'W_SET', 0x3B: 'W_GET', 0x3C: 'W_PARENT',
+    0x2E: 'ARR_ALLOC_S',
     0x3D: 'W_SET_LEN', 0x3E: 'ARR_ALLOC', 0x3F: 'ARR_INIT',
     0x40: 'F_READ', 0x41: 'F_WRITE',
     0x42: 'W_TARGET_S',
@@ -1275,7 +1298,7 @@ def superop_size(op, wide=False):
 _NO_ARG_OPS = (
     set(range(0x00, 0x1C)) |           # 0x00-0x1B
     {0x1E, 0x1F} |                     # SHL, SHR
-    set(range(0x20, 0x2E)) |           # 0x20-0x2D
+    set(range(0x20, 0x2F)) |           # 0x20-0x2D, ARR_ALLOC_S
     {0x42, 0x43} |                     # W_TARGET_S, W_PARENT_S
     {op for op in range(0x80, 0xA9)    # 0x80-0xA8 except 0x86, 0x88
      if op not in (0x86, 0x88)} |
