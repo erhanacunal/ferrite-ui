@@ -77,6 +77,7 @@ from pathlib import Path
 # ferrite_cc ve ferrite_img'den import
 sys.path.insert(0, str(Path(__file__).parent))
 import ferrite_devices
+import ferrite_font_converter
 
 # --- Constants (fs.rs ile birebir aynı) ---
 
@@ -548,23 +549,23 @@ def build(project_path: str, output_path: str | None) -> dict:
         font_path = project_dir / font["file"]
         font_data = bytearray(font_path.read_bytes())
 
-        # Patch the project-assigned font_id into the header. The byte offset
-        # differs by format: V1 (legacy 1bpp) keeps font_id at byte 3, while
-        # V2 (2bpp, magic 0x00 0x02) keeps it at byte 5 — byte 3 there is the
-        # high byte of num_glyphs, so writing to it corrupts the glyph count.
-        if len(font_data) < 4:
-            print(f"Error: font '{name}' binary too small ({len(font_data)} bytes)", file=sys.stderr)
+        # V1 (1bpp) / V2 (2bpp) / V3 (wide metrics: glyphs over 255 px, bitmaps
+        # over 64 KB). caps.font_v3 devices (ferrite-ui-xl) get every font as V3
+        # (a lossless repack: same pixels); others can't read V3.
+        font_v3 = bool(device and device["caps"].get("font_v3"))
+        try:
+            if font_v3:
+                font_data = bytearray(ferrite_font_converter.to_v3(font_data))
+            hdr = ferrite_font_converter.parse_header(font_data)
+        except ValueError as e:
+            print(f"Error: font '{name}': {e}", file=sys.stderr)
             sys.exit(1)
-        if font_data[0] == 0x00 and font_data[1] == 0x02:
-            # V2: [0..1]=magic, [2..3]=num_glyphs, [4]=y_adv, [5]=font_id, [6]=bpp
-            if len(font_data) < 7:
-                print(f"Error: font '{name}' V2 binary too small ({len(font_data)} bytes)",
-                      file=sys.stderr)
-                sys.exit(1)
-            font_data[5] = font_id
-        else:
-            # V1: [0..1]=num_glyphs, [2]=y_adv, [3]=font_id
-            font_data[3] = font_id
+        if hdr["version"] == 3 and not font_v3:
+            print(f"Error: font '{name}' is a V3 font; device '{device_id}' reads "
+                  f"V1/V2 only (no caps.font_v3)", file=sys.stderr)
+            sys.exit(1)
+        # Patch the project-assigned font_id into the header (byte 3 / 5 / 6 for V1 / V2 / V3).
+        font_data[hdr["font_id_at"]] = font_id
 
         resources.append((name, RES_FONT, bytes(font_data), 0))
 

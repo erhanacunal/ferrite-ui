@@ -23,7 +23,9 @@ in sync by hand:
     caps.storage <-> CAP_STORAGE (ferrite-ui-xl: the diskOpen / fileWrite /
     diskMkdir ... builtins, ferrite-core storage.rs); caps.gestures <->
     CAP_GESTURES (ferrite-ui-xl: onGesture / gestureInfo, ferrite-core
-    gesture.rs). A missing
+    gesture.rs); caps.font_v3 (ferrite-ui-xl, build-time only: no CAPS bit)
+    <-> ferrite-core font.rs reading V3 font resources (wide glyph metrics):
+    ferrite_build repacks every font as V3, the Designer generates V3. A missing
     cap reads as false, so the fallback boards below leave it out.
 """
 

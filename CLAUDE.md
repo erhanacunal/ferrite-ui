@@ -377,7 +377,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
   - Transparent: only fg pixels via `fill_rect(1,1)` (slow, background preserved)
 - **API:** `draw_char(ch: char)`, `draw_str(text: &[u8])` (UTF-8), `char_width()`, `char_width_cp(u16)`, `text_width()`, `line_height()`
 - **UTF-8:** `font::utf8_next(bytes, pos)` decodes one BMP codepoint; returns `Some(0xFFFF)` for invalid sequences
-- **Tool:** `tools/ferrite_font_converter.py` — TrueType → sparse binary; supports `-r` range spec (e.g. `32-127,0x011E-0x011F`)
+- **Tool:** `tools/ferrite_font_converter.py` — TrueType → sparse binary; supports `-r` range spec (e.g. `32-127,0x011E-0x011F`). `--v3`: V3 layout (magic `00 03`, 14-byte glyphs: offset u32, w/h/advance u16, offsets i16; u16 line height) for fonts past V1/V2's limits (~130pt at 96 DPI); read only by ferrite-ui-xl (`caps.font_v3`: `ferrite_build` repacks every font of those projects as V3, the Designer generates V3)
 - **RAM cost:** N × 9B (codepoints + glyphs) per font; bitmap read in 128B chunks
 
 ## Project Name

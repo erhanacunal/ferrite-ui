@@ -322,8 +322,10 @@ def _is_sparse_font(data):
     """
     if len(data) < 4:
         return False
-    # V2 (2bpp anti-aliased): magic bytes 0x00, 0x02 at positions 0-1.
+    # V2 (2bpp anti-aliased) / V3 (wide metrics): magic 0x00, 0x02 / 0x00, 0x03.
     if len(data) >= 7 and data[0] == 0x00 and data[1] == 0x02:
+        return True
+    if len(data) >= 8 and data[0] == 0x00 and data[1] == 0x03 and data[7] in (1, 2):
         return True
     n = _struct.unpack_from("<H", data, 0)[0]
     if n == 0 or n > 0x3FFF:
@@ -374,9 +376,19 @@ class GfxFontPreview:
     def __init__(self, binary):
         if len(binary) < 4:
             raise ValueError("font binary too short")
-        # V2 (2bpp): 7-byte header  magic(0x00,0x02) + n u16 + y_adv + font_id + bpp
-        # V1 (1bpp): 4-byte header  n u16 + y_adv + font_id
-        if len(binary) >= 7 and binary[0] == 0x00 and binary[1] == 0x02:
+        # V3 (wide):  8-byte header  magic(0x00,0x03) + n u16 + y_adv u16 + font_id + bpp,
+        #             14-byte glyphs (offset u32, w/h/x_adv u16, x_off/y_off i16)
+        # V2 (2bpp):  7-byte header  magic(0x00,0x02) + n u16 + y_adv + font_id + bpp
+        # V1 (1bpp):  4-byte header  n u16 + y_adv + font_id
+        # (ferrite_font_converter.parse_header / ferrite-ui-xl font::Header::read)
+        glyph_fmt = "<HBBBbb"
+        if (len(binary) >= 8 and binary[0] == 0x00 and binary[1] == 0x03
+                and binary[7] in (1, 2)):
+            n, self.y_advance = _struct.unpack_from("<HH", binary, 2)
+            self.bpp = binary[7]
+            hdr_len = 8
+            glyph_fmt = "<IHHHhh"
+        elif len(binary) >= 7 and binary[0] == 0x00 and binary[1] == 0x02:
             n = _struct.unpack_from("<H", binary, 2)[0]
             self.y_advance = binary[4]
             self.bpp = binary[6]
@@ -387,22 +399,16 @@ class GfxFontPreview:
             self.bpp = 1
             hdr_len = 4
         # font_id not needed for rendering
+        rec = _struct.calcsize(glyph_fmt)
         cp_end = hdr_len + n * 2
-        glyph_end = cp_end + n * 7
+        glyph_end = cp_end + n * rec
         if len(binary) < glyph_end:
             raise ValueError("font binary truncated")
         self.codepoints = [_struct.unpack_from("<H", binary, hdr_len + i * 2)[0]
                            for i in range(n)]
-        self.glyphs = []  # (bitmap_offset, w, h, x_advance, x_offset, y_offset)
-        for i in range(n):
-            off = cp_end + i * 7
-            bm_off = _struct.unpack_from("<H", binary, off)[0]
-            w = binary[off + 2]
-            h = binary[off + 3]
-            x_adv = binary[off + 4]
-            x_off = binary[off + 5] if binary[off + 5] < 128 else binary[off + 5] - 256
-            y_off = binary[off + 6] if binary[off + 6] < 128 else binary[off + 6] - 256
-            self.glyphs.append((bm_off, w, h, x_adv, x_off, y_off))
+        # (bitmap_offset, w, h, x_advance, x_offset, y_offset)
+        self.glyphs = [_struct.unpack_from(glyph_fmt, binary, cp_end + i * rec)
+                       for i in range(n)]
         self.bitmap = binary[glyph_end:]
 
     def _find(self, cp):
@@ -2909,6 +2915,9 @@ class ResourcePanel(QWidget):
             if tools_dir not in sys.path:
                 sys.path.insert(0, tools_dir)
             from ferrite_font_converter import rasterize, write_resource, parse_ranges
+            import ferrite_font_converter as _conv
+            if _conv.freetype is None:
+                raise _conv._FREETYPE_ERROR
         except ImportError as e:
             QMessageBox.critical(
                 self, "Missing dependency",
@@ -2921,6 +2930,8 @@ class ResourcePanel(QWidget):
         sizes = dlg.sizes()
         ranges_spec = dlg.ranges_spec()
         bpp = dlg.bpp()
+        # caps.font_v3 devices (ferrite-ui-xl) read V3: glyphs over 255 px (~130pt).
+        version = 3 if device_spec(self.model.device_id)["caps"].get("font_v3") else None
         basename = (os.path.splitext(os.path.basename(font_path))[0]
                     .lower().replace(" ", "_"))
 
@@ -2960,7 +2971,7 @@ class ResourcePanel(QWidget):
             try:
                 bitmap, table, y_advance = rasterize(font_path, size, codes, bpp)
                 buf = _io.BytesIO()
-                write_resource(bitmap, table, y_advance, next_id, bpp, buf)
+                write_resource(bitmap, table, y_advance, next_id, bpp, buf, version)
                 self.model.fonts.append({
                     "name": name,
                     "font_id": next_id,

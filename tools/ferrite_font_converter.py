@@ -28,9 +28,24 @@ BINARY RESOURCE LAYOUT
                                 each pixel = 2 bits: 0=0%, 1=33%, 2=67%, 3=100%
                                 each glyph padded to a byte boundary
 
-  Glyph entry (7 bytes):
+  V3 (wide metrics, --v3; ferrite-ui-xl devices only, caps.font_v3):
+    [0..1]           magic        0x00, 0x03
+    [2..3]           num_glyphs   u16 LE
+    [4..5]           y_advance    u16 LE
+    [6]              font_id      u8
+    [7]              bpp          u8 (1 or 2)
+    [8..8+N*2]       codepoints   N x u16 LE, sorted ascending
+    [8+N*2..8+N*16]  glyphs       N x 14 bytes
+    [8+N*16..]       bitmap       as V1 (bpp 1) / V2 (bpp 2)
+
+  Glyph entry, V1/V2 (7 bytes):
     bitmapOffset u16 LE, width u8, height u8,
     xAdvance u8, xOffset i8, yOffset i8
+  Glyph entry, V3 (14 bytes, LE):
+    bitmapOffset u32, width u16, height u16,
+    xAdvance u16, xOffset i16, yOffset i16
+  V1/V2 limit glyphs to 255 px (offsets -128..127) and bitmaps to 64 KB:
+  around 130pt at 96 DPI; V3 has no practical limit.
 
 RUST CODE OUTPUT  (arrays for use as an embedded ROM font):
   pub const Y_ADVANCE:  u8           = ...;
@@ -53,19 +68,26 @@ Requires: freetype-py  (pip install freetype-py)
 """
 
 import argparse
+import io
 import os
 import struct
 import sys
 
-import freetype
-from freetype import (
-    FT_LOAD_DEFAULT,
-    FT_LOAD_TARGET_MONO,
-    FT_RENDER_MODE_MONO,
-    FT_RENDER_MODE_NORMAL,
-    FT_Property_Set,
-    FT_UInt,
-)
+# freetype-py is only needed to rasterize: ferrite_build imports this module for
+# the resource layout helpers (parse_header / read_resource / to_v3) without it.
+try:
+    import freetype
+    from freetype import (
+        FT_LOAD_DEFAULT,
+        FT_LOAD_TARGET_MONO,
+        FT_RENDER_MODE_MONO,
+        FT_RENDER_MODE_NORMAL,
+        FT_Property_Set,
+        FT_UInt,
+    )
+except ImportError as _e:
+    freetype = None
+    _FREETYPE_ERROR = _e
 
 DPI = 96
 TT_INTERPRETER_VERSION_35 = 35
@@ -173,6 +195,8 @@ def rasterize(font_path, size, codes, bpp=1):
                     metrics: bitmapOffset, width, height, xAdvance, xOffset, yOffset
       y_advance     int                  -- line height in pixels
     """
+    if freetype is None:
+        raise ImportError(f"freetype-py is required to rasterize fonts: {_FREETYPE_ERROR}")
     library = freetype.FT_Library()
     if freetype.FT_Init_FreeType(freetype.byref(library)):
         raise RuntimeError("FreeType init failed")
@@ -341,24 +365,40 @@ def _zero_glyph(bmap_offset):
 
 # ── output: binary resource ───────────────────────────────────────────────────
 
-def write_resource(bitmap, table, y_advance, font_id, bpp, out):
+V3_MAGIC = b"\x00\x03"
+GLYPH_V2 = 7
+GLYPH_V3 = 14
+
+
+def _check(code, name, v, lo, hi, hint):
+    if not lo <= v <= hi:
+        raise ValueError(f"U+{code:04X} {name}={v} out of range {lo}..{hi}{hint}")
+
+
+def write_resource(bitmap, table, y_advance, font_id, bpp, out, version=None):
     """
     Write the binary font resource to `out` (binary-mode file or buffer).
 
-    V1 (bpp=1):  4-byte header  | N*2 codepoints | N*7 glyphs | bitmap
-    V2 (bpp>=2): 7-byte header  | N*2 codepoints | N*7 glyphs | bitmap
+    V1 (bpp=1):  4-byte header  | N*2 codepoints | N*7 glyphs  | bitmap
+    V2 (bpp>=2): 7-byte header  | N*2 codepoints | N*7 glyphs  | bitmap
+    V3 (version=3, any bpp):
+                 8-byte header  | N*2 codepoints | N*14 glyphs | bitmap
+    `version` None = V1 or V2 by bpp.
     """
-    if not (0 <= y_advance <= 255):
-        max_pt = int(255 * 72 / DPI)
-        raise ValueError(
-            f"y_advance={y_advance}px exceeds u8 max (255); "
-            f"reduce point size — try ≤{max_pt}pt at {DPI} DPI")
-
+    v3 = version == 3
     n = len(table)
-    if bpp == 1:
-        out.write(struct.pack("<HBB", n, y_advance, font_id))
+    hint = "" if v3 else ": too large for V1/V2; use V3 (--v3, ferrite-ui-xl devices)"
+    if v3:
+        if not 0 <= y_advance <= 0xFFFF:
+            raise ValueError(f"y_advance={y_advance}px exceeds u16 max")
+        out.write(V3_MAGIC + struct.pack("<HHBB", n, y_advance, font_id, bpp))
     else:
-        out.write(struct.pack("<BBHBBB", 0x00, 0x02, n, y_advance, font_id, bpp))
+        if not 0 <= y_advance <= 255:
+            raise ValueError(f"y_advance={y_advance}px exceeds u8 max (255){hint}")
+        if bpp == 1:
+            out.write(struct.pack("<HBB", n, y_advance, font_id))
+        else:
+            out.write(struct.pack("<BBHBBB", 0x00, 0x02, n, y_advance, font_id, bpp))
 
     for code, _g in table:
         out.write(struct.pack("<H", code))
@@ -366,22 +406,72 @@ def write_resource(bitmap, table, y_advance, font_id, bpp, out):
         bmo = g["bitmapOffset"]
         w, h, xa = g["width"], g["height"], g["xAdvance"]
         xo, yo = g["xOffset"], g["yOffset"]
-        if bmo > 65535:
-            raise ValueError(
-                f"U+{code:04X} bitmapOffset={bmo} exceeds u16 max (65535); "
-                f"bitmap too large — use fewer/smaller glyphs")
-        if w > 255:
-            raise ValueError(f"U+{code:04X} width={w}px exceeds u8 max (255)")
-        if h > 255:
-            raise ValueError(f"U+{code:04X} height={h}px exceeds u8 max (255)")
-        if not (0 <= xa <= 255):
-            raise ValueError(f"U+{code:04X} xAdvance={xa}px out of u8 range 0-255")
-        if not (-128 <= xo <= 127):
-            raise ValueError(f"U+{code:04X} xOffset={xo}px out of i8 range -128..127")
-        if not (-128 <= yo <= 127):
-            raise ValueError(f"U+{code:04X} yOffset={yo}px out of i8 range -128..127")
-        out.write(struct.pack("<HBBBbb", bmo, w, h, xa, xo, yo))
+        if v3:
+            _check(code, "bitmapOffset", bmo, 0, 0xFFFFFFFF, "")
+            for name, val in (("width", w), ("height", h), ("xAdvance", xa)):
+                _check(code, name, val, 0, 0xFFFF, "")
+            for name, val in (("xOffset", xo), ("yOffset", yo)):
+                _check(code, name, val, -0x8000, 0x7FFF, "")
+            out.write(struct.pack("<IHHHhh", bmo, w, h, xa, xo, yo))
+        else:
+            _check(code, "bitmapOffset", bmo, 0, 0xFFFF, hint)
+            for name, val in (("width", w), ("height", h), ("xAdvance", xa)):
+                _check(code, name, val, 0, 255, hint)
+            for name, val in (("xOffset", xo), ("yOffset", yo)):
+                _check(code, name, val, -128, 127, hint)
+            out.write(struct.pack("<HBBBbb", bmo, w, h, xa, xo, yo))
     out.write(bitmap)
+
+
+def parse_header(data):
+    """A font resource's header: dict(version, num_glyphs, y_advance, font_id,
+    font_id_at, bpp, hdr_len, glyph_bytes). Same detection as ferrite-ui-xl's
+    `font::Header::read`. Raises ValueError if too short."""
+    data = bytes(data)
+    if len(data) < 4:
+        raise ValueError(f"font binary too small ({len(data)} bytes)")
+    if data[:2] == V3_MAGIC and len(data) >= 8 and data[7] in (1, 2):
+        n, y_adv = struct.unpack_from("<HH", data, 2)
+        if len(data) >= 8 + n * (2 + GLYPH_V3):
+            return dict(version=3, num_glyphs=n, y_advance=y_adv, font_id=data[6],
+                        font_id_at=6, bpp=data[7], hdr_len=8, glyph_bytes=GLYPH_V3)
+    if data[:2] == b"\x00\x02" and len(data) >= 7:
+        n = struct.unpack_from("<H", data, 2)[0]
+        return dict(version=2, num_glyphs=n, y_advance=data[4], font_id=data[5],
+                    font_id_at=5, bpp=data[6], hdr_len=7, glyph_bytes=GLYPH_V2)
+    n = struct.unpack_from("<H", data, 0)[0]
+    return dict(version=1, num_glyphs=n, y_advance=data[2], font_id=data[3],
+                font_id_at=3, bpp=1, hdr_len=4, glyph_bytes=GLYPH_V2)
+
+
+def read_resource(data):
+    """Decode a font resource: (header dict, [(code, glyph dict)], bitmap bytes)."""
+    data = bytes(data)
+    h = parse_header(data)
+    n, rec = h["num_glyphs"], h["glyph_bytes"]
+    cp_at = h["hdr_len"]
+    gl_at = cp_at + 2 * n
+    bm_at = gl_at + rec * n
+    if len(data) < bm_at:
+        raise ValueError(f"font binary truncated ({len(data)} < {bm_at} bytes)")
+    fmt = "<IHHHhh" if rec == GLYPH_V3 else "<HBBBbb"
+    table = []
+    for i in range(n):
+        code = struct.unpack_from("<H", data, cp_at + 2 * i)[0]
+        bmo, w, hh, xa, xo, yo = struct.unpack_from(fmt, data, gl_at + rec * i)
+        table.append((code, {"bitmapOffset": bmo, "width": w, "height": hh,
+                             "xAdvance": xa, "xOffset": xo, "yOffset": yo}))
+    return h, table, data[bm_at:]
+
+
+def to_v3(data):
+    """A V1/V2/V3 font resource as V3 (same glyphs and bitmap: same pixels)."""
+    h, table, bitmap = read_resource(data)
+    if h["version"] == 3:
+        return bytes(data)
+    buf = io.BytesIO()
+    write_resource(bitmap, table, h["y_advance"], h["font_id"], h["bpp"], buf, version=3)
+    return buf.getvalue()
 
 
 # ── output: Rust source ───────────────────────────────────────────────────────
@@ -460,6 +550,10 @@ def _common_args(p):
     p.add_argument(
         "--bpp", type=int, choices=[1, 2], default=1,
         help="bits per pixel: 1 = monochrome (default), 2 = anti-aliased (4 gray levels)")
+    p.add_argument(
+        "--v3", action="store_true",
+        help="resource: V3 layout (glyphs over 255 px, bitmaps over 64 KB); "
+             "ferrite-ui-xl devices only (caps.font_v3)")
 
 
 def _resolve_codes(args):
@@ -475,16 +569,20 @@ def cmd_resource(args):
     codes = _resolve_codes(args)
     bitmap, table, y_advance = rasterize(args.fontfile, args.size, codes, args.bpp)
     n, m = len(table), len(bitmap)
-    hdr = 4 if args.bpp == 1 else 7
-    total = hdr + n * 9 + m
-    sys.stderr.write("resource: %d glyphs, bpp=%d, bitmap %d B, total %d B\n"
-                     % (n, args.bpp, m, total))
+    buf = io.BytesIO()
+    try:
+        write_resource(bitmap, table, y_advance, args.font_id, args.bpp, buf,
+                       3 if args.v3 else None)
+    except ValueError as e:
+        sys.exit(f"error: {e}")
+    version = 3 if args.v3 else (1 if args.bpp == 1 else 2)
+    sys.stderr.write("resource: %d glyphs, bpp=%d, V%d, bitmap %d B, total %d B\n"
+                     % (n, args.bpp, version, m, len(buf.getvalue())))
     if args.output:
         with open(args.output, "wb") as f:
-            write_resource(bitmap, table, y_advance, args.font_id, args.bpp, f)
+            f.write(buf.getvalue())
     else:
-        write_resource(bitmap, table, y_advance, args.font_id, args.bpp,
-                       sys.stdout.buffer)
+        sys.stdout.buffer.write(buf.getvalue())
 
 
 def cmd_code(args):
