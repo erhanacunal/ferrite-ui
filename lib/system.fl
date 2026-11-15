@@ -1,0 +1,75 @@
+// system.fl — the board's settings: WiFi state, network scan, saving the
+// WiFi settings (ferrite-ui-xl, exynos4412; the sim answers with fakes).
+//
+// Used by ferrite-ui-xl's setup screen (system/setup/main.fl), which runs
+// when volume up is held at start or no program is saved. Settings are saved
+// as SYSTEM/WIFI.TXT on CACHE and count from the next start (sysRestart()).
+//
+// Ids and codes are duplicated in ferrite-ui-xl ferrite-core/src/setup.rs
+// and bsp/sim/src/platform.rs — keep them in sync.
+
+const SYS_WIFI_STATE      = 0x70;  // () -> WIFI_*
+const SYS_WIFI_INFO       = 0x71;  // (field) -> string (syscallStr), INFO_*
+const SYS_WIFI_SCAN       = 0x72;  // () -> 1 scan asked for, 0 none can run now
+const SYS_WIFI_SCAN_COUNT = 0x73;  // () -> networks in the last scan, -1 none yet
+const SYS_WIFI_SCAN_SSID  = 0x74;  // (i) -> string (syscallStr), strongest first
+const SYS_WIFI_SCAN_RSSI  = 0x75;  // (i) -> dBm
+const SYS_WIFI_SCAN_INFO  = 0x76;  // (i) -> channel | 0x100 if joinable (WPA2-PSK)
+const SYS_WIFI_SAVE       = 0x77;  // (ssid, password, band, hostname) -> SAVE_*
+const SYS_SYSTEM_FILES    = 0x78;  // () -> FILE_* bits
+const SYS_SETUP_REASON    = 0x79;  // () -> SETUP_*
+const SYS_WIFI_SCANS      = 0x7A;  // () -> scans completed (changes with the list)
+const SYS_RESTART         = 0x01;  // () restarts the board
+
+const WIFI_OFF         = 0;
+const WIFI_JOINING     = 1;
+const WIFI_DHCP        = 2;
+const WIFI_UP          = 3;
+const WIFI_FAILED      = 4;
+const WIFI_DOWN        = 5;
+const WIFI_ASLEEP      = 6;
+const WIFI_SCANNING    = 7;  // chip up, no network named: scanning only
+const WIFI_NO_FIRMWARE = 8;  // no SYSTEM/WIFIFW.BIN + WIFINV.TXT
+
+const INFO_SSID     = 0;
+const INFO_PASSWORD = 1;
+const INFO_BAND     = 2;  // "2.4", "5" or ""
+const INFO_HOSTNAME = 3;
+const INFO_ADDRESS  = 4;  // "a.b.c.d" once DHCP gave one
+const INFO_MAC      = 5;
+const INFO_JOINED   = 6;  // the network joined, "" if none
+
+const BAND_ANY = 0;
+const BAND_2G  = 2;
+const BAND_5G  = 5;
+
+const SAVE_OK      = 1;
+const SAVE_FAILED  = 0;
+const SAVE_INVALID = -1;  // name 1..32 bytes, passphrase 8..63 (or 64 hex), hostname letters/digits/-
+
+const FILE_SETTINGS = 1;   // SYSTEM/WIFI.TXT
+const FILE_FIRMWARE = 2;   // SYSTEM/WIFIFW.BIN
+const FILE_NVRAM    = 4;   // SYSTEM/WIFINV.TXT
+const FILE_PROGRAM  = 8;   // a saved program image (FERRITE/FLASH.BIN)
+const FILE_STORAGE  = 16;  // CACHE can be written
+
+const SETUP_NONE       = 0;
+const SETUP_KEY        = 1;  // volume up held at start
+const SETUP_NO_PROGRAM = 2;  // nothing saved to run
+
+const SCAN_JOINABLE = 0x100;
+
+fn wifiState() { return syscall(SYS_WIFI_STATE); }
+fn wifiInfo(field) -> string { return syscallStr(SYS_WIFI_INFO, field); }
+fn wifiScan() { return syscall(SYS_WIFI_SCAN); }
+fn wifiScanCount() { return syscall(SYS_WIFI_SCAN_COUNT); }
+fn wifiScanSsid(i) -> string { return syscallStr(SYS_WIFI_SCAN_SSID, i); }
+fn wifiScanRssi(i) { return syscall(SYS_WIFI_SCAN_RSSI, i); }
+fn wifiScanInfo(i) { return syscall(SYS_WIFI_SCAN_INFO, i); }
+fn wifiScans() { return syscall(SYS_WIFI_SCANS); }
+fn wifiSave(ssid: string, password: string, band, hostname: string) {
+    return syscall(SYS_WIFI_SAVE, ssid, password, band, hostname);
+}
+fn systemFiles() { return syscall(SYS_SYSTEM_FILES); }
+fn setupReason() { return syscall(SYS_SETUP_REASON); }
+fn sysRestart() { return syscall(SYS_RESTART); }

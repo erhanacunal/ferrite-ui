@@ -1387,6 +1387,43 @@ def cmd_savefw(path: str, host: str, wait: float) -> bool:
     return ub_http_send(host, "/save", data, wait)
 
 
+# Files a board keeps in SYSTEM/ on CACHE (exynos4412; uart_boot reads them too).
+SYSTEM_NAMES = {".bin": "WIFIFW.BIN", ".txt": "WIFINV.TXT"}
+
+
+def system_file_name(path: str, name: str | None) -> str | None:
+    """The 8.3 SYSTEM/ name for `path`: `name` if given, else WIFI.TXT for
+    wifi.txt / wifi.cfg, WIFIFW.BIN / WIFINV.TXT for the brcmfmac .bin / .txt."""
+    if name:
+        return name.upper()
+    base = os.path.basename(path).lower()
+    if base in ("wifi.txt", "wifi.cfg"):
+        return "WIFI.TXT"
+    if base.startswith("brcmfmac"):
+        return SYSTEM_NAMES.get(os.path.splitext(base)[1])
+    return None
+
+
+def cmd_system(path: str, name: str | None, host: str, wait: float) -> bool:
+    """exynos4412: POSTs a file into SYSTEM/ on CACHE (WiFi settings, chip
+    firmware) to /system/NAME, which a running ferrite and uart_boot both
+    answer. Counts from the next start."""
+    target = system_file_name(path, name)
+    if target is None:
+        print("system: give the name (WIFI.TXT, WIFIFW.BIN, WIFINV.TXT)", file=sys.stderr)
+        return False
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        print(f"system: {e}", file=sys.stderr)
+        return False
+    if not data:
+        print(f"system: {path} is empty", file=sys.stderr)
+        return False
+    return ub_http_send(host, f"/system/{target}", data, wait)
+
+
 def cmd_bootflash(ser: serial.Serial | None, path: str, host: str | None, fs_base: int,
                   wait: float, reset: bool, app: str | None, save: bool, run: bool) -> bool:
     """Saves an FS image as FERRITE/FLASH.BIN through uart_boot, then starts the
@@ -1503,12 +1540,25 @@ def main():
     p_sf.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
                       help="wait this long for the board's HTTP server")
 
+    p_sys = sub.add_parser("system",
+                           help="exynos4412 over WiFi (--host): copy a file into SYSTEM/ on CACHE "
+                                "(WIFI.TXT, WIFIFW.BIN, WIFINV.TXT; running ferrite or uart_boot)")
+    p_sys.add_argument("file", help="the file (brcmfmac*.bin / .txt and wifi.txt are named by themselves)")
+    p_sys.add_argument("name", nargs="?", help="its 8.3 name in SYSTEM/")
+    p_sys.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
+                       help="wait this long for the board's HTTP server")
+
     args = parser.parse_args()
 
     if args.command == "savefw":
         if args.host is None:
             parser.error("savefw needs --host (WiFi)")
         sys.exit(0 if cmd_savefw(args.file, args.host, args.wait) else 1)
+
+    if args.command == "system":
+        if args.host is None:
+            parser.error("system needs --host (WiFi)")
+        sys.exit(0 if cmd_system(args.file, args.name, args.host, args.wait) else 1)
 
     if args.command == "bootflash" and args.port is None:
         if args.host is None:
