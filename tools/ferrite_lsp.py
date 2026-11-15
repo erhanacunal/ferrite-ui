@@ -635,6 +635,7 @@ PROP_DOCS = {
     'graph_count': 'Max graph samples to draw',
     'graph_flags': 'Graph render flags (bit 0: linear/spline, bit 1: fill)',
     'multi_line': 'Multi-line label text flag',
+    'rich_text': 'Text as HTML: <b> <i> <u> <font color="#RRGGBB"> <br> &lt; ... (caps.rich_text)',
     'alpha': 'Background opacity (0-255)',
     'group_id': 'Exclusive group (button group, radio): one checked per group_id; radio 0 = siblings',
     'flex': 'Flex container mode for lib/flex.fl: FLEX_ROW/FLEX_COLUMN | JUSTIFY_* | ALIGN_*',

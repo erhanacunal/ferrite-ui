@@ -325,7 +325,7 @@ def _is_sparse_font(data):
     # V2 (2bpp anti-aliased) / V3 (wide metrics): magic 0x00, 0x02 / 0x00, 0x03.
     if len(data) >= 7 and data[0] == 0x00 and data[1] == 0x02:
         return True
-    if len(data) >= 8 and data[0] == 0x00 and data[1] == 0x03 and data[7] in (1, 2):
+    if len(data) >= 12 and data[0] == 0x00 and data[1] == 0x03 and data[7] in (1, 2):
         return True
     n = _struct.unpack_from("<H", data, 0)[0]
     if n == 0 or n > 0x3FFF:
@@ -370,23 +370,28 @@ def _old_range_font_to_sparse(data):
     return bytes(out)
 
 
+# Project font entries' family links (rich text): the fonts drawing <b>, <i>, both.
+FONT_VARIANT_KEYS = ("bold", "italic", "bold_italic")
+
+
 class GfxFontPreview:
     """Parses Ferrite sparse binary font data for QPainter rendering."""
 
     def __init__(self, binary):
         if len(binary) < 4:
             raise ValueError("font binary too short")
-        # V3 (wide):  8-byte header  magic(0x00,0x03) + n u16 + y_adv u16 + font_id + bpp,
+        # V3 (wide): 12-byte header  magic(0x00,0x03) + n u16 + y_adv u16 + font_id + bpp
+        #             + bold/italic/bold-italic font ids + 0,
         #             14-byte glyphs (offset u32, w/h/x_adv u16, x_off/y_off i16)
         # V2 (2bpp):  7-byte header  magic(0x00,0x02) + n u16 + y_adv + font_id + bpp
         # V1 (1bpp):  4-byte header  n u16 + y_adv + font_id
         # (ferrite_font_converter.parse_header / ferrite-ui-xl font::Header::read)
         glyph_fmt = "<HBBBbb"
-        if (len(binary) >= 8 and binary[0] == 0x00 and binary[1] == 0x03
+        if (len(binary) >= 12 and binary[0] == 0x00 and binary[1] == 0x03
                 and binary[7] in (1, 2)):
             n, self.y_advance = _struct.unpack_from("<HH", binary, 2)
             self.bpp = binary[7]
-            hdr_len = 8
+            hdr_len = 12
             glyph_fmt = "<IHHHhh"
         elif len(binary) >= 7 and binary[0] == 0x00 and binary[1] == 0x02:
             n = _struct.unpack_from("<H", binary, 2)[0]
@@ -620,6 +625,7 @@ class WidgetNode:
         self.value = 0
         self.checked = False
         self.multi_line = False
+        self.rich_text = False  # caps.rich_text: text as an HTML subset (ferrite_rich)
         self.image_id = 0
         self.group_id = 0  # KIND_BUTTON_GROUP selection group
 
@@ -665,6 +671,7 @@ class WidgetNode:
             "visible": self.visible, "enabled": self.enabled,
             "clickable": self.clickable,
             "value": self.value, "checked": self.checked, "multi_line": self.multi_line,
+            "rich_text": self.rich_text,
             "image_id": self.image_id, "group_id": self.group_id,
             "on_click": self.on_click, "on_tap": self.on_tap, "on_paint": self.on_paint,
         }
@@ -675,7 +682,7 @@ class WidgetNode:
         for key in ("loc_x", "loc_y", "size_w", "size_h", "bg_color", "border_color",
                      "border_radius", "text_color", "press_color", "alpha", "text",
                      "font_id", "text_align", "visible", "enabled", "clickable", "value",
-                     "checked", "multi_line", "image_id", "group_id",
+                     "checked", "multi_line", "rich_text", "image_id", "group_id",
                      "on_click", "on_tap", "on_paint"):
             if key in d:
                 setattr(n, key, d[key])
@@ -1091,10 +1098,14 @@ class DesignerModel(QWidget):
                 # If old range-based format (starts with first/last u16 pair, 6-byte header)
                 if len(combined) >= 6 and not _is_sparse_font(combined):
                     combined = _old_range_font_to_sparse(combined) or combined
-                self.fonts.append({
+                entry = {
                     "name": f_entry["name"], "font_id": f_entry["font_id"],
                     "combined_b64": base64.b64encode(combined).decode("ascii"),
-                })
+                }
+                for k in FONT_VARIANT_KEYS:
+                    if f_entry.get(k):
+                        entry[k] = f_entry[k]
+                self.fonts.append(entry)
             elif "header_b64" in f_entry and "data_b64" in f_entry:
                 # Old split format: header (first+last+y_adv+font_id+glyphs) + bitmap
                 combined = (base64.b64decode(f_entry["header_b64"])
@@ -1219,10 +1230,11 @@ class DesignerModel(QWidget):
             font_file = f"{name}.bin"
             with open(os.path.join(build_dir, font_file), "wb") as f:
                 f.write(base64.b64decode(font["combined_b64"]))
-            font_entries.append({
-                "name": name, "font_id": font["font_id"],
-                "file": font_file,
-            })
+            entry = {"name": name, "font_id": font["font_id"], "file": font_file}
+            for k in FONT_VARIANT_KEYS:
+                if font.get(k):
+                    entry[k] = font[k]
+            font_entries.append(entry)
 
         # Images — extract source files
         image_entries = []
@@ -1351,6 +1363,63 @@ class WidgetItem(QGraphicsItem):
                 painter.setPen(QPen(stroke, bw) if stroke else Qt.NoPen)
                 painter.drawPolygon(poly)
 
+    def _paint_rich_text(self, painter, node, w, h, gfx_font, text_color):
+        """A rich_text widget's text (ferrite_rich): runs in the font's family
+        variants and colours, underlines; one line per <br> (no word wrap in the
+        preview), centred as a block."""
+        import ferrite_rich
+        model = getattr(self, "model", None)
+        fonts = getattr(model, "fonts", []) if model else []
+        by_id = {f.get("font_id"): f for f in fonts}
+        by_name = {f.get("name"): f for f in fonts}
+        entry = by_id.get(node.font_id, {})
+
+        def font_for(flags):
+            style = flags & (ferrite_rich.BOLD | ferrite_rich.ITALIC)
+            keys = {ferrite_rich.BOLD: ["bold"], ferrite_rich.ITALIC: ["italic"],
+                    ferrite_rich.BOLD | ferrite_rich.ITALIC: ["bold_italic", "bold", "italic"]}.get(style, [])
+            for k in keys:
+                v = by_name.get(entry.get(k))
+                if v:
+                    f = self.res_cache.get_font(v.get("font_id"))
+                    if f:
+                        return f
+            return gfx_font
+
+        pad_l = node.border[3] + node.padding[3]
+        pad_r = node.border[1] + node.padding[1]
+        pad_t = node.border[0] + node.padding[0]
+        pad_b = node.border[2] + node.padding[2]
+        content_w = w - pad_l - pad_r
+        content_h = h - pad_t - pad_b
+        lh = gfx_font.line_height()
+        lines = ferrite_rich.runs(node.text)
+        if not node.multi_line:
+            lines = [[r for line in lines for r in line]]
+        top = pad_t + max(0, (content_h - lh * len(lines)) // 2)
+        painter.save()
+        painter.setClipRect(QRectF(pad_l, pad_t, content_w, content_h))
+        for li, line in enumerate(lines):
+            widths = [font_for(fl).text_width(t) for t, fl, _c in line]
+            lw = sum(widths)
+            if node.text_align == 1:
+                x = pad_l + (content_w - lw) // 2
+            elif node.text_align == 2:
+                x = pad_l + content_w - lw
+            else:
+                x = pad_l
+            base = top + li * lh + (lh * 3) // 4
+            rules = []
+            for (t, fl, c), tw in zip(line, widths):
+                color = rgb565_to_qcolor(c) if c is not None else text_color
+                font_for(fl).draw_text(painter, int(x), int(base), t, color)
+                if fl & ferrite_rich.UNDERLINE and tw:
+                    rules.append((x, tw, color))
+                x += tw
+            for rx, rw, color in rules:
+                painter.fillRect(QRectF(rx, base + max(1, lh // 12), rw, max(1, lh // 20)), color)
+        painter.restore()
+
     def paint(self, painter, option, widget=None):
         node = self.node
         w, h = node.size_w, node.size_h
@@ -1478,7 +1547,9 @@ class WidgetItem(QGraphicsItem):
             pad_b = node.border[2] + node.padding[2]
             text_color = rgb565_to_qcolor(node.text_color)
             gfx_font = self.res_cache.get_font(node.font_id) if self.res_cache else None
-            if gfx_font:
+            if gfx_font and node.rich_text:
+                self._paint_rich_text(painter, node, w, h, gfx_font, text_color)
+            elif gfx_font:
                 # Render with actual Adafruit GFX bitmap font
                 tw = gfx_font.text_width(node.text)
                 content_w = w - pad_l - pad_r - 4
@@ -2122,6 +2193,7 @@ class PropertyEditor(QScrollArea):
         self._add_bool(g, "checked", "Checked")
         self._add_int(g, "group_id", "Group ID", 0, 255)
         self._add_bool(g, "multi_line", "Multi-line")
+        self._add_bool(g, "rich_text", "Rich text (HTML)")
         self._add_resource_combo(g, "image_id", "Image", "images")
 
         # Callbacks (double-click to auto-create handler)
@@ -2379,6 +2451,7 @@ class PropertyEditor(QScrollArea):
         self._set_editor("value", node.value)
         self._set_editor("checked", node.checked)
         self._set_editor("multi_line", node.multi_line)
+        self._set_editor("rich_text", node.rich_text)
         self._set_editor("image_id", node.image_id)
         self._set_editor("group_id", node.group_id)
 
@@ -2725,6 +2798,8 @@ class ResourcePanel(QWidget):
         self.font_list.setHeaderLabels(["Name", "ID", "Size"])
         self.font_list.setMaximumHeight(100)
         self.font_list.setRootIsDecorated(False)
+        self.font_list.setToolTip("Double-click: the font's bold / italic variants (rich text)")
+        self.font_list.itemDoubleClicked.connect(self._edit_font_family)
         layout.addWidget(self.font_list)
         fb = QHBoxLayout()
         add_font_btn = QPushButton("+ Font")
@@ -2995,6 +3070,43 @@ class ResourcePanel(QWidget):
                 self, "Font generation",
                 f"Added {len(added)} font(s).\n\nIssues:\n" + "\n".join(errors))
 
+    def _edit_font_family(self, item, _column=0):
+        """Pick the fonts drawing this one's <b>, <i> and both in rich text
+        (project font entries' "bold" / "italic" / "bold_italic"; needs
+        caps.font_v3, the build writes them into the V3 headers)."""
+        idx = self.font_list.indexOfTopLevelItem(item)
+        if not 0 <= idx < len(self.model.fonts):
+            return
+        font = self.model.fonts[idx]
+        others = [f["name"] for f in self.model.fonts if f is not font]
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Font family: {font['name']}")
+        form = QFormLayout(dlg)
+        combos = {}
+        for key, label in (("bold", "Bold <b>"), ("italic", "Italic <i>"),
+                           ("bold_italic", "Bold italic <b><i>")):
+            combo = QComboBox()
+            combo.addItem("(none)", None)
+            for name in others:
+                combo.addItem(name, name)
+            i = combo.findData(font.get(key))
+            combo.setCurrentIndex(max(0, i))
+            form.addRow(label, combo)
+            combos[key] = combo
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        for key, combo in combos.items():
+            if combo.currentData():
+                font[key] = combo.currentData()
+            else:
+                font.pop(key, None)
+        self.model._res_gen += 1
+        self.model.notify_changed()
+
     def _rm_font(self):
         idx = self.font_list.indexOfTopLevelItem(self.font_list.currentItem())
         if idx >= 0 and idx < len(self.model.fonts):
@@ -3193,6 +3305,8 @@ def generate_designer_fl(model):
             lines.append(f"    {node.name}.checked = 1;")
         if node.multi_line:
             lines.append(f"    {node.name}.multi_line = 1;")
+        if node.rich_text:
+            lines.append(f"    {node.name}.rich_text = 1;")
         if node.image_id != 0:
             lines.append(f"    {node.name}.image_id = {node.image_id};")
 

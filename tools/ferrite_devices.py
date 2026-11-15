@@ -25,7 +25,10 @@ in sync by hand:
     CAP_GESTURES (ferrite-ui-xl: onGesture / gestureInfo, ferrite-core
     gesture.rs); caps.font_v3 (ferrite-ui-xl, build-time only: no CAPS bit)
     <-> ferrite-core font.rs reading V3 font resources (wide glyph metrics):
-    ferrite_build repacks every font as V3, the Designer generates V3. A missing
+    ferrite_build repacks every font as V3, the Designer generates V3;
+    caps.rich_text (ferrite-ui-xl rich.rs, build-time only) <-> the rich_text
+    property (FLAG_RICH_TEXT: text as an HTML subset; font families need
+    font_v3). A missing
     cap reads as false, so the fallback boards below leave it out.
 """
 

@@ -34,9 +34,13 @@ BINARY RESOURCE LAYOUT
     [4..5]           y_advance    u16 LE
     [6]              font_id      u8
     [7]              bpp          u8 (1 or 2)
-    [8..8+N*2]       codepoints   N x u16 LE, sorted ascending
-    [8+N*2..8+N*16]  glyphs       N x 14 bytes
-    [8+N*16..]       bitmap       as V1 (bpp 1) / V2 (bpp 2)
+    [8..10]          variants     bold, italic, bold italic font_id (0 = none;
+                                  ferrite_build sets them from the project's
+                                  font entries: "bold" / "italic" / "bold_italic")
+    [11]             reserved     0
+    [12..12+N*2]     codepoints   N x u16 LE, sorted ascending
+    [12+N*2..12+N*16] glyphs      N x 14 bytes
+    [12+N*16..]      bitmap       as V1 (bpp 1) / V2 (bpp 2)
 
   Glyph entry, V1/V2 (7 bytes):
     bitmapOffset u16 LE, width u8, height u8,
@@ -366,6 +370,8 @@ def _zero_glyph(bmap_offset):
 # ── output: binary resource ───────────────────────────────────────────────────
 
 V3_MAGIC = b"\x00\x03"
+V3_HEADER = 12
+V3_VARIANTS_AT = 8   # bold, italic, bold italic font ids
 GLYPH_V2 = 7
 GLYPH_V3 = 14
 
@@ -375,15 +381,17 @@ def _check(code, name, v, lo, hi, hint):
         raise ValueError(f"U+{code:04X} {name}={v} out of range {lo}..{hi}{hint}")
 
 
-def write_resource(bitmap, table, y_advance, font_id, bpp, out, version=None):
+def write_resource(bitmap, table, y_advance, font_id, bpp, out, version=None,
+                   variants=(0, 0, 0)):
     """
     Write the binary font resource to `out` (binary-mode file or buffer).
 
     V1 (bpp=1):  4-byte header  | N*2 codepoints | N*7 glyphs  | bitmap
     V2 (bpp>=2): 7-byte header  | N*2 codepoints | N*7 glyphs  | bitmap
     V3 (version=3, any bpp):
-                 8-byte header  | N*2 codepoints | N*14 glyphs | bitmap
-    `version` None = V1 or V2 by bpp.
+                 12-byte header | N*2 codepoints | N*14 glyphs | bitmap
+    `version` None = V1 or V2 by bpp. `variants`: V3's bold / italic / bold
+    italic font ids.
     """
     v3 = version == 3
     n = len(table)
@@ -391,7 +399,7 @@ def write_resource(bitmap, table, y_advance, font_id, bpp, out, version=None):
     if v3:
         if not 0 <= y_advance <= 0xFFFF:
             raise ValueError(f"y_advance={y_advance}px exceeds u16 max")
-        out.write(V3_MAGIC + struct.pack("<HHBB", n, y_advance, font_id, bpp))
+        out.write(V3_MAGIC + struct.pack("<HHBB3BB", n, y_advance, font_id, bpp, *variants, 0))
     else:
         if not 0 <= y_advance <= 255:
             raise ValueError(f"y_advance={y_advance}px exceeds u8 max (255){hint}")
@@ -425,23 +433,26 @@ def write_resource(bitmap, table, y_advance, font_id, bpp, out, version=None):
 
 def parse_header(data):
     """A font resource's header: dict(version, num_glyphs, y_advance, font_id,
-    font_id_at, bpp, hdr_len, glyph_bytes). Same detection as ferrite-ui-xl's
-    `font::Header::read`. Raises ValueError if too short."""
+    font_id_at, bpp, hdr_len, glyph_bytes, variants). Same detection as
+    ferrite-ui-xl's `font::Header::read`. Raises ValueError if too short."""
     data = bytes(data)
     if len(data) < 4:
         raise ValueError(f"font binary too small ({len(data)} bytes)")
-    if data[:2] == V3_MAGIC and len(data) >= 8 and data[7] in (1, 2):
+    if data[:2] == V3_MAGIC and len(data) >= V3_HEADER and data[7] in (1, 2):
         n, y_adv = struct.unpack_from("<HH", data, 2)
-        if len(data) >= 8 + n * (2 + GLYPH_V3):
+        if len(data) >= V3_HEADER + n * (2 + GLYPH_V3):
             return dict(version=3, num_glyphs=n, y_advance=y_adv, font_id=data[6],
-                        font_id_at=6, bpp=data[7], hdr_len=8, glyph_bytes=GLYPH_V3)
+                        font_id_at=6, bpp=data[7], hdr_len=V3_HEADER, glyph_bytes=GLYPH_V3,
+                        variants=tuple(data[8:11]))
     if data[:2] == b"\x00\x02" and len(data) >= 7:
         n = struct.unpack_from("<H", data, 2)[0]
         return dict(version=2, num_glyphs=n, y_advance=data[4], font_id=data[5],
-                    font_id_at=5, bpp=data[6], hdr_len=7, glyph_bytes=GLYPH_V2)
+                    font_id_at=5, bpp=data[6], hdr_len=7, glyph_bytes=GLYPH_V2,
+                    variants=(0, 0, 0))
     n = struct.unpack_from("<H", data, 0)[0]
     return dict(version=1, num_glyphs=n, y_advance=data[2], font_id=data[3],
-                font_id_at=3, bpp=1, hdr_len=4, glyph_bytes=GLYPH_V2)
+                font_id_at=3, bpp=1, hdr_len=4, glyph_bytes=GLYPH_V2,
+                variants=(0, 0, 0))
 
 
 def read_resource(data):
@@ -470,7 +481,8 @@ def to_v3(data):
     if h["version"] == 3:
         return bytes(data)
     buf = io.BytesIO()
-    write_resource(bitmap, table, h["y_advance"], h["font_id"], h["bpp"], buf, version=3)
+    write_resource(bitmap, table, h["y_advance"], h["font_id"], h["bpp"], buf, version=3,
+                   variants=h["variants"])
     return buf.getvalue()
 
 

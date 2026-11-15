@@ -792,6 +792,33 @@ animate(drawer, PROP_LAYER_ALPHA, 0, 300, EASE_IN);     // fades without redrawi
 - `layer_alpha` (0-255, default 255) fades the whole layer. It differs from `alpha`, which is the root's own background opacity. It only acts while the subtree is drawn as a layer: drawn in the tree (see above) it shows opaque, so hide the root at the end of a fade-out (`onAnimEnd`) instead of leaving it at 0.
 - A layer costs memory: width x height x 4 bytes (exynos4412: x 3).
 
+### Rich text (`rich_text`)
+
+Devices with `caps.rich_text` (ferrite-ui-xl, `exynos4412-xl`) read a label's or button's text as a small HTML subset when `rich_text` is set:
+
+```c
+title.rich_text = 1;
+title.text = "Temperature <b>24°</b> <i>updated</i> <u>now</u> <font color=\"#FF4040\">alarm</font>";
+```
+
+- `<b>` / `<strong>`, `<i>` / `<em>`, `<u>`: bold, italic, underline. They nest; each close tag ends one open tag.
+- `<font color="...">` ... `</font>`: text colour as `#RRGGBB`, `#RGB`, a name (`red`, `green`, `blue`, `white`, `black`, `yellow`, `cyan`, `magenta`, `gray`, `orange`, `purple`) or an RGB565 number (`63488`, `0xF800`, so `sprintf("<font color=%d>", RED)` works). Quotes are optional; 8 nested levels are kept.
+- `<br>` breaks the line (with `multi_line`; a single-line label ignores breaks, as it ignores `\n`). Multi-line rich text wraps like plain text.
+- Entities: `&lt;` `&gt;` `&amp;` `&quot;` `&apos;` `&nbsp;` `&#NNN;` `&#xHHHH;`. Write `&lt;` for a literal `<` before letters; a `<` that doesn't start a tag (`a < b`, `a<3`) shows as itself. Unknown tags are left out.
+- Bold and italic come from **font families**, not from slanting or thickening glyphs: in `project.json` a font entry names its variants, and the build writes them into the font (V3 fonts, `caps.font_v3`). A font without a variant draws that text in itself.
+
+```json
+"fonts": [
+  {"name": "ui",    "font_id": 1, "file": "ui.font", "bold": "ui_b", "italic": "ui_i", "bold_italic": "ui_bi"},
+  {"name": "ui_b",  "font_id": 2, "file": "ui_b.font"},
+  {"name": "ui_i",  "font_id": 3, "file": "ui_i.font"},
+  {"name": "ui_bi", "font_id": 4, "file": "ui_bi.font"}
+]
+```
+
+  Generate each variant from its own TTF at the same size (e.g. `Ubuntu-B.ttf`, `Ubuntu-RI.ttf`, `Ubuntu-BI.ttf`). Setting `font_id` to the regular font loads its variants too. In the Designer, double-click a font in the font list to pick its variants; the `Rich text (HTML)` box sets `rich_text`.
+- Lines use the regular font's line height. Inputs and dropdowns stay plain text.
+
 ### dirty() / render()
 
 `dirty()` marks the target widget subtree for redraw. `render()` redraws all dirty widgets.

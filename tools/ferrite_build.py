@@ -196,6 +196,15 @@ STORAGE_BUILTINS = ("diskOpen", "diskDelete", "diskMkdir", "diskRmdir", "diskExi
 GESTURE_BUILTINS = ("onGesture", "gestureInfo")
 
 
+def uses_word(source_path: str, include_dirs, word: str) -> bool:
+    """Whether the program names `word` (after `#include` expansion): a property,
+    as `w.rich_text = 1` or `set(rich_text, 1)`."""
+    from ferrite_lang import preprocess, tokenize
+    source = Path(source_path).read_text(encoding="utf-8")
+    return any(t.type == "IDENT" and t.value == word
+               for t in tokenize(preprocess(source, source_path, include_dirs)))
+
+
 def used_builtins(source_path: str, include_dirs, names) -> set[str]:
     """Which of `names` the program calls (after `#include` expansion)."""
     from ferrite_lang import preprocess, tokenize
@@ -566,6 +575,23 @@ def build(project_path: str, output_path: str | None) -> dict:
             sys.exit(1)
         # Patch the project-assigned font_id into the header (byte 3 / 5 / 6 for V1 / V2 / V3).
         font_data[hdr["font_id_at"]] = font_id
+        # Font families (rich text, caps.rich_text): "bold" / "italic" / "bold_italic" name
+        # the fonts drawing this one's <b> / <i> / both (V3 header bytes 8..10).
+        styles = [font.get(k) for k in ("bold", "italic", "bold_italic")]
+        if any(styles):
+            if hdr["version"] != 3:
+                print(f"Error: font '{name}': bold/italic variants need V3 fonts "
+                      f"(caps.font_v3)", file=sys.stderr)
+                sys.exit(1)
+            by_name = {f["name"]: f.get("font_id") for f in project.get("fonts", [])}
+            for i, v in enumerate(styles):
+                if v is None:
+                    continue
+                if v not in by_name:
+                    print(f"Error: font '{name}': variant '{v}' is not a font of this project",
+                          file=sys.stderr)
+                    sys.exit(1)
+                font_data[ferrite_font_converter.V3_VARIANTS_AT + i] = by_name[v]
 
         resources.append((name, RES_FONT, bytes(font_data), 0))
 
@@ -664,6 +690,11 @@ def build(project_path: str, output_path: str | None) -> dict:
                       f"device with gesture recognizers (caps.gestures); "
                       f"the firmware has no gesture opcodes",
                       file=sys.stderr)
+                sys.exit(1)
+        if device and not device["caps"].get("rich_text"):
+            if uses_word(str(source), include_dirs, "rich_text"):
+                print(f"Error: {prog['source']}: rich_text needs a device that reads "
+                      f"rich text (caps.rich_text)", file=sys.stderr)
                 sys.exit(1)
         image_data = compile_program(str(source), include_dirs=include_dirs,
                                      render_mode=render_mode,
