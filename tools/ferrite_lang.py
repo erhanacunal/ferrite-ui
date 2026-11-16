@@ -33,16 +33,56 @@ from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
 
 
 class CompileError(Exception):
-    def __init__(self, msg, line=0):
-        super().__init__(f"line {line}: {msg}" if line else msg)
+    """`line` is a line of the source being compiled; `file` is None for the
+    main file, else the included file the line belongs to (set by
+    `locate`, which maps lines of the preprocessed source back)."""
+
+    def __init__(self, msg, line=0, file=None):
+        self.msg = msg
         self.line = line
+        self.file = file
+        self._located = file is not None
+        super().__init__(self._format())
+
+    def _format(self):
+        if self.file is not None:
+            return f"{self.file} line {self.line}: {self.msg}" if self.line \
+                else f"{self.file}: {self.msg}"
+        return f"line {self.line}: {self.msg}" if self.line else self.msg
+
+    def locate(self, line_map, main_file):
+        """Turn a line of the preprocessed source (`preprocess_map`) into
+        the file and line it came from."""
+        if self._located or not self.line:
+            return self
+        self._located = True
+        if self.line <= len(line_map):
+            path, self.line = line_map[self.line - 1]
+            self.file = _display_path(path, main_file)
+        else:
+            # Past the user's source: the generated callback dispatchers.
+            self.msg = f"in a generated callback dispatcher: {self.msg}"
+            self.line = 0
+        self.args = (self._format(),)
+        return self
+
+
+def _display_path(path, main_file):
+    """None for the main file, else `path` relative to its directory."""
+    main = os.path.abspath(main_file)
+    if os.path.normcase(path) == os.path.normcase(main):
+        return None
+    try:
+        return os.path.relpath(path, os.path.dirname(main)).replace('\\', '/')
+    except ValueError:  # another drive
+        return path
 
 
 # ============================================================
 # Preprocessor — #include "file.fl"  /  #hint_widgets N [M]
 # ============================================================
 
-_INCLUDE_RE = re.compile(r'^[ \t]*#include\s+"([^"]+)"', re.MULTILINE)
+_INCLUDE_RE = re.compile(r'^[ \t]*#include\s+"([^"]+)"')
 # #hint_widgets <widget_count> [<ext_count>]
 # Overrides the compiler's static alloc()-site count for Vec pre-allocation.
 # Use when alloc() is called inside loops so the firmware reserves enough capacity.
@@ -62,9 +102,18 @@ def _extract_hint_widgets(source):
     return wc, ec
 
 
-def preprocess(source, filename="<input>", include_dirs=None, _included=None):
+def preprocess(source, filename="<input>", include_dirs=None):
     """Expand #include directives. Resolves paths relative to the
     including file, then searches include_dirs. Detects circular includes."""
+    return preprocess_map(source, filename, include_dirs)[0]
+
+
+def preprocess_map(source, filename="<input>", include_dirs=None, _included=None,
+                   _main=None):
+    """`preprocess`, plus the origin of each line of its output: a list of
+    (absolute file path, line) indexed by output line - 1. An included file
+    takes the place of its #include line (the rest of that line, e.g. a
+    comment, follows on a line of its own)."""
     if _included is None:
         _included = set()
     if include_dirs is None:
@@ -87,22 +136,37 @@ def preprocess(source, filename="<input>", include_dirs=None, _included=None):
                 return candidate
         return None
 
-    def _replace(m):
+    out, line_map = [], []
+    for n, line in enumerate(source.split('\n'), 1):
+        m = _INCLUDE_RE.match(line)
+        if m is None:
+            out.append(line)
+            line_map.append((filepath, n))
+            continue
         inc_path = m.group(1)
         full_path = _resolve(inc_path)
+        where = _display_path(filepath, _main or filename)
         if full_path is None:
             searched = [base_dir] + list(include_dirs)
-            raise CompileError(f'include file not found: {inc_path} (searched: {searched})')
+            raise CompileError(
+                f'include file not found: {inc_path} (searched: {searched})', n, where)
         with open(full_path, 'r', encoding='utf-8') as f:
             inc_source = f.read()
         # Recursively preprocess the included file
-        return preprocess(inc_source, full_path, include_dirs, _included)
-
-    source = _INCLUDE_RE.sub(_replace, source)
-    # Strip #hint_widgets lines so the tokenizer never sees them.
-    # _extract_hint_widgets() reads them from the raw source before this call.
-    source = _HINT_WIDGETS_RE.sub('', source)
-    return source
+        inc_text, inc_map = preprocess_map(inc_source, full_path, include_dirs, _included,
+                                           _main or filename)
+        inc_lines = inc_text.split('\n')
+        if inc_lines[-1] == '':  # ends with a newline
+            inc_lines.pop()
+            inc_map = inc_map[:-1]
+        out += inc_lines
+        line_map += inc_map
+        out.append(line[m.end():])
+        line_map.append((filepath, n))
+    # Strip #hint_widgets lines so the tokenizer never sees them (keeping the
+    # line). _extract_hint_widgets() reads them from the raw source first.
+    source = _HINT_WIDGETS_RE.sub('', '\n'.join(out))
+    return source, line_map
 
 
 # ============================================================
@@ -5063,16 +5127,17 @@ class CodeGen:
 
 def compile(source, filename="<input>", include_dirs=None):
     """Compile source code to bytecode. Returns bytes."""
+    line_map = []
     try:
-        source = preprocess(source, filename, include_dirs)
+        source, line_map = preprocess_map(source, filename, include_dirs)
         tokens = tokenize(source)
         parser = Parser(tokens)
         program = parser.parse()
         codegen = CodeGen()
         bytecode = codegen.generate(program)
         return _ImageBytes(bytecode, debug_symbols=codegen.debug_info(filename))
-    except CompileError:
-        raise
+    except CompileError as e:
+        raise e.locate(line_map, filename)
     except Exception as e:
         raise CompileError(f"internal error: {e}") from e
 
@@ -5310,11 +5375,12 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
     native_flex=True compiles flexLayout(box) to the FLEX_LAYOUT opcode
     (0xDB): only for devices with caps.native_flex (ferrite-ui-xl).
     """
+    line_map = []
     try:
         # Extract #hint_widgets from raw source before preprocessing strips the directive.
         hint_wc, hint_ec = _extract_hint_widgets(source)
 
-        source = preprocess(source, filename, include_dirs)
+        source, line_map = preprocess_map(source, filename, include_dirs)
 
         # Generate and append compile-time widget callback dispatchers.
         # Must run on the preprocessed source so #include'd callback
@@ -5386,8 +5452,8 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         image.page = bytes(codegen.page)
         return image
 
-    except CompileError:
-        raise
+    except CompileError as e:
+        raise e.locate(line_map, filename)
     except Exception as e:
         raise CompileError(f"internal error: {e}") from e
 

@@ -175,7 +175,12 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
         _write_debug_sidecar(source_path, image)
         return image
     except CompileError as e:
-        raise CompileError(f"{source_path}: {e}") from e
+        # file:line: message, the file being the one the error is in.
+        path = Path(source_path).parent / e.file if e.file else Path(source_path)
+        where = f"{path}:{e.line}" if e.line else str(path)
+        err = CompileError(f"{where}: {e.msg}")
+        err.line, err.file = e.line, e.file
+        raise err from e
 
 
 # Builtins whose opcodes exist only in firmware built with ferrite-core's

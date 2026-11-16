@@ -23,3 +23,8 @@ Language pitfalls and compiler changes (the language itself: docs/ferrite-lang.m
 - `x = f()` with `f -> widget` now makes `x` a widget variable (`_gen_assign`), so `target(x)` accepts it (needed for `extra = card("y")` children).
 - Adding the declarations to lib/core.fl and lib/flex.fl left every example's bytecode identical.
 - Test: ferrite-ui-xl `ferrite-core/testdata/widgets/ctor.fl` (`gen.py`) → `runtime::widget_ctor_tests`.
+
+## Compiler: error lines through #include (2026-11-16)
+- `preprocess_map` returns the expanded source plus each output line's origin (absolute path, line); an included file replaces its `#include` line, and what follows the directive on that line stays on a line of its own. `preprocess` wraps it. `compile`/`build_image` call `CompileError.locate(line_map, filename)`, which sets `e.file` (None = the main file, else the path relative to its directory) and `e.line` in that file; lines past the map are the generated callback dispatchers. Before, every error after an include reported a line of the expanded source (line 3 of main.fl came out as "line 236" after `core.fl` + `flex.fl`).
+- Message forms: `line N: msg` (main file), `sub/x.fl line N: msg` (included). `ferrite_build.compile_program` re-raises as `path:N: msg`, with the error's own file. A missing include is reported at the `#include` line of the file that asked for it.
+- Bytecode unchanged for every example.

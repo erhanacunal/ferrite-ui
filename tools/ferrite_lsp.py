@@ -191,6 +191,8 @@ class Server:
         except Exception as e:
             line = getattr(e, 'line', 0)
             msg = str(e)
+            if getattr(e, 'file', None):
+                line = 0  # in an included file: report at the top
             # Parse "line N: message" format from CompileError
             if not line and msg.startswith('line '):
                 try:
