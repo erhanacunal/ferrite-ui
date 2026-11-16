@@ -953,7 +953,7 @@ title.text = "Temperature <b>24°</b> <i>updated</i> <u>now</u> <font color=\"#F
 ]
 ```
 
-  Generate each variant from its own TTF at the same size (e.g. `Ubuntu-B.ttf`, `Ubuntu-RI.ttf`, `Ubuntu-BI.ttf`). Setting `font_id` to the regular font loads its variants too. In the Designer, double-click a font in the font list to pick its variants; the `Rich text (HTML)` box sets `rich_text`.
+  Generate each variant from its own TTF at the same size (e.g. `Ubuntu-B.ttf`, `Ubuntu-RI.ttf`, `Ubuntu-BI.ttf`). Setting `font_id` to the regular font loads its variants too. In the Designer, `+ Font` takes the Bold / Italic / Bold italic TTFs next to the regular one and generates and links the variants for every size (named `<font>_<size>_bold` etc.; the font list's Family column shows the links); double-click a font in the font list to change them; the `Rich text (HTML)` box sets `rich_text`.
 - Lines use the regular font's line height. Inputs and dropdowns stay plain text.
 
 ### dirty() / render()

@@ -2527,7 +2527,12 @@ class AddFontDialog(QDialog):
 
     DEFAULT_RANGES = "32-126"
 
-    def __init__(self, parent=None):
+    # (key, label) of the family variants a font can link (FONT_VARIANT_KEYS).
+    VARIANTS = (("bold", "Bold"), ("italic", "Italic"), ("bold_italic", "Bold italic"))
+
+    def __init__(self, parent=None, family=False):
+        """family: the device reads font families (caps.font_v3) — offer
+        bold / italic / bold-italic TTFs generated and linked with each size."""
         super().__init__(parent)
         self.setWindowTitle("Add Font from TrueType")
         self.setMinimumWidth(500)
@@ -2548,6 +2553,24 @@ class AddFontDialog(QDialog):
         fl.addWidget(self._file_edit, 1)
         fl.addWidget(browse_btn)
         layout.addRow("Font file:", file_row)
+
+        # Family variants (rich text <b> / <i>): optional TTFs of the same family.
+        self._variant_edits = {}
+        if family:
+            for key, label in self.VARIANTS:
+                row = QWidget()
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(0, 0, 0, 0)
+                rl.setSpacing(4)
+                edit = QLineEdit()
+                edit.setPlaceholderText("optional — e.g. Ubuntu-B.ttf")
+                btn = QPushButton("Browse…")
+                set_icon(btn, "fa5s.folder-open", QStyle.SP_DialogOpenButton)
+                btn.clicked.connect(lambda _=False, e=edit: self._browse(e))
+                rl.addWidget(edit, 1)
+                rl.addWidget(btn)
+                layout.addRow(f"{label}:", row)
+                self._variant_edits[key] = edit
 
         # Sizes
         self._sizes_edit = QLineEdit()
@@ -2571,7 +2594,10 @@ class AddFontDialog(QDialog):
         hint = QLabel(
             "Sizes: comma-separated point sizes (each becomes a separate font entry).\n"
             "Ranges: decimal, hex (0x011E), or char ('A'), dash for inclusive ranges.\n"
-            "Rendering: anti-aliased is smoother; monochrome is half the size.")
+            "Rendering: anti-aliased is smoother; monochrome is half the size."
+            + ("\nBold / Italic / Bold italic: the family's other TTFs; each size gets "
+               "them too, linked to the regular font (rich text <b>, <i>)."
+               if family else ""))
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray; font-size: 11px;")
         layout.addRow("", hint)
@@ -2582,12 +2608,14 @@ class AddFontDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addRow(btns)
 
-    def _browse(self):
+    def _browse(self, edit=None):
+        edit = edit or self._file_edit
+        start = os.path.dirname(edit.text().strip() or self._file_edit.text().strip())
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select TrueType Font", "",
+            self, "Select TrueType Font", start,
             "TrueType Fonts (*.ttf *.TTF *.otf *.OTF);;All Files (*)")
         if path:
-            self._file_edit.setText(path)
+            edit.setText(path)
 
     def _validate_and_accept(self):
         if not self._file_edit.text().strip():
@@ -2597,6 +2625,10 @@ class AddFontDialog(QDialog):
             QMessageBox.warning(self, "File not found",
                                 f"File not found:\n{self._file_edit.text().strip()}")
             return
+        for path in self.variant_files().values():
+            if not os.path.isfile(path):
+                QMessageBox.warning(self, "File not found", f"File not found:\n{path}")
+                return
         try:
             sizes = self._parse_sizes()
         except ValueError as e:
@@ -2648,6 +2680,11 @@ class AddFontDialog(QDialog):
 
     def bpp(self):
         return self._bpp_combo.currentData()
+
+    def variant_files(self):
+        """{"bold" / "italic" / "bold_italic": TTF path} for the filled-in variants."""
+        return {k: e.text().strip() for k, e in self._variant_edits.items()
+                if e.text().strip()}
 
 
 # ============================================================
@@ -2804,7 +2841,7 @@ class ResourcePanel(QWidget):
         # Fonts
         layout.addWidget(QLabel("Fonts"))
         self.font_list = QTreeWidget()
-        self.font_list.setHeaderLabels(["Name", "ID", "Size"])
+        self.font_list.setHeaderLabels(["Name", "ID", "Size", "Family"])
         self.font_list.setMaximumHeight(100)
         self.font_list.setRootIsDecorated(False)
         self.font_list.setToolTip("Double-click: the font's bold / italic variants (rich text)")
@@ -2944,9 +2981,12 @@ class ResourcePanel(QWidget):
         self.font_list.clear()
         for f in self.model.fonts:
             size = len(base64.b64decode(f.get("combined_b64", "")))
+            # Family links, e.g. "B: ubuntu_24_bold  I: ubuntu_24_italic".
+            family = "  ".join(f"{tag}: {f[k]}" for k, tag in
+                               zip(FONT_VARIANT_KEYS, ("B", "I", "BI")) if f.get(k))
             QTreeWidgetItem(self.font_list, [
                 f.get("name", ""), str(f.get("font_id", "")),
-                f"{size} B"])
+                f"{size} B", family])
         self.image_list.clear()
         for img in self.model.images:
             size = len(base64.b64decode(img.get("data_b64", "")))
@@ -2987,8 +3027,12 @@ class ResourcePanel(QWidget):
             spin.setValue(self.model.memory.get(key, 0))
             spin.blockSignals(False)
 
+    def _family_ok(self):
+        """Font families (bold / italic variants) need V3 fonts (caps.font_v3)."""
+        return bool(device_spec(self.model.device_id)["caps"].get("font_v3"))
+
     def _add_font(self):
-        dlg = AddFontDialog(self)
+        dlg = AddFontDialog(self, family=self._family_ok())
         if dlg.exec() != QDialog.Accepted:
             return
 
@@ -3028,48 +3072,74 @@ class ResourcePanel(QWidget):
         used_ids = {f.get("font_id", 0) for f in self.model.fonts}
         next_id = max(used_ids, default=0) + 1
 
-        progress = QProgressDialog("Generating fonts…", "Cancel", 0, len(sizes), self)
+        # Each size: the regular font, then its family variants (rich text <b> / <i>),
+        # named <regular>_<variant> and linked from the regular font's entry. A
+        # name that already exists is kept (so variants can be added later).
+        variants = dlg.variant_files()
+        jobs = len(sizes) * (1 + len(variants))
+        progress = QProgressDialog("Generating fonts…", "Cancel", 0, jobs, self)
         progress.setWindowTitle("Add Font")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
 
         added = []
         errors = []
+        by_name = {f["name"]: f for f in self.model.fonts}
+        done = 0
+        linked = 0
 
-        for i, size in enumerate(sizes):
-            if progress.wasCanceled():
-                break
-            progress.setValue(i)
-            progress.setLabelText(
-                f"Rendering {basename} {size} pt  ({i + 1}/{len(sizes)})…")
+        def generate(path, size, name):
+            nonlocal next_id, done
+            progress.setValue(done)
+            progress.setLabelText(f"Rendering {name}  ({done + 1}/{jobs})…")
             QApplication.processEvents()
-
+            done += 1
             while next_id in used_ids:
                 next_id += 1
-
-            name = f"{basename}_{size}"
-            if any(f["name"] == name for f in self.model.fonts):
-                errors.append(f"{name}: already exists, skipped")
-                continue
-
             try:
-                bitmap, table, y_advance = rasterize(font_path, size, codes, bpp)
+                bitmap, table, y_advance = rasterize(path, size, codes, bpp)
                 buf = _io.BytesIO()
                 write_resource(bitmap, table, y_advance, next_id, bpp, buf, version)
-                self.model.fonts.append({
-                    "name": name,
-                    "font_id": next_id,
-                    "combined_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
-                })
-                used_ids.add(next_id)
-                next_id += 1
-                added.append(name)
             except Exception as e:
                 errors.append(f"{name}: {e}")
+                return None
+            entry = {
+                "name": name,
+                "font_id": next_id,
+                "combined_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+            }
+            self.model.fonts.append(entry)
+            by_name[name] = entry
+            used_ids.add(next_id)
+            next_id += 1
+            added.append(name)
+            return entry
 
-        progress.setValue(len(sizes))
+        for size in sizes:
+            if progress.wasCanceled():
+                break
+            name = f"{basename}_{size}"
+            regular = by_name.get(name)
+            if regular is not None:
+                errors.append(f"{name}: already exists, kept")
+                done += 1
+            else:
+                regular = generate(font_path, size, name)
+            for key, vpath in variants.items():
+                if progress.wasCanceled():
+                    break
+                vname = f"{name}_{key}"
+                if vname in by_name:
+                    done += 1
+                elif generate(vpath, size, vname) is None:
+                    continue
+                if regular is not None and regular.get(key) != vname:
+                    regular[key] = vname
+                    linked += 1
 
-        if added:
+        progress.setValue(jobs)
+
+        if added or linked:
             self.model._res_gen += 1
             self.refresh()
             self.model.notify_changed()
@@ -3091,6 +3161,12 @@ class ResourcePanel(QWidget):
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Font family: {font['name']}")
         form = QFormLayout(dlg)
+        if not self._family_ok():
+            note = QLabel(f"Device '{self.model.device_id}' has no V3 fonts "
+                          f"(caps.font_v3): the build rejects variants.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #c0392b;")
+            form.addRow(note)
         combos = {}
         for key, label in (("bold", "Bold <b>"), ("italic", "Italic <i>"),
                            ("bold_italic", "Bold italic <b><i>")):
@@ -3114,12 +3190,18 @@ class ResourcePanel(QWidget):
             else:
                 font.pop(key, None)
         self.model._res_gen += 1
+        self.refresh()
         self.model.notify_changed()
 
     def _rm_font(self):
         idx = self.font_list.indexOfTopLevelItem(self.font_list.currentItem())
         if idx >= 0 and idx < len(self.model.fonts):
-            self.model.fonts.pop(idx)
+            name = self.model.fonts.pop(idx).get("name")
+            # Drop family links to it (the build rejects unknown variants).
+            for f in self.model.fonts:
+                for k in FONT_VARIANT_KEYS:
+                    if f.get(k) == name:
+                        del f[k]
             self.model._res_gen += 1
             self.refresh()
             self.model.notify_changed()
