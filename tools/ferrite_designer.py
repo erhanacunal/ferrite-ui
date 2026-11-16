@@ -34,7 +34,7 @@ try:
     )
     from PySide6.QtCore import (
         Qt, QRectF, QPointF, Signal, QSize, QSettings, QRegularExpression, QBuffer,
-        QTimer, QObject, QEvent,
+        QTimer, QObject, QEvent, QProcess,
     )
     from PySide6.QtGui import (
         QColor, QPainter, QPen, QBrush, QFont, QAction, QIcon,
@@ -152,6 +152,7 @@ def set_icon(widget, name, fallback=None):
 # Device definitions come from tools/devices/*.json via the shared loader.
 from ferrite_devices import (
     DEFAULT_DEVICE_ID,
+    canonical_device_id,
     device_spec,
     infer_device_id,
     load_devices,
@@ -1067,7 +1068,8 @@ class DesignerModel(QWidget):
         screen = data.get("screen")
         has_render_mode = "render_mode" in data
         render_mode = data.get("render_mode", "dirty")
-        self.device_id = data.get("device") or infer_device_id(screen, render_mode)
+        self.device_id = canonical_device_id(
+            data.get("device") or infer_device_id(screen, render_mode))
         if self.device_id not in load_devices():
             self.device_id = DEFAULT_DEVICE_ID
         spec = device_spec(self.device_id)
@@ -4668,6 +4670,21 @@ class DesignerWindow(QMainWindow):
         self.resizeDocks(
             [self._dock_tree, self._dock_props], [220, 380], Qt.Vertical
         )
+
+        # Output of Run in Simulator: the build, cargo and the sim itself.
+        self._output = QPlainTextEdit()
+        self._output.setReadOnly(True)
+        self._output.setMaximumBlockCount(5000)
+        out_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        out_font.setPointSize(9)
+        self._output.setFont(out_font)
+        self._dock_output = QDockWidget("Output", self)
+        self._dock_output.setObjectName("dock_output")
+        self._dock_output.setWidget(self._output)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self._dock_output)
+        self._dock_output.hide()
+        self._cargo = None   # QProcess: cargo build of the sim
+        self._sim = None     # QProcess: the running sim
         self.resizeDocks([self._dock_tree], [260], Qt.Horizontal)
         self.resizeDocks([self._dock_resources], [260], Qt.Horizontal)
 
@@ -4755,6 +4772,12 @@ class DesignerWindow(QMainWindow):
         upload_act.setShortcut(QKeySequence("Ctrl+U"))
         upload_act.triggered.connect(self._build_and_upload)
         tb.addAction(upload_act)
+        sim_act = QAction("Run in Simulator", self)
+        set_icon(sim_act, "fa5s.play", QStyle.SP_MediaPlay)
+        sim_act.setToolTip("Build and run in the simulator (F5)")
+        sim_act.setShortcut(QKeySequence("F5"))
+        sim_act.triggered.connect(self._run_in_sim)
+        tb.addAction(sim_act)
 
         # Program-wide serial port selector
         tb.addSeparator()
@@ -4922,6 +4945,9 @@ class DesignerWindow(QMainWindow):
         set_icon(build_upload_act, "fa5s.cloud-upload-alt", QStyle.SP_ArrowUp)
         build_upload_act.setShortcut(QKeySequence("Ctrl+U"))
         build_upload_act.triggered.connect(self._build_and_upload)
+        sim_menu_act = device_menu.addAction("Run in &Simulator\tF5")
+        set_icon(sim_menu_act, "fa5s.play", QStyle.SP_MediaPlay)
+        sim_menu_act.triggered.connect(self._run_in_sim)
 
         view_menu = mb.addMenu("&View")
         fit_act = view_menu.addAction("&Fit to Window")
@@ -4938,6 +4964,10 @@ class DesignerWindow(QMainWindow):
         s = self._settings()
         s.setValue("geometry", self.saveGeometry())
         s.setValue("windowState", self.saveState())
+        for proc in (self._cargo, self._sim):
+            if proc is not None and proc.state() != QProcess.NotRunning:
+                proc.kill()
+                proc.waitForFinished(2000)
         super().closeEvent(event)
 
     def _on_tab_changed(self, index):
@@ -5424,6 +5454,120 @@ class DesignerWindow(QMainWindow):
             QMessageBox.critical(self, "Build Error", "Build timed out (30s)")
         except Exception as e:
             QMessageBox.critical(self, "Build Error", str(e))
+
+
+    # --- Simulator ---
+
+    def _out(self, text):
+        self._dock_output.show()
+        self._output.appendPlainText(text.rstrip("\n"))
+        self._output.verticalScrollBar().setValue(self._output.verticalScrollBar().maximum())
+
+    def _sim_repo(self):
+        """(repo root, None) holding the simulator for the project's screen,
+        or (None, why not). The sims have fixed screens: ferrite-ui's is
+        800x480, ferrite-ui-xl's 1280x800."""
+        ui_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        size = tuple(device_spec(self.model.device_id)["screen"])  # physical, not portrait
+        if size == (800, 480):
+            return ui_root, None
+        if size == (1280, 800):
+            xl = os.environ.get("FERRITE_UI_XL") or os.path.join(
+                os.path.dirname(ui_root), "ferrite-ui-xl")
+            if os.path.isfile(os.path.join(xl, "bsp", "sim", "Cargo.toml")):
+                return os.path.abspath(xl), None
+            return None, (f"The 1280x800 simulator lives in ferrite-ui-xl, not found at\n{xl}\n\n"
+                          f"Put it next to ferrite-ui or set FERRITE_UI_XL.")
+        return None, (f"No simulator for a {size[0]}x{size[1]} screen "
+                      f"(device '{self.model.device_id}'): the simulators are 800x480 "
+                      f"(ferrite-ui) and 1280x800 (ferrite-ui-xl).")
+
+    @staticmethod
+    def _host_triple():
+        if sys.platform == "win32":
+            return "x86_64-pc-windows-msvc"
+        try:
+            out = subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout
+        except OSError:
+            return None
+        m = re.search(r"^host: (\S+)", out, re.M)
+        return m.group(1) if m else None
+
+    def _run_in_sim(self):
+        """Build flash.bin, bring the simulator up to date (cargo build: a
+        no-op when it is) and run it on the image, replacing a sim that is
+        still running."""
+        if self._cargo is not None and self._cargo.state() != QProcess.NotRunning:
+            self.statusBar().showMessage("The simulator is still being compiled...", 3000)
+            return
+        repo, why = self._sim_repo()
+        if repo is None:
+            QMessageBox.warning(self, "Run in Simulator", why)
+            return
+        triple = self._host_triple()
+        if triple is None:
+            QMessageBox.warning(self, "Run in Simulator", "rustc not found: the simulator "
+                                "is built with cargo.")
+            return
+        self._output.clear()
+        if self.model.portrait:
+            self._out("note: the simulator has no portrait mode; the screen shows landscape.")
+        self._out("Building flash image...")
+        self.statusBar().showMessage("Building...")
+        QApplication.processEvents()
+        try:
+            output_path, _build_dir, result = self._build_to_dir()
+        except Exception as e:  # noqa: BLE001
+            self._out(f"BUILD ERROR: {e}")
+            self.statusBar().showMessage("Build failed", 5000)
+            return
+        if result.returncode != 0:
+            self._out("BUILD FAILED:\n" + (result.stderr or result.stdout))
+            self.statusBar().showMessage("Build failed", 5000)
+            return
+        size = os.path.getsize(output_path)
+        self._out(f"Build OK: {output_path} ({size / 1024:.1f} KB)")
+
+        self._out(f"Compiling the simulator in {repo} (cargo build -p bsp-sim)...")
+        self.statusBar().showMessage("Compiling the simulator...")
+        cargo = QProcess(self)
+        cargo.setWorkingDirectory(repo)
+        cargo.setProcessChannelMode(QProcess.MergedChannels)
+        cargo.readyReadStandardOutput.connect(
+            lambda: self._out(bytes(cargo.readAllStandardOutput()).decode("utf-8", "replace")))
+        cargo.finished.connect(
+            lambda code, _status: self._start_sim(code, repo, triple, output_path))
+        cargo.errorOccurred.connect(lambda err: self._out(
+            f"cargo could not be started ({err}): is Rust installed and on PATH?")
+            if err == QProcess.FailedToStart else None)
+        self._cargo = cargo
+        cargo.start("cargo", ["build", "-p", "bsp-sim", "--target", triple])
+
+    def _start_sim(self, code, repo, triple, image):
+        if code != 0:
+            self._out(f"Simulator build failed (cargo exit code {code}).")
+            self.statusBar().showMessage("Simulator build failed", 5000)
+            return
+        exe = os.path.join(repo, "target", triple, "debug",
+                           "sim.exe" if sys.platform == "win32" else "sim")
+        if self._sim is not None and self._sim.state() != QProcess.NotRunning:
+            self._sim.finished.disconnect()
+            self._sim.kill()
+            self._sim.waitForFinished(2000)
+        sim = QProcess(self)
+        sim.setWorkingDirectory(repo)
+        sim.setProcessChannelMode(QProcess.MergedChannels)
+        sim.readyReadStandardOutput.connect(
+            lambda: self._out(bytes(sim.readAllStandardOutput()).decode("utf-8", "replace")))
+        sim.finished.connect(lambda c, _s: self._out(f"Simulator exited (code {c})."))
+        self._sim = sim
+        self._out(f"Running {exe} --fsimage {image}")
+        sim.start(exe, ["--fsimage", image])
+        if not sim.waitForStarted(5000):
+            self._out(f"Could not start the simulator: {sim.errorString()}")
+            self.statusBar().showMessage("Simulator did not start", 5000)
+            return
+        self.statusBar().showMessage("Simulator running", 3000)
 
 
 # ============================================================

@@ -85,7 +85,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 ## ferrite-ui-xl (exynos4412)
 - The exynos4412 board and the runtime features only it used live in the ferrite-ui-xl repo (its own ferrite-core, sim, BSP and examples; it uses this repo's `tools/` and `lib/`). Removed from this runtime: `wide_obj`, `multi_program` (tasks), `fast_vm`, `superops`, `render_cache` (geometry table), `layers`, `perf` (main-loop profiler), the pixel shift (`move_rects`), the whole-area compose and `on_paint` capture renderer hooks, model3d / sysinfo / battery syscalls, the sim's `tablet` size.
 - Here: opcodes 0x45–0x4D (superops) and 0xD4–0xDA (tasks) are bad opcodes, `PROP_LAYER`/`PROP_LAYER_ALPHA` (0x36/0x37) are ignored (read 0 / 255), `CAP_*` bits 3/4 are XL's, kind 18 (`KIND_MODEL3D`) and `RES_MESH` (7) are XL's, `on_task_message`/`on_task_exit` (FunctionKind 15/16) never fire, a `perf` query gets no reply.
-- Tools keep supporting XL: `tools/devices/exynos4412*.json`, `caps.superops`/`caps.multi_program` gating, `ferrite_cli` `perf`, `bootflash`, `savefw`, `--host`, `-p tcp://HOST` (bridge port 7000), `KIND_MODEL3D` in the designer, `"meshes"` in project.json, `lib/model3d.fl`, `lib/sysinfo.fl`, `lib/battery.fl`.
+- Tools keep supporting XL: `tools/devices/exynos4412-xl.json`, `caps.superops`/`caps.multi_program` gating, `ferrite_cli` `perf`, `bootflash`, `savefw`, `--host`, `-p tcp://HOST` (bridge port 7000), `KIND_MODEL3D` in the designer, `"meshes"` in project.json, `lib/model3d.fl`, `lib/sysinfo.fl`, `lib/battery.fl`.
 
 ## Project Name
 

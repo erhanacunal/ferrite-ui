@@ -148,9 +148,22 @@ def load_devices():
     return devices
 
 
+# Device ids that were removed, and the profile that replaces them (project
+# files keep their old "device").
+_RENAMED = {
+    "exynos4412": "exynos4412-xl",  # the tablet is ferrite-ui-xl's target only
+}
+
+
+def canonical_device_id(device_id):
+    """device_id, or what replaced it if that profile was removed."""
+    return _RENAMED.get(device_id, device_id)
+
+
 def device_spec(device_id):
     """Spec for device_id, falling back to the default device."""
     devices = load_devices()
+    device_id = canonical_device_id(device_id)
     if device_id in devices:
         return devices[device_id]
     if DEFAULT_DEVICE_ID in devices:
@@ -170,4 +183,6 @@ def infer_device_id(screen, render_mode):
         return "epaper"
     if list(screen or []) == [480, 480]:
         return "tdo_y13"
+    if list(screen or []) == [1280, 800]:
+        return "exynos4412-xl"
     return DEFAULT_DEVICE_ID

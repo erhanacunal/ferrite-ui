@@ -508,6 +508,8 @@ def build(project_path: str, output_path: str | None) -> dict:
     # Validate against the device definition when the project declares one.
     # Projects without a "device" key build exactly as before (legacy).
     device_id = project.get("device")
+    if device_id is not None:
+        device_id = ferrite_devices.canonical_device_id(device_id)
     device = None
     fs_base = FS_BASE
     if device_id is not None:
