@@ -3851,6 +3851,17 @@ class CodeEditorWidget(QPlainTextEdit):
         self._sig.move(pos.x(), pos.y() + 4)
         self._sig.show()
 
+    def event(self, e):
+        # Typing beats window shortcuts: any key that produces a printable
+        # character (AltGr combinations arrive as Ctrl+Alt on Windows).
+        if e.type() == QEvent.ShortcutOverride and not self.isReadOnly():
+            mods = e.modifiers()
+            ctrl_only = bool(mods & Qt.ControlModifier) and not (mods & Qt.AltModifier)
+            if e.text() and e.text().isprintable() and not ctrl_only:
+                e.accept()
+                return True
+        return super().event(e)
+
     # --- hover and definitions ---
 
     def viewportEvent(self, e):
@@ -4881,6 +4892,12 @@ class DesignerWindow(QMainWindow):
         set_icon(back_act2, "fa5s.arrow-down", QStyle.SP_ArrowDown)
         back_act2.setShortcut(QKeySequence("["))
         back_act2.triggered.connect(self._send_to_back)
+        # Plain characters as shortcuts: only on the canvas, so text fields
+        # (the code editor, property fields) can type them; with AltGr (as
+        # on a Turkish keyboard) they would otherwise never reach the field.
+        for act in (front_act2, back_act2):
+            act.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+            self.canvas.addAction(act)
         edit_menu.addSeparator()
         align_menu = edit_menu.addMenu("&Align")
         for label, slot in (
