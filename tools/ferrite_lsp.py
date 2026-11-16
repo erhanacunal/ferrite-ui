@@ -677,7 +677,7 @@ _COMPLETION_TYPE = 13  # Type parameter
 def _keyword_completions(prefix):
     items = []
     for kw in ['var', 'const', 'fn', 'if', 'else', 'while', 'for', 'return',
-               'true', 'false', 'break', 'continue']:
+               'true', 'false', 'break', 'continue', 'class']:
         if kw.startswith(prefix):
             items.append({
                 'label': kw,

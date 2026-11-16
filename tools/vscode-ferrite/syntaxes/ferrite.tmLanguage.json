@@ -105,7 +105,7 @@
             "patterns": [
                 {
                     "name": "keyword.control.ferrite",
-                    "match": "\\b(var|const|fn|if|else|while|for|return|break|continue)\\b"
+                    "match": "\\b(var|const|fn|class|if|else|while|for|return|break|continue)\\b"
                 },
                 {
                     "name": "constant.language.boolean.ferrite",

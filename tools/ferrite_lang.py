@@ -112,7 +112,7 @@ def preprocess(source, filename="<input>", include_dirs=None, _included=None):
 KEYWORDS = {
     'var', 'const', 'fn', 'if', 'else', 'while', 'for',
     'return', 'true', 'false', 'break', 'continue',
-    'not',
+    'not', 'class',
 }
 
 
@@ -487,10 +487,22 @@ class FnDef:
         self.line = line
 
 
+class ClassDef:
+    """`class Name { var field...; fn method(...) {...} }`. Instances are
+    pool arrays (one word per field, in declaration order); the parser lowers
+    the methods and the constructor into ordinary functions."""
+    def __init__(self, name, fields, methods, line):
+        self.name = name
+        self.fields = fields    # [VarDecl]
+        self.methods = methods  # [FnDef] as written (no `self` param)
+        self.line = line
+
+
 class Program:
-    def __init__(self, functions, statements):
+    def __init__(self, functions, statements, classes=None):
         self.functions = functions
         self.statements = statements
+        self.classes = classes or []
 
 
 # ============================================================
@@ -498,10 +510,50 @@ class Program:
 # ============================================================
 
 
+def _lower_class(c):
+    """Functions that implement class `c`: each method as `Name.method` with
+    `self: Name` in front of its params, and the constructor `Name(...)`,
+    which takes `init`'s params: it allocates the instance (`__new`, which
+    also stores the field initializers), calls `init` if there is one and
+    returns the instance."""
+    fns = []
+    init = None
+    for m in c.methods:
+        if m.name == 'init':
+            init = m
+        if m.name == 'drop' and m.params:
+            raise CompileError(f"{c.name}.drop() takes no parameters", m.line)
+        pt = list(m.param_types or ['any'] * len(m.params))
+        fns.append(FnDef(f"{c.name}.{m.name}", ['self'] + list(m.params), m.body, m.line,
+                         [c.name] + pt, m.return_type))
+    line = c.line
+    body = [VarDecl('self', CallExpr('__new', [StrLit(c.name, line)], line), line,
+                    var_type=c.name)]
+    params, ptypes = [], []
+    if init is not None:
+        params = list(init.params)
+        ptypes = list(init.param_types or ['any'] * len(params))
+        body.append(ExprStmt(CallExpr(
+            f"{c.name}.init", [VarRef('self', line)] + [VarRef(p, line) for p in params],
+            line), line))
+    body.append(ReturnStmt(VarRef('self', line), line))
+    fns.append(FnDef(c.name, params, body, line, ptypes, c.name))
+    return fns
+
+
+# Type names a class may not take.
+_BUILTIN_TYPES = ('int', 'float', 'widget', 'string', 'array', 'any')
+
+
 class Parser:
     def __init__(self, tokens):
         self.tokens = tokens
         self.pos = 0
+        # Class names, known up front so a type annotation may name a class
+        # declared further down.
+        self.class_names = {
+            tokens[i + 1].value for i in range(len(tokens) - 1)
+            if tokens[i].type == 'CLASS' and tokens[i + 1].type == 'IDENT'}
 
     def _cur(self):
         return self.tokens[self.pos]
@@ -539,12 +591,55 @@ class Parser:
     def parse(self):
         functions = []
         statements = []
+        classes = []
         while not self._at_end():
             if self._check('FN'):
                 functions.append(self._fn_def())
+            elif self._check('CLASS'):
+                classes.append(self._class_def())
             else:
                 statements.append(self._statement())
-        return Program(functions, statements)
+        for c in classes:
+            if any(f.name == c.name for f in functions):
+                raise CompileError(
+                    f"function '{c.name}' has the name of a class "
+                    f"(the class's constructor)", c.line)
+            functions.extend(_lower_class(c))
+        return Program(functions, statements, classes)
+
+    def _class_def(self):
+        line = self._cur().line
+        self._expect('CLASS')
+        name = self._expect('IDENT').value
+        if name in _BUILTIN_TYPES:
+            raise CompileError(f"'{name}' is a built-in type name", line)
+        self._expect('{')
+        fields = []
+        methods = []
+        names = set()
+        while not self._check('}') and not self._at_end():
+            if self._check('VAR'):
+                member = self._var_decl()
+            elif self._check('FN'):
+                member = self._fn_def()
+            else:
+                self._error(f"expected 'var' or 'fn' in class {name}")
+            if member.name in names:
+                raise CompileError(f"class {name} has two members named '{member.name}'",
+                                   member.line)
+            names.add(member.name)
+            if isinstance(member, VarDecl):
+                fields.append(member)
+            else:
+                if 'self' in member.params:
+                    raise CompileError(
+                        f"{name}.{member.name}: 'self' is implicit, don't declare it",
+                        member.line)
+                methods.append(member)
+        self._expect('}')
+        if not fields:
+            raise CompileError(f"class {name} has no fields", line)
+        return ClassDef(name, fields, methods, line)
 
     def _fn_def(self):
         line = self._cur().line
@@ -569,23 +664,9 @@ class Parser:
         return FnDef(name, params, body, line, param_types, return_type)
 
     def _parse_type_annotation(self):
-        """Parse optional ': int|float|widget|string|array' type annotation."""
+        """Parse optional ': int|float|widget|string|array|<class>' type annotation."""
         if self._match(':'):
-            tok = self._expect('IDENT')
-            if tok.value == 'float':
-                return 'float'
-            elif tok.value == 'int':
-                return 'int'
-            elif tok.value == 'widget':
-                return 'widget'
-            elif tok.value == 'string':
-                return 'string'
-            elif tok.value == 'array':
-                return 'array'
-            else:
-                raise CompileError(
-                    f"unknown type '{tok.value}' (expected 'int', 'float', 'widget', 'string', or 'array')",
-                    tok.line)
+            return self._expect_type_name()
         # No annotation → polymorphic. Distinct from an explicit ': int' so an
         # un-annotated param accepts string/widget/etc. args (e.g. lib/modal.fl's
         # showConfirmation(title, message) called with str(...)).
@@ -594,20 +675,13 @@ class Parser:
     def _expect_type_name(self):
         """Parse mandatory type name after '->' (no leading colon)."""
         tok = self._expect('IDENT')
-        if tok.value == 'float':
-            return 'float'
-        elif tok.value == 'int':
-            return 'int'
-        elif tok.value == 'widget':
-            return 'widget'
-        elif tok.value == 'string':
-            return 'string'
-        elif tok.value == 'array':
-            return 'array'
-        else:
-            raise CompileError(
-                f"unknown type '{tok.value}' (expected 'int', 'float', 'widget', 'string', or 'array')",
-                tok.line)
+        if tok.value in ('float', 'int', 'widget', 'string', 'array') \
+                or tok.value in self.class_names:
+            return tok.value
+        raise CompileError(
+            f"unknown type '{tok.value}' (expected 'int', 'float', 'widget', 'string', "
+            f"'array' or a class name)",
+            tok.line)
 
     def _block(self):
         self._expect('{')
@@ -882,9 +956,18 @@ class Parser:
             index = self._expression()
             self._expect(']')
             return IndexExpr(expr.name, index, expr.line)
-        # Dot access: widget.prop
+        # Dot access: widget.prop / obj.field; obj.method(args)
         if isinstance(expr, VarRef) and self._match('.'):
             prop = self._expect('IDENT').value
+            if self._match('('):
+                args = [expr]
+                if not self._check(')'):
+                    args.append(self._expression())
+                    while self._match(','):
+                        args.append(self._expression())
+                self._expect(')')
+                # '.name': resolved against the receiver's class by CodeGen.
+                return CallExpr('.' + prop, args, expr.line)
             return DotExpr(expr.name, prop, expr.line)
         # Postfix increment/decrement: i++, i--
         if isinstance(expr, VarRef) and self._check('++', '--'):
@@ -1213,6 +1296,7 @@ class CodeGen:
         self._last_alltar_var = None  # peephole: skip target() after alloc+target+store
         self._current_target = None  # track targeted widget for dot-access optimization
         self.array_vars = set() # names that hold array_ids
+        self.classes = {}       # class name -> layout (see _register_classes)
         self.const_vars = set() # names declared with const (immutable)
         self.const_values = {}  # name -> (value, type) for inlineable consts (no slot needed)
         self._global_init_stmts = None  # set during generate_image()
@@ -1261,6 +1345,7 @@ class CodeGen:
             }
             self.func_ids[fn.name] = next_fid
             next_fid += 1
+        self._register_classes(program)
 
         # Phase 3: JMP over function bodies + emit them
         main_jmp = None
@@ -1406,6 +1491,7 @@ class CodeGen:
                 stored_type = self.T_ARRAY
             self.var_types[stmt.name] = stored_type
             self.global_var_types[stmt.name] = stored_type
+        self._register_classes(program)
 
         # Emit functions. Global var init code is injected at the start of setup().
         # Order: setup first (runs once, evicted from cache), user functions
@@ -1792,6 +1878,8 @@ class CodeGen:
         if isinstance(node, IndexExpr):
             return self.T_INT  # array elements are untyped
         if isinstance(node, DotExpr):
+            if self._class_of_var(node.obj) is not None:
+                return self._field(node.obj, node.prop, node.line)[1]
             return self.T_INT  # widget properties are int
         if isinstance(node, UnaryOp):
             if node.op == '!':
@@ -1812,6 +1900,10 @@ class CodeGen:
                 return self.T_FLOAT
             return self.T_INT
         if isinstance(node, CallExpr):
+            if node.name == '__new':
+                return node.args[0].value
+            if node.name.startswith('.'):
+                return self.functions[self._method_name(node)].get('return_type', self.T_INT)
             if node.name in self._STRING_RETURNING:
                 return self.T_STRING
             if node.name in self._FLOAT_RETURNING:
@@ -1850,6 +1942,177 @@ class CodeGen:
             return self.T_INT  # func_id
         raise CompileError(f"unknown expression in type inference: {type(node).__name__}")
 
+    # --- Classes ---
+    #
+    # An instance is a pool array with one word per field, in declaration
+    # order; a class-typed variable holds its id. `obj.field` compiles to the
+    # array ops with a constant index. Methods are functions `Class.method`
+    # with `self` first, called statically by the receiver's declared class.
+
+    def _register_classes(self, program):
+        """Field layout and types of every class. Runs once the functions and
+        the globals are known (field initializers may use them)."""
+        for c in getattr(program, 'classes', []):
+            types = {}
+            owned = []
+            for i, f in enumerate(c.fields):
+                if f.array_size is not None:
+                    if f.init is not None and (not isinstance(f.init, ArrayLit)
+                                               or len(f.init.elements) != f.array_size):
+                        raise CompileError(
+                            f"field '{c.name}.{f.name}[{f.array_size}]' must be "
+                            f"initialized with {f.array_size} values in [...]", f.line)
+                    types[f.name] = self.T_ARRAY
+                    owned.append(i)
+                    continue
+                declared = f.var_type or self.T_ANY
+                if f.init is not None:
+                    vt = self._infer_type(f.init)
+                    self._check_type_match(declared, vt,
+                        f"field '{c.name}.{f.name}' declared {declared} but initialized with {vt}",
+                        f.line)
+                    t = vt if declared == self.T_ANY else declared
+                else:
+                    t = self.T_INT if declared == self.T_ANY else declared
+                types[f.name] = self.T_INT if t == self.T_WIDGET else t
+            self.classes[c.name] = {
+                'name': c.name,
+                'fields': c.fields,
+                'index': {f.name: i for i, f in enumerate(c.fields)},
+                'types': types,
+                'owned': owned,  # array fields: allocated by the constructor, freed by free()
+            }
+
+    def _class_of_var(self, name):
+        """Layout of the class variable `name` is declared with, or None."""
+        t = self.var_types.get(name)
+        return self.classes.get(t) if isinstance(t, str) else None
+
+    def _field(self, obj, field, line):
+        """(index, type) of `obj.field` for a class variable `obj`."""
+        cls = self._class_of_var(obj)
+        i = cls['index'].get(field)
+        if i is None:
+            raise CompileError(f"class {cls['name']} has no field '{field}'", line)
+        return i, cls['types'][field]
+
+    def _method_name(self, node):
+        """Function implementing the method call `node` (CallExpr '.name')."""
+        recv = node.args[0]
+        method = node.name[1:]
+        cls = self._class_of_var(recv.name) if isinstance(recv, VarRef) else None
+        if cls is None:
+            raise CompileError(
+                f"'{getattr(recv, 'name', '?')}' is not a class instance "
+                f"(calling .{method}())", node.line)
+        fn = f"{cls['name']}.{method}"
+        if fn not in self.functions:
+            raise CompileError(f"class {cls['name']} has no method '{method}'", node.line)
+        return fn
+
+    def _gen_field_load(self, obj, i, line):
+        slot = self._var_slot(obj, line)
+        if self.superops:
+            self.asm.push(i)
+            self.asm.arr_load_var(slot)
+        else:
+            self.asm.load(slot)
+            self.asm.push(i)
+            self.asm.arr_load()
+
+    def _gen_field_read(self, node):
+        i, _ = self._field(node.obj, node.prop, node.line)
+        self._gen_field_load(node.obj, i, node.line)
+
+    def _gen_field_assign(self, node):
+        i, ft = self._field(node.obj, node.prop, node.line)
+        vt = self._infer_type(node.value)
+        self._check_type_match(ft, vt,
+            f"'{node.obj}.{node.prop}' is {ft} but assigned {vt} value", node.line)
+        self.asm.load(self._var_slot(node.obj, node.line))
+        self.asm.push(i)
+        self._gen_expr(node.value)
+        if ft == self.T_FLOAT and vt == self.T_INT:
+            self.asm.itof()
+        self.asm.arr_store()
+
+    def _gen_field_compound(self, node):
+        i, ft = self._field(node.obj, node.prop, node.line)
+        if ft not in (self.T_INT, self.T_FLOAT, self.T_ANY):
+            raise CompileError(
+                f"compound assignment needs a number, '{node.obj}.{node.prop}' is {ft}",
+                node.line)
+        vt = self._infer_type(node.value)
+        use_float = ft == self.T_FLOAT
+        if not use_float and vt == self.T_FLOAT:
+            raise CompileError(
+                f"'{node.obj}.{node.prop}' is {ft}: declare the field float "
+                f"for float arithmetic", node.line)
+        self.asm.load(self._var_slot(node.obj, node.line))
+        self.asm.push(i)
+        self._gen_field_load(node.obj, i, node.line)
+        self._gen_expr(node.value)
+        if use_float and vt == self.T_INT:
+            self.asm.itof()
+        self._emit_arith_op(node.op, use_float, node.line)
+        self.asm.arr_store()
+
+    def _gen_new(self, node):
+        """`__new("Class")`: allocate an instance, store its field initializers
+        (fields without one stay 0) and allocate its array fields."""
+        cls = self.classes[node.args[0].value]
+        self.asm.arr_alloc(len(cls['fields']))
+        for i, f in enumerate(cls['fields']):
+            if f.array_size is not None:
+                self.asm.dup()
+                self.asm.push(i)
+                elems = f.init.elements if f.init is not None else None
+                if elems is None:
+                    self.asm.arr_alloc(f.array_size)
+                elif all(isinstance(e, NumLit) for e in elems):
+                    self.asm.arr_alloc_init([e.value for e in elems])
+                else:
+                    self.asm.arr_alloc(f.array_size)
+                    for j, e in enumerate(elems):
+                        self.asm.dup()
+                        self.asm.push(j)
+                        self._gen_expr(e)
+                        self.asm.arr_store()
+                self.asm.arr_store()
+            elif f.init is not None:
+                if isinstance(f.init, (NumLit, BoolLit)) and not f.init.value:
+                    continue  # the array starts zero-filled
+                self.asm.dup()
+                self.asm.push(i)
+                self._gen_expr(f.init)
+                if cls['types'][f.name] == self.T_FLOAT and self._infer_type(f.init) == self.T_INT:
+                    self.asm.itof()
+                self.asm.arr_store()
+
+    def _gen_free(self, node):
+        """`free(obj)`: `obj.drop()` if the class has one, then the array
+        fields and the instance itself go back to the pool."""
+        if len(node.args) != 1:
+            raise CompileError("free() takes 1 argument: a class instance", node.line)
+        arg = node.args[0]
+        cls = self.classes.get(self._infer_type(arg))
+        if cls is None:
+            raise CompileError(
+                "free() takes a class instance (arrays: arrFree(), strings: strFree())",
+                node.line)
+        self._gen_expr(arg)
+        drop = f"{cls['name']}.drop"
+        if drop in self.functions:
+            self.asm.dup()
+            self._emit_call(drop)
+            self.asm.pop()
+        for i in cls['owned']:
+            self.asm.dup()
+            self.asm.push(i)
+            self.asm.arr_load()
+            self.asm.arr_free()
+        self.asm.arr_free()
+
     def _types_compatible(self, expected: str, actual: str) -> bool:
         """Check if an expression of type `actual` can be used where
         `expected` is declared.  int→float is the only automatic promotion."""
@@ -1876,8 +2139,8 @@ class CodeGen:
         variables would compile to the int ops."""
         if declared == 'widget':
             return self.T_INT
-        if declared == self.T_ANY and init_type == self.T_FLOAT:
-            return self.T_FLOAT
+        if declared == self.T_ANY and (init_type == self.T_FLOAT or init_type in self.classes):
+            return init_type  # an unannotated `var p = Point()` is a Point
         return declared
 
     def _check_type_match(self, expected: str, actual: str, msg: str, line: int):
@@ -2054,11 +2317,17 @@ class CodeGen:
         elif isinstance(node, Assign):
             self._gen_assign(node)
         elif isinstance(node, DotAssign):
-            self._gen_dot_assign(node)
+            if self._class_of_var(node.obj) is not None:
+                self._gen_field_assign(node)
+            else:
+                self._gen_dot_assign(node)
         elif isinstance(node, CompoundAssign):
             self._gen_compound_assign(node)
         elif isinstance(node, DotCompoundAssign):
-            self._gen_dot_compound_assign(node)
+            if self._class_of_var(node.obj) is not None:
+                self._gen_field_compound(node)
+            else:
+                self._gen_dot_compound_assign(node)
         elif isinstance(node, IfStmt):
             self._gen_if(node)
         elif isinstance(node, WhileStmt):
@@ -2142,6 +2411,9 @@ class CodeGen:
                     return
                 if isinstance(node.init, CallExpr) and node.init.name in _ARRAY_RETURNING_BUILTINS:
                     self.array_vars.add(node.name)
+                if (isinstance(node.init, DotExpr) and vtype == self.T_ARRAY
+                        and self._class_of_var(node.init.obj) is not None):
+                    self.array_vars.add(node.name)  # an array field: `x[i]`
                 self._gen_expr(node.init)
                 # Auto-promote int→float if variable is typed float
                 if declared == self.T_FLOAT and vtype == self.T_INT:
@@ -2609,6 +2881,8 @@ class CodeGen:
 
     def _expr_has_value(self, node):
         if isinstance(node, CallExpr):
+            if node.name == 'free' and 'free' not in self.functions:
+                return False
             return node.name not in NO_VALUE_BUILTINS
         return True
 
@@ -2652,7 +2926,10 @@ class CodeGen:
             self._gen_expr(node.index)    # index (any expression)
             self.asm.arr_load()
         elif isinstance(node, DotExpr):
-            self._gen_dot_read(node)
+            if self._class_of_var(node.obj) is not None:
+                self._gen_field_read(node)
+            else:
+                self._gen_dot_read(node)
         elif isinstance(node, (BinOp, UnaryOp)) and self._const_int(node) is not None:
             # Constant folding (every device: the VM computes the same).
             self.asm.push(self._const_int(node))
@@ -2894,6 +3171,17 @@ class CodeGen:
 
     def _gen_call(self, node):
         name = node.name
+
+        # --- Classes ---
+        if name == '__new':
+            self._gen_new(node)
+            return
+        if name.startswith('.'):
+            self._gen_call(CallExpr(self._method_name(node), node.args, node.line))
+            return
+        if name == 'free' and 'free' not in self.functions:
+            self._gen_free(node)
+            return
 
         # --- Built-in: alloc() ---
         if name == 'alloc':
@@ -3805,6 +4093,11 @@ class CodeGen:
                     f"'{info['params'][i]}' expects {pt} "
                     f"but arg {i+1} is {arg_type}", node.line)
 
+        self._emit_call(name)
+
+    def _emit_call(self, name):
+        """CALL user function `name` (args already pushed)."""
+        info = self.functions[name]
         # CALL (with forward patching if needed)
         if info['addr'] is not None:
             self.asm.call(info['addr'])

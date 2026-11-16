@@ -366,6 +366,52 @@ A `: widget` parameter or local can be used with `target()`/`parent()` and dot s
 
 The VM has an 8-deep call stack.
 
+## Classes
+
+A class groups fields and the functions that work on them. It is compiler-only: an instance is an array in the object pool (one word per field, in declaration order) and a class-typed variable holds its id, so classes run on every device and need no firmware support.
+
+```c
+class Particle {
+    var x = 0.0;              // float (from the initializer)
+    var y: float;             // float, starts 0.0
+    var life = 100;           // int
+    var trail[8];             // array field: allocated with the instance
+    var name = str("dot");    // string
+    var link: Particle;       // another instance (starts 0 = none)
+
+    fn init(x0: float, y0: float) {   // optional constructor body
+        self.x = x0;
+        self.y = y0;
+    }
+    fn step(dt: float) {
+        self.x += dt;
+        self.life -= 1;
+    }
+    fn alive() -> int { return self.life > 0; }
+    fn drop() {               // optional, run by free()
+        strFree(self.name);
+    }
+}
+
+fn setup() {
+    var p = Particle(10, 20);    // allocates, runs init(10, 20) (ints promoted)
+    p.step(0.016);
+    var px = p.x;                // float
+    p.life = 5;
+    var t = p.trail;             // array field → t[i]
+    t[0] = p.life;
+    free(p);
+}
+```
+
+- **Fields** are `var` declarations. The type comes from the annotation, else from the initializer, else `int`. Unset fields start at 0. An array field (`var a[N]` or `var a[N] = [...]`) is allocated by the constructor and freed by `free()`.
+- **Constructor:** `Name(args)` allocates the instance, stores the field initializers, then calls `init(args)` if the class has one. Without `init` it takes no arguments.
+- **Methods** are `fn`s inside the class. In a method `self` is the instance; fields are always reached as `self.field` (there is no implicit field scope). Calls are static (`p.step(dt)` calls `Particle.step(p, dt)`), there is no inheritance or virtual dispatch.
+- **Types:** a class name is a type for parameters, return values, variables and fields (`fn f(p: Particle) -> Particle`, `var p: Particle;`). An unannotated `var p = Particle();` is a `Particle`. Instances of different classes don't mix. Assignment copies the reference, not the fields.
+- **Field access** is one level deep: `p.x`, `p.x = v`, `p.x += v` (float-aware: a float field gets float ops, an int assigned to it is converted). For `p.link.x` or `p.trail[i]` go through a variable: `var l = p.link; l.x`. `p.x++` is not supported, use `p.x += 1;`.
+- **Lifetime is manual**, like arrays: `free(p)` calls `p.drop()` if it exists, frees the array fields, then the instance. It does not free string fields or instances held in fields — do that in `drop()`. Freeing twice or using a freed instance faults (`invalid array`) unless its id was reused. A program switch frees everything.
+- Field access compiles to the array instructions with a constant index (`ARR_LOAD_V` with superops); a method call is a normal `CALL`, and a constructor with `init` takes two of the 8 call-stack levels.
+
 ## Widget System
 
 Widgets form a tree structure (parent-child) with a CSS-like box model.
