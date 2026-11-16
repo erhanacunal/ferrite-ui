@@ -350,6 +350,22 @@ class IncDecLExpr:
         self.line = line
 
 
+class IsExpr:
+    """`expr is Class`: 1 when the instance is a `Class` (or a subclass)."""
+    def __init__(self, expr, cls, line):
+        self.expr = expr
+        self.cls = cls
+        self.line = line
+
+
+class AsExpr:
+    """`expr as Class`: the instance typed `Class`, or 0 when it isn't one."""
+    def __init__(self, expr, cls, line):
+        self.expr = expr
+        self.cls = cls
+        self.line = line
+
+
 class BinOp:
     def __init__(self, op, left, right, line):
         self.op = op
@@ -528,11 +544,12 @@ class ClassDef:
     """`class Name { var field...; fn method(...) {...} }`. Instances are
     pool arrays (one word per field, in declaration order); the parser lowers
     the methods and the constructor into ordinary functions."""
-    def __init__(self, name, fields, methods, line):
+    def __init__(self, name, fields, methods, line, parent=None):
         self.name = name
         self.fields = fields    # [VarDecl]
         self.methods = methods  # [FnDef] as written (no `self` param)
         self.line = line
+        self.parent = parent    # base class name or None
 
 
 class Program:
@@ -547,17 +564,18 @@ class Program:
 # ============================================================
 
 
-def _lower_class(c):
+def _lower_class(c, by_name, in_tree):
     """Functions that implement class `c`: each method as `Name.method` with
     `self: Name` in front of its params, and the constructor `Name(...)`,
-    which takes `init`'s params: it allocates the instance (`__new`, which
-    also stores the field initializers), calls `init` if there is one and
-    returns the instance."""
+    which takes the params of `init` (its own, else the nearest base
+    class's): it allocates the instance (`__new`, which also stores the
+    field initializers), calls that `init` and returns the instance. A class
+    in an inheritance tree also gets `Name.__free` (what `free()` calls,
+    dispatched on the instance's class)."""
     fns = []
-    init = None
     for m in c.methods:
-        if m.name == 'init':
-            init = m
+        if m.name.startswith('__'):
+            raise CompileError(f"{c.name}.{m.name}: names starting with __ are reserved", m.line)
         if m.name == 'drop' and m.params:
             raise CompileError(f"{c.name}.drop() takes no parameters", m.line)
         pt = list(m.param_types or ['any'] * len(m.params))
@@ -567,14 +585,24 @@ def _lower_class(c):
     body = [VarDecl('self', CallExpr('__new', [StrLit(c.name, line)], line), line,
                     var_type=c.name)]
     params, ptypes = [], []
+    owner, init = c, None
+    while owner is not None:
+        init = next((m for m in owner.methods if m.name == 'init'), None)
+        if init is not None:
+            break
+        owner = by_name.get(owner.parent)
     if init is not None:
         params = list(init.params)
         ptypes = list(init.param_types or ['any'] * len(params))
         body.append(ExprStmt(CallExpr(
-            f"{c.name}.init", [VarRef('self', line)] + [VarRef(p, line) for p in params],
+            f"{owner.name}.init", [VarRef('self', line)] + [VarRef(p, line) for p in params],
             line), line))
     body.append(ReturnStmt(VarRef('self', line), line))
     fns.append(FnDef(c.name, params, body, line, ptypes, c.name))
+    if in_tree:
+        fns.append(FnDef(f"{c.name}.__free", ['self'],
+                         [ExprStmt(CallExpr('__freebody', [StrLit(c.name, line)], line), line)],
+                         line, [c.name], 'int'))
     return fns
 
 
@@ -636,12 +664,25 @@ class Parser:
                 classes.append(self._class_def())
             else:
                 statements.append(self._statement())
+        by_name = {c.name: c for c in classes}
+        for c in classes:
+            seen = {c.name}
+            k = c
+            while k.parent is not None:
+                if k.parent not in by_name:
+                    raise CompileError(f"class {k.name}: unknown base class '{k.parent}'", k.line)
+                if k.parent in seen:
+                    raise CompileError(f"class {c.name}: inheritance cycle", c.line)
+                seen.add(k.parent)
+                k = by_name[k.parent]
+        has_subclasses = {c.parent for c in classes if c.parent}
         for c in classes:
             if any(f.name == c.name for f in functions):
                 raise CompileError(
                     f"function '{c.name}' has the name of a class "
                     f"(the class's constructor)", c.line)
-            functions.extend(_lower_class(c))
+            functions.extend(_lower_class(
+                c, by_name, c.parent is not None or c.name in has_subclasses))
         return Program(functions, statements, classes)
 
     def _class_def(self):
@@ -650,6 +691,9 @@ class Parser:
         name = self._expect('IDENT').value
         if name in _BUILTIN_TYPES:
             raise CompileError(f"'{name}' is a built-in type name", line)
+        parent = None
+        if self._match(':'):
+            parent = self._expect('IDENT').value
         self._expect('{')
         fields = []
         methods = []
@@ -674,9 +718,9 @@ class Parser:
                         member.line)
                 methods.append(member)
         self._expect('}')
-        if not fields:
+        if not fields and parent is None:
             raise CompileError(f"class {name} has no fields", line)
-        return ClassDef(name, fields, methods, line)
+        return ClassDef(name, fields, methods, line, parent)
 
     def _fn_def(self):
         line = self._cur().line
@@ -932,11 +976,21 @@ class Parser:
 
     def _comparison_expr(self):
         left = self._shift_expr()
-        while self._check('<', '<=', '>', '>='):
-            op = self._advance().value
-            right = self._shift_expr()
-            left = BinOp(op, left, right, left.line)
-        return left
+        while True:
+            if self._check('<', '<=', '>', '>='):
+                op = self._advance().value
+                right = self._shift_expr()
+                left = BinOp(op, left, right, left.line)
+            elif (self._check('IDENT') and self._cur().value in ('is', 'as')
+                    and self.tokens[self.pos + 1].type == 'IDENT'):
+                # Contextual: `is`/`as` stay usable as names (`var as = ...`).
+                kind = self._advance().value
+                tok = self._expect('IDENT')
+                if tok.value not in self.class_names:
+                    raise CompileError(f"'{tok.value}' is not a class", tok.line)
+                left = (IsExpr if kind == 'is' else AsExpr)(left, tok.value, left.line)
+            else:
+                return left
 
     def _shift_expr(self):
         left = self._add_expr()
@@ -1689,6 +1743,9 @@ class CodeGen:
         elif isinstance(expr, IncDecLExpr):
             self._collect_lambdas_in_expr(
                 expr.target, enclosing_params, global_names)
+        elif isinstance(expr, (IsExpr, AsExpr)):
+            self._collect_lambdas_in_expr(
+                expr.expr, enclosing_params, global_names)
 
     def _register_lambda(self, expr, enclosing_params, global_names):
         """Check captures and register a lambda as an anonymous function."""
@@ -1790,6 +1847,8 @@ class CodeGen:
             self._collect_var_refs_expr(expr.index, refs)
         elif isinstance(expr, IncDecLExpr):
             self._collect_var_refs_expr(expr.target, refs)
+        elif isinstance(expr, (IsExpr, AsExpr)):
+            self._collect_var_refs_expr(expr.expr, refs)
 
     def _collect_declared_vars(self, stmts, declared):
         """Collect variable names declared (via var) in statements."""
@@ -1976,6 +2035,10 @@ class CodeGen:
             return self.T_INT
         if isinstance(node, IncDecLExpr):
             return self._lvalue(node.target)[3]
+        if isinstance(node, IsExpr):
+            return self.T_INT
+        if isinstance(node, AsExpr):
+            return node.cls
         if isinstance(node, DotExpr):
             if self._class_of_var(node.obj) is not None:
                 return self._field(node.obj, node.prop, node.line)[1]
@@ -2049,12 +2112,46 @@ class CodeGen:
     # with `self` first, called statically by the receiver's declared class.
 
     def _register_classes(self, program):
-        """Field layout and types of every class. Runs once the functions and
-        the globals are known (field initializers may use them)."""
-        for c in getattr(program, 'classes', []):
-            types = {}
-            owned = []
-            for i, f in enumerate(c.fields):
+        """Layout, types and class ids of every class. Runs once the
+        functions and the globals are known (field initializers may use
+        them).
+
+        A class with a base class starts with the base's fields (so a
+        subclass instance is a valid base instance). Classes in an
+        inheritance tree keep a hidden class id in word 0; ids are given in
+        preorder, so a class's subtree is the id range [id, last]."""
+        defs = {c.name: c for c in getattr(program, 'classes', [])}
+        kids = {name: [] for name in defs}
+        for c in defs.values():
+            if c.parent:
+                kids[c.parent].append(c.name)
+        order = []
+
+        def visit(name, depth):
+            order.append((name, depth))
+            for k in kids[name]:
+                visit(k, depth + 1)
+        for c in defs.values():
+            if not c.parent:
+                visit(c.name, 0)
+        next_id = 1
+        for name, depth in order:
+            c = defs[name]
+            parent = self.classes.get(c.parent) if c.parent else None
+            in_tree = parent is not None or bool(kids[name])
+            if parent is not None:
+                fields = list(parent['fields'])
+                types = dict(parent['types'])
+                owned = list(parent['owned'])
+            else:
+                fields, types, owned = [], {}, []
+            base = 1 if in_tree else 0
+            for f in c.fields:
+                if f.name in types:
+                    raise CompileError(
+                        f"field '{c.name}.{f.name}' is already a field of a base class", f.line)
+                i = base + len(fields)
+                fields.append(f)
                 if f.array_size is not None:
                     if f.init is not None and (not isinstance(f.init, ArrayLit)
                                                or len(f.init.elements) != f.array_size):
@@ -2074,13 +2171,61 @@ class CodeGen:
                 else:
                     t = self.T_INT if declared == self.T_ANY else declared
                 types[f.name] = self.T_INT if t == self.T_WIDGET else t
-            self.classes[c.name] = {
-                'name': c.name,
-                'fields': c.fields,
-                'index': {f.name: i for i, f in enumerate(c.fields)},
+            self.classes[name] = {
+                'name': name,
+                'parent': c.parent,
+                'depth': depth,
+                'in_tree': in_tree,
+                'id': next_id if in_tree else 0,
+                'last': None,  # set below
+                'fields': fields,
+                'words': base + len(fields),
+                'index': {f.name: base + i for i, f in enumerate(fields)},
                 'types': types,
                 'owned': owned,  # array fields: allocated by the constructor, freed by free()
+                'methods': {m.name: m.line for m in c.methods},
             }
+            if in_tree:
+                next_id += 1
+        # Subtree ranges: preorder, so the last id of a subtree is the
+        # highest id among the class and its descendants.
+        for name, _ in reversed(order):
+            cls = self.classes[name]
+            cls['last'] = max([cls['id']] + [self.classes[k]['last'] for k in kids[name]])
+        self._has_hierarchy = any(c['in_tree'] for c in self.classes.values())
+        # Overrides keep the signature.
+        for cls in self.classes.values():
+            if not cls['parent']:
+                continue
+            for m in cls['methods'].keys() - {'init'}:
+                owner = self._resolve_method(cls['parent'], m)
+                if owner is None:
+                    continue
+                mine = self.functions[f"{cls['name']}.{m}"]
+                base = self.functions[f"{owner}.{m}"]
+                if (len(mine['params']) != len(base['params'])
+                        or mine['param_types'][1:] != base['param_types'][1:]
+                        or mine['return_type'] != base['return_type']):
+                    raise CompileError(
+                        f"{cls['name']}.{m} overrides {owner}.{m} with another signature",
+                        cls['methods'][m])
+
+    def _is_subclass(self, a, b):
+        """Class `a` is `b` or derives from it."""
+        while a is not None:
+            if a == b:
+                return True
+            a = self.classes[a]['parent'] if a in self.classes else None
+        return False
+
+    def _resolve_method(self, cls, m):
+        """Class that defines method `m` for class `cls` (itself or the
+        nearest base class), or None."""
+        while cls is not None:
+            if f"{cls}.{m}" in self.functions:
+                return cls
+            cls = self.classes[cls]['parent']
+        return None
 
     def _class_of_var(self, name):
         """Layout of the class variable `name` is declared with, or None."""
@@ -2095,19 +2240,162 @@ class CodeGen:
             raise CompileError(f"class {cls['name']} has no field '{field}'", line)
         return i, cls['types'][field]
 
-    def _method_name(self, node):
-        """Function implementing the method call `node` (CallExpr '.name')."""
+    def _resolve_call(self, node):
+        """Method call `node` (CallExpr '.name') as (function, overriders,
+        receiver): `function` implements it for the receiver's declared
+        class; `overriders` are the subclasses that override it (empty: a
+        static call). `super.m()` calls the base class's `m` on `self`."""
         recv = node.args[0]
         method = node.name[1:]
+        if isinstance(recv, VarRef) and recv.name == 'super' and 'super' not in self.vars:
+            cur = self._class_of_var('self')
+            if cur is None or not cur['parent']:
+                raise CompileError("super is only valid in a method of a subclass", node.line)
+            owner = self._resolve_method(cur['parent'], method)
+            if owner is None:
+                raise CompileError(
+                    f"class {cur['parent']} has no method '{method}' (super.{method}())",
+                    node.line)
+            return f"{owner}.{method}", [], VarRef('self', recv.line)
         cls = self.classes.get(self._infer_type(recv))
         if cls is None:
             what = f"'{recv.name}'" if isinstance(recv, VarRef) else "the receiver"
             raise CompileError(
                 f"{what} is not a class instance (calling .{method}())", node.line)
-        fn = f"{cls['name']}.{method}"
-        if fn not in self.functions:
+        owner = self._resolve_method(cls['name'], method)
+        if owner is None:
             raise CompileError(f"class {cls['name']} has no method '{method}'", node.line)
-        return fn
+        overriders = []
+        if cls['in_tree'] and method != 'init':
+            overriders = [c for c in self.classes.values()
+                          if cls['id'] < c['id'] <= cls['last'] and method in c['methods']]
+            if method == '__free':
+                overriders = [c for c in self.classes.values()
+                              if cls['id'] < c['id'] <= cls['last']]
+        return f"{owner}.{method}", overriders, recv
+
+    def _method_name(self, node):
+        """Function implementing the method call `node` for the receiver's
+        declared class (overrides have the same signature)."""
+        return self._resolve_call(node)[0]
+
+    def _emit_class_test(self, cls):
+        """Replace the class id on the stack by 1 if it is `cls` or a
+        subclass, else 0."""
+        lo, hi = cls['id'], cls['last']
+        if lo == hi:
+            self.asm.push(lo)
+            self.asm.eq()
+        else:
+            self.asm.dup()
+            self.asm.push(lo)
+            self.asm.ge()
+            self.asm.swap()
+            self.asm.push(hi)
+            self.asm.le()
+            self.asm.and_()
+
+    def _emit_is_test(self, cls):
+        """Replace the instance on the stack by 1 if it is a `cls`, else 0
+        (also 0 for 0, no instance)."""
+        self.asm.dup()
+        none = self.asm.jz_fwd()
+        self.asm.push(0)
+        self.asm.arr_load()
+        self._emit_class_test(cls)
+        end = self.asm.jmp_fwd()
+        self.asm.patch(none)
+        self.asm.pop()
+        self.asm.push(0)
+        self.asm.patch(end)
+
+    def _gen_is(self, node):
+        st = self._infer_type(node.expr)
+        if st not in self.classes:
+            raise CompileError(f"'is' needs a class instance, got {st}", node.line)
+        if self._is_subclass(st, node.cls):
+            self._gen_expr(node.expr)  # always one, unless there is no instance
+            self.asm.push(0)
+            self.asm.ne()
+            return
+        if not self._is_subclass(node.cls, st):
+            raise CompileError(
+                f"a '{st}' is never a '{node.cls}' (unrelated classes)", node.line)
+        self._gen_expr(node.expr)
+        self._emit_is_test(self.classes[node.cls])
+
+    def _gen_as(self, node):
+        st = self._infer_type(node.expr)
+        if st not in self.classes:
+            raise CompileError(f"'as' needs a class instance, got {st}", node.line)
+        self._gen_expr(node.expr)
+        if self._is_subclass(st, node.cls):
+            return  # upcast
+        if not self._is_subclass(node.cls, st):
+            raise CompileError(
+                f"a '{st}' is never a '{node.cls}' (unrelated classes)", node.line)
+        self.asm.dup()
+        self._emit_is_test(self.classes[node.cls])
+        ok = self.asm.jnz_fwd()
+        self.asm.pop()
+        self.asm.push(0)
+        self.asm.patch(ok)
+
+    def _gen_method_call(self, node):
+        fn, overriders, recv = self._resolve_call(node)
+        args = [recv] + node.args[1:]
+        if not overriders:
+            self._gen_call(CallExpr(fn, args, node.line))
+            return
+        # Virtual: push the args, read the receiver's class id, then one
+        # static CALL per overriding class (deepest first: nested ranges),
+        # falling back to the declared class's method.
+        info = self.functions[fn]
+        if len(args) != len(info['params']):
+            raise CompileError(
+                f"{node.name[1:]}() expects {len(info['params']) - 1} args, "
+                f"got {len(args) - 1}", node.line)
+        if self._lv_pure(recv):
+            self._gen_expr(recv)
+            reload = lambda: self._gen_expr(recv)
+        else:
+            tmp = self._alloc_var(f"__recv{self._recv_temps}", node.line)
+            self._recv_temps += 1
+            self._gen_expr(recv)
+            self.asm.dup()
+            self.asm.store(tmp)
+            reload = lambda: self.asm.load(tmp)
+        self._gen_args(fn, args, node.line, first=1)
+        reload()
+        self.asm.push(0)
+        self.asm.arr_load()
+        method = node.name[1:]
+        ends = []
+        for c in sorted(overriders, key=lambda c: -c['depth']):
+            self.asm.dup()
+            self._emit_class_test(c)
+            nxt = self.asm.jz_fwd()
+            self.asm.pop()
+            self._emit_call(f"{c['name']}.{method}")
+            ends.append(self.asm.jmp_fwd())
+            self.asm.patch(nxt)
+        self.asm.pop()
+        self._emit_call(fn)
+        for e in ends:
+            self.asm.patch(e)
+        self._current_target = None
+
+    def _count_recv_temps(self, fn):
+        """Upper bound of the receiver temporaries `fn`'s virtual calls need
+        (receivers that can't be evaluated twice)."""
+        if not getattr(self, '_has_hierarchy', False):
+            return 0
+        stmts = list(fn.body)
+        if fn.name == 'setup' and self._global_init_stmts:
+            stmts += self._global_init_stmts
+        return sum(1 for n in _walk_ast(stmts)
+                   if isinstance(n, CallExpr) and n.name.startswith('.')
+                   and n.args and not self._lv_pure(n.args[0]))
 
     def _gen_field_load(self, obj, i, line):
         slot = self._var_slot(obj, line)
@@ -2281,8 +2569,14 @@ class CodeGen:
         """`__new("Class")`: allocate an instance, store its field initializers
         (fields without one stay 0) and allocate its array fields."""
         cls = self.classes[node.args[0].value]
-        self.asm.arr_alloc(len(cls['fields']))
-        for i, f in enumerate(cls['fields']):
+        self.asm.arr_alloc(cls['words'])
+        if cls['in_tree']:
+            self.asm.dup()
+            self.asm.push(0)
+            self.asm.push(cls['id'])
+            self.asm.arr_store()
+        for f in cls['fields']:
+            i = cls['index'][f.name]
             if f.array_size is not None:
                 self.asm.dup()
                 self.asm.push(i)
@@ -2320,6 +2614,11 @@ class CodeGen:
             raise CompileError(
                 "free() takes a class instance (arrays: arrFree(), strings: strFree())",
                 node.line)
+        if cls['in_tree']:
+            # The instance may be a subclass with more to free.
+            self._gen_method_call(CallExpr('.__free', [arg], node.line))
+            self.asm.pop()
+            return
         self._gen_expr(arg)
         drop = f"{cls['name']}.drop"
         if drop in self.functions:
@@ -2331,6 +2630,24 @@ class CodeGen:
             self.asm.push(i)
             self.asm.arr_load()
             self.asm.arr_free()
+        self.asm.arr_free()
+
+    def _gen_free_body(self, node):
+        """Body of `Class.__free(self)`: drop() (own or inherited), the
+        array fields, the instance."""
+        cls = self.classes[node.args[0].value]
+        slot = self._var_slot('self', node.line)
+        owner = self._resolve_method(cls['name'], 'drop')
+        if owner is not None:
+            self.asm.load(slot)
+            self._emit_call(f"{owner}.drop")
+            self.asm.pop()
+        for i in cls['owned']:
+            self.asm.load(slot)
+            self.asm.push(i)
+            self.asm.arr_load()
+            self.asm.arr_free()
+        self.asm.load(slot)
         self.asm.arr_free()
 
     def _types_compatible(self, expected: str, actual: str) -> bool:
@@ -2350,6 +2667,9 @@ class CodeGen:
         # `var c: widget = get(first_child)`).
         if expected == self.T_WIDGET and actual == self.T_INT:
             return True
+        # A subclass instance fills a base class slot.
+        if expected in self.classes and actual in self.classes:
+            return self._is_subclass(actual, expected)
         return False
 
     def _stored_type(self, declared, init_type):
@@ -2409,7 +2729,9 @@ class CodeGen:
         self._last_alltar_var = None
 
         # Emit FRAME prologue: tells VM how many local slots this function needs
-        local_count = len(fn.params) + self._count_var_slots(fn.body)
+        local_count = (len(fn.params) + self._count_var_slots(fn.body)
+                       + self._count_recv_temps(fn))
+        self._recv_temps = 0
         self.asm.frame(local_count)
 
         # Allocate param slots and pop args (reverse order)
@@ -3108,6 +3430,8 @@ class CodeGen:
         if isinstance(node, CallExpr):
             if node.name == 'free' and 'free' not in self.functions:
                 return False
+            if node.name == '__freebody':
+                return False
             return node.name not in NO_VALUE_BUILTINS
         return True
 
@@ -3167,6 +3491,10 @@ class CodeGen:
             self.asm.arr_load()
         elif isinstance(node, IncDecLExpr):
             self._gen_lincdec(node)
+        elif isinstance(node, IsExpr):
+            self._gen_is(node)
+        elif isinstance(node, AsExpr):
+            self._gen_as(node)
         elif isinstance(node, (BinOp, UnaryOp)) and self._const_int(node) is not None:
             # Constant folding (every device: the VM computes the same).
             self.asm.push(self._const_int(node))
@@ -3414,7 +3742,10 @@ class CodeGen:
             self._gen_new(node)
             return
         if name.startswith('.'):
-            self._gen_call(CallExpr(self._method_name(node), node.args, node.line))
+            self._gen_method_call(node)
+            return
+        if name == '__freebody':
+            self._gen_free_body(node)
             return
         if name == 'free' and 'free' not in self.functions:
             self._gen_free(node)
@@ -4312,9 +4643,18 @@ class CodeGen:
             raise CompileError(
                 f"{name}() expects {len(info['params'])} args, got {len(node.args)}", node.line)
 
+        self._gen_args(name, node.args, node.line)
+        self._emit_call(name)
+
+    def _gen_args(self, name, args, line, first=0):
+        """Push `args[first:]` for user function `name`, left to right,
+        checking them against its parameter types."""
+        info = self.functions[name]
         # Push args left to right, validating types against param declarations
         param_types = info.get('param_types', ['int'] * len(info['params']))
-        for i, arg in enumerate(node.args):
+        for i, arg in enumerate(args):
+            if i < first:
+                continue
             arg_type = self._infer_type(arg)
             pt = param_types[i] if i < len(param_types) else 'int'
             self._gen_expr(arg)
@@ -4328,9 +4668,7 @@ class CodeGen:
                 raise CompileError(
                     f"type mismatch: {name}() param "
                     f"'{info['params'][i]}' expects {pt} "
-                    f"but arg {i+1} is {arg_type}", node.line)
-
-        self._emit_call(name)
+                    f"but arg {i+1} is {arg_type}", line)
 
     def _emit_call(self, name):
         """CALL user function `name` (args already pushed)."""

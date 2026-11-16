@@ -408,11 +408,56 @@ fn setup() {
 
 - **Fields** are `var` declarations. The type comes from the annotation, else from the initializer, else `int`. Unset fields start at 0. An array field (`var a[N]` or `var a[N] = [...]`) is allocated by the constructor and freed by `free()`.
 - **Constructor:** `Name(args)` allocates the instance, stores the field initializers, then calls `init(args)` if the class has one. Without `init` it takes no arguments.
-- **Methods** are `fn`s inside the class. In a method `self` is the instance; fields are always reached as `self.field` (there is no implicit field scope). Calls are static (`p.step(dt)` calls `Particle.step(p, dt)`), there is no inheritance or virtual dispatch.
+- **Methods** are `fn`s inside the class. In a method `self` is the instance; fields are always reached as `self.field` (there is no implicit field scope). `p.step(dt)` calls `Particle.step(p, dt)`; see Inheritance for overridden methods.
 - **Types:** a class name is a type for parameters, return values, variables and fields (`fn f(p: Particle) -> Particle`, `var p: Particle;`). An unannotated `var p = Particle();` is a `Particle`. Instances of different classes don't mix. Assignment copies the reference, not the fields.
 - **Field access** chains: `p.x`, `p.link.x`, `p.trail[i]`, `p.next().x`, `p.link.step(dt)`, each readable and assignable with `=`, `+=`… and `++`/`--` (prefix or postfix; also on plain array elements, `a[i]++`). Float-aware: a float field gets float ops, an int assigned to it is converted. `+=` and `++` evaluate the target twice, so their target may not contain calls or `++` (`p.next().x += 1` is a compile error: use a variable); a plain `=` may. Widget properties don't take `++`, use `w.value += 1`.
 - **Lifetime is manual**, like arrays: `free(p)` calls `p.drop()` if it exists, frees the array fields, then the instance. It does not free string fields or instances held in fields — do that in `drop()`. Freeing twice or using a freed instance faults (`invalid array`) unless its id was reused. A program switch frees everything.
 - Field access compiles to the array instructions with a constant index (`ARR_LOAD_V` with superops); a method call is a normal `CALL`, and a constructor with `init` takes two of the 8 call-stack levels.
+
+### Inheritance
+
+```c
+class Shape {
+    var x;
+    fn init(x0) { self.x = x0; }
+    fn area() -> int { return 0; }
+    fn describe() -> int { return self.kind() * 1000 + self.area(); }
+    fn kind() -> int { return 1; }
+}
+
+class Rect : Shape {                 // single inheritance
+    var w;
+    var h;
+    fn init(x0, w0, h0) {
+        super.init(x0);              // the base class's method
+        self.w = w0;
+        self.h = h0;
+    }
+    fn area() -> int { return self.w * self.h; }   // override
+    fn kind() -> int { return 2; }
+}
+
+class Circle : Shape {               // no init: Circle(x0) runs Shape.init
+    var rad = 2;
+    fn area() -> int { return 3 * self.rad * self.rad; }
+}
+
+fn total(s: Shape) -> int { return s.area(); }      // Rect.area for a Rect
+
+var s: Shape = Rect(0, 3, 4);
+if (s is Rect) {                     // 1 for a Rect or a subclass of it
+    var r = s as Rect;               // typed Rect, 0 if s isn't one
+    r.w += 1;
+}
+```
+
+- A subclass has its base classes' fields first, then its own (a field name may not repeat), and every method it doesn't override. A subclass instance can be used wherever a base class is expected; the other way needs `as`.
+- **Overriding:** a method with the name of a base class method replaces it for that class and its subclasses, with the same parameters and return type. Calls go to the instance's actual class, also from base class code (`describe()` above calls `Rect.kind` on a Rect). A method nobody overrides is still a plain `CALL`.
+- **`super.m(args)`** calls the base class's `m` on `self` (statically), from any method of a subclass.
+- **Constructor:** `Name(args)` runs the class's own `init`, else the nearest base class's (with its parameters). A subclass `init` calls `super.init(...)` itself if it wants the base's.
+- **`x is C`** is 1 when `x` holds a `C` or a subclass of it, 0 otherwise (and for no instance, 0). **`x as C`** gives `x` typed `C`, or 0 when it isn't one. Both are compile errors for unrelated classes. `is`/`as` are only keywords there: they still work as variable names.
+- **`free(x)`** frees what the instance's actual class owns: its `drop()` (own or inherited; a subclass `drop` calls `super.drop()` itself if needed), every array field, the instance.
+- **Cost:** classes in an inheritance tree carry one hidden word (the class id) per instance. A call to an overridden method reads it and compares it against each overriding class (a range check, deepest class first) before a static `CALL`, so it costs a few instructions per overriding class; no extra call-stack level.
 
 ## Widget System
 
