@@ -9,7 +9,7 @@ Bare-metal HMI framework in Rust: a bytecode VM runs `.fl` programs on a widget 
 - `docs/notes/features.md` — user files, GPIO, EEPROM, CAPS/cargo features, JPEG, audio, SD boot, Wi-Fi (epaper), gestures, animation, fonts.
 - `docs/notes/boards.md` — hardware, FPGA protocol and double buffer, W25Q256, recovery mode + PENIRQ touch, sim tools, what moved to ferrite-ui-xl.
 - `docs/notes/compiler.md` — `.fl` pitfalls, compiler changes (float locals, classes, widget constructors).
-- `docs/notes/tools.md` — USART resync, writefs CRC chunks / sequence ACKs, `ferrite_cli` upload paths (bootflash, bridge, monitor).
+- `docs/notes/tools.md` — USART resync, writefs CRC chunks / sequence ACKs, `ferrite_cli` upload paths (bootflash, bridge, monitor), editor support (`ferrite_analysis`: designer code editor + LSP).
 - `docs/notes/history.md` — the original feature checklist.
 - Language/bytecode/protocol references: `docs/ferrite-lang.md`, `docs/bytecode.md`, `docs/protocol.md`. Platform abstraction design: `HANDOFF.md`.
 

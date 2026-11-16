@@ -7,11 +7,16 @@ Communicates via JSON-RPC 2.0 over stdin/stdout.
 Usage:
     python ferrite_lsp.py
 
-Features:
-    - Diagnostics (compile errors on open/save)
-    - Completions (keywords, builtins, widget properties, types)
-    - Hover info (builtin signatures, property descriptions)
-    - Go-to-definition (functions, @callback references)
+Features (the analysis is ferrite_analysis.Document, shared with the
+designer's code editor):
+    - Diagnostics (compile errors as you type, with the project's include
+      dirs and device caps from the nearest project.json)
+    - Completions (locals, globals, functions, classes and their members,
+      widget constructors and their named arguments, properties, builtins)
+    - Hover info (declarations with their comments, builtins, properties)
+    - Signature help
+    - Go-to-definition (functions, classes, members, widgets, globals, locals,
+      also into included files)
     - Document symbols (function outline)
     - Semantic tokens (syntax highlighting)
 """
@@ -68,6 +73,15 @@ def _send_message(msg):
 class Server:
     def __init__(self):
         self.documents = {}  # uri -> {"text": str, "version": int}
+        self.analyzers = {}  # uri -> ferrite_analysis.Document
+
+    def _analyzer(self, uri):
+        a = self.analyzers.get(uri)
+        if a is None:
+            path = _uri_to_path(uri)
+            dirs, superops, native_flex = project_settings(path)
+            a = self.analyzers[uri] = Document(path, dirs, superops, native_flex)
+        return a
 
     def handle(self, msg):
         method = msg.get('method', '')
@@ -99,6 +113,8 @@ class Server:
             return self._hover(msg_id, msg.get('params', {}))
         elif method == 'textDocument/definition':
             return self._definition(msg_id, msg.get('params', {}))
+        elif method == 'textDocument/signatureHelp':
+            return self._signature_help(msg_id, msg.get('params', {}))
         elif method == 'textDocument/documentSymbol':
             return self._document_symbol(msg_id, msg.get('params', {}))
         elif method == 'textDocument/semanticTokens/full':
@@ -125,7 +141,10 @@ class Server:
                     'save': True,
                 },
                 'completionProvider': {
-                    'triggerCharacters': ['.', '@', '"'],
+                    'triggerCharacters': ['.', '@', '"', '(', ','],
+                },
+                'signatureHelpProvider': {
+                    'triggerCharacters': ['(', ','],
                 },
                 'hoverProvider': True,
                 'definitionProvider': True,
@@ -172,6 +191,7 @@ class Server:
     def _did_close(self, params):
         uri = params['textDocument']['uri']
         self.documents.pop(uri, None)
+        self.analyzers.pop(uri, None)
 
     def _did_save(self, params):
         uri = params['textDocument']['uri']
@@ -184,193 +204,90 @@ class Server:
         doc = self.documents.get(uri)
         if not doc:
             return
-        diagnostics = []
-        try:
-            from ferrite_lang import compile
-            compile(doc['text'], filename=_uri_to_path(uri))
-        except Exception as e:
-            line = getattr(e, 'line', 0)
-            msg = str(e)
-            if getattr(e, 'file', None):
-                line = 0  # in an included file: report at the top
-            # Parse "line N: message" format from CompileError
-            if not line and msg.startswith('line '):
-                try:
-                    parts = msg.split(': ', 1)
-                    line = int(parts[0].split(' ')[1])
-                    msg = parts[1] if len(parts) > 1 else msg
-                except (ValueError, IndexError):
-                    pass
-            diagnostics.append({
-                'range': {
-                    'start': {'line': max(0, line - 1), 'character': 0},
-                    'end': {'line': max(0, line - 1), 'character': 0},
-                },
-                'severity': 1,  # Error
-                'source': 'ferrite',
-                'message': msg,
-            })
+        diagnostics = [{
+            'range': {
+                'start': {'line': d.line, 'character': 0},
+                'end': {'line': d.line, 'character': 1000},
+            },
+            'severity': 1,  # Error
+            'source': 'ferrite',
+            'message': d.message,
+        } for d in self._analyzer(uri).check(doc['text'])]
         self._notify('textDocument/publishDiagnostics', {
             'uri': uri,
             'diagnostics': diagnostics,
         })
 
+    def _position(self, params):
+        """(analyzer, text, line, character) of a request, or None."""
+        uri = params['textDocument']['uri']
+        doc = self.documents.get(uri)
+        if not doc:
+            return None
+        pos = params['position']
+        return self._analyzer(uri), doc['text'], pos['line'], pos['character']
+
     # ---- completions ----
 
     def _completion(self, msg_id, params):
-        uri = params['textDocument']['uri']
-        position = params['position']
-        doc = self.documents.get(uri)
-        if not doc:
+        at = self._position(params)
+        if at is None:
             return self._respond(msg_id, [])
-
-        text = doc['text']
-        line = position['line']
-        char = position['character']
-        lines = text.split('\n')
-        if line >= len(lines):
-            return self._respond(msg_id, [])
-
-        current_line = lines[line]
-        prefix = current_line[:char]
-
-        # Determine completion context
+        a, text, line, char = at
         items = []
-
-        # After '.' → widget property completions
-        dot_match = re.search(r'(\w+)\.(\w*)$', prefix)
-        if dot_match:
-            prop_prefix = dot_match.group(2).lower()
-            items = _property_completions(prop_prefix)
-            return self._respond(msg_id, {'isIncomplete': False, 'items': items})
-
-        # After '@' → function reference completions
-        at_match = re.search(r'@(\w*)$', prefix)
-        if at_match:
-            func_prefix = at_match.group(1)
-            items = _func_ref_completions(func_prefix, doc['text'])
-            return self._respond(msg_id, {'isIncomplete': False, 'items': items})
-
-        # Inside #include "..." → file path completion
-        inc_match = re.search(r'#include\s+"([^"]*)$', prefix)
-        if inc_match:
-            file_prefix = inc_match.group(1)
-            items = _include_completions(file_prefix, uri)
-            return self._respond(msg_id, {'isIncomplete': False, 'items': items})
-
-        # General context: keywords + builtins + types
-        word_match = re.search(r'(\w*)$', prefix)
-        word_prefix = word_match.group(1) if word_match else ''
-        items = _keyword_completions(word_prefix)
-        items += _builtin_completions(word_prefix)
-        items += _type_completions(word_prefix)
-
+        for c in a.complete(text, line, char):
+            item = {'label': c.label, 'kind': _COMPLETION_KINDS.get(c.kind, 1)}
+            if c.detail:
+                item['detail'] = c.detail
+            if c.doc:
+                item['documentation'] = c.doc
+            if c.insert is not None:
+                item['insertText'] = c.insert
+            items.append(item)
         return self._respond(msg_id, {'isIncomplete': False, 'items': items})
 
     # ---- hover ----
 
     def _hover(self, msg_id, params):
-        uri = params['textDocument']['uri']
-        position = params['position']
-        doc = self.documents.get(uri)
-        if not doc:
+        at = self._position(params)
+        text = at and at[0].hover(*at[1:])
+        if not text:
             return self._respond(msg_id, None)
+        head, _, rest = text.partition('\n\n')
+        value = f"```ferrite\n{head}\n```" + (f"\n\n{rest}" if rest else '')
+        return self._respond(msg_id, {'contents': {'kind': 'markdown', 'value': value}})
 
-        text = doc['text']
-        line = position['line']
-        char = position['character']
-        lines = text.split('\n')
-        if line >= len(lines):
+    # ---- signature help ----
+
+    def _signature_help(self, msg_id, params):
+        at = self._position(params)
+        sig = at and at[0].signature(*at[1:])
+        if not sig:
             return self._respond(msg_id, None)
-
-        current_line = lines[line]
-
-        # Find the word at the cursor position
-        word, word_start, word_end = _word_at(current_line, char)
-        if not word:
-            return self._respond(msg_id, None)
-
-        # Check if it's a builtin
-        builtin_info = BUILTIN_SIGNATURES.get(word)
-        if builtin_info:
-            markdown = f"### `{word}` — built-in function\n\n```ferrite\n{builtin_info['sig']}\n```\n\n{builtin_info['desc']}"
-            return self._respond(msg_id, {
-                'contents': {'kind': 'markdown', 'value': markdown},
-            })
-
-        # Check if it's a keyword
-        keyword_info = KEYWORD_DOCS.get(word)
-        if keyword_info:
-            return self._respond(msg_id, {
-                'contents': {'kind': 'markdown', 'value': f'### `{word}` — keyword\n\n{keyword_info}'},
-            })
-
-        # Check if it's a property (inside dot access context)
-        prop_info = PROP_DOCS.get(word.lower())
-        if prop_info:
-            return self._respond(msg_id, {
-                'contents': {'kind': 'markdown', 'value': f'### `.`{word} — widget property\n\n{prop_info}'},
-            })
-
-        # Check if it's a callback
-        callback_info = CALLBACK_DOCS.get(word)
-        if callback_info:
-            return self._respond(msg_id, {
-                'contents': {'kind': 'markdown', 'value': f'### `{word}` — system callback\n\n```ferrite\n{callback_info["sig"]}\n```\n\n{callback_info["desc"]}'},
-            })
-
-        return self._respond(msg_id, None)
+        return self._respond(msg_id, {
+            'signatures': [{
+                'label': sig.label,
+                'documentation': sig.doc,
+                'parameters': [{'label': p} for p in sig.params],
+            }],
+            'activeSignature': 0,
+            'activeParameter': max(sig.active, 0),
+        })
 
     # ---- go-to-definition ----
 
     def _definition(self, msg_id, params):
-        uri = params['textDocument']['uri']
-        position = params['position']
-        doc = self.documents.get(uri)
-        if not doc:
+        at = self._position(params)
+        loc = at and at[0].definition(*at[1:])
+        if not loc:
             return self._respond(msg_id, None)
-
-        text = doc['text']
-        line = position['line']
-        char = position['character']
-        lines = text.split('\n')
-        if line >= len(lines):
-            return self._respond(msg_id, None)
-
-        current_line = lines[line]
-        word, _, _ = _word_at(current_line, char)
-        if not word:
-            return self._respond(msg_id, None)
-
-        # Look for function definition: fn word(
-        fn_pattern = re.compile(r'\bfn\s+' + re.escape(word) + r'\s*\(', re.MULTILINE)
-        m = fn_pattern.search(text)
-        if m:
-            before = text[:m.start()]
-            def_line = before.count('\n')
-            return self._respond(msg_id, {
-                'uri': uri,
-                'range': {
-                    'start': {'line': def_line, 'character': 0},
-                    'end': {'line': def_line, 'character': 0},
-                },
-            })
-
-        # Look for @word function reference → jump to fn word
-        at_fn_pattern = re.compile(r'\bfn\s+' + re.escape(word) + r'\s*\(', re.MULTILINE)
-        m = at_fn_pattern.search(text)
-        if m:
-            before = text[:m.start()]
-            def_line = before.count('\n')
-            return self._respond(msg_id, {
-                'uri': uri,
-                'range': {
-                    'start': {'line': def_line, 'character': 0},
-                    'end': {'line': def_line, 'character': 0},
-                },
-            })
-
-        return self._respond(msg_id, None)
+        return self._respond(msg_id, {
+            'uri': _path_to_uri(loc.path),
+            'range': {
+                'start': {'line': loc.line, 'character': 0},
+                'end': {'line': loc.line, 'character': 0},
+            },
+        })
 
     # ---- document symbols ----
 
@@ -441,380 +358,29 @@ class Server:
         return self._respond(msg_id, {'data': data})
 
 
-# ============================================================
-# Keyword / Builtin / Property data
-# ============================================================
+# Keyword / builtin / property data lives in ferrite_analysis (shared with
+# the designer's editor).
+from ferrite_analysis import (  # noqa: E402
+    KEYWORD_DOCS, BUILTIN_SIGNATURES, PROP_DOCS, CALLBACK_DOCS, Document, project_settings)
 
-KEYWORD_DOCS = {
-    'var': 'Declare a mutable local variable: `var name: type = expr;`',
-    'const': 'Declare a compile-time constant: `const NAME = expr;`',
-    'fn': 'Define a function: `fn name(params) -> type { ... }`',
-    'if': 'Conditional branch: `if (cond) { ... } else { ... }`',
-    'else': 'Alternative branch for `if`',
-    'while': 'Loop while condition is true: `while (cond) { ... }`',
-    'for': 'C-style for loop: `for (init; cond; update) { ... }`',
-    'return': 'Return from function, optionally with a value',
-    'true': 'Boolean true (integer 1)',
-    'false': 'Boolean false (integer 0)',
-    'break': 'Exit the innermost loop immediately',
-    'continue': 'Skip to next iteration of the innermost loop',
-    'not': 'Logical NOT prefix operator: `not expr` (alias for `!`)',
-    'int': '32-bit signed integer type',
-    'float': '32-bit IEEE-754 floating point type',
-    'widget': 'Widget reference type',
-    'string': 'Heap-allocated string ID type',
-    'array': 'Heap-allocated dynamic array ID type',
+
+_COMPLETION_KINDS = {
+    'method': 2, 'function': 3, 'widget': 4, 'field': 5, 'variable': 6, 'class': 7,
+    'property': 10, 'keyword': 14, 'snippet': 15, 'file': 17, 'constant': 21, 'type': 22,
 }
-
-BUILTIN_SIGNATURES = {
-    'alloc':       {'sig': 'alloc() -> widget', 'desc': 'Allocate a new widget. Returns the widget ID.'},
-    'target':      {'sig': 'target(widget)', 'desc': 'Set the current target widget for subsequent property access.'},
-    'set':         {'sig': 'set(prop, value...)', 'desc': 'Set a widget property on the current target. Compound props accept multiple values.'},
-    'get':         {'sig': 'get(prop) -> int', 'desc': 'Read a scalar property from the current target widget.'},
-    'parent':      {'sig': 'parent(widget)', 'desc': 'Set the parent of the current target widget.'},
-    'dirty':       {'sig': 'dirty()', 'desc': 'Mark the current target widget as dirty (needs repaint).'},
-    'render':      {'sig': 'render()', 'desc': 'Trigger a full render pass.'},
-    'halt':        {'sig': 'halt()', 'desc': 'Halt the VM (stop execution).'},
-    'yield_op':    {'sig': 'yield_op()', 'desc': 'Yield execution to the VM scheduler.'},
-    'fillRect':    {'sig': 'fillRect(x, y, w, h, color)', 'desc': 'Draw a filled rectangle.'},
-    'rect':        {'sig': 'rect(x, y, w, h, color)', 'desc': 'Draw a rectangle outline.'},
-    'line':        {'sig': 'line(x0, y0, x1, y1, color)', 'desc': 'Draw a line between two points.'},
-    'circle':      {'sig': 'circle(cx, cy, r, color)', 'desc': 'Draw a circle outline.'},
-    'fillCircle':  {'sig': 'fillCircle(cx, cy, r, color)', 'desc': 'Draw a filled circle.'},
-    'drawImage':   {'sig': 'drawImage(x, y, image_id)', 'desc': 'Draw an image at position.'},
-    'drawText':    {'sig': 'drawText(x, y, font_id, fg, bg, "text")', 'desc': 'Draw static text at position.'},
-    'delay':       {'sig': 'delay(ms)', 'desc': 'Pause execution for N milliseconds.'},
-    'itof':        {'sig': 'itof(int) -> float', 'desc': 'Convert int to float.'},
-    'ftoi':        {'sig': 'ftoi(float) -> int', 'desc': 'Convert float to int (truncate).'},
-    'fneg':        {'sig': 'fneg(float) -> float', 'desc': 'Negate a float value.'},
-    'fadd':        {'sig': 'fadd(a, b) -> float', 'desc': 'Float addition.'},
-    'fsub':        {'sig': 'fsub(a, b) -> float', 'desc': 'Float subtraction.'},
-    'fmul':        {'sig': 'fmul(a, b) -> float', 'desc': 'Float multiplication.'},
-    'fdiv':        {'sig': 'fdiv(a, b) -> float', 'desc': 'Float division.'},
-    'feq':         {'sig': 'feq(a, b) -> int', 'desc': 'Float equality comparison (returns 0 or 1).'},
-    'fne':         {'sig': 'fne(a, b) -> int', 'desc': 'Float not-equal comparison.'},
-    'flt':         {'sig': 'flt(a, b) -> int', 'desc': 'Float less-than comparison.'},
-    'fle':         {'sig': 'fle(a, b) -> int', 'desc': 'Float less-or-equal comparison.'},
-    'fgt':         {'sig': 'fgt(a, b) -> int', 'desc': 'Float greater-than comparison.'},
-    'fge':         {'sig': 'fge(a, b) -> int', 'desc': 'Float greater-or-equal comparison.'},
-    'sin':         {'sig': 'sin(x) -> float', 'desc': 'Sine of x (radians).'},
-    'cos':         {'sig': 'cos(x) -> float', 'desc': 'Cosine of x (radians).'},
-    'sqrt':        {'sig': 'sqrt(x) -> float', 'desc': 'Square root of x.'},
-    'abs':         {'sig': 'abs(x) -> float', 'desc': 'Absolute value of x.'},
-    'atan2':       {'sig': 'atan2(y, x) -> float', 'desc': 'Arc tangent of y/x (radians).'},
-    'floor':       {'sig': 'floor(x) -> float', 'desc': 'Floor (round down).'},
-    'ceil':        {'sig': 'ceil(x) -> float', 'desc': 'Ceil (round up).'},
-    'str':         {'sig': 'str("literal") -> str_id', 'desc': 'Allocate a string from a literal.'},
-    'itos':        {'sig': 'itos(int) -> str_id', 'desc': 'Convert int to string.'},
-    'ftos':        {'sig': 'ftos(float) -> str_id', 'desc': 'Convert float to string.'},
-    'sprintf':     {'sig': 'sprintf(fmt, args...) -> str_id', 'desc': 'Format a string (C-style, up to 8 args).'},
-    'concat':      {'sig': 'concat(a, b) -> str_id', 'desc': 'Concatenate two strings.'},
-    'strcat':      {'sig': 'strcat(a, b) -> str_id', 'desc': 'Alias for concat().'},
-    'parseInt':    {'sig': 'parseInt(str_id) -> int', 'desc': 'Parse string as integer.'},
-    'parseFloat':  {'sig': 'parseFloat(str_id) -> float', 'desc': 'Parse string as float.'},
-    'strLen':      {'sig': 'strLen(str_id) -> int', 'desc': 'Get string length in bytes.'},
-    'strlen':      {'sig': 'strlen(str_id) -> int', 'desc': 'Alias for strLen().'},
-    'strcmp':      {'sig': 'strcmp(a, b) -> int', 'desc': 'Compare two strings (-1/0/1).'},
-    'setText':     {'sig': 'setText(str_id)', 'desc': 'Set text on the current target widget.'},
-    'drawStr':     {'sig': 'drawStr(x, y, font_id, fg, bg, str_id)', 'desc': 'Draw a dynamic string at position.'},
-    'strClear':    {'sig': 'strClear()', 'desc': 'Clear all allocated strings.'},
-    'strFree':     {'sig': 'strFree(str_id)', 'desc': 'Free a specific string.'},
-    'arrFree':     {'sig': 'arrFree(arr_id)', 'desc': 'Free an array.'},
-    'arrLen':      {'sig': 'arrLen(arr_id) -> int', 'desc': 'Number of elements in an array.'},
-    'arrToStr':    {'sig': 'arrToStr(arr, [len]) -> str_id', 'desc': 'Convert array bytes to string.'},
-    'roundedRect': {'sig': 'roundedRect(x, y, w, h, r, color)', 'desc': 'Draw a rectangle with rounded corners.'},
-    'fillRoundedRect': {'sig': 'fillRoundedRect(x, y, w, h, r, color)', 'desc': 'Draw a filled rounded rectangle.'},
-    'arc':         {'sig': 'arc(cx, cy, r, start, end, color)', 'desc': 'Draw an arc.'},
-    'beginFrame':  {'sig': 'beginFrame()', 'desc': 'Begin a buffered render frame.'},
-    'endFrame':    {'sig': 'endFrame()', 'desc': 'Commit and display the current render frame.'},
-    'sendUsart':   {'sig': 'sendUsart(data)', 'desc': 'Send data via USART (array or string).'},
-    'millis':      {'sig': 'millis() -> int', 'desc': 'Get elapsed milliseconds since boot.'},
-    'fpgaCmd':     {'sig': 'fpgaCmd(cmd, data)', 'desc': 'Send raw FPGA command.'},
-    'fpgaData':    {'sig': 'fpgaData(data)', 'desc': 'Send raw FPGA data (after fpgaCmd).'},
-    'critical':    {'sig': 'critical()', 'desc': 'Enter critical section (VM runs without yielding).'},
-    'setBrightness': {'sig': 'setBrightness(pct)', 'desc': 'Set LCD backlight brightness (0-100).'},
-    'brightness':  {'sig': 'brightness() -> int', 'desc': 'Get current backlight brightness (0-100).'},
-    'rtcRead':     {'sig': 'rtcRead() -> arr_id', 'desc': 'Read RTC: returns array [sec, min, hour, day, weekday, month, year].'},
-    'rtcWrite':    {'sig': 'rtcWrite(arr_id)', 'desc': 'Write array to RTC.'},
-    'fileOpen':    {'sig': 'fileOpen(name) -> handle', 'desc': 'Open a file. Returns handle (1 or 2) or 0xFF on error.'},
-    'fileRead':    {'sig': 'fileRead(handle) -> int', 'desc': 'Read next byte (0-255) or -1 on EOF.'},
-    'fileSize':    {'sig': 'fileSize(handle) -> int', 'desc': 'Get file size in bytes.'},
-    'fileClose':   {'sig': 'fileClose(handle)', 'desc': 'Close a file handle.'},
-    'fileSeek':    {'sig': 'fileSeek(handle, pos)', 'desc': 'Seek to byte position in file.'},
-    'syscall':     {'sig': 'syscall(id, args...) -> int', 'desc': 'Invoke a system call (up to 16 args).'},
-    'syscallStr':  {'sig': 'syscallStr(id, args...) -> string', 'desc': 'Invoke a system call whose result is a string id (up to 16 args).'},
-    'showModal':   {'sig': 'showModal(builderFn, [overlayClickFn]) -> int', 'desc': 'Show a modal dialog. Suspends VM until setDialogResult.'},
-    'setDialogResult': {'sig': 'setDialogResult(result)', 'desc': 'Set result value on innermost modal dialog frame.'},
-    'animate':     {'sig': 'animate(widget, prop, to, durationMs, easing, [@onEnd])', 'desc': 'Tween a widget property from its current value to `to`. easing = EASE_* | REPEAT_LOOP/REPEAT_YOYO. Optional @onEnd fires when a one-shot tween finishes.'},
-    'stopAnim':    {'sig': 'stopAnim(widget)', 'desc': 'Cancel all running tweens on a widget.'},
-    'stopAnimProp': {'sig': 'stopAnimProp(widget, prop)', 'desc': 'Cancel the tween on one property of a widget.'},
-    'pinMode':     {'sig': 'pinMode(pin, mode)', 'desc': 'Configure a user GPIO pin: GPIO_INPUT, GPIO_OUTPUT, GPIO_INPUT_PULLUP, GPIO_INPUT_PULLDOWN (gpio.fl).'},
-    'pinWrite':    {'sig': 'pinWrite(pin, value)', 'desc': 'Drive an output pin: non-zero = high, 0 = low.'},
-    'pinRead':     {'sig': 'pinRead(pin) -> int', 'desc': 'Read a GPIO pin level (0 or 1).'},
-    'strByte':     {'sig': 'strByte(str, index) -> int', 'desc': 'Byte `index` of a string (0..255), or -1 past the end. UTF-8 characters outside ASCII take 2-3 bytes.'},
-    'playSound':   {'sig': 'playSound(name [, loop]) -> int', 'desc': 'Play a sound resource ("sounds" in project.json), replacing the playing one. loop != 0 repeats it until stopSound(). Returns 1 if it started, 0 if the sound is missing. Boards with audio (caps.audio) only: elsewhere the build fails.'},
-    'stopSound':   {'sig': 'stopSound()', 'desc': 'Stop the playing sound.'},
-    'setVolume':   {'sig': 'setVolume(percent)', 'desc': 'Audio output volume, 0..100.'},
-    'runProgram':  {'sig': 'runProgram(name, arg = 0) -> int', 'desc': 'Ends this program and starts program `name` from scratch (widgets, strings, arrays, callbacks and dialogs are dropped; EEPROM and files stay). Nothing after a successful call runs. Returns 0 only if there is no such program.'},
-    'programArg':  {'sig': 'programArg() -> int', 'desc': 'The `arg` the program that started this one passed to `runProgram`; 0 for `main` at boot.'},
-    'programName': {'sig': 'programName(index) -> string', 'desc': 'Name of program `index` (0-based, image order), "" past the last one. `programName(-1)` is the name of this program.'},
-    'spawnProgram': {'sig': 'spawnProgram(name, arg = 0) -> int', 'desc': 'Start program `name` as a new task next to this one, on the same widget tree (it starts after this burst; `programArg()` gives it `arg`). Returns its task id, or -1 if there is no such program or all 16 task slots are taken. Its objects are freed when it ends. Boards with caps.multi_program only: elsewhere the build fails.'},
-    'killProgram': {'sig': 'killProgram(task) -> int', 'desc': 'End task `task` after this burst (its widgets, strings and arrays are freed); `killProgram(taskId())` ends this task at once. Returns 0 for main (task 0) or a task that is not running. Boards with caps.multi_program only: elsewhere the build fails.'},
-    'taskId':      {'sig': 'taskId() -> int', 'desc': 'This task\'s id (0 = main). Boards with caps.multi_program only: elsewhere the build fails.'},
-    'taskAlive':   {'sig': 'taskAlive(task) -> int', 'desc': '1 while task `task` is starting or running, else 0. Boards with caps.multi_program only: elsewhere the build fails.'},
-    'sendMessage': {'sig': 'sendMessage(task, a, b = 0) -> int', 'desc': 'Queue `on_task_message(from, a, b)` on task `task` (delivered after this burst). Returns 0 if it is not running or 64 messages are waiting. Boards with caps.multi_program only: elsewhere the build fails.'},
-    'setForeground': {'sig': 'setForeground(task) -> int', 'desc': 'Task `task` now gets the global input events (on_touch_down/move/up, on_swipe, on_long_press); widget events always go to the task that set the handler. 0 if it is not running. Boards with caps.multi_program only: elsewhere the build fails.'},
-    'foregroundTask': {'sig': 'foregroundTask() -> int', 'desc': 'The task that gets the global input events (0 = main). Boards with caps.multi_program only: elsewhere the build fails.'},
-    'soundPlaying': {'sig': 'soundPlaying() -> int', 'desc': '1 while a sound is playing (until its last sample is output), else 0.'},
-    'eepromSize':  {'sig': 'eepromSize() -> int', 'desc': 'EEPROM size in bytes (0 if the board has none).'},
-    'eepromRead':  {'sig': 'eepromRead(addr) -> int', 'desc': 'Read one EEPROM byte (0..255). Bad address or bus error → VM fault 16.'},
-    'eepromWrite': {'sig': 'eepromWrite(addr, value)', 'desc': 'Store the low byte of value. Unchanged bytes are not rewritten. Blocks up to ~5 ms per write.'},
-    'eepromReadArr': {'sig': 'eepromReadArr(addr, arr, count)', 'desc': 'Read count EEPROM bytes into arr[0..count].'},
-    'eepromWriteArr': {'sig': 'eepromWriteArr(addr, arr, count)', 'desc': 'Store the low byte of arr[0..count] at addr. Only changed 16-byte chunks are written (~5 ms each).'},
-    'diskOpen':    {'sig': 'diskOpen(path, mode) -> int', 'desc': 'Open a file on the board storage (caps.storage): mode 0 read, 1 write (create/truncate), 2 append. A handle (16+) for fileRead/fileWrite/fileClose, or DISK_ERR_* (< 0). Paths: 8.3 names separated by "/".'},
-    'diskDelete':  {'sig': 'diskDelete(path) -> int', 'desc': 'Delete a file that is not open. 0 or DISK_ERR_*.'},
-    'diskMkdir':   {'sig': 'diskMkdir(path) -> int', 'desc': 'Make a directory. 0 or DISK_ERR_* (DISK_ERR_EXISTS if it is there).'},
-    'diskRmdir':   {'sig': 'diskRmdir(path) -> int', 'desc': 'Delete an empty directory. 0 or DISK_ERR_* (DISK_ERR_NOT_EMPTY).'},
-    'diskExists':  {'sig': 'diskExists(path) -> int', 'desc': '0 nothing there, 1 a file, 2 a directory, or DISK_ERR_*.'},
-    'diskList':    {'sig': 'diskList(dir, index) -> string', 'desc': 'Name of entry `index` of `dir` (a directory name ends in "/"); "" past the last.'},
-    'fileWrite':   {'sig': 'fileWrite(handle, byte) -> int', 'desc': 'Write the low byte to a diskOpen file. 1 or DISK_ERR_*.'},
-    'fileWriteStr': {'sig': 'fileWriteStr(handle, str) -> int', 'desc': 'Write the bytes of a string to a diskOpen file. Bytes written or DISK_ERR_*.'},
-    'fileWriteArr': {'sig': 'fileWriteArr(handle, arr, count) -> int', 'desc': 'Write the low byte of each of arr[0..count]. Bytes written or DISK_ERR_*.'},
-    'fileReadArr': {'sig': 'fileReadArr(handle, arr, count) -> int', 'desc': 'Read up to `count` bytes into arr[0..] (diskOpen or fileOpen handles). Bytes read, 0 at the end.'},
-    'onGesture':   {'sig': 'onGesture(widget, mask, @handler)', 'desc': 'Flutter-style gesture recognizers (caps.gestures, lib/gesture.fl): the widget takes part in the GESTURE_* recognizers of `mask`, which compete in an arena per touch and report to handler(widget, event) with GE_* events. mask 0 removes them.'},
-    'gestureInfo': {'sig': 'gestureInfo(field) -> int', 'desc': 'Inside a gesture handler: a detail (GI_*) of the event it was called for (position, deltas, velocity, scale x1000, rotation in milliradians...). 0 elsewhere.'},
-}
-
-PROP_DOCS = {
-    'loc_x': 'X position (scalar)',
-    'loc_y': 'Y position (scalar)',
-    'size_w': 'Width (scalar)',
-    'width': 'Width (alias for size_w)',
-    'size_h': 'Height (scalar)',
-    'height': 'Height (alias for size_h)',
-    'visible': 'Visibility flag: 0 = hidden, 1 = visible',
-    'enabled': 'Enabled flag: 0 = disabled, 1 = enabled',
-    'clickable': 'Clickable flag: 0 = not clickable, 1 = clickable',
-    'bg_color': 'Background color (RGB565)',
-    'background_color': 'Background color (alias for bg_color)',
-    'border_color': 'Border color (RGB565)',
-    'flags': 'Widget flags bitmask',
-    'location': 'Location compound: {x, y}',
-    'pos': 'Position (alias for location)',
-    'size': 'Size compound: {w, h}',
-    'border': 'Border widths compound: {top, right, bottom, left}',
-    'padding': 'Padding compound: {top, right, bottom, left}',
-    'border_top': 'Top border width',
-    'border_right': 'Right border width',
-    'border_bottom': 'Bottom border width',
-    'border_left': 'Left border width',
-    'padding_top': 'Top padding',
-    'padding_right': 'Right padding',
-    'padding_bottom': 'Bottom padding',
-    'padding_left': 'Left padding',
-    'kind': 'Widget kind ID',
-    'text_color': 'Text/foreground color (RGB565)',
-    'font_id': 'Font resource ID',
-    'text_align': 'Text alignment (bitmask: H=0-2, V=0-8)',
-    'press_color': 'Press highlight color (RGB565)',
-    'image_id': 'Image resource ID',
-    'on_click': 'Click event handler (assigned with @handler)',
-    'on_paint': 'Paint event handler',
-    'on_tap': 'Tap/change event handler',
-    'border_radius': 'Border corner radius in pixels',
-    'radius': 'Border radius (alias for border_radius)',
-    'value': 'Current value (sliders, etc.)',
-    'checked': 'Checkbox checked state',
-    'max_length': 'Maximum text length for text input',
-    'cursor_pos': 'Cursor position in text input',
-    'on_change': 'Change event handler (alias for on_tap)',
-    'scroll_y': 'Vertical scroll offset',
-    'clip_children': 'Clip children to widget bounds',
-    'gradient_color': 'End color for background gradient',
-    'gradient_dir': 'Gradient direction: 0=none, 1=horizontal, 2=vertical',
-    'graph_arr': 'Graph data array ID',
-    'graph_array': 'Graph data array (alias)',
-    'graph_count': 'Max graph samples to draw',
-    'graph_flags': 'Graph render flags (bit 0: linear/spline, bit 1: fill)',
-    'multi_line': 'Multi-line label text flag',
-    'rich_text': 'Text as HTML: <b> <i> <u> <font color="#RRGGBB"> <br> &lt; ... (caps.rich_text)',
-    'alpha': 'Background opacity (0-255)',
-    'group_id': 'Exclusive group (button group, radio): one checked per group_id; radio 0 = siblings',
-    'flex': 'Flex container mode for lib/flex.fl: FLEX_ROW/FLEX_COLUMN | JUSTIFY_* | ALIGN_*',
-    'flex_gap': 'Flex container: gap between children in px (lib/flex.fl)',
-    'flex_grow': 'Flex child: share of the leftover main-axis space, 0 = fixed size (lib/flex.fl)',
-    'parent': 'Parent widget id, read-only (-1 = none)',
-    'first_child': 'First child widget id, read-only (-1 = none)',
-    'next_sibling': 'Next sibling widget id, read-only (-1 = none)',
-    'text': 'Text content (compound: LEN-encoded)',
-    'text_id': 'Text content (alias for text)',
-}
-
-CALLBACK_DOCS = {
-    'setup': {'sig': 'fn setup()', 'desc': 'Called once at program start.'},
-    'loop': {'sig': 'fn loop()', 'desc': 'Called repeatedly in the main event loop.'},
-    'on_program_start': {'sig': 'fn on_program_start()', 'desc': 'Called when the program begins execution.'},
-    'on_page_changing': {'sig': 'fn on_page_changing(from_page, to_page)', 'desc': 'Called before a page transition.'},
-    'on_page_changed': {'sig': 'fn on_page_changed(new_page)', 'desc': 'Called after a page transition completes.'},
-    'on_user_message': {'sig': 'fn on_user_message(data)', 'desc': 'Called when a USART user message is received.'},
-    'on_touch_down': {'sig': 'fn on_touch_down(x, y)', 'desc': 'Called on touch press. Coordinates are packed.'},
-    'on_touch_up': {'sig': 'fn on_touch_up()', 'desc': 'Called on touch release.'},
-    'on_touch_move': {'sig': 'fn on_touch_move(x, y)', 'desc': 'Called on touch drag. Coordinates are packed.'},
-    'on_task_message': {'sig': 'fn on_task_message(from, a, b)', 'desc': 'Task `from` called sendMessage(this task, a, b).'},
-    'on_task_exit': {'sig': 'fn on_task_exit(task, code)', 'desc': 'A task this one spawned ended: code 0 = exited or killed, > 0 = VM fault code, -1 = could not start. Without this handler a fault opens the built-in "Program stopped" dialog.'},
-}
-
-# ============================================================
-# Completion helpers
-# ============================================================
-
-_COMPLETION_ITEM = 1  # Text
-_COMPLETION_FUNCTION = 3  # Function
-_COMPLETION_PROPERTY = 10  # Property
-_COMPLETION_KEYWORD = 14  # Keyword
-_COMPLETION_SNIPPET = 15  # Snippet
-_COMPLETION_TYPE = 13  # Type parameter
-
-
-def _keyword_completions(prefix):
-    items = []
-    for kw in ['var', 'const', 'fn', 'if', 'else', 'while', 'for', 'return',
-               'true', 'false', 'break', 'continue', 'class']:
-        if kw.startswith(prefix):
-            items.append({
-                'label': kw,
-                'kind': _COMPLETION_KEYWORD,
-                'detail': 'keyword',
-            })
-    # Snippets for common constructs
-    if 'fn'.startswith(prefix):
-        items.append({
-            'label': 'fn',
-            'kind': _COMPLETION_SNIPPET,
-            'detail': 'function definition',
-            'insertText': 'fn ${1:name}(${2:params}) {\n    ${0}\n}',
-            'insertTextFormat': 2,  # Snippet
-        })
-    if 'if'.startswith(prefix):
-        items.append({
-            'label': 'if',
-            'kind': _COMPLETION_SNIPPET,
-            'detail': 'if statement',
-            'insertText': 'if (${1:cond}) {\n    ${0}\n}',
-            'insertTextFormat': 2,
-        })
-    if 'while'.startswith(prefix):
-        items.append({
-            'label': 'while',
-            'kind': _COMPLETION_SNIPPET,
-            'detail': 'while loop',
-            'insertText': 'while (${1:cond}) {\n    ${0}\n}',
-            'insertTextFormat': 2,
-        })
-    if 'for'.startswith(prefix):
-        items.append({
-            'label': 'for',
-            'kind': _COMPLETION_SNIPPET,
-            'detail': 'for loop',
-            'insertText': 'for (${1:var i = 0}; ${2:i < n}; ${3:i++}) {\n    ${0}\n}',
-            'insertTextFormat': 2,
-        })
-    return items
-
-
-def _builtin_completions(prefix):
-    items = []
-    for name, info in BUILTIN_SIGNATURES.items():
-        if name.startswith(prefix):
-            items.append({
-                'label': name,
-                'kind': _COMPLETION_FUNCTION,
-                'detail': info['sig'],
-                'documentation': info['desc'],
-            })
-    return items
-
-
-def _type_completions(prefix):
-    items = []
-    for t in ['int', 'float', 'widget', 'string', 'array']:
-        if t.startswith(prefix):
-            items.append({
-                'label': t,
-                'kind': _COMPLETION_TYPE,
-                'detail': 'type',
-            })
-    return items
-
-
-def _property_completions(prefix):
-    items = []
-    for name, doc in PROP_DOCS.items():
-        if name.startswith(prefix):
-            items.append({
-                'label': name,
-                'kind': _COMPLETION_PROPERTY,
-                'detail': 'widget property',
-                'documentation': doc,
-            })
-    return items
-
-
-def _func_ref_completions(prefix, text):
-    """Complete @function references with functions defined in the document."""
-    items = []
-    # Find all fn definitions in the document
-    fn_pattern = re.compile(r'^\s*fn\s+(\w+)\s*\(', re.MULTILINE)
-    seen = set()
-    for m in fn_pattern.finditer(text):
-        name = m.group(1)
-        if name.startswith(prefix) and name not in seen:
-            seen.add(name)
-            items.append({
-                'label': name,
-                'kind': _COMPLETION_FUNCTION,
-                'detail': 'fn',
-            })
-    return items
-
-
-def _include_completions(prefix, uri):
-    """Complete #include paths with .fl files in the workspace."""
-    items = []
-    base_path = _uri_to_path(uri) if uri.startswith('file://') else ''
-    base_dir = os.path.dirname(base_path) if base_path else _TOOLS_DIR
-    search_dir = base_dir
-
-    # If prefix has a directory component, resolve it
-    if '/' in prefix or '\\' in prefix:
-        candidate = os.path.normpath(os.path.join(search_dir, prefix))
-        search_dir = os.path.dirname(candidate) if os.path.dirname(candidate) else search_dir
-        file_prefix = os.path.basename(prefix)
-    else:
-        file_prefix = prefix
-
-    try:
-        for entry in os.listdir(search_dir):
-            if entry.endswith('.fl') and entry.startswith(file_prefix):
-                # Compute relative path
-                full = os.path.join(search_dir, entry)
-                try:
-                    rel = os.path.relpath(full, base_dir) if base_dir else entry
-                except ValueError:
-                    rel = entry
-                items.append({
-                    'label': rel.replace('\\', '/'),
-                    'kind': 17,  # File
-                    'detail': 'include',
-                })
-    except OSError:
-        pass
-    return items
 
 
 # ============================================================
 # Helpers
 # ============================================================
+
+def _path_to_uri(path):
+    """Local path → file:// URI."""
+    path = os.path.abspath(path).replace('\\', '/')
+    if not path.startswith('/'):
+        path = '/' + path  # C:/x → /C:/x
+    return 'file://' + path
+
 
 def _uri_to_path(uri):
     """Convert file:// URI to a local filesystem path."""
@@ -832,34 +398,6 @@ def _uri_to_path(uri):
     elif uri.startswith('file://'):
         return uri[7:]
     return uri
-
-
-def _word_at(line, column):
-    """Extract the identifier word at the given column position in a line.
-    Returns (word, start_col, end_col) or (None, 0, 0).
-    """
-    if column < 0 or column > len(line):
-        return None, 0, 0
-    # Find word boundaries
-    start = column
-    while start > 0 and _is_ident_char(line[start - 1]):
-        start -= 1
-    end = column
-    while end < len(line) and _is_ident_char(line[end]):
-        end += 1
-    if start < end:
-        return line[start:end], start, end
-    # Check if cursor is directly on a dot (for property hover)
-    if column > 0 and line[column - 1] == '.' and column > 1 and _is_ident_char(line[column - 2]):
-        pstart = column - 2
-        while pstart > 0 and _is_ident_char(line[pstart - 1]):
-            pstart -= 1
-        return line[pstart:column - 1], pstart, column - 1
-    return None, 0, 0
-
-
-def _is_ident_char(ch):
-    return ch.isalnum() or ch == '_'
 
 
 # ============================================================

@@ -17,6 +17,9 @@ import os
 import subprocess
 import base64
 import tempfile
+import re
+import html
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     from PySide6.QtWidgets import (
@@ -27,13 +30,17 @@ try:
         QLabel, QSplitter, QToolBar, QStatusBar, QGroupBox,
         QFileDialog, QColorDialog, QMessageBox, QDialog, QTextEdit,
         QDialogButtonBox, QTabWidget, QPlainTextEdit, QStyle, QDockWidget,
-        QProgressDialog,
+        QProgressDialog, QCompleter, QToolTip,
     )
-    from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QSettings, QRegularExpression, QBuffer
+    from PySide6.QtCore import (
+        Qt, QRectF, QPointF, Signal, QSize, QSettings, QRegularExpression, QBuffer,
+        QTimer, QObject, QEvent,
+    )
     from PySide6.QtGui import (
         QColor, QPainter, QPen, QBrush, QFont, QAction, QIcon,
         QPainterPath, QKeySequence, QSyntaxHighlighter, QTextCharFormat,
         QFontDatabase, QImage, QTextCursor, QPolygonF,
+        QStandardItemModel, QStandardItem, QTextFormat,
     )
     from PySide6.QtWidgets import QListWidget, QListWidgetItem
 except ImportError:
@@ -3443,8 +3450,8 @@ class FerriteSyntaxHighlighter(QSyntaxHighlighter):
         kw_fmt = QTextCharFormat()
         kw_fmt.setForeground(QColor("#CC7832"))
         kw_fmt.setFontWeight(QFont.Bold)
-        keywords = ["var", "fn", "if", "else", "while", "for",
-                     "return", "true", "false", "break", "continue"]
+        keywords = ["var", "const", "fn", "class", "if", "else", "while", "for",
+                     "return", "true", "false", "break", "continue", "not"]
         for w in keywords:
             self._rules.append((QRegularExpression(rf"\b{w}\b"), kw_fmt))
 
@@ -3548,8 +3555,35 @@ class LineNumberArea(QWidget):
         self._editor.line_number_area_paint(event)
 
 
+class _SignaturePopup(QLabel):
+    """The call's signature under the cursor while typing its arguments.
+    A tool window of its own: QToolTip hides on every key press."""
+
+    def __init__(self, editor):
+        super().__init__(editor, Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setTextFormat(Qt.RichText)
+        self.setStyleSheet(
+            "QLabel { background-color: #3C3F41; color: #BBBBBB; border: 1px solid #555555;"
+            " padding: 4px 6px; }")
+        self.setFont(editor.font())
+
+
+_ERROR_COLOR = "#FF5555"
+
+
 class CodeEditorWidget(QPlainTextEdit):
-    """Plain text editor with line numbers and ferrite syntax highlighting."""
+    """Plain text editor with line numbers and ferrite syntax highlighting.
+
+    With an `analyzer` (ferrite_analysis.Document) it also completes (as you
+    type after '.', '@', '#include "', in widget constructor arguments, after
+    two letters, or Ctrl+Space), shows the signature of the call being typed,
+    hover info, errors from `set_diagnostics`, and jumps to definitions
+    (Ctrl+click, F12)."""
+
+    # A definition in another file: (path, 0-based line).
+    definition_requested = Signal(str, int)
+
+    _COMPLETION_ROLE = Qt.UserRole + 1
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3570,6 +3604,23 @@ class CodeEditorWidget(QPlainTextEdit):
         self.setStyleSheet(
             "QPlainTextEdit { background-color: #2B2B2B; color: #A9B7C6; "
             "selection-background-color: #214283; }")
+
+        self.analyzer = None   # ferrite_analysis.Document, set by the panel
+        self._diags = {}       # 0-based line -> message
+        self._inserts = {}     # completion label -> text to insert
+        self._completer = QCompleter(self)
+        self._completer.setWidget(self)
+        self._completer.setCompletionMode(QCompleter.PopupCompletion)
+        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._completer.setCompletionRole(self._COMPLETION_ROLE)
+        self._completer.setMaxVisibleItems(12)
+        self._completer.setModel(QStandardItemModel(self._completer))
+        self._completer.activated[str].connect(self._insert_completion)
+        self._completer.popup().setFont(font)
+        self._sig = _SignaturePopup(self)
+        self._sig.hide()
+
+    # --- gutter ---
 
     def line_number_area_width(self):
         digits = max(1, len(str(self.blockCount())))
@@ -3601,27 +3652,283 @@ class CodeEditorWidget(QPlainTextEdit):
         painter.setPen(QColor("#444444"))
         painter.drawLine(w - 1, event.rect().top(), w - 1, event.rect().bottom())
 
-        painter.setPen(QColor("#606366"))
         painter.setFont(self.font())
 
         block = self.firstVisibleBlock()
         block_num = block.blockNumber()
         top = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
         bottom = top + int(self.blockBoundingRect(block).height())
+        fh = self.fontMetrics().height()
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
-                painter.drawText(4, top, w - 10,
-                                 self.fontMetrics().height(),
-                                 Qt.AlignRight, str(block_num + 1))
+                if block_num in self._diags:
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QColor(_ERROR_COLOR))
+                    painter.drawEllipse(3, top + fh // 2 - 3, 6, 6)
+                    painter.setPen(QColor(_ERROR_COLOR))
+                else:
+                    painter.setPen(QColor("#606366"))
+                painter.drawText(4, top, w - 10, fh, Qt.AlignRight, str(block_num + 1))
             block = block.next()
             top = bottom
             bottom = top + int(self.blockBoundingRect(block).height())
             block_num += 1
 
+    # --- diagnostics ---
+
+    def set_diagnostics(self, diags):
+        """Underline the lines of `diags` (ferrite_analysis.Diagnostic)."""
+        self._diags = {d.line: d.message for d in diags}
+        sels = []
+        for line in self._diags:
+            block = self.document().findBlockByNumber(line)
+            if not block.isValid():
+                continue
+            text = block.text()
+            start = len(text) - len(text.lstrip())
+            end = len(text.rstrip())
+            sel = QTextEdit.ExtraSelection()
+            fmt = QTextCharFormat()
+            if end > start:
+                fmt.setUnderlineStyle(QTextCharFormat.WaveUnderline)
+                fmt.setUnderlineColor(QColor(_ERROR_COLOR))
+                cur = QTextCursor(block)
+                cur.setPosition(block.position() + start)
+                cur.setPosition(block.position() + end, QTextCursor.KeepAnchor)
+            else:  # empty line: tint it
+                fmt.setBackground(QColor("#4A2B2B"))
+                fmt.setProperty(QTextFormat.FullWidthSelection, True)
+                cur = QTextCursor(block)
+            sel.cursor = cur
+            sel.format = fmt
+            sels.append(sel)
+        self.setExtraSelections(sels)
+        self._line_area.update()
+
+    def goto_line(self, line):
+        block = self.document().findBlockByNumber(max(0, line))
+        if block.isValid():
+            cur = QTextCursor(block)
+            self.setTextCursor(cur)
+            self.centerCursor()
+            self.setFocus()
+
+    # --- analysis helpers ---
+
+    def _cursor_pos(self):
+        c = self.textCursor()
+        return c.blockNumber(), c.positionInBlock()
+
+    def _ask(self, method, line=None, col=None):
+        """Call analyzer.method(text, line, col); None if there is no analyzer
+        or it fails (an editor must not die on an analysis bug)."""
+        if self.analyzer is None:
+            return None
+        if line is None:
+            line, col = self._cursor_pos()
+        try:
+            return getattr(self.analyzer, method)(self.toPlainText(), line, col)
+        except Exception as e:  # noqa: BLE001
+            print(f"ferrite_analysis.{method}: {e}", file=sys.stderr)
+            return None
+
+    # --- keys ---
+
+    def keyPressEvent(self, e):
+        popup = self._completer.popup()
+        if popup.isVisible() and e.key() in (Qt.Key_Enter, Qt.Key_Return, Qt.Key_Tab,
+                                             Qt.Key_Backtab, Qt.Key_Escape):
+            e.ignore()  # the completer takes them
+            return
+        if e.key() == Qt.Key_Escape and self._sig.isVisible():
+            self._sig.hide()
+            return
+        if e.key() == Qt.Key_F12:
+            self.goto_definition()
+            return
+        manual = e.key() == Qt.Key_Space and bool(e.modifiers() & Qt.ControlModifier)
+        if manual:
+            pass
+        elif e.key() in (Qt.Key_Return, Qt.Key_Enter) and not e.modifiers():
+            self._newline_with_indent()
+        else:
+            super().keyPressEvent(e)
+        if self.analyzer is None:
+            return
+        ch = e.text()
+        if manual or (ch and ch in '.@"'):
+            self._complete(force=True)
+        elif ch and (ch.isalnum() or ch == '_'):
+            self._complete(force=False)
+        elif ch in ('(', ','):
+            self._complete(args_only=True)
+        elif e.key() == Qt.Key_Backspace and popup.isVisible():
+            self._complete(force=False)
+        else:
+            popup.hide()
+        if ch in ('(', ',', ')') or self._sig.isVisible():
+            self._update_signature()
+
+    def _newline_with_indent(self):
+        """Enter keeps the line's indent, one level more after '{'."""
+        cur = self.textCursor()
+        line = cur.block().text()[:cur.positionInBlock()]
+        indent = line[:len(line) - len(line.lstrip())]
+        if line.rstrip().endswith('{'):
+            indent += '    '
+        cur.insertText('\n' + indent)
+        self.setTextCursor(cur)
+
+    def focusOutEvent(self, e):
+        self._sig.hide()
+        super().focusOutEvent(e)
+
+    # --- completion ---
+
+    def _prefix(self):
+        line = self.textCursor().block().text()[:self.textCursor().positionInBlock()]
+        m = re.search(r'#include\s+"([^"]*)$', line)
+        if m:
+            return m.group(1)
+        return re.search(r'(\w*)$', line).group(1)
+
+    def _complete(self, force=False, args_only=False):
+        popup = self._completer.popup()
+        items = self._ask('complete') or []
+        if args_only:  # after '(' or ',': only a widget constructor's named args
+            items = [c for c in items if c.insert and c.insert.endswith(': ')]
+        prefix = self._prefix()
+        if (not items or (not force and not args_only and not popup.isVisible()
+                          and len(prefix) < 2)
+                or (len(items) == 1 and items[0].label == prefix)):
+            popup.hide()
+            return
+        model = self._completer.model()
+        model.clear()
+        self._inserts = {}
+        for c in items[:300]:
+            detail = c.detail if len(c.detail) <= 60 else c.detail[:57] + '...'
+            it = QStandardItem(f"{c.label}    {detail}" if detail and detail != c.label else c.label)
+            it.setData(c.label, self._COMPLETION_ROLE)
+            it.setToolTip((c.detail + ("\n\n" + c.doc if c.doc else "")).strip())
+            model.appendRow(it)
+            self._inserts[c.label] = c.insert or c.label
+        self._completer.setCompletionPrefix(prefix)
+        rect = self.cursorRect()
+        rect.setWidth(min(560, max(240, popup.sizeHintForColumn(0)
+                                   + popup.verticalScrollBar().sizeHint().width())))
+        self._completer.complete(rect)
+        popup.setCurrentIndex(self._completer.completionModel().index(0, 0))
+
+    def _insert_completion(self, label):
+        insert = self._inserts.get(label, label)
+        cur = self.textCursor()
+        n = len(self._completer.completionPrefix())
+        cur.movePosition(QTextCursor.Left, QTextCursor.KeepAnchor, n)
+        cur.insertText(insert)
+        self.setTextCursor(cur)
+
+    # --- signature help ---
+
+    def _update_signature(self):
+        sig = self._ask('signature')
+        if sig is None:
+            self._sig.hide()
+            return
+        label = html.escape(sig.label)
+        if 0 <= sig.active < len(sig.params):
+            p = html.escape(sig.params[sig.active])
+            at = label.find('(') + 1
+            i = label.find(p, at)
+            if i >= 0:
+                label = (label[:i] + f"<b style='color:#FFC66D'>{p}</b>" + label[i + len(p):])
+        doc = html.escape(sig.doc.split('\n')[-1]) if sig.doc else ''
+        self._sig.setText(f"<code>{label}</code>"
+                          + (f"<br><span style='color:#808080'>{doc}</span>" if doc else ''))
+        self._sig.adjustSize()
+        pos = self.viewport().mapToGlobal(self.cursorRect().bottomLeft())
+        self._sig.move(pos.x(), pos.y() + 4)
+        self._sig.show()
+
+    # --- hover and definitions ---
+
+    def viewportEvent(self, e):
+        if e.type() == QEvent.ToolTip:
+            cur = self.cursorForPosition(e.pos())
+            line, col = cur.blockNumber(), cur.positionInBlock()
+            parts = []
+            if line in self._diags:
+                parts.append(f"<span style='color:{_ERROR_COLOR}'><b>Error:</b> "
+                             f"{html.escape(self._diags[line])}</span>")
+            info = self._ask('hover', line, col)
+            if info:
+                head, _, rest = info.partition('\n\n')
+                parts.append(f"<pre>{html.escape(head)}</pre>"
+                             + (f"<p>{html.escape(rest)}</p>" if rest else ''))
+            if parts:
+                QToolTip.showText(e.globalPos(), '<hr>'.join(parts), self.viewport())
+            else:
+                QToolTip.hideText()
+            return True
+        return super().viewportEvent(e)
+
+    def mousePressEvent(self, e):
+        super().mousePressEvent(e)
+        if e.button() == Qt.LeftButton and e.modifiers() & Qt.ControlModifier:
+            self.goto_definition()
+
+    def goto_definition(self):
+        loc = self._ask('definition')
+        if loc is None:
+            return
+        if os.path.normcase(loc.path) == os.path.normcase(self.analyzer.path):
+            self.goto_line(loc.line)
+        else:
+            self.definition_requested.emit(loc.path, loc.line)
+
+
+class _FileViewDialog(QDialog):
+    """Read-only view of another .fl file (a definition outside main.fl)."""
+
+    def __init__(self, path, line, title, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(820, 620)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.editor = CodeEditorWidget()
+        self.editor.setReadOnly(True)
+        try:
+            with open(path, encoding='utf-8') as f:
+                self.editor.setPlainText(f.read())
+        except OSError as e:
+            self.editor.setPlainText(f"// {e}")
+        layout.addWidget(self.editor)
+        block = self.editor.document().findBlockByNumber(line)
+        if block.isValid():
+            sel = QTextEdit.ExtraSelection()
+            fmt = QTextCharFormat()
+            fmt.setBackground(QColor("#32593D"))
+            fmt.setProperty(QTextFormat.FullWidthSelection, True)
+            sel.cursor = QTextCursor(block)
+            sel.format = fmt
+            self.editor.setExtraSelections([sel])
+            self.editor.setTextCursor(QTextCursor(block))
+            self.editor.centerCursor()
+
+
+class _CheckBridge(QObject):
+    """Brings a background check's result to the GUI thread."""
+    done = Signal(int, object)   # text version, [Diagnostic]
+
 
 class CodeEditorPanel(QWidget):
-    """Panel containing the code editor for main.fl — reads/writes from model."""
+    """Panel containing the code editor for main.fl — reads/writes from model.
+    Checks the code as you type: ~0.5 s after the last change it compiles it
+    in the background the way a build would (the project's .build directory
+    with the generated main.designer.fl, its include dirs and the device's
+    caps)."""
 
     def __init__(self, model):
         super().__init__()
@@ -3652,11 +3959,123 @@ class CodeEditorPanel(QWidget):
         # Editor
         self.editor = CodeEditorWidget()
         self.editor.textChanged.connect(self._on_text_changed)
+        self.editor.definition_requested.connect(self._show_file)
         layout.addWidget(self.editor)
+
+        # Check result: "line 12: ..." (click to go there)
+        self._status = QLabel()
+        self._status.setContentsMargins(6, 3, 6, 3)
+        self._status.setTextFormat(Qt.RichText)
+        self._status.linkActivated.connect(lambda line: self.editor.goto_line(int(line)))
+        layout.addWidget(self._status)
+
+        self._version = 0
+        self._settings = None
+        self._tmp_dir = None
+        self._views = []
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._bridge = _CheckBridge()
+        self._bridge.done.connect(self._on_checked)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self._run_check)
+        model.tree_changed.connect(self._schedule_check)  # widget names are globals
 
     def _on_text_changed(self):
         self._modified = True
         self._file_label.setText("main.fl *")
+        self._schedule_check()
+
+    def _schedule_check(self):
+        self._version += 1
+        self._timer.start()
+
+    # --- checking ---
+
+    def _check_settings(self):
+        """(main.fl path, include dirs, superops, native_flex) as a build of
+        the project would use them."""
+        proj_dir = self.model.project_dir()
+        if proj_dir:
+            build_dir = os.path.join(proj_dir, ".build")
+        else:
+            if self._tmp_dir is None:
+                self._tmp_dir = tempfile.mkdtemp(prefix="ferrite_check_")
+            build_dir = self._tmp_dir
+        dirs = list(self.model.include_dirs)
+        if "." not in dirs:
+            dirs.insert(0, ".")
+        include_dirs = [os.path.normpath(os.path.join(build_dir, d)) for d in dirs]
+        try:
+            caps = device_spec(self.model.device_id)["caps"]
+        except Exception:  # noqa: BLE001
+            caps = {}
+        return (os.path.join(build_dir, "main.fl"), tuple(include_dirs),
+                bool(caps.get("superops")), bool(caps.get("native_flex")))
+
+    def _analyzer(self):
+        settings = self._check_settings()
+        if settings != self._settings or self.editor.analyzer is None:
+            from ferrite_analysis import Document
+            path, dirs, superops, native_flex = settings
+            self.editor.analyzer = Document(path, list(dirs), superops, native_flex)
+            self._settings = settings
+        return self.editor.analyzer
+
+    def _run_check(self):
+        text = self.editor.toPlainText()
+        if not text.strip():  # not loaded yet (load_file checks again)
+            self.editor.set_diagnostics([])
+            self._status.setText("")
+            return
+        doc = self._analyzer()
+        designer_fl = generate_designer_fl(self.model)
+        version = self._version
+        bridge = self._bridge
+
+        def job():
+            from ferrite_analysis import Diagnostic
+            try:
+                build_dir = os.path.dirname(doc.path)
+                os.makedirs(build_dir, exist_ok=True)
+                gen = os.path.join(build_dir, "main.designer.fl")
+                try:
+                    with open(gen, encoding="utf-8") as f:
+                        same = f.read() == designer_fl
+                except OSError:
+                    same = False
+                if not same:
+                    with open(gen, "w", encoding="utf-8") as f:
+                        f.write(designer_fl)
+                diags = doc.check(text)
+            except Exception as e:  # noqa: BLE001
+                diags = [Diagnostic(0, f"code check failed: {e}")]
+            bridge.done.emit(version, diags)
+
+        self._pool.submit(job)
+
+    def _on_checked(self, version, diags):
+        if version != self._version:
+            return  # the text changed meanwhile; another check is on its way
+        self.editor.set_diagnostics(diags)
+        if diags:
+            d = diags[0]
+            self._status.setText(
+                f"<a href='{d.line}' style='color:{_ERROR_COLOR}; text-decoration:none'>"
+                f"✖ line {d.line + 1}: {html.escape(d.message)}</a>")
+        else:
+            self._status.setText("<span style='color:#6A8759'>✔ no errors</span>")
+
+    def _show_file(self, path, line):
+        doc = self.editor.analyzer
+        title = f"{doc.short_path(path) if doc else path}:{line + 1}"
+        view = _FileViewDialog(path, line, title, self)
+        view.finished.connect(lambda _=None, v=view: self._views.remove(v))
+        self._views.append(view)
+        view.show()
+
+    # --- file ---
 
     def load_file(self):
         """Load main.fl content from model."""
@@ -3665,6 +4084,7 @@ class CodeEditorPanel(QWidget):
         self.editor.blockSignals(False)
         self._modified = False
         self._file_label.setText("main.fl")
+        self._schedule_check()
 
     def save_file(self):
         """Save editor content back to model."""

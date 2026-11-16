@@ -148,8 +148,10 @@ def preprocess_map(source, filename="<input>", include_dirs=None, _included=None
         where = _display_path(filepath, _main or filename)
         if full_path is None:
             searched = [base_dir] + list(include_dirs)
-            raise CompileError(
+            err = CompileError(
                 f'include file not found: {inc_path} (searched: {searched})', n, where)
+            err._located = True  # a line of this file, not of the expanded source
+            raise err
         with open(full_path, 'r', encoding='utf-8') as f:
             inc_source = f.read()
         # Recursively preprocess the included file
@@ -711,6 +713,7 @@ class Parser:
             tokens[i + 1].value for i in range(len(tokens) - 2)
             if self._widget_decl_at(i)}
         self.widgets = {}            # name -> [(prop, expr, line)] defaults
+        self.widget_lines = {}       # name -> line of its declaration
         self._wscopes = []           # per function: depth -> temp declared
         self.widget_callbacks = []   # (event, var, handler, line) from widget args
 
@@ -913,6 +916,7 @@ class Parser:
                 f"widget {name}: a declaration takes properties only "
                 f"(no children/parent)", line)
         self.widgets[name] = self._merge_props(defaults, props)
+        self.widget_lines[name] = line
 
     @staticmethod
     def _merge_props(defaults, props):
