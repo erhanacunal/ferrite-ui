@@ -323,6 +323,33 @@ class DotExpr:
         self.line = line
 
 
+class FieldExpr:
+    """`base.field` where `base` is an expression of a class type (a chain:
+    `p.link.x`, `p.next().x`). A plain `name.field` stays a DotExpr."""
+    def __init__(self, base, field, line):
+        self.base = base
+        self.field = field
+        self.line = line
+
+
+class ElemExpr:
+    """`base[index]` where `base` is an array-typed expression (`p.trail[i]`).
+    A plain `name[index]` stays an IndexExpr."""
+    def __init__(self, base, index, line):
+        self.base = base
+        self.index = index
+        self.line = line
+
+
+class IncDecLExpr:
+    """`++`/`--` on a class field or array element (`p.x++`, `--a[i]`)."""
+    def __init__(self, target, op, pre, line):
+        self.target = target  # DotExpr | FieldExpr | ElemExpr | IndexExpr
+        self.op = op          # '+' | '-'
+        self.pre = pre
+        self.line = line
+
+
 class BinOp:
     def __init__(self, op, left, right, line):
         self.op = op
@@ -420,6 +447,16 @@ class Assign:
         self.value = value
         self.line = line
         self.index = index
+
+
+class LStore:
+    """`target = value` / `target op= value` for a FieldExpr or ElemExpr
+    target (chained class fields, array fields)."""
+    def __init__(self, target, op, value, line):
+        self.target = target
+        self.op = op        # None for '=', else '+', '-', '*', '/', '%'
+        self.value = value
+        self.line = line
 
 
 class DotAssign:
@@ -818,6 +855,8 @@ class Parser:
                 return Assign(expr.name, value, expr.line, expr.index)
             elif isinstance(expr, DotExpr):
                 return DotAssign(expr.obj, expr.prop, value, expr.line)
+            elif isinstance(expr, (FieldExpr, ElemExpr)):
+                return LStore(expr, None, value, expr.line)
             else:
                 raise CompileError("invalid assignment target", expr.line)
         # Compound assignment: x += expr, arr[i] += expr, widget.prop += expr
@@ -833,6 +872,8 @@ class Parser:
                 return CompoundAssign(expr.name, arith_op, value, expr.line, expr.index)
             elif isinstance(expr, DotExpr):
                 return DotCompoundAssign(expr.obj, expr.prop, arith_op, value, expr.line)
+            elif isinstance(expr, (FieldExpr, ElemExpr)):
+                return LStore(expr, arith_op, value, expr.line)
             else:
                 raise CompileError("invalid compound assignment target", expr.line)
         if not skip_semi:
@@ -926,9 +967,12 @@ class Parser:
         if self._check('++', '--'):
             tok = self._advance()
             operand = self._unary_expr()
+            op = '+' if tok.type == '++' else '-'
+            if isinstance(operand, (DotExpr, FieldExpr, ElemExpr, IndexExpr)):
+                return IncDecLExpr(operand, op, True, tok.line)
             if not isinstance(operand, VarRef):
                 raise CompileError("increment/decrement requires a variable", tok.line)
-            return IncDecExpr(operand.name, '+' if tok.type == '++' else '-', True, tok.line)
+            return IncDecExpr(operand.name, op, True, tok.line)
         if self._check('-', '!'):
             op = self._advance()
             operand = self._unary_expr()
@@ -955,24 +999,46 @@ class Parser:
         if isinstance(expr, VarRef) and self._match('['):
             index = self._expression()
             self._expect(']')
-            return IndexExpr(expr.name, index, expr.line)
-        # Dot access: widget.prop / obj.field; obj.method(args)
-        if isinstance(expr, VarRef) and self._match('.'):
-            prop = self._expect('IDENT').value
-            if self._match('('):
-                args = [expr]
-                if not self._check(')'):
-                    args.append(self._expression())
-                    while self._match(','):
-                        args.append(self._expression())
-                self._expect(')')
-                # '.name': resolved against the receiver's class by CodeGen.
-                return CallExpr('.' + prop, args, expr.line)
-            return DotExpr(expr.name, prop, expr.line)
+            expr = IndexExpr(expr.name, index, expr.line)
+            return self._postfix_incdec(expr)
+        # Dot access: widget.prop / obj.field; obj.method(args); chains of
+        # them (obj.a.b, obj.arr[i], obj.m().x)
+        if isinstance(expr, VarRef) and self._check('.'):
+            while True:
+                if self._match('.'):
+                    name = self._expect('IDENT').value
+                    if self._match('('):
+                        args = [expr]
+                        if not self._check(')'):
+                            args.append(self._expression())
+                            while self._match(','):
+                                args.append(self._expression())
+                        self._expect(')')
+                        # '.name': resolved against the receiver's class by CodeGen.
+                        expr = CallExpr('.' + name, args, expr.line)
+                    elif isinstance(expr, VarRef):
+                        expr = DotExpr(expr.name, name, expr.line)
+                    else:
+                        expr = FieldExpr(expr, name, expr.line)
+                elif self._check('['):
+                    self._advance()
+                    index = self._expression()
+                    self._expect(']')
+                    expr = ElemExpr(expr, index, expr.line)
+                else:
+                    break
+            return self._postfix_incdec(expr)
         # Postfix increment/decrement: i++, i--
         if isinstance(expr, VarRef) and self._check('++', '--'):
             tok = self._advance()
             return IncDecExpr(expr.name, '+' if tok.type == '++' else '-', False, tok.line)
+        return expr
+
+    def _postfix_incdec(self, expr):
+        """`target++` / `target--` after an element or member access."""
+        if self._check('++', '--') and isinstance(expr, (DotExpr, FieldExpr, ElemExpr, IndexExpr)):
+            tok = self._advance()
+            return IncDecLExpr(expr, '+' if tok.type == '++' else '-', False, tok.line)
         return expr
 
     def _primary_expr(self):
@@ -1539,6 +1605,11 @@ class CodeGen:
         elif isinstance(stmt, DotAssign):
             self._collect_lambdas_in_expr(
                 stmt.value, enclosing_params, global_names)
+        elif isinstance(stmt, LStore):
+            self._collect_lambdas_in_expr(
+                stmt.target, enclosing_params, global_names)
+            self._collect_lambdas_in_expr(
+                stmt.value, enclosing_params, global_names)
         elif isinstance(stmt, ExprStmt):
             self._collect_lambdas_in_expr(
                 stmt.expr, enclosing_params, global_names)
@@ -1607,6 +1678,17 @@ class CodeGen:
         elif isinstance(expr, DotCompoundAssign):
             self._collect_lambdas_in_expr(
                 expr.value, enclosing_params, global_names)
+        elif isinstance(expr, FieldExpr):
+            self._collect_lambdas_in_expr(
+                expr.base, enclosing_params, global_names)
+        elif isinstance(expr, ElemExpr):
+            self._collect_lambdas_in_expr(
+                expr.base, enclosing_params, global_names)
+            self._collect_lambdas_in_expr(
+                expr.index, enclosing_params, global_names)
+        elif isinstance(expr, IncDecLExpr):
+            self._collect_lambdas_in_expr(
+                expr.target, enclosing_params, global_names)
 
     def _register_lambda(self, expr, enclosing_params, global_names):
         """Check captures and register a lambda as an anonymous function."""
@@ -1642,6 +1724,9 @@ class CodeGen:
                 self._collect_var_refs_expr(stmt.init, refs)
         elif isinstance(stmt, Assign):
             refs.add(stmt.name)
+            self._collect_var_refs_expr(stmt.value, refs)
+        elif isinstance(stmt, LStore):
+            self._collect_var_refs_expr(stmt.target, refs)
             self._collect_var_refs_expr(stmt.value, refs)
         elif isinstance(stmt, ExprStmt):
             self._collect_var_refs_expr(stmt.expr, refs)
@@ -1698,6 +1783,13 @@ class CodeGen:
         elif isinstance(expr, ArrayLit):
             for elem in expr.elements:
                 self._collect_var_refs_expr(elem, refs)
+        elif isinstance(expr, FieldExpr):
+            self._collect_var_refs_expr(expr.base, refs)
+        elif isinstance(expr, ElemExpr):
+            self._collect_var_refs_expr(expr.base, refs)
+            self._collect_var_refs_expr(expr.index, refs)
+        elif isinstance(expr, IncDecLExpr):
+            self._collect_var_refs_expr(expr.target, refs)
 
     def _collect_declared_vars(self, stmts, declared):
         """Collect variable names declared (via var) in statements."""
@@ -1877,6 +1969,13 @@ class CodeGen:
             return self.var_types.get(node.name, self.T_INT)
         if isinstance(node, IndexExpr):
             return self.T_INT  # array elements are untyped
+        if isinstance(node, FieldExpr):
+            return self._member_field(node)[1]
+        if isinstance(node, ElemExpr):
+            self._check_elem_base(node)
+            return self.T_INT
+        if isinstance(node, IncDecLExpr):
+            return self._lvalue(node.target)[3]
         if isinstance(node, DotExpr):
             if self._class_of_var(node.obj) is not None:
                 return self._field(node.obj, node.prop, node.line)[1]
@@ -2000,11 +2099,11 @@ class CodeGen:
         """Function implementing the method call `node` (CallExpr '.name')."""
         recv = node.args[0]
         method = node.name[1:]
-        cls = self._class_of_var(recv.name) if isinstance(recv, VarRef) else None
+        cls = self.classes.get(self._infer_type(recv))
         if cls is None:
+            what = f"'{recv.name}'" if isinstance(recv, VarRef) else "the receiver"
             raise CompileError(
-                f"'{getattr(recv, 'name', '?')}' is not a class instance "
-                f"(calling .{method}())", node.line)
+                f"{what} is not a class instance (calling .{method}())", node.line)
         fn = f"{cls['name']}.{method}"
         if fn not in self.functions:
             raise CompileError(f"class {cls['name']} has no method '{method}'", node.line)
@@ -2024,38 +2123,159 @@ class CodeGen:
         i, _ = self._field(node.obj, node.prop, node.line)
         self._gen_field_load(node.obj, i, node.line)
 
-    def _gen_field_assign(self, node):
-        i, ft = self._field(node.obj, node.prop, node.line)
-        vt = self._infer_type(node.value)
-        self._check_type_match(ft, vt,
-            f"'{node.obj}.{node.prop}' is {ft} but assigned {vt} value", node.line)
-        self.asm.load(self._var_slot(node.obj, node.line))
-        self.asm.push(i)
-        self._gen_expr(node.value)
-        if ft == self.T_FLOAT and vt == self.T_INT:
-            self.asm.itof()
-        self.asm.arr_store()
-
-    def _gen_field_compound(self, node):
-        i, ft = self._field(node.obj, node.prop, node.line)
-        if ft not in (self.T_INT, self.T_FLOAT, self.T_ANY):
+    def _member_field(self, node):
+        """(index, type) of a FieldExpr's field."""
+        t = self._infer_type(node.base)
+        cls = self.classes.get(t)
+        if cls is None:
             raise CompileError(
-                f"compound assignment needs a number, '{node.obj}.{node.prop}' is {ft}",
-                node.line)
-        vt = self._infer_type(node.value)
+                f"'{self._lv_name(node)}': '{self._lv_name(node.base)}' is {t}, "
+                f"not a class instance", node.line)
+        i = cls['index'].get(node.field)
+        if i is None:
+            raise CompileError(f"class {cls['name']} has no field '{node.field}'", node.line)
+        return i, cls['types'][node.field]
+
+    def _check_elem_base(self, node):
+        t = self._infer_type(node.base)
+        if t not in (self.T_ARRAY, self.T_ANY):
+            raise CompileError(f"'{self._lv_name(node.base)}' is {t}, not an array", node.line)
+
+    @staticmethod
+    def _lv_name(t):
+        """Source-like text of an access chain, for messages."""
+        n = CodeGen._lv_name
+        if isinstance(t, VarRef):
+            return t.name
+        if isinstance(t, DotExpr):
+            return f"{t.obj}.{t.prop}"
+        if isinstance(t, IndexExpr):
+            return f"{t.name}[..]"
+        if isinstance(t, FieldExpr):
+            return f"{n(t.base)}.{t.field}"
+        if isinstance(t, ElemExpr):
+            return f"{n(t.base)}[..]"
+        if isinstance(t, CallExpr) and t.name.startswith('.') and t.args:
+            return f"{n(t.args[0])}{t.name}(..)"
+        if isinstance(t, CallExpr):
+            return f"{t.name}(..)"
+        return ".."
+
+    def _lvalue(self, t):
+        """Store target `t` as (push_base, push_index, push_value, type):
+        callables emitting the array id, the index and the current value."""
+        line = t.line
+        if isinstance(t, DotExpr) and self._class_of_var(t.obj) is not None:
+            i, ft = self._field(t.obj, t.prop, line)
+            slot = self._var_slot(t.obj, line)
+            return (lambda: self.asm.load(slot), lambda: self.asm.push(i),
+                    lambda: self._gen_field_load(t.obj, i, line), ft)
+        if isinstance(t, FieldExpr):
+            i, ft = self._member_field(t)
+            base = lambda: self._gen_expr(t.base)
+            return (base, lambda: self.asm.push(i),
+                    lambda: (base(), self.asm.push(i), self.asm.arr_load()), ft)
+        if isinstance(t, ElemExpr):
+            self._check_elem_base(t)
+            base = lambda: self._gen_expr(t.base)
+            index = lambda: self._gen_expr(t.index)
+            return (base, index, lambda: (base(), index(), self.asm.arr_load()), self.T_INT)
+        if isinstance(t, IndexExpr):
+            if t.name not in self.array_vars:
+                raise CompileError(f"'{t.name}' is not an array", line)
+            self._check_const(t.name, line)
+            slot = self._var_slot(t.name, line)
+            base = lambda: self.asm.load(slot)
+            index = lambda: self._gen_expr(t.index)
+            return (base, index, lambda: (base(), index(), self.asm.arr_load()), self.T_INT)
+        if isinstance(t, DotExpr):
+            raise CompileError(
+                f"++/-- on widget property '{t.prop}': use {t.obj}.{t.prop} += 1", line)
+        raise CompileError("invalid assignment target", line)
+
+    def _lv_pure(self, t):
+        """Evaluating the store target `t` twice is safe (no calls, no writes)."""
+        if isinstance(t, (VarRef, DotExpr)):
+            return True
+        if isinstance(t, FieldExpr):
+            return self._lv_pure(t.base)
+        if isinstance(t, ElemExpr):
+            return self._lv_pure(t.base) and self._is_pure(t.index)
+        if isinstance(t, IndexExpr):
+            return self._is_pure(t.index)
+        return False
+
+    def _numeric_target(self, t, ft, what):
+        if ft not in (self.T_INT, self.T_FLOAT, self.T_ANY):
+            raise CompileError(f"{what} needs a number, '{self._lv_name(t)}' is {ft}", t.line)
+        if not isinstance(t, DotExpr) and not self._lv_pure(t):
+            raise CompileError(
+                f"{what} on '{self._lv_name(t)}': the target is evaluated twice, "
+                f"so it can't contain calls or ++/-- (use a variable)", t.line)
+
+    def _gen_lstore(self, t, op, value):
+        """`t = value` (op None) or `t op= value` for a class field / array
+        element target."""
+        base, index, load, ft = self._lvalue(t)
+        vt = self._infer_type(value)
+        if op is None:
+            self._check_type_match(ft, vt,
+                f"'{self._lv_name(t)}' is {ft} but assigned {vt} value", t.line)
+            base()
+            index()
+            self._gen_expr(value)
+            if ft == self.T_FLOAT and vt == self.T_INT:
+                self.asm.itof()
+            self.asm.arr_store()
+            return
+        self._numeric_target(t, ft, "compound assignment")
         use_float = ft == self.T_FLOAT
         if not use_float and vt == self.T_FLOAT:
             raise CompileError(
-                f"'{node.obj}.{node.prop}' is {ft}: declare the field float "
-                f"for float arithmetic", node.line)
-        self.asm.load(self._var_slot(node.obj, node.line))
-        self.asm.push(i)
-        self._gen_field_load(node.obj, i, node.line)
-        self._gen_expr(node.value)
+                f"'{self._lv_name(t)}' is {ft}: declare the field float "
+                f"for float arithmetic", t.line)
+        base()
+        index()
+        load()
+        self._gen_expr(value)
         if use_float and vt == self.T_INT:
             self.asm.itof()
-        self._emit_arith_op(node.op, use_float, node.line)
+        self._emit_arith_op(op, use_float, t.line)
         self.asm.arr_store()
+
+    def _gen_lincdec(self, node, keep_value=True):
+        """`++t`, `t++`, `--t`, `t--` on a class field or array element.
+        Prefix leaves the new value, postfix the old one (unless not kept)."""
+        base, index, load, ft = self._lvalue(node.target)
+        self._numeric_target(node.target, ft, "++/--")
+        use_float = ft == self.T_FLOAT
+
+        def bump():
+            base()
+            index()
+            load()
+            if use_float:
+                self.asm.push(float_bits(1.0))
+                self.asm.fadd() if node.op == '+' else self.asm.fsub()
+            else:
+                self.asm.push(1)
+                self.asm.add() if node.op == '+' else self.asm.sub()
+            self.asm.arr_store()
+
+        if not keep_value:
+            bump()
+        elif node.pre:
+            bump()
+            load()
+        else:
+            load()
+            bump()
+
+    def _gen_field_assign(self, node):
+        self._gen_lstore(DotExpr(node.obj, node.prop, node.line), None, node.value)
+
+    def _gen_field_compound(self, node):
+        self._gen_lstore(DotExpr(node.obj, node.prop, node.line), node.op, node.value)
 
     def _gen_new(self, node):
         """`__new("Class")`: allocate an instance, store its field initializers
@@ -2323,6 +2543,8 @@ class CodeGen:
                 self._gen_dot_assign(node)
         elif isinstance(node, CompoundAssign):
             self._gen_compound_assign(node)
+        elif isinstance(node, LStore):
+            self._gen_lstore(node.target, node.op, node.value)
         elif isinstance(node, DotCompoundAssign):
             if self._class_of_var(node.obj) is not None:
                 self._gen_field_compound(node)
@@ -2868,6 +3090,9 @@ class CodeGen:
 
     def _gen_expr_stmt(self, node):
         e = node.expr
+        if isinstance(e, IncDecLExpr):
+            self._gen_lincdec(e, keep_value=False)
+            return
         if isinstance(e, IncDecExpr):
             self._check_const(e.name, e.line)
             k = self._add_imm_target(e.name, NumLit(1, e.line), e.op)
@@ -2930,6 +3155,18 @@ class CodeGen:
                 self._gen_field_read(node)
             else:
                 self._gen_dot_read(node)
+        elif isinstance(node, FieldExpr):
+            i, _ = self._member_field(node)
+            self._gen_expr(node.base)
+            self.asm.push(i)
+            self.asm.arr_load()
+        elif isinstance(node, ElemExpr):
+            self._check_elem_base(node)
+            self._gen_expr(node.base)
+            self._gen_expr(node.index)
+            self.asm.arr_load()
+        elif isinstance(node, IncDecLExpr):
+            self._gen_lincdec(node)
         elif isinstance(node, (BinOp, UnaryOp)) and self._const_int(node) is not None:
             # Constant folding (every device: the VM computes the same).
             self.asm.push(self._const_int(node))

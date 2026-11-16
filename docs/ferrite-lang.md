@@ -398,8 +398,10 @@ fn setup() {
     p.step(0.016);
     var px = p.x;                // float
     p.life = 5;
-    var t = p.trail;             // array field → t[i]
-    t[0] = p.life;
+    p.trail[0] = p.life;         // array field
+    p.life++;
+    p.link = Particle(0, 0);
+    p.link.x += 1.5;             // chains
     free(p);
 }
 ```
@@ -408,7 +410,7 @@ fn setup() {
 - **Constructor:** `Name(args)` allocates the instance, stores the field initializers, then calls `init(args)` if the class has one. Without `init` it takes no arguments.
 - **Methods** are `fn`s inside the class. In a method `self` is the instance; fields are always reached as `self.field` (there is no implicit field scope). Calls are static (`p.step(dt)` calls `Particle.step(p, dt)`), there is no inheritance or virtual dispatch.
 - **Types:** a class name is a type for parameters, return values, variables and fields (`fn f(p: Particle) -> Particle`, `var p: Particle;`). An unannotated `var p = Particle();` is a `Particle`. Instances of different classes don't mix. Assignment copies the reference, not the fields.
-- **Field access** is one level deep: `p.x`, `p.x = v`, `p.x += v` (float-aware: a float field gets float ops, an int assigned to it is converted). For `p.link.x` or `p.trail[i]` go through a variable: `var l = p.link; l.x`. `p.x++` is not supported, use `p.x += 1;`.
+- **Field access** chains: `p.x`, `p.link.x`, `p.trail[i]`, `p.next().x`, `p.link.step(dt)`, each readable and assignable with `=`, `+=`… and `++`/`--` (prefix or postfix; also on plain array elements, `a[i]++`). Float-aware: a float field gets float ops, an int assigned to it is converted. `+=` and `++` evaluate the target twice, so their target may not contain calls or `++` (`p.next().x += 1` is a compile error: use a variable); a plain `=` may. Widget properties don't take `++`, use `w.value += 1`.
 - **Lifetime is manual**, like arrays: `free(p)` calls `p.drop()` if it exists, frees the array fields, then the instance. It does not free string fields or instances held in fields — do that in `drop()`. Freeing twice or using a freed instance faults (`invalid array`) unless its id was reused. A program switch frees everything.
 - Field access compiles to the array instructions with a constant index (`ARR_LOAD_V` with superops); a method call is a normal `CALL`, and a constructor with `init` takes two of the 8 call-stack levels.
 
