@@ -26,3 +26,21 @@ const ALIGN_RIGHT  = 2;
 // Boolean values for set() calls
 const ON  = 1;
 const OFF = 0;
+
+// Widget constructors: `var b = Button(text: "OK", size: [120, 40]);`
+// Arguments are property names; the call's own arguments override these
+// defaults. `children: [...]` and `parent: w` build the tree (see
+// docs/ferrite-lang.md "Widget constructors").
+widget Box();
+widget Label(kind: KIND_LABEL);
+widget Button(kind: KIND_BUTTON);
+widget Progress(kind: KIND_PROGRESS);
+widget Slider(kind: KIND_SLIDER);
+widget Checkbox(kind: KIND_CHECKBOX);
+widget Radio(kind: KIND_RADIO);
+widget Input(kind: KIND_INPUT);
+widget Gauge(kind: KIND_GAUGE);
+widget Dropdown(kind: KIND_DROPDOWN);
+widget Graph(kind: KIND_GRAPH);
+widget Image(kind: KIND_IMAGE);
+widget ButtonGroup(kind: KIND_BUTTON_GROUP);

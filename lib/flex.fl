@@ -55,6 +55,12 @@ const ITEMS_STRETCH = 96;
 // Automatic layout (bit 7; see above)
 const FLEX_AUTO = 128;
 
+// Flex containers as widget constructors (lib/core.fl). A `flex:` argument
+// replaces the default, so it names the direction too:
+//   Column(flex: FLEX_COLUMN | ITEMS_STRETCH, children: [...])
+widget Row(flex: FLEX_ROW);
+widget Column(flex: FLEX_COLUMN);
+
 fn flexLayout(box: widget) {
     target(box);
     var mode = get(flex);

@@ -366,6 +366,27 @@ class AsExpr:
         self.line = line
 
 
+class WidgetExpr:
+    """`Button(text: "Hi", children: [...])`: a widget declared with
+    `widget Button(...)`. The parser lowers it to alloc() + property stores +
+    parent() statements, so it only appears in the AST when it was used
+    somewhere it can't be lowered."""
+    def __init__(self, name, props, children, parent, line):
+        self.name = name
+        self.props = props        # [(prop, expr, line)] as written
+        self.children = children  # None or [expr | ChildAssign]
+        self.parent = parent      # expr or None
+        self.line = line
+
+
+class ChildAssign:
+    """`name = expr` as an element of `children: [...]`."""
+    def __init__(self, name, value, line):
+        self.name = name
+        self.value = value
+        self.line = line
+
+
 class BinOp:
     def __init__(self, op, left, right, line):
         self.op = op
@@ -619,6 +640,22 @@ class Parser:
         self.class_names = {
             tokens[i + 1].value for i in range(len(tokens) - 1)
             if tokens[i].type == 'CLASS' and tokens[i + 1].type == 'IDENT'}
+        # `widget Name(...)` declarations (`widget` is only a keyword there:
+        # elsewhere it is a type name). Lowering needs a declaration's
+        # defaults, so it must come before the widget's first use.
+        self.widget_names = {
+            tokens[i + 1].value for i in range(len(tokens) - 2)
+            if self._widget_decl_at(i)}
+        self.widgets = {}            # name -> [(prop, expr, line)] defaults
+        self._wscopes = []           # per function: depth -> temp declared
+        self.widget_callbacks = []   # (event, var, handler, line) from widget args
+
+    def _widget_decl_at(self, i):
+        t = self.tokens
+        return (t[i].type == 'IDENT' and t[i].value == 'widget'
+                and i + 2 < len(t) and t[i + 1].type == 'IDENT'
+                and t[i + 2].type in ('(', ':')
+                and (i == 0 or t[i - 1].type in (';', '}')))
 
     def _cur(self):
         return self.tokens[self.pos]
@@ -662,8 +699,14 @@ class Parser:
                 functions.append(self._fn_def())
             elif self._check('CLASS'):
                 classes.append(self._class_def())
+            elif self._widget_decl_at(self.pos):
+                self._widget_decl()
             else:
                 statements.append(self._statement())
+        for f in functions:
+            if f.name in self.widgets:
+                raise CompileError(
+                    f"function '{f.name}' has the name of a widget declaration", f.line)
         by_name = {c.name: c for c in classes}
         for c in classes:
             seen = {c.name}
@@ -741,7 +784,9 @@ class Parser:
         return_type = 'int'  # default
         if self._match('->'):
             return_type = self._expect_type_name()
+        self._wscopes.append({})
         body = self._block()
+        self._wscopes.pop()
         return FnDef(name, params, body, line, param_types, return_type)
 
     def _parse_type_annotation(self):
@@ -768,9 +813,162 @@ class Parser:
         self._expect('{')
         stmts = []
         while not self._check('}') and not self._at_end():
-            stmts.append(self._statement())
+            stmts.extend(self._lower_widgets(self._statement()))
         self._expect('}')
         return stmts
+
+    # --- Widget declarations and constructors ---
+
+    _WIDGET_EVENTS = ('on_click', 'on_tap', 'on_paint', 'on_change')
+
+    def _widget_decl(self):
+        """`widget Name(prop: value, ...);` or `widget Name : Base(...);`:
+        a constructor that allocates a widget and sets these properties
+        (the call's own arguments override them)."""
+        line = self._advance().line            # 'widget'
+        name = self._expect('IDENT').value
+        if name in self.widgets:
+            raise CompileError(f"widget '{name}' is declared twice", line)
+        if name in self.class_names:
+            raise CompileError(f"widget '{name}' has the name of a class", line)
+        if name in _BUILTIN_TYPES:
+            raise CompileError(f"'{name}' is a built-in type name", line)
+        defaults = []
+        if self._match(':'):
+            base_tok = self._expect('IDENT')
+            if base_tok.value not in self.widgets:
+                raise CompileError(
+                    f"widget {name}: unknown base widget '{base_tok.value}' "
+                    f"(declare it first)", base_tok.line)
+            defaults = list(self.widgets[base_tok.value])
+        self._expect('(')
+        props, children, parent = self._widget_args(name)
+        self._expect(';')
+        if children is not None or parent is not None:
+            raise CompileError(
+                f"widget {name}: a declaration takes properties only "
+                f"(no children/parent)", line)
+        self.widgets[name] = self._merge_props(defaults, props)
+
+    @staticmethod
+    def _merge_props(defaults, props):
+        given = {p for p, _, _ in props}
+        return [d for d in defaults if d[0] not in given] + props
+
+    def _widget_args(self, name):
+        """Named arguments after `Name(`, up to and including `)`."""
+        props, children, parent = [], None, None
+        seen = set()
+        while not self._check(')'):
+            tok = self._cur()
+            if not (tok.type == 'IDENT' and self.tokens[self.pos + 1].type == ':'):
+                raise CompileError(
+                    f"{name}(...) takes named arguments: {name}(text: \"Hi\", ...)",
+                    tok.line)
+            self.pos += 2
+            if tok.value in seen:
+                raise CompileError(f"{name}(...): '{tok.value}' given twice", tok.line)
+            seen.add(tok.value)
+            if tok.value == 'children':
+                self._expect('[')
+                children = []
+                while not self._check(']'):
+                    if (self._check('IDENT') and self.tokens[self.pos + 1].type == '='):
+                        ctok = self._advance()
+                        self._advance()
+                        children.append(ChildAssign(ctok.value, self._expression(), ctok.line))
+                    else:
+                        children.append(self._expression())
+                    if not self._match(','):
+                        break
+                self._expect(']')
+            elif tok.value == 'parent':
+                parent = self._expression()
+            else:
+                try:
+                    _resolve_prop(tok.value)
+                except ValueError:
+                    raise CompileError(f"{name}(...): unknown property '{tok.value}'",
+                                       tok.line) from None
+                props.append((tok.value, self._expression(), tok.line))
+            if not self._match(','):
+                break
+        self._expect(')')
+        return props, children, parent
+
+    def _widget_expr(self, tok):
+        """`Name(args)` for a declared widget; `(` is next."""
+        if tok.value not in self.widgets:
+            raise CompileError(
+                f"widget '{tok.value}' is used before its declaration", tok.line)
+        self._expect('(')
+        props, children, parent = self._widget_args(tok.value)
+        return WidgetExpr(tok.value, props, children, parent, tok.line)
+
+    def _widget_temp(self, depth):
+        """Hidden local for an unnamed widget at nesting `depth`, and whether
+        this is its first use in the function (so it needs a `var`)."""
+        if not self._wscopes:
+            raise CompileError("widgets can only be created inside a function")
+        scope = self._wscopes[-1]
+        first = depth not in scope
+        scope[depth] = True
+        return f'__w{depth}', first
+
+    def _lower_widgets(self, stmt):
+        """Expand a statement holding a widget constructor into plain widget
+        statements (what one would write by hand, so the widget page and the
+        target tracking apply unchanged)."""
+        out = []
+        if (isinstance(stmt, VarDecl) and isinstance(stmt.init, WidgetExpr)
+                and not stmt.is_const and stmt.array_size is None):
+            self._lower_widget(out, stmt.name, stmt.init, 'var', stmt.var_type, None, 0)
+        elif (isinstance(stmt, Assign) and stmt.index is None
+                and isinstance(stmt.value, WidgetExpr)):
+            self._lower_widget(out, stmt.name, stmt.value, 'set', None, None, 0)
+        elif isinstance(stmt, ExprStmt) and isinstance(stmt.expr, WidgetExpr):
+            tmp, first = self._widget_temp(0)
+            self._lower_widget(out, tmp, stmt.expr, 'var' if first else 'set', None, None, 0)
+        elif isinstance(stmt, ReturnStmt) and isinstance(stmt.value, WidgetExpr):
+            tmp, first = self._widget_temp(0)
+            self._lower_widget(out, tmp, stmt.value, 'var' if first else 'set', None, None, 0)
+            out.append(ReturnStmt(VarRef(tmp, stmt.line), stmt.line))
+        else:
+            out.append(stmt)
+        return out
+
+    def _lower_widget(self, out, name, w, mode, var_type, parent, depth):
+        line = w.line
+        alloc = CallExpr('alloc', [], line)
+        if mode == 'var':
+            out.append(VarDecl(name, alloc, line, var_type=var_type))
+        else:
+            out.append(Assign(name, alloc, line))
+        if w.parent is not None:
+            parent = w.parent
+        if parent is not None:
+            out.append(ExprStmt(CallExpr('parent', [parent], line), line))
+        for prop, value, pline in self._merge_props(self.widgets[w.name], w.props):
+            out.append(DotAssign(name, prop, value, pline))
+            if prop in self._WIDGET_EVENTS and isinstance(value, FuncRef):
+                if name.startswith('__w'):
+                    raise CompileError(
+                        f"{w.name}({prop}: @{value.name}): name the widget "
+                        f"(x = {w.name}(...)) so the {prop} handler can find it", pline)
+                self.widget_callbacks.append((prop, name, value.name, pline))
+        for c in w.children or ():
+            me = VarRef(name, line)
+            if isinstance(c, WidgetExpr):
+                tmp, first = self._widget_temp(depth + 1)
+                self._lower_widget(out, tmp, c, 'var' if first else 'set', None, me, depth + 1)
+            elif isinstance(c, ChildAssign) and isinstance(c.value, WidgetExpr):
+                self._lower_widget(out, c.name, c.value, 'set', None, me, depth + 1)
+            else:
+                if isinstance(c, ChildAssign):
+                    out.append(Assign(c.name, c.value, c.line))
+                    c = VarRef(c.name, c.line)
+                out.append(ExprStmt(CallExpr('target', [c], c.line), c.line))
+                out.append(ExprStmt(CallExpr('parent', [me], c.line), c.line))
 
     # --- Statements ---
 
@@ -1039,6 +1237,10 @@ class Parser:
 
     def _postfix_expr(self):
         expr = self._primary_expr()
+        # Widget constructor: Button(text: "Hi")
+        if (isinstance(expr, VarRef) and expr.name in self.widget_names
+                and self._check('(')):
+            return self._widget_expr(self.tokens[self.pos - 1])
         # Function call
         if isinstance(expr, VarRef) and self._check('('):
             self._advance()
@@ -1152,7 +1354,9 @@ class Parser:
                     params.append(pname)
                     param_types.append(self._parse_type_annotation())
             self._expect('|')
+        self._wscopes.append({})
         body = self._block()
+        self._wscopes.pop()
         return LambdaExpr(params, param_types, body, line)
 
 
@@ -2102,6 +2306,8 @@ class CodeGen:
             return self.var_types.get(node.name, self.T_INT)
         if isinstance(node, LambdaExpr):
             return self.T_INT  # func_id
+        if isinstance(node, WidgetExpr):
+            self._gen_expr(node)  # raises: not lowered here
         raise CompileError(f"unknown expression in type inference: {type(node).__name__}")
 
     # --- Classes ---
@@ -3069,6 +3275,10 @@ class CodeGen:
             # The variable now holds another widget id (c = get(next_sibling)).
             if self._current_target == node.name:
                 self._current_target = None
+            # x = f() with f -> widget: x is a widget variable from here on.
+            if (node.name not in self.widget_ids
+                    and self._infer_type(node.value) == self.T_WIDGET):
+                self.widget_ids[node.name] = -1
             v = node.value
             if isinstance(v, BinOp) and v.op in ('+', '-'):
                 k = None
@@ -3528,6 +3738,11 @@ class CodeGen:
         elif isinstance(node, LambdaExpr):
             func_id = self._resolve_func_id(node.func_name, node.line)
             self.asm.push(func_id)
+        elif isinstance(node, WidgetExpr):
+            raise CompileError(
+                f"{node.name}(...) creates a widget: inside a function, use it as a statement, "
+                f"in `var x = ...`, `x = ...`, `return ...` or in children: [...]",
+                node.line)
         else:
             raise CompileError(f"unknown expression: {type(node).__name__}")
 
@@ -4957,7 +5172,30 @@ def _function_arities(source):
     return arities
 
 
-def _generate_dispatchers(source):
+# A callback given as a widget constructor argument: `on_click: @h`.
+_CTOR_CB_RE = _re.compile(r'\b(?:on_click|on_tap|on_paint|on_change)\s*:')
+
+
+def _ctor_callbacks(source):
+    """`on_click: @h` registrations from widget constructors, as
+    (event, widget variable, handler). Needs a parse: the widget variable
+    comes from the constructor's position in the tree."""
+    if not _CTOR_CB_RE.search(source):
+        return []
+    parser = Parser(tokenize(source))
+    program = parser.parse()
+    file_globals = {s.name for s in program.statements if isinstance(s, VarDecl)}
+    out = []
+    for event, var, handler, line in parser.widget_callbacks:
+        if var not in file_globals:
+            raise CompileError(
+                f"{event}: @{handler} on '{var}': the widget variable must be "
+                f"global (declare `var {var};` at the top level)", line)
+        out.append(('on_tap' if event == 'on_change' else event, var, handler))
+    return out
+
+
+def _generate_dispatchers(source, extra=()):
     """Pre-scan preprocessed source for widget callback assignments and return
     generated dispatcher function source code to append before compilation.
 
@@ -4981,6 +5219,11 @@ def _generate_dispatchers(source):
             registry[event_key].append((widget_var, handler))
 
     _scan_set_callbacks(source, registry, seen)
+
+    for key in extra:
+        if key not in seen:
+            seen.add(key)
+            registry[key[0]].append(key[1:])
 
     parts = []
 
@@ -5076,7 +5319,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         # Generate and append compile-time widget callback dispatchers.
         # Must run on the preprocessed source so #include'd callback
         # assignments are visible.
-        dispatchers = _generate_dispatchers(source)
+        dispatchers = _generate_dispatchers(source, _ctor_callbacks(source))
         if dispatchers:
             source = source + '\n\n' + dispatchers
 

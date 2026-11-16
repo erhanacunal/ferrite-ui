@@ -868,6 +868,50 @@ flexLayout(row);
 
 See `examples/nextion/flex_demo`.
 
+### Widget constructors
+
+A widget can be built in one expression, with properties as named arguments and its children in a list:
+
+```c
+#include "core.fl"
+#include "flex.fl"
+
+var status;
+var ok;
+
+fn setup() {
+    var root = Column(parent: 0, flex: FLEX_COLUMN | ITEMS_STRETCH, size: [400, 300], children: [
+        Label(text: "Settings", size: [0, 30]),
+        Row(flex: FLEX_ROW, flex_grow: 1, children: [
+            ok = Button(text: "OK", size: [80, 40], on_click: @on_ok),
+            Button(text: "Cancel", size: [80, 40]),
+        ]),
+        status = Label(text: "ready"),
+    ]);
+    flexLayout(root);
+    status.text = "changed";
+}
+```
+
+- **Arguments** are property names, as in `w.prop = value` (compound ones take `[...]`, callbacks `@fn`). Positional arguments are an error.
+- **`children: [...]`** attaches each element to the widget, in order. An element is a constructor, `name = constructor` (also stores the widget in `name`, which must be declared), or any widget expression (`card("x")`, a widget variable), which is attached as it is.
+- **`parent: w`** attaches the widget to `w` (`parent: 0` = the root).
+- **Where:** inside a function, as a statement, in `var x = ...`, `x = ...`, `return ...` or in `children`. Not in other expressions or global initializers.
+- **`on_click`/`on_tap`/`on_paint`/`on_change`** need a named widget held in a global (`ok = Button(on_click: @h)` with `var ok;` at the top level), like `ok.on_click = @h`.
+- **Cost:** none. The compiler expands the expression into the `alloc()`, `parent()` and `w.prop = ...` statements you would write by hand, so the widget page and target tracking apply as usual. Unnamed widgets use hidden locals, one per nesting depth.
+
+Constructors are declared with `widget`. `lib/core.fl` declares `Box`, `Label`, `Button`, `Progress`, `Slider`, `Checkbox`, `Radio`, `Input`, `Gauge`, `Dropdown`, `Graph`, `Image` and `ButtonGroup` (each sets `kind`); `lib/flex.fl` declares `Row` and `Column` (each sets `flex`). A declaration lists default properties; the call's own arguments override them, so a `flex:` argument on `Column` names the direction too. A declaration may build on another one:
+
+```c
+widget Primary : Button(bg_color: 0x001F, text_color: 0xFFFF);
+
+fn card(title) -> widget {
+    return Box(size: [100, 50], children: [Label(text: title)]);
+}
+```
+
+A declaration must come before the widget's first use. Its name may not be a function or class name.
+
 ### Layers (`layer`, `layer_alpha`)
 
 A widget subtree can be drawn into its own retained surface, which the display composites over the screen (exynos4412: the FIMD's hardware windows; the sim does it in software). Moving such a subtree's root, hiding/showing it and fading it then redraw nothing: only where and how the surface is shown changes. Changes inside the subtree redraw only its surface.
