@@ -1424,14 +1424,23 @@ def cmd_system(path: str, name: str | None, host: str, wait: float) -> bool:
     return ub_http_send(host, f"/system/{target}", data, wait)
 
 
-def cmd_storage(host: str, migrate: bool) -> bool:
+def cmd_storage(host: str, migrate: bool, stress: str | None = None, check: bool = False) -> bool:
     """exynos4412 (running ferrite): where the files are (GET /api/storage), or,
     with `migrate`, POST /api/storage/migrate: format USERDATA as ext4, copy
-    FERRITE/ and SYSTEM/ from CACHE, verify and switch to it."""
-    method, path = ("POST", "/api/storage/migrate") if migrate else ("GET", "/api/storage")
+    FERRITE/ and SYSTEM/ from CACHE, verify and switch to it. Power-loss tests:
+    `stress` on/off (a write load to cut the power under), `check` (after the
+    restart: the whole file system and the load's files)."""
+    if stress is not None:
+        method, path = "POST", f"/api/storage/stress?on={1 if stress == 'on' else 0}"
+    elif check:
+        method, path = "GET", "/api/storage/check"
+    elif migrate:
+        method, path = "POST", "/api/storage/migrate"
+    else:
+        method, path = "GET", "/api/storage"
     try:
         # Formatting 13 GiB and copying takes a while; the board answers when done.
-        conn = http.client.HTTPConnection(host, UB_HTTP_PORT, timeout=660 if migrate else 10)
+        conn = http.client.HTTPConnection(host, UB_HTTP_PORT, timeout=660 if migrate else 130 if check else 15)
         if migrate:
             print(f"storage: {host}: formatting USERDATA and copying from CACHE (the UI stops meanwhile) ...")
         conn.request(method, path)
@@ -1575,13 +1584,17 @@ def main():
                                "or CACHE FAT32); --migrate moves them to USERDATA")
     p_st.add_argument("--migrate", action="store_true",
                       help="format USERDATA (erasing it), copy FERRITE/ and SYSTEM/ from CACHE, switch to it")
+    p_st.add_argument("--stress", choices=("on", "off"),
+                      help="power-loss test: a write load on USERDATA (/stress/) to cut the power under")
+    p_st.add_argument("--check", action="store_true",
+                      help="after a cut: check the whole file system and the stress files")
 
     args = parser.parse_args()
 
     if args.command == "storage":
         if args.host is None:
             parser.error("storage needs --host (WiFi)")
-        sys.exit(0 if cmd_storage(args.host, args.migrate) else 1)
+        sys.exit(0 if cmd_storage(args.host, args.migrate, args.stress, args.check) else 1)
 
     if args.command == "savefw":
         if args.host is None:
