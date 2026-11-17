@@ -1424,13 +1424,17 @@ def cmd_system(path: str, name: str | None, host: str, wait: float) -> bool:
     return ub_http_send(host, f"/system/{target}", data, wait)
 
 
-def cmd_storage(host: str, migrate: bool, stress: str | None = None, check: bool = False) -> bool:
+def cmd_storage(host: str, migrate: bool, stress: str | None = None, check: bool = False,
+                cut: bool = False) -> bool:
     """exynos4412 (running ferrite): where the files are (GET /api/storage), or,
     with `migrate`, POST /api/storage/migrate: format USERDATA as ext4, copy
     FERRITE/ and SYSTEM/ from CACHE, verify and switch to it. Power-loss tests:
     `stress` on/off (a write load to cut the power under), `check` (after the
-    restart: the whole file system and the load's files)."""
-    if stress is not None:
+    restart: the whole file system and the load's files), `cut` (a transaction
+    committed to the journal only, then a reset: the next mount must replay it)."""
+    if cut:
+        method, path = "POST", "/api/storage/stress?cut=1"
+    elif stress is not None:
         method, path = "POST", f"/api/storage/stress?on={1 if stress == 'on' else 0}"
     elif check:
         method, path = "GET", "/api/storage/check"
@@ -1588,13 +1592,16 @@ def main():
                       help="power-loss test: a write load on USERDATA (/stress/) to cut the power under")
     p_st.add_argument("--check", action="store_true",
                       help="after a cut: check the whole file system and the stress files")
+    p_st.add_argument("--cut", action="store_true",
+                      help="write cut.bin, commit it to the journal only and reset the board; "
+                           "then --check must find it (replayed)")
 
     args = parser.parse_args()
 
     if args.command == "storage":
         if args.host is None:
             parser.error("storage needs --host (WiFi)")
-        sys.exit(0 if cmd_storage(args.host, args.migrate, args.stress, args.check) else 1)
+        sys.exit(0 if cmd_storage(args.host, args.migrate, args.stress, args.check, args.cut) else 1)
 
     if args.command == "savefw":
         if args.host is None:
