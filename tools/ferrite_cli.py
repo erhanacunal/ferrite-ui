@@ -1424,6 +1424,28 @@ def cmd_system(path: str, name: str | None, host: str, wait: float) -> bool:
     return ub_http_send(host, f"/system/{target}", data, wait)
 
 
+def cmd_storage(host: str, migrate: bool) -> bool:
+    """exynos4412 (running ferrite): where the files are (GET /api/storage), or,
+    with `migrate`, POST /api/storage/migrate: format USERDATA as ext4, copy
+    FERRITE/ and SYSTEM/ from CACHE, verify and switch to it."""
+    method, path = ("POST", "/api/storage/migrate") if migrate else ("GET", "/api/storage")
+    try:
+        # Formatting 13 GiB and copying takes a while; the board answers when done.
+        conn = http.client.HTTPConnection(host, UB_HTTP_PORT, timeout=660 if migrate else 10)
+        if migrate:
+            print(f"storage: {host}: formatting USERDATA and copying from CACHE (the UI stops meanwhile) ...")
+        conn.request(method, path)
+        resp = conn.getresponse()
+        answer = resp.read().decode("utf-8", "replace").rstrip()
+    except (OSError, http.client.HTTPException) as e:
+        print(f"storage: {e}", file=sys.stderr)
+        return False
+    print(answer)
+    if resp.status != 200:
+        print(f"storage: {resp.status} {resp.reason}", file=sys.stderr)
+    return resp.status == 200
+
+
 def cmd_bootflash(ser: serial.Serial | None, path: str, host: str | None, fs_base: int,
                   wait: float, reset: bool, app: str | None, save: bool, run: bool) -> bool:
     """Saves an FS image as FERRITE/FLASH.BIN through uart_boot, then starts the
@@ -1548,7 +1570,18 @@ def main():
     p_sys.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
                        help="wait this long for the board's HTTP server")
 
+    p_st = sub.add_parser("storage",
+                          help="exynos4412 over WiFi (--host): where the files are (USERDATA ext4 "
+                               "or CACHE FAT32); --migrate moves them to USERDATA")
+    p_st.add_argument("--migrate", action="store_true",
+                      help="format USERDATA (erasing it), copy FERRITE/ and SYSTEM/ from CACHE, switch to it")
+
     args = parser.parse_args()
+
+    if args.command == "storage":
+        if args.host is None:
+            parser.error("storage needs --host (WiFi)")
+        sys.exit(0 if cmd_storage(args.host, args.migrate) else 1)
 
     if args.command == "savefw":
         if args.host is None:
