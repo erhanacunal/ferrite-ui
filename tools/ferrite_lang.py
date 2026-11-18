@@ -1632,11 +1632,14 @@ def _walk_ast(node):
 def _void_functions(program):
     """Functions that return no value, so they skip the implicit `return 0`
     (RET leaves the eval stack alone: a function's value is what it pushes
-    before RET) and their callers don't pop it: plain functions (not
-    methods, constructors or lambdas) with an int return type and no
+    before RET) and their callers don't pop it: functions and methods (not
+    constructors, lambdas or `__` helpers) with an int return type and no
     `return <value>`, that are not system callbacks and whose id is never
     taken (`@name`): the VM reads the value of some functions it calls
-    (setup's, a modal builder's overlay)."""
+    (setup's, a modal builder's overlay). A virtual call runs one of a
+    method's overrides, so a method is void only if the method it overrides
+    (the one in the topmost class defining it) and every override of that
+    are."""
     taken = set()
     for node in _walk_ast([fn.body for fn in program.functions] + list(program.statements)):
         if isinstance(node, FuncRef):
@@ -1644,13 +1647,30 @@ def _void_functions(program):
     void = set()
     for fn in program.functions:
         name = fn.name
-        if ('.' in name or name.startswith('__') or name in SYSTEM_CALLBACK_KINDS
+        if (name.split('.')[-1].startswith('__') or name in SYSTEM_CALLBACK_KINDS
                 or name in taken or name == 'modalDefaultOverlayClick'
                 or (getattr(fn, 'return_type', None) or 'int') != 'int'):
             continue
         if any(isinstance(n, ReturnStmt) and n.value is not None for n in _walk_ast(fn.body)):
             continue
         void.add(name)
+    # Methods: group the overrides of each method by its topmost definition.
+    parents = {c.name: c.parent for c in program.classes}
+    names = {fn.name for fn in program.functions}
+    groups = {}
+    for name in names:
+        cls, dot, m = name.partition('.')
+        if not dot or cls not in parents:
+            continue
+        root, c = cls, parents.get(cls)
+        while c is not None:
+            if f"{c}.{m}" in names:
+                root = c
+            c = parents.get(c)
+        groups.setdefault((root, m), set()).add(name)
+    for members in groups.values():
+        if not members <= void:
+            void -= members
     return void
 
 
@@ -2687,8 +2707,12 @@ class CodeGen:
     def _gen_method_call(self, node):
         fn, overriders, recv = self._resolve_call(node)
         args = [recv] + node.args[1:]
+        stmt = self._stmt_call is node
         if not overriders:
-            self._gen_call(CallExpr(fn, args, node.line))
+            call = CallExpr(fn, args, node.line)
+            if stmt:
+                self._stmt_call = call  # a statement: a void method pushes nothing
+            self._gen_call(call)
             return
         # Virtual: push the args, read the receiver's class id, then one
         # static CALL per overriding class (deepest first: nested ranges),
@@ -2727,6 +2751,11 @@ class CodeGen:
         for e in ends:
             self.asm.patch(e)
         self._current_target = None
+        if fn in self.void_fns:  # so are all its overrides
+            if stmt:
+                self._stmt_call_void = True
+            else:
+                self.asm.push(0)
 
     def _count_recv_temps(self, fn):
         """Upper bound of the receiver temporaries `fn`'s virtual calls need
@@ -2967,7 +2996,8 @@ class CodeGen:
         if drop in self.functions:
             self.asm.dup()
             self._emit_call(drop)
-            self.asm.pop()
+            if drop not in self.void_fns:
+                self.asm.pop()
         for i in cls['owned']:
             self.asm.dup()
             self.asm.push(i)
@@ -2984,7 +3014,8 @@ class CodeGen:
         if owner is not None:
             self.asm.load(slot)
             self._emit_call(f"{owner}.drop")
-            self.asm.pop()
+            if f"{owner}.drop" not in self.void_fns:
+                self.asm.pop()
         for i in cls['owned']:
             self.asm.load(slot)
             self.asm.push(i)
