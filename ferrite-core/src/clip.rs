@@ -7,6 +7,7 @@ pub const MAX_CLIP_RECTS: usize = 32;
 ///
 /// In the painter's algorithm, occluder rects are subtracted from each widget's
 /// clip region, leaving only the actually visible portions.
+#[derive(Clone)]
 pub struct ClipRegion {
     rects: [Rect; MAX_CLIP_RECTS],
     count: usize,

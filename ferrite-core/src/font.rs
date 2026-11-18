@@ -550,11 +550,15 @@ impl Font {
         fg: u16,
         bg: u16,
     ) {
-        lcd.begin_pixels(draw_x as u16, draw_y as u16, width as u16, height as u16);
+        let Some(win) = GlyphWindow::new(lcd, draw_x, draw_y, width, height) else {
+            return;
+        };
+        win.begin(lcd, draw_x, draw_y);
 
         let total_bits = width as u32 * height as u32;
         let mut bit_idx: u32 = 0;
         let mut bytes_read: u32 = 0;
+        let (mut col, mut row) = (0u8, 0u8);
 
         while bytes_read < total_bytes {
             let chunk = (total_bytes - bytes_read).min(BITMAP_BUF_SIZE as u32) as usize;
@@ -567,12 +571,15 @@ impl Font {
                     if bit_idx >= total_bits {
                         return;
                     }
-                    if byte & (1 << bit) != 0 {
-                        lcd.write_pixel(fg);
-                    } else {
-                        lcd.write_pixel(bg);
+                    if win.full || win.has(col, row) {
+                        lcd.write_pixel(if byte & (1 << bit) != 0 { fg } else { bg });
                     }
                     bit_idx += 1;
+                    col += 1;
+                    if col == width {
+                        col = 0;
+                        row += 1;
+                    }
                 }
             }
 
@@ -656,10 +663,14 @@ impl Font {
             fg,
         ];
 
-        lcd.begin_pixels(draw_x as u16, draw_y as u16, width as u16, height as u16);
+        let Some(win) = GlyphWindow::new(lcd, draw_x, draw_y, width, height) else {
+            return;
+        };
+        win.begin(lcd, draw_x, draw_y);
 
         let mut pixel_idx: u32 = 0;
         let mut bytes_read: u32 = 0;
+        let (mut col, mut row) = (0u8, 0u8);
 
         while bytes_read < total_bytes {
             let chunk = (total_bytes - bytes_read).min(BITMAP_BUF_SIZE as u32) as usize;
@@ -673,8 +684,15 @@ impl Font {
                     if pixel_idx >= total_pixels {
                         return;
                     }
-                    lcd.write_pixel(palette[((byte >> shift) & 0x03) as usize]);
+                    if win.full || win.has(col, row) {
+                        lcd.write_pixel(palette[((byte >> shift) & 0x03) as usize]);
+                    }
                     pixel_idx += 1;
+                    col += 1;
+                    if col == width {
+                        col = 0;
+                        row += 1;
+                    }
                 }
             }
 
@@ -908,5 +926,112 @@ mod tests {
         // A word longer than a line is cut.
         assert_eq!(lines("aaaaaaa", "aaa"), ["aaa", "aaa", "a"]);
         assert_eq!(lines("", "aaa"), [""]);
+    }
+
+    /// A write-only panel with an address window: `begin_pixels` opens it,
+    /// pixels fill it row by row, nothing is clamped (the Nextion bus).
+    struct WinLcd {
+        px: core::cell::RefCell<alloc::vec::Vec<u16>>,
+        win: core::cell::Cell<(u16, u16, u16, u16, u32)>,
+    }
+    const WW: usize = 64;
+    impl LcdBackend for WinLcd {
+        const WIDTH: u16 = WW as u16;
+        const HEIGHT: u16 = 32;
+        fn begin_frame(&mut self) {}
+        fn end_frame(&mut self) {}
+        fn back_buf(&self) -> u8 {
+            0
+        }
+        fn fill_rect(&self, _: u16, _: u16, _: u16, _: u16, _: u16) {}
+        fn begin_pixels(&self, x: u16, y: u16, w: u16, h: u16) {
+            self.win.set((x, y, w, h, 0));
+        }
+        fn write_pixel(&self, c: u16) {
+            let (x, y, w, h, n) = self.win.get();
+            let (cx, cy) = (x as u32 + n % w as u32, y as u32 + n / w as u32);
+            if n < w as u32 * h as u32 {
+                let k = (cy as usize * WW + cx as usize) % (WW * 32);
+                self.px.borrow_mut()[k] = c;
+            }
+            self.win.set((x, y, w, h, n + 1));
+        }
+        fn send_command(&self, _: u16) {}
+        fn send_data(&self, _: u16) {}
+    }
+
+    /// The opaque glyph stream keeps to the scissor: a glyph across its edge
+    /// draws only the part inside, the same pixels there as unclipped.
+    #[test]
+    fn opaque_glyphs_stay_in_the_scissor() {
+        let f = rom();
+        let flash = FlashImpl::with_backend(crate::mock::MockFlash);
+        let mk = || {
+            LcdImpl::with_backend(WinLcd {
+                px: core::cell::RefCell::new(alloc::vec![0x1234; WW * 32]),
+                win: core::cell::Cell::new((0, 0, 0, 0, 0)),
+            })
+        };
+        let (whole, cut) = (mk(), mk());
+        f.draw_str(&whole, &flash, b"WM", 10, 20, 0xFFFF, Some(0x0000));
+        let s = Rect::new(16, 12, 30, 6);
+        cut.set_scissor(Some(s));
+        f.draw_str(&cut, &flash, b"WM", 10, 20, 0xFFFF, Some(0x0000));
+        let (pw, pc) = (whole.backend().px.borrow(), cut.backend().px.borrow());
+        let mut inside = 0;
+        for y in 0..32 {
+            for x in 0..WW {
+                let k = y * WW + x;
+                if s.contains(x as u16, y as u16) {
+                    assert_eq!(pc[k], pw[k], "({x}, {y}) inside");
+                    inside += (pw[k] != 0x1234) as u32;
+                } else {
+                    assert_eq!(pc[k], 0x1234, "({x}, {y}) outside the scissor was drawn");
+                }
+            }
+        }
+        assert!(inside > 20, "the glyphs drew inside: {inside}");
+    }
+
+}
+
+/// The part of a glyph streamed through `begin_pixels` (its opaque paths):
+/// the glyph's cells cut to the screen and the scissor, in glyph cells. The
+/// stream itself ignores the scissor, and some backends (the Nextion FPGA
+/// bus) don't clamp the window: a glyph past an edge wrapped around, and one
+/// across a scroll container's view drew outside it.
+struct GlyphWindow {
+    c0: u8,
+    r0: u8,
+    c1: u8,
+    r1: u8,
+    /// The whole glyph: no per-cell test.
+    full: bool,
+}
+
+impl GlyphWindow {
+    fn new<L: LcdBackend>(lcd: &LcdImpl<L>, x: i16, y: i16, w: u8, h: u8) -> Option<Self> {
+        let glyph = Rect::new(x, y, w as u16, h as u16);
+        let mut r = glyph.intersection(&Rect::new(0, 0, lcd.width(), lcd.height()))?;
+        if let Some(c) = lcd.scissor() {
+            r = r.intersection(&c)?;
+        }
+        let (c0, r0) = ((r.x - x) as u8, (r.y - y) as u8);
+        Some(Self { c0, r0, c1: c0 + r.w as u8, r1: r0 + r.h as u8, full: r == glyph })
+    }
+
+    /// Opens the stream on the window.
+    fn begin<L: LcdBackend>(&self, lcd: &LcdImpl<L>, x: i16, y: i16) {
+        lcd.begin_pixels(
+            (x + self.c0 as i16) as u16,
+            (y + self.r0 as i16) as u16,
+            (self.c1 - self.c0) as u16,
+            (self.r1 - self.r0) as u16,
+        );
+    }
+
+    #[inline(always)]
+    fn has(&self, col: u8, row: u8) -> bool {
+        col >= self.c0 && col < self.c1 && row >= self.r0 && row < self.r1
     }
 }

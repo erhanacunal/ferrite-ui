@@ -31,6 +31,12 @@ impl ObjPool {
         self.scroll_parent(self.dfs_at(i))
     }
 
+    /// `scroll_view` of DFS entry `i`.
+    #[inline]
+    pub fn view_at(&self, i: usize) -> Option<Rect> {
+        self.scroll_view(self.dfs_at(i))
+    }
+
     /// DFS index one past the subtree of entry `i` (its descendants follow
     /// it contiguously).
     pub fn sub_end_at(&self, i: usize) -> usize {

@@ -947,6 +947,26 @@ impl ObjPool {
 
     /// Scroll viewport: content_rect minus scrollbar width when scrollbar is needed.
     /// Used for viewport checks (render, hit_test). If no scrollbar needed, returns content_rect.
+    /// What of the screen the scroll containers around `id` show: the
+    /// intersection of the viewports of all of them (nested ones too);
+    /// `None` outside any. A child is drawn clipped to it, and not at all
+    /// where it doesn't meet it.
+    pub fn scroll_view(&self, id: WidgetId) -> Option<Rect> {
+        let mut view: Option<Rect> = None;
+        let mut sp = self.scroll_parent(id);
+        let mut depth = 0usize;
+        while sp.is_some() && depth <= self.count() {
+            let v = self.scroll_viewport(sp);
+            view = Some(match view {
+                None => v,
+                Some(cur) => cur.intersection(&v).unwrap_or(Rect::new(v.x, v.y, 0, 0)),
+            });
+            sp = self.scroll_parent(sp);
+            depth += 1;
+        }
+        view
+    }
+
     pub fn scroll_viewport(&self, id: WidgetId) -> Rect {
         let cr = self.content_rect(id);
         let ch = self.content_height(id);

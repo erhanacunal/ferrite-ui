@@ -205,12 +205,9 @@ pub fn hit_test(tree: &mut crate::pool::ObjPool, x: u16, y: u16) -> crate::widge
             && (y as i16) >= abs.y
             && (y as i16) < abs.bottom()
         {
-            let sp = tree.scroll_parent(id);
-            if sp.is_some() {
-                let viewport = tree.scroll_viewport(sp);
-                if !abs.intersects(&viewport) {
-                    continue;
-                }
+            // A scroll container's child: only where it shows.
+            if tree.scroll_view(id).is_some_and(|v| !v.contains(x, y)) {
+                continue;
             }
             result = id;
         }
