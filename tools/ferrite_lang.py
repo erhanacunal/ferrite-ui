@@ -1629,6 +1629,31 @@ def _walk_ast(node):
                 yield from _walk_ast(value)
 
 
+def _void_functions(program):
+    """Functions that return no value, so they skip the implicit `return 0`
+    (RET leaves the eval stack alone: a function's value is what it pushes
+    before RET) and their callers don't pop it: plain functions (not
+    methods, constructors or lambdas) with an int return type and no
+    `return <value>`, that are not system callbacks and whose id is never
+    taken (`@name`): the VM reads the value of some functions it calls
+    (setup's, a modal builder's overlay)."""
+    taken = set()
+    for node in _walk_ast([fn.body for fn in program.functions] + list(program.statements)):
+        if isinstance(node, FuncRef):
+            taken.add(node.name)
+    void = set()
+    for fn in program.functions:
+        name = fn.name
+        if ('.' in name or name.startswith('__') or name in SYSTEM_CALLBACK_KINDS
+                or name in taken or name == 'modalDefaultOverlayClick'
+                or (getattr(fn, 'return_type', None) or 'int') != 'int'):
+            continue
+        if any(isinstance(n, ReturnStmt) and n.value is not None for n in _walk_ast(fn.body)):
+            continue
+        void.add(name)
+    return void
+
+
 def _init_only_functions(functions):
     """setup() plus the functions only it reaches: called from nowhere else
     and never used as a callback (@ref, lambda, system callback)."""
@@ -1708,6 +1733,12 @@ class CodeGen:
         # their ids (name -> func_id; None = all; see build_image).
         self._fn_refs = {}
         self.keep_functions = None
+        # Void functions (_void_functions): return nothing, not even the
+        # implicit 0. `_stmt_call` is the call of the expression statement
+        # being emitted; a void call there leaves no value to pop.
+        self.void_fns = set()
+        self._stmt_call = None
+        self._stmt_call_void = False
 
     def generate(self, program):
         """Compile program to bytecode (raw, no image header).
@@ -1860,6 +1891,7 @@ class CodeGen:
 
         if self.widget_page:
             self._init_only = _init_only_functions(program.functions)
+        self.void_fns = _void_functions(program)
 
         # Phase 3: Emit all functions (no JMP-over needed — functions are the code)
         # Allocate global variable slots first (visible to all functions)
@@ -3090,9 +3122,10 @@ class CodeGen:
                 emit(stmt, self._gen_stmt)
             self._page_flush()
 
-            # Implicit return 0
+            # Implicit return 0 (nothing for a void function)
             if not fn.body or not isinstance(fn.body[-1], ReturnStmt):
-                self.asm.push(0)
+                if fn.name not in self.void_fns:
+                    self.asm.push(0)
                 self.asm.ret()
 
         info['end_addr'] = self.asm.pos
@@ -3708,7 +3741,8 @@ class CodeGen:
                 raise CompileError(
                     f"function returns {self._current_fn_return_type} "
                     f"but return statement has no value", node.line)
-            self.asm.push(0)
+            if self._current_fn_name not in self.void_fns:
+                self.asm.push(0)
         self.asm.ret()
 
     def _gen_break(self, node):
@@ -3736,9 +3770,12 @@ class CodeGen:
             if k is not None:
                 self.asm.add_var_imm(self._var_slot(e.name, e.line), k)
                 return
+        self._stmt_call, self._stmt_call_void = node.expr, False
         self._gen_expr(node.expr)
+        void = self._stmt_call_void
+        self._stmt_call, self._stmt_call_void = None, False
         # Discard value if expression leaves one on stack
-        if self._expr_has_value(node.expr):
+        if self._expr_has_value(node.expr) and not void:
             self.asm.pop()
 
     def _expr_has_value(self, node):
@@ -4965,6 +5002,11 @@ class CodeGen:
 
         self._gen_args(name, node.args, node.line)
         self._emit_call(name)
+        if name in self.void_fns:
+            if self._stmt_call is node:
+                self._stmt_call_void = True   # nothing to pop
+            else:
+                self.asm.push(0)              # its value is 0, as before
 
     def _gen_args(self, name, args, line, first=0):
         """Push `args[first:]` for user function `name`, left to right,

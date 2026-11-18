@@ -104,7 +104,7 @@ Older images are still parsed:
 | `0x10` | `LE` | - | signed less-or-equal |
 | `0x11` | `GT` | - | signed greater-than |
 | `0x12` | `GE` | - | signed greater-or-equal |
-| `0x13` | `RET` | - | return from call/callback |
+| `0x13` | `RET` | - | return from call/callback; leaves the eval stack alone (a function's value is what it pushed before RET; the compiler's void functions push none and their callers pop none) |
 | `0x14` | `YIELD` | - | yield to main loop |
 | `0x35` | `JMP` | `u16 target` | set `pc = target` |
 | `0x36` | `JZ` | `u16 target` | pop condition; jump if zero |
