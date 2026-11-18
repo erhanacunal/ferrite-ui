@@ -1703,6 +1703,11 @@ class CodeGen:
         self._page_ops = bytearray()   # pending block
         self._page_code = bytearray()  # bytecode the pending block replaces
         self._init_only = set()
+        # Unused-function elimination (generate_image): the functions each
+        # function calls or takes the id of, and the functions to emit with
+        # their ids (name -> func_id; None = all; see build_image).
+        self._fn_refs = {}
+        self.keep_functions = None
 
     def generate(self, program):
         """Compile program to bytecode (raw, no image header).
@@ -1774,6 +1779,14 @@ class CodeGen:
         become global variables accessible from all functions.
         Top-level imperative statements are not allowed.
         """
+        # Functions a previous pass found unused (build_image) are left out.
+        # The others keep that pass's ids: a program may use a function's id
+        # as a number (`set(on_click, 1)`), and the VM finds functions by id
+        # (gaps are fine).
+        keep = self.keep_functions
+        if keep is not None:
+            program.functions = [fn for fn in program.functions if fn.name in keep]
+
         # Phase 1: Collect global variable declarations
         global_var_stmts = []
         for stmt in program.statements:
@@ -1817,9 +1830,10 @@ class CodeGen:
         # Append lambda FnDefs so they're registered and emitted as regular functions
         program.functions.extend(self._lambda_fns)
 
-        # Phase 2: Register all functions and assign func_ids (1-based, source order)
+        # Phase 2: Register all functions and assign func_ids (1-based, source
+        # order; kept ones keep theirs, lambdas are numbered after them)
         self.func_ids = {}
-        next_fid = 1
+        next_fid = 1 if keep is None else max(keep.values(), default=0) + 1
         for fn in program.functions:
             pt = getattr(fn, 'param_types', None) or ['int'] * len(fn.params)
             rt = getattr(fn, 'return_type', None) or 'int'
@@ -1830,9 +1844,13 @@ class CodeGen:
                 'addr': None,
                 'end_addr': None,
                 'patches': [],
+                'line': getattr(fn, 'line', 0),
             }
-            self.func_ids[fn.name] = next_fid
-            next_fid += 1
+            if keep is not None and fn.name in keep:
+                self.func_ids[fn.name] = keep[fn.name]
+            else:
+                self.func_ids[fn.name] = next_fid
+                next_fid += 1
 
         # Validate: setup and loop must exist
         if 'setup' not in self.functions:
@@ -2190,7 +2208,24 @@ class CodeGen:
     def _resolve_func_id(self, name, line):
         if name not in self.func_ids:
             raise CompileError(f"unknown function '{name}' in @{name}", line)
+        self._note_ref(name)
         return self.func_ids[name]
+
+    def _note_ref(self, name):
+        """The function being emitted calls `name` or takes its id."""
+        self._fn_refs.setdefault(self._current_fn_name, set()).add(name)
+
+    def unused_functions(self):
+        """Functions no system callback (what the VM calls) reaches through
+        calls and function ids, after generate_image."""
+        seen = set()
+        work = [n for n in self.functions if n in SYSTEM_CALLBACK_KINDS]
+        while work:
+            n = work.pop()
+            if n not in seen:
+                seen.add(n)
+                work.extend(self._fn_refs.get(n, ()))
+        return set(self.functions) - seen
 
     # --- Variable management ---
 
@@ -2475,8 +2510,10 @@ class CodeGen:
                 owner = self._resolve_method(cls['parent'], m)
                 if owner is None:
                     continue
-                mine = self.functions[f"{cls['name']}.{m}"]
-                base = self.functions[f"{owner}.{m}"]
+                mine = self.functions.get(f"{cls['name']}.{m}")
+                base = self.functions.get(f"{owner}.{m}")
+                if mine is None or base is None:
+                    continue  # left out as unused (checked when all were compiled)
                 if (len(mine['params']) != len(base['params'])
                         or mine['param_types'][1:] != base['param_types'][1:]
                         or mine['return_type'] != base['return_type']):
@@ -4854,7 +4891,7 @@ class CodeGen:
                         'showModal() without explicit handler requires '
                         '#include "modal.fl"',
                         node.line)
-                fn_id = self.func_ids['modalDefaultOverlayClick']
+                fn_id = self._resolve_func_id('modalDefaultOverlayClick', node.line)
                 self.asm.push(fn_id)
             self.asm.builtin(Builtin.SHOW_MODAL)
             return
@@ -4956,6 +4993,7 @@ class CodeGen:
     def _emit_call(self, name):
         """CALL user function `name` (args already pushed)."""
         info = self.functions[name]
+        self._note_ref(name)
         # CALL (with forward patching if needed)
         if info['addr'] is not None:
             self.asm.call(info['addr'])
@@ -5350,7 +5388,8 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
 
 
 def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty",
-                widget_page=False, portrait=False, superops=False, native_flex=False):
+                widget_page=False, portrait=False, superops=False, native_flex=False,
+                strip_unused=True):
     """Compile source to VM image format (v4 header + opcodes).
 
     Image format (v4):
@@ -5378,6 +5417,10 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
 
     native_flex=True compiles flexLayout(box) to the FLEX_LAYOUT opcode
     (0xDB): only for devices with caps.native_flex (ferrite-ui-xl).
+
+    strip_unused=True leaves out the #include'd functions no system callback
+    reaches through calls or `@name` ids (a second compile pass; the first
+    one still checks them). Function ids don't change, so there may be gaps.
     """
     line_map = []
     try:
@@ -5405,20 +5448,41 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
                             fn.line if hasattr(fn, 'line') else 0)
             return program
 
-        # Compact u16 jump targets unless the bytecode outgrows 64 KB; then
-        # regenerate from a fresh parse with u32 targets (wide-address image).
-        wide = False
-        codegen = CodeGen(superops=superops, native_flex=native_flex)
-        codegen.widget_page = widget_page
-        try:
-            bytecode = codegen.generate_image(parse_program())
-            wide = len(bytecode) > NARROW_CODE_MAX
-        except AddrOverflow:
-            wide = True
-        if wide:
-            codegen = CodeGen(wide=True, superops=superops, native_flex=native_flex)
-            codegen.widget_page = widget_page
-            bytecode = codegen.generate_image(parse_program())
+        def generate(keep):
+            """(codegen, bytecode, wide). Compact u16 jump targets unless
+            the bytecode outgrows 64 KB; then regenerate from a fresh parse
+            with u32 targets (wide-address image)."""
+            for wide in (False, True):
+                codegen = CodeGen(wide=wide, superops=superops, native_flex=native_flex)
+                codegen.widget_page = widget_page
+                codegen.keep_functions = keep
+                try:
+                    bytecode = codegen.generate_image(parse_program())
+                except AddrOverflow:
+                    continue
+                if wide or len(bytecode) <= NARROW_CODE_MAX:
+                    return codegen, bytecode, wide
+            raise AssertionError("unreachable")
+
+        codegen, bytecode, wide = generate(None)
+        # Unused-function elimination: compile everything once (so all of
+        # it is checked), then again without the #include'd functions that
+        # no system callback reaches (lib functions a program doesn't use,
+        # the .fl flexLayout under native_flex, ...). The main file's own
+        # functions stay: it may refer to them by number (`set(on_click, 1)`).
+        if strip_unused:
+            main_path = os.path.abspath(filename)
+
+            def origin(name):
+                line = codegen.functions[name]['line']
+                return line_map[line - 1][0] if 0 < line <= len(line_map) else main_path
+
+            strip = {n for n in codegen.unused_functions()
+                     if not n.startswith('__lambda_') and origin(n) != main_path}
+            if strip:
+                keep = {n: fid for n, fid in codegen.func_ids.items()
+                        if n not in strip and not n.startswith('__lambda_')}
+                codegen, bytecode, wide = generate(keep)
         debug_symbols = codegen.debug_info(filename)
 
         # Build the image header with function table
@@ -5426,11 +5490,11 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         func_names = {}  # offset -> name
         for fn_name, info in codegen.functions.items():
             if info['addr'] is not None:
-                func_id = cc.define_func(fn_name)
-                fid, kind, _, _ = cc._funcs[fn_name]
+                cc.define_func(fn_name)
+                _, kind, _, _ = cc._funcs[fn_name]
                 offset = info['addr']
                 length = (info['end_addr'] or offset) - offset
-                cc._funcs[fn_name] = (fid, kind, offset, length)
+                cc._funcs[fn_name] = (codegen.func_ids[fn_name], kind, offset, length)
                 func_names[offset] = fn_name
         if render_mode not in ("dirty", "buffered", "epaper"):
             raise CompileError(f"invalid render mode: {render_mode}")        

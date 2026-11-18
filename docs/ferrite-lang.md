@@ -2053,6 +2053,8 @@ set(on_paint, @my_painter);
 
 `@name` can be used anywhere an integer expression is expected — it evaluates to the function's numeric ID.
 
+IDs are numbered in source order (included files first, where their `#include` stands) and don't change when the compiler leaves out functions of `#include`d files that nothing reaches (from `setup`, `loop`, the system callbacks, through calls and `@name`), so an image may have gaps. Functions of the main file are always kept, since it may use their IDs as numbers (`set(on_click, 1)`).
+
 ### Lambda Expressions
 
 Lambdas are anonymous functions defined inline. They compile to a regular function and evaluate to the function's ID — syntactic sugar for defining a named function + using `@name`.
