@@ -1,0 +1,41 @@
+// device.fl — the board's device settings (ferrite-ui-xl, exynos4412; the sim
+// keeps them for the run only): UTC offset, clock sync over NTP, and the
+// volume last set.
+//
+// The board keeps them in system/settings.txt and reads it at start: the UTC
+// offset, the NTP server (ntp=, default pool.ntp.org, "off" = no sync) and the
+// backlight / volume a program last set with setBrightness / setVolume (saved
+// by the firmware once a change has settled, applied at the next start).
+// The RTC keeps UTC; rtcRead / rtcWrite are local time (UTC + the offset).
+// The clock is set from NTP once the network is up, then every 6 hours.
+//
+// Ids and codes are duplicated in ferrite-ui-xl ferrite-core/src/settings.rs
+// and the BSPs' platform.rs — keep them in sync.
+
+const SYS_UTC_OFFSET     = 0x50;  // () -> minutes east of UTC
+const SYS_SET_UTC_OFFSET = 0x51;  // (minutes) -> 1 set (and saved), -1 out of -12:00..+14:00
+const SYS_NTP_SYNC       = 0x52;  // () -> 1 a sync was asked for, 0 none can run now
+const SYS_NTP_STATE      = 0x53;  // () -> NTP_*
+const SYS_NTP_AGE        = 0x54;  // () -> seconds since the last sync, -1 none yet
+const SYS_NTP_SERVER     = 0x55;  // () -> string (syscallStr), "" when off
+const SYS_VOLUME         = 0x56;  // () -> the volume last set (0..100), -1 none
+
+const NTP_OFF     = 0;  // ntp=off, or no network on this board
+const NTP_WAITING = 1;  // waiting for the network
+const NTP_RUNNING = 2;  // a query is out
+const NTP_SYNCED  = 3;  // the clock was set from the last query
+const NTP_FAILED  = 4;  // the last query failed; retried in a minute
+
+fn utcOffset() { return syscall(SYS_UTC_OFFSET); }
+fn setUtcOffset(minutes) { return syscall(SYS_SET_UTC_OFFSET, minutes); }
+fn ntpSync() { return syscall(SYS_NTP_SYNC); }
+fn ntpState() { return syscall(SYS_NTP_STATE); }
+fn ntpAge() { return syscall(SYS_NTP_AGE); }
+fn ntpServer() -> string { return syscallStr(SYS_NTP_SERVER); }
+fn savedVolume() { return syscall(SYS_VOLUME); }
+
+// "UTC+03:00" for an offset in minutes.
+fn utcText(minutes) -> string {
+    var a = minutes < 0 ? 0 - minutes : minutes;
+    return sprintf("UTC%s%02d:%02d", minutes < 0 ? "-" : "+", a / 60, a % 60);
+}
