@@ -1980,7 +1980,7 @@ fn loop() {}
 | Property | Event | Callback args |
 |----------|-------|---------------|
 | `on_click` | Press + release on same widget | `(widget_id)` |
-| `on_paint` | After the frame's widgets are rendered (once per frame, for every dirty widget with `on_paint`) | `(ids)` — an array of those widget ids, freed after the call |
+| `on_paint` | After the frame's widgets are rendered (once per frame, for every dirty widget with `on_paint`). On ferrite-ui-xl it runs just before that render and its drawing is part of the widget: drawn over the widget's background and under its children and later widgets, cut to its box, and kept, so a repaint that doesn't run `on_paint` (something over the widget moved) shows it again | `(ids)` — an array of those widget ids, freed after the call |
 | `on_tap` | Tap with coordinates | `(widget_id, packed_xy)` |
 
 For `on_tap`, extract coordinates: `x = coords / 65536`, `y = coords & 0xFFFF`.
