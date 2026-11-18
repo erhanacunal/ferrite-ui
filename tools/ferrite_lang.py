@@ -3075,7 +3075,13 @@ class CodeGen:
         local_count = (len(fn.params) + self._count_var_slots(fn.body)
                        + self._count_recv_temps(fn))
         self._recv_temps = 0
-        self.asm.frame(local_count)
+        # With superops, FRAME_A also pops the arguments (one opcode instead of
+        # FRAME plus a STORE per parameter).
+        fuse_args = self.superops and fn.params
+        if fuse_args:
+            self.asm.frame_args(local_count, len(fn.params))
+        else:
+            self.asm.frame(local_count)
 
         # Allocate param slots and pop args (reverse order)
         # Set parameter types from annotations (default: int)
@@ -3093,8 +3099,9 @@ class CodeGen:
             else:
                 self.var_types[p] = pt
             param_slots.append(slot)
-        for slot in reversed(param_slots):
-            self.asm.store(slot)
+        if not fuse_args:
+            for slot in reversed(param_slots):
+                self.asm.store(slot)
 
         if self.widget_page and fn.name in self._init_only:
             def emit(stmt, gen, global_init=False):

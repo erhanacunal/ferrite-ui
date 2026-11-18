@@ -114,6 +114,7 @@ class Op:
     ADD_VI     = 0x4B  # + u8 slot + i16: var += imm
     ARR_LOAD_V = 0x4C  # + u8 slot: pop index, push array(var)[index]
     STORE_OP   = 0x4D  # + u8 op + u8 slot: pop b; var = var <op> b
+    FRAME_A    = 0x4E  # + u8 local_count + u8 nargs: FRAME, pop args into locals
 
     # Builtins as first-class opcodes (all no-arg, operands on stack)
     FILL_RECT       = 0x80
@@ -768,6 +769,13 @@ class Asm:
         self._emit(Op.FRAME)
         self._emit_u8(local_count)
 
+    def frame_args(self, local_count, nargs):
+        """FRAME_A: FRAME plus popping `nargs` arguments into locals
+        nargs-1..0 (caps.superops)."""
+        self._emit(Op.FRAME_A)
+        self._emit_u8(local_count)
+        self._emit_u8(nargs)
+
     # --- Jump/call -- opcode + u16 LE target (u32 when wide) ---
 
     def jmp(self, target):
@@ -1222,6 +1230,7 @@ OP_NAMES = {
     0x44: 'W_LOAD',
     0x45: 'JCMP', 0x46: 'JCMP_VI', 0x47: 'JCMP_VV',
     0x48: 'BIN_I', 0x49: 'BIN_I32', 0x4A: 'BIN_V', 0x4B: 'ADD_VI', 0x4C: 'ARR_LOAD_V', 0x4D: 'STORE_OP',
+    0x4E: 'FRAME_A',
 
     0x80: 'fillRect', 0x81: 'rect', 0x82: 'line', 0x83: 'circle',
     0x84: 'fillCircle', 0x85: 'drawImage', 0x86: 'drawTextLit',
@@ -1299,7 +1308,7 @@ def superop_size(op, wide=False):
     return {
         Op.JCMP: 2 + addr, Op.JCMP_VI: 5 + addr, Op.JCMP_VV: 4 + addr,
         Op.BIN_I: 4, Op.BIN_I32: 6, Op.BIN_V: 3, Op.ADD_VI: 4, Op.ARR_LOAD_V: 2,
-        Op.STORE_OP: 3,
+        Op.STORE_OP: 3, Op.FRAME_A: 3,
     }.get(op)
 
 
@@ -1404,6 +1413,9 @@ def disassemble(data, labels=None, symbols=None, wide=False):
         elif op == Op.FRAME:
             count = data[pos]; pos += 1
             lines.append(f'{addr:04X}: FRAME {count}')
+        elif op == Op.FRAME_A:
+            count, nargs = data[pos], data[pos + 1]; pos += 2
+            lines.append(f'{addr:04X}: FRAME_A {count} {nargs}')
 
         # LOAD / STORE with u8 slot (bit 7 = local)
         elif op == Op.LOAD:

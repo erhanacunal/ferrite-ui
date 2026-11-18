@@ -340,7 +340,7 @@ const OP_F_WRITE: u8 = 0x41; // + u32 addr + u8 len + data
 const OP_W_TARGET_S: u8 = 0x42; // widget id from stack (dynamic target)
 const OP_W_PARENT_S: u8 = 0x43; // parent id from stack (dynamic parent)
 const OP_W_LOAD: u8 = 0x44; // + u16 block offset in the widget page (RES_PAGE)
-// 0x45..=0x4D: ferrite-ui-xl superinstructions (bad opcodes here).
+// 0x45..=0x4E: ferrite-ui-xl superinstructions (bad opcodes here).
 
 // Widget page (RES_PAGE) ops: static widget setup the compiler moved out of
 // the bytecode. 0x01..=0x3F = W_SET <tag> + zigzag varint, 0x40..=0x7F =
@@ -4436,7 +4436,7 @@ mod anim_tests {
 
     #[test]
     fn superops_are_bad_opcodes_without_the_feature() {
-        for op in 0x45..=0x4D {
+        for op in 0x45..=0x4E {
             let vm = run_code(&[OP_PUSH_1, op, OP_ADD, 0, 0, 0, 0]);
             assert_eq!(vm.fault(), fault::BAD_OPCODE, "op {op:#x}");
         }

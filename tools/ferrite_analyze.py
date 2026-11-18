@@ -98,7 +98,7 @@ OPCODE_CATEGORIES = {
     Op.AND: CATEGORY_LOGIC, Op.OR: CATEGORY_LOGIC, Op.NOT: CATEGORY_LOGIC,
     # Control flow
     Op.HALT: CATEGORY_CONTROL, Op.RET: CATEGORY_CONTROL,
-    Op.YIELD: CATEGORY_CONTROL, Op.FRAME: CATEGORY_CONTROL,
+    Op.YIELD: CATEGORY_CONTROL, Op.FRAME: CATEGORY_CONTROL, Op.FRAME_A: CATEGORY_CONTROL,
     Op.JMP: CATEGORY_CONTROL, Op.JZ: CATEGORY_CONTROL,
     Op.JNZ: CATEGORY_CONTROL, Op.CALL: CATEGORY_CONTROL,
     # Variables
@@ -798,7 +798,7 @@ def analyze_bytecode(data, opcode_start=0, opcode_end=None, wide=False):
                 result.global_var_slots.add(slot)
 
         # Track max local frame size from FRAME instructions
-        if op == Op.FRAME:
+        if op in (Op.FRAME, Op.FRAME_A):
             frame_size = data[addr + 1]
             if frame_size > result.max_local_frame:
                 result.max_local_frame = frame_size
@@ -891,7 +891,7 @@ def analyze_image(data, exec_mode=None):
             if op in (Op.W_ALLOC, Op.W_ALLTAR):
                 fstats['widget_allocs'] += 1
 
-            if op == Op.FRAME:
+            if op in (Op.FRAME, Op.FRAME_A):
                 fstats['local_frame'] = data[addr + 1]
 
         result.func_stats[func['name']] = fstats

@@ -42,3 +42,6 @@ Language pitfalls and compiler changes (the language itself: docs/ferrite-lang.m
 - Why id-taken functions are excluded: the VM reads the value of some functions it enters as callbacks (setup's via `pop_result`, a modal builder's overlay in `handle_builder_return`); other callbacks' values are dropped by `leave_callback`. A main-file function used by number as a modal builder and also void is not detected (unlikely).
 - No firmware change, no cap: works on every VM. Example builds 180 097 -> 177 728 B (-1.3%); in the XL examples CALL;POP 263 -> 80, PUSH;RET 153 -> 95. Test: ferrite-ui-xl `ferrite-core/testdata/calls/calls.fl` (`gen.py`) -> `runtime::call_tests` (1000-call loops: a mismatch over/underflows the 32-entry stack; checked that a caller that still pops fails it).
 
+## Compiler: FRAME_A prologue (2026-11-18)
+
+With `caps.superops` a function with parameters starts with `FRAME_A n, nargs` (0x4E) instead of `FRAME n` plus one `STORE` per parameter; parameters are always locals `0..nargs-1`. Same size for one parameter, `nargs - 1` bytes less above that, and `nargs` fewer dispatches per call. Example XL builds: 77 864 → 77 245 B; plain builds unchanged. ferrite-ui-xl `vm::frame_a_matches_plain_prologue` checks it against the plain sequence.

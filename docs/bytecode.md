@@ -222,6 +222,7 @@ Only in firmware built with the ferrite-core `superops` feature (`caps.superops`
 | `0x4B` | `ADD_VI` | `u8 slot, i16 imm` | `LOAD; PUSH imm; ADD; STORE` (`x++`, `x += 3`, `x = x - 1`): var += imm |
 | `0x4C` | `ARR_LOAD_V` | `u8 slot` | `LOAD slot; <index>; ARR_LOAD` with a side-effect-free index: pop index, push element of the array in var |
 | `0x4D` | `STORE_OP` | `u8 op, u8 slot` | `LOAD x; <e>; <op>; STORE x` with a side-effect-free `e`: pop b; var = var op b |
+| `0x4E` | `FRAME_A` | `u8 local_count, u8 nargs` | the prologue `FRAME n; STORE nargs-1; …; STORE 0`: reserves the locals, then pops the arguments (last on top) into locals `nargs-1`…`0` |
 
 The compiler also inverts loops for these devices (`JMP test; body: …; test: JCMP… body`), so an iteration runs one jump instead of two. On every device it folds integer constant expressions (`16 * 12`, `-(5 - 9)`, int `const`s) to one `PUSH`, with the VM's semantics: 32-bit wrap, division truncating toward zero, `x / 0` = `x % 0` = 0, `i32::MIN / -1` = `i32::MIN`, shifts by `b & 31`.
 
