@@ -810,7 +810,7 @@ def _writefs_once(ser: serial.Serial, data: bytes, log) -> str:
         pct = (i + 1) * 100 // chunk_count
         print(f"\r  [{i + 1}/{chunk_count}] {pct}%", end="", flush=True)
 
-    log(" done (device will restart)")
+    log(" done (the device runs the new image)")
     return "ok"
 
 
@@ -922,7 +922,7 @@ def _send_seq_chunks(ser: serial.Serial, data: bytes, log) -> str:
         log(f"\n  seq {seq}: {why}, resending ({fails}/{tries})")
 
     note = f", {retries} resend(s), last chunk size {size} B" if retries else ""
-    log(f" done{note} (device will restart)")
+    log(f" done{note} (the device runs the new image)")
     return "ok"
 
 
@@ -1003,7 +1003,7 @@ def _send_crc_chunks(ser: serial.Serial, data: bytes, log) -> str:
         log(f"\n  seq {seq}: {why}, resending ({fails}/{tries})")
 
     note = f", {retries} resend(s), last chunk size {size} B" if retries else ""
-    log(f" done{note} (device will restart)")
+    log(f" done{note} (the device runs the new image)")
     return "ok"
 
 
