@@ -495,7 +495,7 @@ Sets the target widget for subsequent `set()`, `get()`, `dirty()`, `parent()` ca
 
 ### parent(widget)
 
-Attaches the current target as a child of the given parent.
+Attaches the current target as the last child of the given parent (drawn last, on top of its siblings). A widget that already has a parent leaves it first, with its children: `parent()` on an attached widget moves it to another parent, or brings it to the front of the same one (`parent(0)` again for a top-level widget). Its old place is repainted. A widget can't go into its own subtree (ignored).
 
 ### Property Access (dot syntax)
 
