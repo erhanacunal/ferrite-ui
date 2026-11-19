@@ -1558,8 +1558,10 @@ def cmd_app(args, ser: serial.Serial | None) -> bool:
             if not answer.get("storage"):
                 print("app: the device has no app storage (needs the ext4 USERDATA)")
             running, boot = answer.get("running", ""), answer.get("boot", "")
+            started = answer.get("started", [])
             for a in answer["apps"]:
                 marks = " ".join(m for m, on in (("[running]", a["id"] == running),
+                                                 ("[started]", a["id"] in started),
                                                  ("[boot]", a["id"] == boot)) if on)
                 print(f"{a['id']:<32} {a['version']:<10} {a['name']}  {marks}".rstrip())
             if answer.get("storage") and not answer["apps"]:

@@ -7,6 +7,12 @@
 // files (disk*) and EEPROM, none of another app's. runApp("") goes back to the
 // system image.
 //
+// Several apps at once: startApp(id) runs one beside the caller (at most four),
+// full screen over it; one app shows at a time, hidden ones keep running (loop,
+// timers). showApp(0), the home gesture (a swipe up from the bottom edge) or
+// exitApp() bring the launcher back. The started app is a task of the caller:
+// on_task_exit(task, code) tells when it ended (-1: it could not start).
+//
 // Ids are duplicated in ferrite-ui-xl ferrite-core/src/apps.rs (SYS_APP_*) —
 // keep them in sync. On boards without app storage appCount() is 0.
 
@@ -14,7 +20,11 @@ const SYS_APP_COUNT   = 0x80;  // () -> number of installed apps
 const SYS_APP_ID      = 0x81;  // (i) -> string: app i's id (sorted by id), "" past the end
 const SYS_APP_NAME    = 0x82;  // (i) -> string: app i's display name, "" past the end
 const SYS_APP_RUN     = 0x83;  // (id: str_id) -> ends every program and runs the app; 0 if not installed
-const SYS_APP_CURRENT = 0x84;  // () -> string: the running app's id, "" for the system image
+const SYS_APP_CURRENT = 0x84;  // () -> string: the calling program's app id, "" for the system image
+const SYS_APP_START   = 0x85;  // (id: str_id) -> task id; -1 not installed, -2 four apps run, -3 no task slot
+const SYS_APP_SHOW    = 0x86;  // (task) -> 1, or 0 if task is no app's; 0 = the launcher
+const SYS_APP_TASK    = 0x87;  // (id: str_id) -> the app's task, -1 if it does not run
+const SYS_APP_EXIT    = 0x88;  // () -> ends the calling app; 0 in the system image
 
 fn appCount() { return syscall(SYS_APP_COUNT); }
 fn appId(i) -> string { return syscallStr(SYS_APP_ID, i); }
@@ -25,3 +35,20 @@ fn currentApp() -> string { return syscallStr(SYS_APP_CURRENT); }
 // runProgram: nothing of the caller runs after it. Returns 0 (and the caller
 // goes on) if `id` is not installed.
 fn runApp(id: string) { return syscall(SYS_APP_RUN, id); }
+
+// Starts installed app `id` beside the caller (from the next frame) and shows
+// it; if it runs already, only shows it. Returns its task id (for showApp,
+// killTask, sendTask), or -1 not installed, -2 four apps already run, -3 no
+// free task slot.
+fn startApp(id: string) { return syscall(SYS_APP_START, id); }
+
+// Shows the app whose task `task` is (from startApp / appTask); 0 shows the
+// launcher. Returns 0 if `task` is no app's.
+fn showApp(task) { return syscall(SYS_APP_SHOW, task); }
+
+// The task of app `id` if it runs (started), else -1.
+fn appTask(id: string) { return syscall(SYS_APP_TASK, id); }
+
+// Ends the calling app (all its programs); the launcher shows again. An app run
+// with runApp goes back to the system image. In the system image: 0, nothing.
+fn exitApp() { return syscall(SYS_APP_EXIT); }

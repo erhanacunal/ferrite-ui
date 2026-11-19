@@ -1786,9 +1786,17 @@ On the tablet the EEPROM builtins (`eepromRead` / `eepromWrite`…) work too: 40
 
 ferrite-ui-xl runs installed app packages (projects built with
 `application_id`, installed with `ferrite_cli app install`; ferrite-ui-xl
-`docs/apps.md`) in place of the system image. An app has its own programs
-and resources, its own files (`disk*`) and EEPROM. Boards without app
-storage report no apps.
+`docs/apps.md`), in place of the system image (`runApp`) or beside it
+(`startApp`, at most four at once). An app has its own programs and
+resources, its own files (`disk*`) and EEPROM. Boards without app storage
+report no apps.
+
+A started app runs full screen over the launcher; one app shows at a time and
+hidden ones keep running (`loop()`, timers). `showApp(0)`, the home gesture (a
+swipe up from the bottom edge) or the app's `exitApp()` bring the launcher back.
+The app is a task of the program that started it, which gets
+`on_task_exit(task, code)` when it ends (`-1`: it could not start). In an app,
+`parent(0)` is the app's own full-screen container.
 
 | Function | Returns |
 | --- | --- |
@@ -1796,9 +1804,13 @@ storage report no apps.
 | `appId(i)` | app `i`'s id (sorted by id), `""` past the end |
 | `appName(i)` | app `i`'s display name |
 | `runApp(id)` | ends every program and runs app `id` from the next frame (`""` = the system image), like `runProgram`; returns `0` (and the caller goes on) if `id` is not installed |
-| `currentApp()` | the running app's id, `""` for the system image |
+| `currentApp()` | the calling program's app id, `""` for the system image |
+| `startApp(id)` | starts app `id` beside the caller (from the next frame) and shows it, or only shows it if it runs; its task id, or `-1` not installed, `-2` four apps already run, `-3` no free task slot |
+| `showApp(task)` | shows the app whose task `task` is (`0` = the launcher); `0` if it is no app's |
+| `appTask(id)` | the started app's task id, `-1` if it does not run |
+| `exitApp()` | ends the calling app (all its programs); one run with `runApp` goes back to the system image; `0` and nothing in the system image |
 
-Syscall ids 0x80–0x84 (handled by the VM itself, on every board).
+Syscall ids 0x80–0x88 (handled by the VM itself, on every board).
 
 ## Gestures
 
