@@ -44,8 +44,19 @@ JSON format:
     "memory": {
       "arena_bytes": 16384, "max_objects": 400, "uart_rx_bytes": 512,
       "eval_stack": 32, "call_stack": 12, "cb_queue": 16, "anim_slots": 8
-    }
+    },
+    "application_id": "com.acme.clock", "name": "Clock", "app_version": "1.2.3",
+    "entry": "main", "icon": "logo"
   }
+
+  "application_id" makes the image an app package (ferrite-ui-xl
+  docs/apps.md): a RES_APPINFO resource "appinfo" (build_appinfo) is added,
+  and the board installs it under ferrite/apps/{id}/ instead of replacing
+  FLASH.BIN. "name" (default: the id), "app_version" ("major.minor.patch",
+  each 0..255; default 1.0.0), "entry" (the program to start, default
+  "main") and "icon" (an image resource name) are optional. An app's
+  "memory" block is ignored on the board (the system image sizes the
+  pools). Without "application_id" the image is a system image, as before.
 
   "sounds" are PCM WAV files (8/16/24/32-bit, mono or stereo, any rate),
   stored as 16-bit PCM and played with playSound(name) on boards with
@@ -68,6 +79,7 @@ JSON format:
 """
 
 import json
+import re
 import struct
 import sys
 import wave
@@ -101,12 +113,24 @@ RES_FILE = 4
 RES_SYSCFG = 5
 RES_SOUND = 6
 RES_MESH = 7
+# App package manifest (fs.rs RES_APPINFO, ferrite-ui-xl docs/apps.md).
+RES_APPINFO = 8
+APPINFO_NAME = "appinfo"
+APPINFO_MAGIC = b"AI"
+APPINFO_VERSION = 1
+APPINFO_SIZE = 108
+APP_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
+# Device caps -> Platform::CAPS bits (ferrite-core platform.rs CAP_*; keep in
+# sync): the bits an app needs, checked by the board before it installs it.
+CAP_BITS = {"audio": 1 << 0, "video": 1 << 1, "jpeg": 1 << 2, "multi_program": 1 << 3,
+            "superops": 1 << 4, "native_flex": 1 << 5, "storage": 1 << 6, "gestures": 1 << 7}
 
 # Resource flags (stored in entry reserved[0], byte 28)
 RES_FLAG_FLASH_EXEC = 0x01
 
 KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE",
-              RES_FILE: "FILE", RES_SYSCFG: "SYSCFG", RES_SOUND: "SOUND", RES_MESH: "MESH"}
+              RES_FILE: "FILE", RES_SYSCFG: "SYSCFG", RES_SOUND: "SOUND", RES_MESH: "MESH",
+              RES_APPINFO: "APPINFO"}
 
 # --- Image conversion (shared encoder in ferrite_img.py) ---
 
@@ -394,6 +418,74 @@ def build_syscfg(memory: dict) -> bytes:
             continue
         struct.pack_into(fmt, rec, offset, value)
     return bytes(rec)
+
+
+def _name_field(text: str, size: int, what: str) -> bytes:
+    raw = text.encode("utf-8")
+    if len(raw) > size:
+        raise ValueError(f"{what} '{text}' is longer than {size} bytes")
+    return raw.ljust(size, b"\0")
+
+
+def build_appinfo(project: dict, programs: set[str], images: set[str],
+                  caps: dict | None) -> bytes:
+    """project.json app fields -> the 108-byte RES_APPINFO record:
+    magic "AI", version u8, id length u8, id[32], name[32] (UTF-8),
+    app version u32 (major << 16 | minor << 8 | patch), entry[16], icon[16],
+    caps u32 (CAP_BITS of the device it is built for). All zero padded,
+    little-endian. Keep in sync with ferrite-core apps.rs."""
+    app_id = project["application_id"]
+    if not isinstance(app_id, str) or not APP_ID_RE.fullmatch(app_id):
+        raise ValueError(f"application_id '{app_id}': 1-32 of a-z 0-9 . _ - "
+                         f"(lower case, starting with a letter or digit)")
+    name = project.get("name", app_id)
+    ver = str(project.get("app_version", "1.0.0"))
+    parts = ver.split(".")
+    if len(parts) != 3 or not all(p.isdigit() and int(p) <= 255 for p in parts):
+        raise ValueError(f"app_version '{ver}': major.minor.patch, each 0..255")
+    major, minor, patch = (int(p) for p in parts)
+    entry = project.get("entry", "main")
+    if entry not in programs:
+        raise ValueError(f"entry '{entry}' is not one of the programs")
+    icon = project.get("icon", "")
+    if icon and icon not in images:
+        raise ValueError(f"icon '{icon}' is not one of the images")
+    cap_bits = sum(bit for cap, bit in CAP_BITS.items() if caps and caps.get(cap))
+    rec = (APPINFO_MAGIC + bytes([APPINFO_VERSION, len(app_id)])
+           + _name_field(app_id, 32, "application_id") + _name_field(name, 32, "name")
+           + struct.pack("<I", major << 16 | minor << 8 | patch)
+           + _name_field(entry, 16, "entry") + _name_field(icon, 16, "icon")
+           + struct.pack("<I", cap_bits))
+    assert len(rec) == APPINFO_SIZE
+    return rec
+
+
+def parse_appinfo(rec: bytes) -> dict:
+    """RES_APPINFO record -> dict (the inverse of build_appinfo)."""
+    if len(rec) < APPINFO_SIZE or rec[:2] != APPINFO_MAGIC or rec[2] != APPINFO_VERSION:
+        raise ValueError("not an appinfo record")
+    text = lambda b: b.split(b"\0", 1)[0].decode("utf-8", "replace")
+    ver = struct.unpack_from("<I", rec, 68)[0]
+    return {"id": rec[4:4 + rec[3]].decode("ascii"), "name": text(rec[36:68]),
+            "version": f"{ver >> 16 & 255}.{ver >> 8 & 255}.{ver & 255}",
+            "entry": text(rec[72:88]), "icon": text(rec[88:104]),
+            "caps": struct.unpack_from("<I", rec, 104)[0]}
+
+
+def read_appinfo(binary: bytes) -> dict | None:
+    """The app manifest of an FS image, or None for a system image."""
+    if binary[:4] != MAGIC:
+        raise ValueError("not a ferrite FS image (missing FERR magic)")
+    count = struct.unpack_from("<H", binary, 10)[0]
+    base = None
+    for i in range(count):
+        e = binary[TABLE_OFFSET + i * ENTRY_SIZE:TABLE_OFFSET + (i + 1) * ENTRY_SIZE]
+        offset, size = struct.unpack_from("<II", e, 20)
+        if base is None:
+            base = offset - (TABLE_OFFSET + count * ENTRY_SIZE)
+        if e[16] == RES_APPINFO and e[:16].split(b"\0", 1)[0] == APPINFO_NAME.encode():
+            return parse_appinfo(binary[offset - base:offset - base + size])
+    return None
 
 
 def build_fs(project: dict, resources: list[tuple[str, int, bytes, int]],
@@ -770,6 +862,18 @@ def build(project_path: str, output_path: str | None) -> dict:
             raise ValueError('"memory" must be an object')
         resources.append((SYSCFG_NAME, RES_SYSCFG, build_syscfg(memory), 0))
 
+    # 6b. App package: the manifest the board installs it by.
+    app = None
+    if "application_id" in project:
+        if memory is not None:
+            print('warning: an app\'s "memory" block is ignored on the board '
+                  '(the system image sizes the pools)', file=sys.stderr)
+        names = lambda kind: {n for n, k, _d, _f in resources if k == kind}
+        rec = build_appinfo(project, names(RES_PROGRAM), names(RES_IMAGE),
+                            device["caps"] if device else None)
+        resources.append((APPINFO_NAME, RES_APPINFO, rec, 0))
+        app = parse_appinfo(rec)
+
     # 7. Build flash binary
     fs_binary = build_fs(project, resources, fs_base)
     if output_path is not None:
@@ -792,6 +896,7 @@ def build(project_path: str, output_path: str | None) -> dict:
         "details": [(name, kind, len(data)) for name, kind, data, _flags in resources],
         "binary": fs_binary,
         "symbols": symbols,
+        "app": app,
     }
 
 
@@ -885,6 +990,13 @@ def dump_fs(binary: bytes, symbols: dict | None = None) -> str:
                        f"{frames} frames ({frames / max(rate, 1):.2f} s)")
         elif kind == RES_MESH and len(blob) >= 8:
             out.append(f"; {struct.unpack_from('<I', blob, 4)[0]} triangles")
+        elif kind == RES_APPINFO:
+            try:
+                a = parse_appinfo(blob)
+                out.append(f"; app {a['id']} \"{a['name']}\" {a['version']}, entry {a['entry']}, "
+                           f"icon {a['icon'] or '-'}, caps 0x{a['caps']:X}")
+            except ValueError as e:
+                out.append(f"; {e}")
         elif kind == RES_SYSCFG:
             fields = [f"{key}={syscfg_value(blob, key)}"
                       for key in SYSCFG_FIELDS if len(blob) >= 32]
@@ -972,6 +1084,9 @@ def main():
         return
 
     print(f"Built: {output_path}")
+    app = stats.get("app")
+    print(f"  App:       {app['id']} {app['version']} (\"{app['name']}\")" if app
+          else "  System image (no application_id)")
     print(f"  Resources: {stats['resources']}")
     print(f"  Data size: {stats['data_size']} bytes")
     print(f"  Total:     {stats['total_size']} bytes ({stats['total_size'] / 1024:.1f} KB)")
