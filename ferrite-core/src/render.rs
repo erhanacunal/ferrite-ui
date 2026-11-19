@@ -908,7 +908,7 @@ fn draw_widget_body<P: Platform>(
         let bw = b.top.max(b.bottom).max(b.left).max(b.right);
         for cr in clip.iter() {
             ctx.lcd.set_scissor(Some(*cr));
-            if ctx.lcd.smooth() {
+            if widget_smooth(&ctx.lcd) {
                 // Anti-aliased: background first, then one border ring over
                 // it. The fill reaches halfway under the ring, so the ring's
                 // soft inner edge blends over the background rather than over
@@ -1205,7 +1205,7 @@ fn shape_stroke(ext: &WidgetExt) -> u16 {
 /// Circle shape: fill with `bg_color` (if set), stroke with `border_color`
 /// drawn as `thickness` concentric rings. Centered in the widget's box.
 fn draw_circle_shape<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, abs: &Rect, ext: &WidgetExt) {
-    if lcd.smooth() {
+    if widget_smooth(&lcd) {
         // Anti-aliased: inscribed in the centred square so the soft edge
         // stays inside the widget box (and its clip).
         let d = abs.w.min(abs.h);
@@ -1867,7 +1867,7 @@ fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, g: &GaugeGeom, e
     };
     if g.needle_r > 4 {
         let (nx, ny) = g.point(value_angle, g.needle_r);
-        if lcd.smooth() {
+        if widget_smooth(&lcd) {
             // One anti-aliased tapered stroke whose round base is the hub
             // (separate strokes would double-blend or, without readback,
             // overwrite each other's soft edges).
@@ -1881,7 +1881,7 @@ fn draw_gauge<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, g: &GaugeGeom, e
     }
 
     // Center dot (part of the wedge when smooth)
-    if !lcd.smooth() || g.needle_r <= 4 {
+    if !widget_smooth(&lcd) || g.needle_r <= 4 {
         lcd.fill_circle(cx, cy, 3, needle_color);
     }
 }
@@ -2455,7 +2455,7 @@ fn draw_check_indicator<B: LcdBackend>(
                 let y1 = cy + (s as i16) * 3 / 4;
                 let x2 = cx + (s as i16) * 3 / 4;
                 let y2 = cy + (s as i16) / 4;
-                if lcd.smooth() {
+                if widget_smooth(&lcd) {
                     let tick = [Offset { x: x0, y: y0 }, Offset { x: x1, y: y1 }, Offset { x: x2, y: y2 }];
                     lcd.draw_polyline(&tick, fill_color, false, 2);
                 } else {
@@ -2468,7 +2468,7 @@ fn draw_check_indicator<B: LcdBackend>(
         }
     } else {
         // Radio: circle
-        if lcd.smooth() {
+        if widget_smooth(&lcd) {
             // Inscribed in the s×s box; the dot keeps s's parity so it is
             // centred exactly.
             lcd.draw_oval(cx, cy, s, s, 1, outline_color);
@@ -3025,4 +3025,12 @@ mod restore_tests {
             }
         }
     }
+}
+
+/// `lcd.smooth()` inside a widget draw, where an underlay is always set on
+/// `AA_UNDERLAY` backends: a compile-time constant, so the aliased fallbacks
+/// drop out of the boards that never take them.
+#[inline(always)]
+fn widget_smooth<B: LcdBackend>(_lcd: &LcdImpl<B>) -> bool {
+    B::HAS_ALPHA || B::AA_UNDERLAY
 }
