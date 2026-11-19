@@ -7,7 +7,7 @@
   "color": { "model": "RGB565", "count": 65536, "image_max_colors": 256 },
   "render_modes": ["dirty", "buffered"],
   "default_render_mode": "dirty",
-  "widgets": ["base", "label", "button", "progress", "slider", "checkbox", "radio", "input", "gauge", "dropdown", "image"],
+  "widgets": ["base", "label", "button", "progress", "slider", "checkbox", "radio", "input", "gauge", "dropdown", "graph", "image", "rectangle", "circle", "polygon", "line", "ellipse", "button_group"],
   "caps": { "alpha": false, "audio": false, "video": false, "jpeg": false, "image_alpha": false },
   "defaults": { "root_bg": "0x0000", "text_color": "0xFFFF" }
 }
