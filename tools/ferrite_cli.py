@@ -138,6 +138,7 @@ VM_FAULT_NAMES = {
     15: "bad widget page",
     16: "eeprom error",
     17: "pool full: array",
+    18: "variable slots full",
 }
 
 

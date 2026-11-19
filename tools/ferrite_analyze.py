@@ -185,14 +185,15 @@ def parse_image_header(data):
       v2: version(u8) + func_count(u16) + global_count(u16) = 5 bytes
       v3: version(u8) + func_count(u16) + global_count(u16) + flags(u16) = 7 bytes
       v4: v3 + widget_count(u8) + ext_count(u8)             = 9 bytes
+      v5: v4 + var_slots(u16)                               = 11 bytes
     """
     if len(data) < 3:
         raise ValueError("Image too small for header (need at least 3 bytes)")
 
     version = data[0]
-    if version < 1 or version > 4:
+    if version < 1 or version > 5:
         raise ValueError(
-            f"Unsupported image version {version} (expected 1-4). "
+            f"Unsupported image version {version} (expected 1-5). "
             f"Is this a VM image binary? Flash dumps are not supported."
         )
 
@@ -207,8 +208,8 @@ def parse_image_header(data):
         header_flags = 0
         widget_count = 0
         ext_count = 0
-    else:  # version 3 or 4
-        header_size = 9 if version >= 4 else 7
+    else:  # version 3, 4 or 5
+        header_size = 11 if version >= 5 else 9 if version >= 4 else 7
 
     if len(data) < header_size:
         raise ValueError(

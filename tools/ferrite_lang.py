@@ -1753,6 +1753,12 @@ class CodeGen:
         # their ids (name -> func_id; None = all; see build_image).
         self._fn_refs = {}
         self.keep_functions = None
+        # Frame layout (_frame_layout): the functions each function CALLs,
+        # the ones that open a modal dialog (showModal runs the builder on
+        # top of their frame), and the variable slots the program needs.
+        self._fn_calls = {}
+        self._modal_fns = set()
+        self.var_slots = None
         # Void functions (_void_functions): return nothing, not even the
         # implicit 0. `_stmt_call` is the call of the expression statement
         # being emitted; a void call there leaves no value to pop.
@@ -1977,7 +1983,50 @@ class CodeGen:
                 if info['addr'] is not None:
                     self.asm.patch(patch_pos, info['addr'])
 
+        self.var_slots = self._frame_layout()
         return self.asm.build()
+
+    def _frame_layout(self):
+        """Reject recursion and return the variable slots the program needs
+        (image header v5 `var_slots`).
+
+        A function's locals sit right above its caller's (`frame_base +
+        frame_size`, its FRAME count), so without recursion the deepest call
+        chain is known here. A callback starts above the code it interrupts;
+        they nest up to VM_CALL_LEVELS deep (the main program plus vm.rs
+        CB_NEST_MAX), and any function may be a callback (`@name` ids are
+        plain numbers). showModal runs its builder on top of the caller's
+        frame, like a call: a function that opens a dialog counts the deepest
+        chain once more. The VM faults (FRAME) past `var_slots` rather than
+        overwrite anything, so a builder that itself opens a dialog is the
+        only case this does not cover."""
+        frame = {n: info.get('frame', 0) for n, info in self.functions.items()
+                 if info['addr'] is not None}
+        calls = {n: sorted(c for c in self._fn_calls.get(n, ()) if c in frame)
+                 for n in frame}
+
+        def deepest(extra):
+            depth, active = {}, []
+
+            def visit(n):
+                if n in depth:
+                    return depth[n]
+                if n in active:
+                    cycle = active[active.index(n):] + [n]
+                    raise CompileError(
+                        "recursion is not allowed: " + " -> ".join(cycle)
+                        + " (use an array as a stack)",
+                        self.functions[n].get('line', 0))
+                active.append(n)
+                below = max((visit(c) for c in calls[n]), default=0)
+                active.pop()
+                depth[n] = frame[n] + max(below, extra if n in self._modal_fns else 0)
+                return depth[n]
+
+            return max((visit(n) for n in frame), default=0)
+
+        chain = deepest(deepest(0))
+        return len(self.global_vars) + VM_CALL_LEVELS * chain
 
     # --- Lambda collection and capture detection ---
 
@@ -3105,6 +3154,7 @@ class CodeGen:
         # Emit FRAME prologue: tells VM how many local slots this function needs
         local_count = (len(fn.params) + self._count_var_slots(fn.body)
                        + self._count_recv_temps(fn))
+        info['frame'] = local_count
         self._recv_temps = 0
         # With superops, FRAME_A also pops the arguments (one opcode instead of
         # FRAME plus a STORE per parameter).
@@ -4969,6 +5019,7 @@ class CodeGen:
                 fn_id = self._resolve_func_id('modalDefaultOverlayClick', node.line)
                 self.asm.push(fn_id)
             self.asm.builtin(Builtin.SHOW_MODAL)
+            self._modal_fns.add(self._current_fn_name)
             return
 
         if name == 'setDialogResult':
@@ -5074,6 +5125,7 @@ class CodeGen:
         """CALL user function `name` (args already pushed)."""
         info = self.functions[name]
         self._note_ref(name)
+        self._fn_calls.setdefault(self._current_fn_name, set()).add(name)
         # CALL (with forward patching if needed)
         if info['addr'] is not None:
             self.asm.call(info['addr'])
@@ -5263,6 +5315,11 @@ def compile(source, filename="<input>", include_dirs=None):
     except Exception as e:
         raise CompileError(f"internal error: {e}") from e
 
+
+# Call levels a VM's locals can stack up in: the main program plus the
+# callbacks nested on it (vm.rs CB_NEST_MAX = MODAL_STACK_MAX + 2). Keep in
+# sync with vm.rs.
+VM_CALL_LEVELS = 7
 
 # System callback name → expected_arg_count
 SYSTEM_CALLBACKS = {
@@ -5469,8 +5526,8 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
 
 def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty",
                 widget_page=False, portrait=False, superops=False, native_flex=False,
-                strip_unused=True):
-    """Compile source to VM image format (v4 header + opcodes).
+                strip_unused=True, var_slots=False):
+    """Compile source to VM image format (v4/v5 header + opcodes).
 
     Image format (v4):
       version(u8=4) + function_count(u16 LE) + global_count(u16 LE) + flags(u16 LE)
@@ -5497,6 +5554,10 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
 
     native_flex=True compiles flexLayout(box) to the FLEX_LAYOUT opcode
     (0xDB): only for devices with caps.native_flex (ferrite-ui-xl).
+
+    var_slots=True writes a v5 header: v4 + var_slots(u16 LE), the variable
+    slots the program needs (CodeGen._frame_layout), which the VM allocates
+    exactly. Only for devices with caps.var_slots (ferrite-ui-xl).
 
     strip_unused=True leaves out the #include'd functions no system callback
     reaches through calls or `@name` ids (a second compile pass; the first
@@ -5592,6 +5653,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
             flags=flags,
             widget_count=widget_count,
             ext_count=ext_count,
+            var_slots=codegen.var_slots if var_slots else None,
         )
         image = header + bytecode
 
@@ -5674,7 +5736,7 @@ def _looks_like_image(data):
     if len(data) < 5:
         return False
     version = data[0]
-    if version < 1 or version > 4:
+    if version < 1 or version > 5:
         return False
     try:
         func_count = struct.unpack_from('<H', data, 1)[0]
@@ -5706,7 +5768,9 @@ def _extract_labels(image, debug_symbols=None):
 
 def _image_header_size(version, func_count):
     """Return header size in bytes for the given version."""
-    if version >= 4:
+    if version >= 5:
+        base = 11
+    elif version >= 4:
         base = 9
     elif version >= 3:
         base = 7
@@ -5820,6 +5884,8 @@ def _image_header_lines(output, debug_symbols=None):
     if version >= 4:
         wc, ec = output[7], output[8]
         extra += f', widgets={wc}, exts={ec}'
+    if version >= 5:
+        extra += f', var_slots={struct.unpack_from("<H", output, 9)[0]}'
 
     lines.append(f'; image v{version}: {func_count} functions, {global_count} globals, opcodes={len(output) - opcode_start}B{extra}')
     for i in range(func_count):

@@ -1925,13 +1925,17 @@ class Compiler:
         fid, kind, offset, _ = self._funcs[name]
         self._funcs[name] = (fid, kind, offset, length)
 
-    def build_image_header(self, global_count=0, flags=0, widget_count=0, ext_count=0):
+    def build_image_header(self, global_count=0, flags=0, widget_count=0, ext_count=0,
+                           var_slots=None):
         """Build VM image header binary.
 
         Format (v4):
           version(u8) + function_count(u16 LE) + global_count(u16 LE) + flags(u16 LE)
           + widget_count(u8) + ext_count(u8)
           + [func_id(u16) + kind(u8) + pad(u8) + offset(u32) + length(u32)] × N
+        v5 (var_slots given; boards with caps.var_slots): v4 + var_slots(u16 LE)
+          after ext_count, the variable slots (globals + the deepest stack of
+          locals) the program needs.
 
         Flags:
           bit 0: render_mode (0=dirty, 1=buffered)
@@ -1944,11 +1948,16 @@ class Compiler:
         """
         func_list = list(self._funcs.values())
         buf = bytearray()
-        buf.append(4)  # version 4: adds widget_count + ext_count fields
+        # version 4: adds widget_count + ext_count; 5: var_slots
+        buf.append(4 if var_slots is None else 5)
         buf.extend(struct.pack('<H', len(func_list)))
         buf.extend(struct.pack('<H', global_count))
         buf.extend(struct.pack('<H', flags))
         buf.extend(struct.pack('BB', min(widget_count, 255), min(ext_count, 255)))
+        if var_slots is not None:
+            if var_slots > 0xFFFF:
+                raise ValueError(f"program needs {var_slots} variable slots (max 65535)")
+            buf.extend(struct.pack('<H', var_slots))
         for func_id, kind, offset, length in func_list:
             buf.extend(struct.pack('<HBBI', func_id, kind, 0, offset))
             buf.extend(struct.pack('<I', length))

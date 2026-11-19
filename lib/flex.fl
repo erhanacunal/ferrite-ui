@@ -62,11 +62,60 @@ widget Row(flex: FLEX_ROW);
 widget Column(flex: FLEX_COLUMN);
 
 fn flexLayout(box: widget) {
+    // Lays out `box`, then the flex containers below it in tree order: a
+    // child's size is final once its parent is laid out. A walk over the tree
+    // (first_child / next_sibling / parent), as .fl has no recursion. The
+    // target is left where the recursive version left it.
+    if (flexPlace(box) == 0) {
+        return;
+    }
+    var cur: widget = box;
+    var placed = 1;
+    while (true) {
+        var nxt: widget = -1;
+        if (placed) {
+            target(cur);
+            nxt = flexNextBox(get(first_child));
+        }
+        while (nxt < 0) {
+            if (cur == box) {
+                target(box);
+                return;
+            }
+            target(cur);
+            nxt = flexNextBox(get(next_sibling));
+            if (nxt < 0) {
+                target(cur);
+                cur = get(parent);
+            }
+        }
+        cur = nxt;
+        placed = flexPlace(cur);
+    }
+}
+
+// `c` or the first sibling after it that is a visible flex container; -1 if
+// none.
+fn flexNextBox(c: widget) -> int {
+    while (c >= 0) {
+        target(c);
+        if (get(visible) && (get(flex) & 3)) {
+            return c;
+        }
+        c = get(next_sibling);
+    }
+    return -1;
+}
+
+// Places the visible children of `box` (flexLayout without the nested
+// containers). 1 if it placed any, 0 if `box` is no flex container or has
+// no visible child.
+fn flexPlace(box: widget) -> int {
     target(box);
     var mode = get(flex);
     var dir = mode & 3;
     if (dir == 0) {
-        return;
+        return 0;
     }
     var justify = mode & 28;
     var items = mode & 96;
@@ -106,7 +155,7 @@ fn flexLayout(box: widget) {
         c = get(next_sibling);
     }
     if (count == 0) {
-        return;
+        return 0;
     }
 
     var free = main_len - used - gap * (count - 1);
@@ -171,12 +220,6 @@ fn flexLayout(box: widget) {
                 pos++;
                 extra_rem--;
             }
-
-            // Nested container: its size is final now.
-            if (get(flex) & 3) {
-                flexLayout(c);
-                target(c);
-            }
         }
         c = get(next_sibling);
     }
@@ -184,4 +227,5 @@ fn flexLayout(box: widget) {
     // Children moved: repaint the container so their old spots are cleared.
     target(box);
     dirty();
+    return 1;
 }

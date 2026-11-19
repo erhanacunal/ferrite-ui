@@ -22,7 +22,8 @@ inside the opcode stream, not the full image file.
 
 ## Image Format
 
-Current compiler output is image version 4:
+Current compiler output is image version 4, or 5 for devices with
+`caps.var_slots` (ferrite-ui-xl):
 
 ```text
 offset  size  field
@@ -32,9 +33,17 @@ offset  size  field
 5       2     flags, u16 LE
 7       1     widget_count
 8       1     ext_count
-9       ...   function table, function_count * 12 bytes
+9       2     var_slots, u16 LE (v5 only)
+9 / 11  ...   function table, function_count * 12 bytes
 ...     ...   opcode stream
 ```
+
+`var_slots` (v5) is how many variable slots the program needs: its globals
+plus the deepest stack of locals (`FRAME` counts along the longest call chain,
+times the call levels callbacks can nest in; the language has no recursion,
+so the compiler knows it). The VM allocates exactly that (ferrite-ui-xl);
+a `FRAME` / `FRAME_A` whose locals would end past it faults 18 (`variable
+slots full`). Older headers get a fixed table.
 
 Flags:
 
@@ -78,6 +87,7 @@ Older images are still parsed:
 - v1/v2: 5-byte base header.
 - v3: adds `flags`.
 - v4: adds `widget_count` and `ext_count`.
+- v5: adds `var_slots`.
 
 ## Core Opcodes
 
@@ -110,7 +120,7 @@ Older images are still parsed:
 | `0x36` | `JZ` | `u16 target` | pop condition; jump if zero |
 | `0x37` | `JNZ` | `u16 target` | pop condition; jump if nonzero |
 | `0x38` | `CALL` | `u16 target` | call function at target |
-| `0x1D` | `FRAME` | `u8 local_count` | function prologue; reserves locals |
+| `0x1D` | `FRAME` | `u8 local_count` | function prologue; reserves locals (fault 18 past the image's `var_slots`) |
 | `0x1E` | `SHL` | - | `a b -> a << (b & 31)`, logical left shift |
 | `0x1F` | `SHR` | - | `a b -> a >> (b & 31)`, arithmetic right shift (sign-preserving) |
 | `0x9F` | `critical` | - | run without cooperative yielding until next explicit yield |
@@ -222,7 +232,7 @@ Only in firmware built with the ferrite-core `superops` feature (`caps.superops`
 | `0x4B` | `ADD_VI` | `u8 slot, i16 imm` | `LOAD; PUSH imm; ADD; STORE` (`x++`, `x += 3`, `x = x - 1`): var += imm |
 | `0x4C` | `ARR_LOAD_V` | `u8 slot` | `LOAD slot; <index>; ARR_LOAD` with a side-effect-free index: pop index, push element of the array in var |
 | `0x4D` | `STORE_OP` | `u8 op, u8 slot` | `LOAD x; <e>; <op>; STORE x` with a side-effect-free `e`: pop b; var = var op b |
-| `0x4E` | `FRAME_A` | `u8 local_count, u8 nargs` | the prologue `FRAME n; STORE nargs-1; …; STORE 0`: reserves the locals, then pops the arguments (last on top) into locals `nargs-1`…`0` |
+| `0x4E` | `FRAME_A` | `u8 local_count, u8 nargs` | the prologue `FRAME n; STORE nargs-1; …; STORE 0`: reserves the locals, then pops the arguments (last on top) into locals `nargs-1`…`0` (fault 18 past `var_slots`, 13 if `nargs > local_count`) |
 
 The compiler also inverts loops for these devices (`JMP test; body: …; test: JCMP… body`), so an iteration runs one jump instead of two. On every device it folds integer constant expressions (`16 * 12`, `-(5 - 9)`, int `const`s) to one `PUSH`, with the VM's semantics: 32-bit wrap, division truncating toward zero, `x / 0` = `x % 0` = 0, `i32::MIN / -1` = `i32::MIN`, shifts by `b & 31`.
 

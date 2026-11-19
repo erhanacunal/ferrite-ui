@@ -331,6 +331,8 @@ while (true) {
 
 Functions are defined with `fn`. Parameters are passed by value. Implicit `return 0` if omitted.
 
+A function may not call itself, directly or through other functions: recursion is a compile error (`recursion is not allowed: a -> b -> a`). This lets the compiler work out how much variable memory a program needs. Walk a tree with a loop (see "Walking the tree" and `lib/flex.fl`'s `flexLayout`) or keep your own stack in an array.
+
 ```c
 fn clamp(val, lo, hi) {
     if (val < lo) { return lo; }
