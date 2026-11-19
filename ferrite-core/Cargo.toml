@@ -12,7 +12,33 @@ path = "src/lib.rs"
 # crate owns the HAL traits, the framework modules and the shared
 # `runtime::run` loop.
 [features]
-default = []
+default = ["widgets"]
+# --- Widget kinds (all on by default) ---
+# Each one builds a kind's drawing and touch handling (`widget::kind_built`).
+# A BSP short on flash depends on ferrite-core with `default-features = false`
+# and lists the kinds it keeps. Base, label, button and rectangle are always
+# built; a kind left out acts as a base widget (box, background, border,
+# children, callbacks) and the tools are not told about it.
+widgets = [
+    "widget-progress", "widget-slider", "widget-checkbox", "widget-radio",
+    "widget-input", "widget-gauge", "widget-dropdown", "widget-graph",
+    "widget-image", "widget-shapes",
+]
+widget-progress = []
+widget-slider = []
+widget-checkbox = []
+# Radio buttons and exclusive button groups (KIND_BUTTON_GROUP).
+widget-radio = []
+# Text inputs and the on-screen keyboard.
+widget-input = []
+widget-gauge = []
+widget-dropdown = []
+widget-graph = []
+# Image widgets (an image centred in the box). Background images
+# (`image_id` on other kinds) are always built.
+widget-image = []
+# Circle, ellipse, polygon and line.
+widget-shapes = []
 # Host-only mock platform for type-checking the generic framework without an
 # embedded toolchain. See src/mock.rs.
 mock = []

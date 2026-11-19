@@ -168,6 +168,19 @@ pub struct Keyboard {
 }
 
 impl Keyboard {
+    /// Shown on screen. Always false without `widget-input` (no input can
+    /// focus it), so the keyboard's code drops out of such a build.
+    #[inline(always)]
+    pub fn shown(&self) -> bool {
+        cfg!(feature = "widget-input") && self.visible
+    }
+
+    /// A key is held down (see [`Keyboard::shown`]).
+    #[inline(always)]
+    pub fn key_down(&self) -> bool {
+        cfg!(feature = "widget-input") && self.pressed_key != KEY_NONE
+    }
+
     pub fn new() -> Self {
         Self {
             visible: false,

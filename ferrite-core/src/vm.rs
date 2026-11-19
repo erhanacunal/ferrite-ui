@@ -2945,6 +2945,7 @@ impl Vm {
             // the rest of its group. Radios in group 0 keep the plain flag.
             if flag == FLAG_CHECKED
                 && val != 0
+                && crate::widget::kind_built(KIND_RADIO)
                 && match ctx.objs.get(target).kind {
                     KIND_BUTTON_GROUP => true,
                     KIND_RADIO => ctx.objs.group_id(target) != 0,

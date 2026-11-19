@@ -1084,7 +1084,7 @@ pub fn dropdown_parent<P: Platform>(ctx: &Ctx<P>, id: WidgetId) -> WidgetId {
         return WidgetId::NONE;
     }
     let parent = ctx.objs.get(id).parent;
-    if parent.is_some() && ctx.objs.get(parent).kind == widget::KIND_DROPDOWN {
+    if parent.is_some() && widget::is_kind(ctx.objs.get(parent).kind, widget::KIND_DROPDOWN) {
         parent
     } else {
         WidgetId::NONE
@@ -1259,7 +1259,7 @@ impl<P: PlatformRuntime> InputHandler<P> for BasicInput {
                     widget_click(vm, hit);
                 }
                 if ctx.objs.get(hit).flags & widget::FLAG_HAS_ON_TAP != 0
-                    && ctx.objs.get(hit).kind != widget::KIND_INPUT
+                    && !widget::is_kind(ctx.objs.get(hit).kind, widget::KIND_INPUT)
                 {
                     let packed = ((event.x as u32) << 16 | event.y as u32) as i32;
                     send_kind(vm, FunctionKind::OnTap, &[hit.0 as i32, packed]);
@@ -1317,7 +1317,7 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
 
     #[inline(never)]
     fn tick(&mut self, ctx: &mut Ctx<P>) {
-        if self.kb.visible && self.kb.focused.is_some() {
+        if self.kb.shown() && self.kb.focused.is_some() {
             let now = ctx.systick.millis();
             if self.kb.update_blink(now) {
                 ctx.cursor_visible = self.kb.cursor_visible;
@@ -1328,10 +1328,10 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
 
     fn draw_overlay(&mut self, ctx: &Ctx<P>, buffered: bool) {
         if buffered {
-            if self.kb.visible {
+            if self.kb.shown() {
                 self.kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
             }
-        } else if self.kb.visible && self.kb.dirty {
+        } else if self.kb.shown() && self.kb.dirty {
             self.kb.draw(&ctx.lcd, &ctx.fonts, &ctx.flash);
             self.kb.dirty = false;
         }
@@ -1346,14 +1346,14 @@ impl<P: PlatformRuntime> InputHandler<P> for FullInput {
     }
 
     fn idle(&self) -> bool {
-        !self.kb.visible
+        !self.kb.shown()
     }
 }
 
 impl FullInput {
     fn on_press<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, x: u16, y: u16) {
         // Keyboard intercept.
-        if self.kb.visible && y >= self.kb.top() {
+        if self.kb.shown() && y >= self.kb.top() {
             self.kb.handle_press(x, y);
             if !(vm.render_mode == RenderMode::Buffered) {
                 self.kb
@@ -1365,7 +1365,7 @@ impl FullInput {
         let hit = crate::touch::hit_test(&mut ctx.objs, x, y);
 
         // Dismiss keyboard when tapping outside an input.
-        if self.kb.visible && (!hit.is_some() || ctx.objs.get(hit).kind != widget::KIND_INPUT) {
+        if self.kb.shown() && (!hit.is_some() || ctx.objs.get(hit).kind != widget::KIND_INPUT) {
             self.dismiss_keyboard(ctx);
         }
 
@@ -1406,12 +1406,12 @@ impl FullInput {
         if hit.is_some() {
             ctx.objs.get_mut(hit).flags |= widget::FLAG_PRESSED;
 
-            if ctx.objs.get(hit).kind == widget::KIND_INPUT {
+            if widget::is_kind(ctx.objs.get(hit).kind, widget::KIND_INPUT) {
                 self.focus_input(ctx, hit);
                 self.position_cursor(ctx, hit, x, y);
             }
 
-            if ctx.objs.get(hit).kind == widget::KIND_SLIDER {
+            if widget::is_kind(ctx.objs.get(hit).kind, widget::KIND_SLIDER) {
                 let abs = ctx.objs.absolute_rect(hit);
                 let new_val = touch_to_slider_value(&abs, x);
                 ctx.objs.update_ext(hit, |ext| {
@@ -1438,7 +1438,7 @@ impl FullInput {
     }
 
     fn on_hold<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, x: u16, y: u16) {
-        if self.kb.pressed_key != keyboard::KEY_NONE {
+        if self.kb.key_down() {
             return;
         }
 
@@ -1455,7 +1455,7 @@ impl FullInput {
         for i in 0..ctx.objs.dfs_len() {
             let id = ctx.objs.dfs_at(i);
             let w = ctx.objs.get(id);
-            if w.flags & widget::FLAG_PRESSED != 0 && w.kind == widget::KIND_SLIDER {
+            if w.flags & widget::FLAG_PRESSED != 0 && widget::is_kind(w.kind, widget::KIND_SLIDER) {
                 let abs = ctx.objs.absolute_rect(id);
                 let new_val = touch_to_slider_value(&abs, x);
                 ctx.objs.update_ext(id, |ext| {
@@ -1499,12 +1499,12 @@ impl FullInput {
 
     fn on_release<P: PlatformRuntime>(&mut self, ctx: &mut Ctx<P>, vm: &mut Vm, x: u16, y: u16) {
         // Keyboard key release.
-        if self.kb.pressed_key != keyboard::KEY_NONE {
+        if self.kb.key_down() {
             let prev_key = self.kb.pressed_key;
             if let Some(action) = self.kb.handle_release(x, y) {
                 self.handle_key_action(ctx, vm, action);
             }
-            if !(vm.render_mode == RenderMode::Buffered) && !self.kb.dirty && self.kb.visible {
+            if !(vm.render_mode == RenderMode::Buffered) && !self.kb.dirty && self.kb.shown() {
                 self.kb
                     .draw_key_by_code(&ctx.lcd, &ctx.fonts, &ctx.flash, prev_key, false);
             }
@@ -1548,13 +1548,13 @@ impl FullInput {
         if dropdown.is_some() {
             select_dropdown_option(ctx, dropdown, clicked_id);
             clicked_id = dropdown;
-        } else if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_DROPDOWN {
+        } else if clicked_id.is_some() && widget::is_kind(ctx.objs.get(clicked_id).kind, widget::KIND_DROPDOWN) {
             toggle_dropdown(ctx, clicked_id);
             clicked_id = WidgetId::NONE;
         }
 
         // Checkbox toggle.
-        if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_CHECKBOX {
+        if clicked_id.is_some() && widget::is_kind(ctx.objs.get(clicked_id).kind, widget::KIND_CHECKBOX) {
             ctx.objs.get_mut(clicked_id).flags ^= widget::FLAG_CHECKED;
             ctx.objs.mark_dirty(clicked_id);
         }
@@ -1562,13 +1562,14 @@ impl FullInput {
         // Radio / button group: select this one, deselect the rest of its
         // group (radio group_id 0 = sibling radios).
         if clicked_id.is_some()
+            && widget::kind_built(widget::KIND_RADIO)
             && matches!(ctx.objs.get(clicked_id).kind, widget::KIND_RADIO | widget::KIND_BUTTON_GROUP)
         {
             ctx.objs.select_in_group(clicked_id);
         }
 
         // Input: reposition cursor on tap.
-        if clicked_id.is_some() && ctx.objs.get(clicked_id).kind == widget::KIND_INPUT {
+        if clicked_id.is_some() && widget::is_kind(ctx.objs.get(clicked_id).kind, widget::KIND_INPUT) {
             self.position_cursor(ctx, clicked_id, x, y);
             ctx.objs.mark_dirty(clicked_id);
         }
@@ -1601,7 +1602,7 @@ impl FullInput {
 
         // on_tap (skip KIND_INPUT).
         if clicked_id.is_some()
-            && ctx.objs.get(clicked_id).kind != widget::KIND_INPUT
+            && !widget::is_kind(ctx.objs.get(clicked_id).kind, widget::KIND_INPUT)
             && ctx.objs.get(clicked_id).flags & widget::FLAG_HAS_ON_TAP != 0
         {
             let packed = ((x as u32) << 16 | y as u32) as i32;

@@ -74,6 +74,36 @@ pub const KIND_BUTTON_GROUP: u8 = 17;
 // Kind 18 is taken by ferrite-ui-xl's 3D model view (KIND_MODEL3D in the
 // tools): drawn here as a plain base widget.
 
+/// Whether this build has kind `kind`'s own code: its drawing and touch
+/// handling, behind a `widget-*` cargo feature (all on by default; a BSP
+/// can leave some out to save flash). Base, label, button and rectangle are
+/// always built. A kind left out still exists in the tree but acts as a
+/// base widget: box, background, border, children and callbacks, nothing
+/// of its own. Folds to a constant for a constant `kind`.
+#[inline(always)]
+pub const fn kind_built(kind: u8) -> bool {
+    match kind {
+        KIND_PROGRESS => cfg!(feature = "widget-progress"),
+        KIND_SLIDER => cfg!(feature = "widget-slider"),
+        KIND_CHECKBOX => cfg!(feature = "widget-checkbox"),
+        KIND_RADIO | KIND_BUTTON_GROUP => cfg!(feature = "widget-radio"),
+        KIND_INPUT => cfg!(feature = "widget-input"),
+        KIND_GAUGE => cfg!(feature = "widget-gauge"),
+        KIND_DROPDOWN => cfg!(feature = "widget-dropdown"),
+        KIND_GRAPH => cfg!(feature = "widget-graph"),
+        KIND_IMAGE => cfg!(feature = "widget-image"),
+        KIND_CIRCLE | KIND_POLYGON | KIND_LINE | KIND_ELLIPSE => cfg!(feature = "widget-shapes"),
+        _ => true,
+    }
+}
+
+/// `kind == want`, and `want` is built (see [`kind_built`]): the check for
+/// code of one kind, which drops out when that kind is left out.
+#[inline(always)]
+pub const fn is_kind(kind: u8, want: u8) -> bool {
+    kind_built(want) && kind == want
+}
+
 // --- Text Alignment ---
 
 pub const ALIGN_LEFT: u8 = 0;
@@ -908,7 +938,7 @@ impl ObjPool {
                 break;
             }
             let p = self.get(pid);
-            if p.kind == KIND_DROPDOWN {
+            if is_kind(p.kind, KIND_DROPDOWN) {
                 x += p.location.x;
                 y += p.location.y;
             } else {

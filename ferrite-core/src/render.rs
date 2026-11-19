@@ -10,7 +10,7 @@ use crate::widget::{
     ALIGN_CENTER, ALIGN_RIGHT, FLAG_CHECKED, FLAG_CLIP_CHILDREN, FLAG_FOCUSED, FLAG_MULTI_LINE,
     FLAG_DIRTY_AB, FLAG_HAS_ON_PAINT, FLAG_PAINTED, FLAG_PRESSED, FLAG_RENDERED, KIND_CHECKBOX, KIND_CIRCLE, KIND_DROPDOWN, KIND_ELLIPSE, KIND_GAUGE,
     KIND_GRAPH, KIND_IMAGE, KIND_INPUT, KIND_LABEL, KIND_LINE, KIND_POLYGON, KIND_PROGRESS,
-    KIND_BUTTON_GROUP, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId,
+    KIND_BUTTON_GROUP, KIND_RADIO, KIND_SLIDER, Widget, WidgetExt, WidgetId, is_kind, kind_built,
 };
 
 /// Screen-bounds rect: the panel size from `LcdBackend::WIDTH`/`HEIGHT`,
@@ -541,7 +541,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>) {
             // A gauge whose own value changed (it is the dirty root, so no
             // ancestor repainted over it) redraws only the boxes the change
             // touches: the same drawing, clipped smaller.
-            let gauge = ctx.objs.get(sid).kind == KIND_GAUGE;
+            let gauge = is_kind(ctx.objs.get(sid).kind, KIND_GAUGE);
             if gauge && si == di {
                 if let Some((rects, n)) = gauge_changed_rects::<P>(&ctx.objs, sid, &sabs) {
                     clip.restrict(&rects[..n]);
@@ -596,7 +596,7 @@ fn dirty_passes<P: Platform>(ctx: &mut Ctx<P>) {
 /// After a complete drawing of widget `id` at `abs`: remember what an
 /// incrementally redrawn kind (gauge) now shows.
 fn record_drawn<P: Platform>(ctx: &mut Ctx<P>, id: WidgetId, abs: &Rect) {
-    if ctx.objs.get(id).kind == KIND_GAUGE {
+    if is_kind(ctx.objs.get(id).kind, KIND_GAUGE) {
         let key = gauge_key::<P>(&ctx.objs, id, abs);
         let value = ctx.objs.get(id).value;
         ctx.objs.set_drawn(id, key, value);
@@ -801,7 +801,7 @@ pub fn effective_bg(tree: &ObjPool, widget: &Widget, ext: &WidgetExt) -> Color {
 /// drawn with `press_color`.
 fn shows_press(w: &Widget) -> bool {
     w.flags & FLAG_PRESSED != 0
-        || (w.kind == KIND_BUTTON_GROUP && w.flags & FLAG_CHECKED != 0)
+        || (is_kind(w.kind, KIND_BUTTON_GROUP) && w.flags & FLAG_CHECKED != 0)
 }
 
 /// Walk up the widget tree to find the actual visible background color for
@@ -1081,18 +1081,25 @@ fn draw_widget_body<P: Platform>(
     // contents. Their primitives take no clip: confine them to the clip
     // region and the box via the scissor. Without it a clipped redraw drew
     // them over widgets in front.
-    if matches!(
-        widget.kind,
-        KIND_PROGRESS | KIND_SLIDER | KIND_CHECKBOX | KIND_RADIO | KIND_INPUT | KIND_DROPDOWN
-    ) {
+    //
+    // A kind left out of the build (`widget::kind_built`) draws none of its
+    // own contents from here on: it is a base widget. (`is_kind` per check:
+    // only constant kinds fold, so the left-out code drops out.)
+    let kind = widget.kind;
+    let value_fill = is_kind(kind, KIND_PROGRESS) || is_kind(kind, KIND_SLIDER);
+    let check = is_kind(kind, KIND_CHECKBOX) || is_kind(kind, KIND_RADIO);
+    let field = is_kind(kind, KIND_INPUT) || is_kind(kind, KIND_DROPDOWN);
+    if value_fill || check || field {
         let inner = inner_rect(abs, &b);
         for cr in clip.iter() {
             let Some(r) = cr.intersection(abs) else { continue };
             ctx.lcd.set_scissor(Some(r));
-            match widget.kind {
-                KIND_PROGRESS | KIND_SLIDER => draw_value_fill(&ctx.lcd, widget, &inner, ext),
-                KIND_CHECKBOX | KIND_RADIO => draw_check_indicator(&ctx.lcd, widget, &inner, ext),
-                _ => draw_field(ctx, widget, abs, ext),
+            if value_fill {
+                draw_value_fill(&ctx.lcd, widget, &inner, ext);
+            } else if check {
+                draw_check_indicator(&ctx.lcd, widget, &inner, ext);
+            } else {
+                draw_field(ctx, widget, abs, ext);
             }
         }
         ctx.lcd.set_scissor(None);
@@ -1100,7 +1107,7 @@ fn draw_widget_body<P: Platform>(
 
     // Gauge arc. Like the shapes below, its primitives take no clip: confine
     // them to the clip region via the scissor.
-    if widget.kind == KIND_GAUGE {
+    if is_kind(kind, KIND_GAUGE) {
         if let Some(g) = GaugeGeom::new(&inner_rect(abs, &ext.border)) {
             for cr in clip.iter() {
                 ctx.lcd.set_scissor(Some(*cr));
@@ -1115,7 +1122,7 @@ fn draw_widget_body<P: Platform>(
     // graph updated under a widget in front (a pull-down shade) drew over it,
     // and the spline's overshoot past the top or bottom left lines outside
     // the box, where no restore reaches.
-    if widget.kind == KIND_GRAPH {
+    if is_kind(kind, KIND_GRAPH) {
         let inner = inner_rect(abs, &b);
         for cr in clip.iter() {
             if let Some(r) = cr.intersection(abs) {
@@ -1127,7 +1134,7 @@ fn draw_widget_body<P: Platform>(
     }
 
     // Image widget — draw image centered in content area
-    if widget.kind == KIND_IMAGE {
+    if is_kind(kind, KIND_IMAGE) {
         for cr in clip.iter() {
             ctx.lcd.set_scissor(Some(*cr));
             draw_widget_image(ctx, abs, ext);
@@ -1142,10 +1149,10 @@ fn draw_widget_body<P: Platform>(
     // this, a clipped redraw (e.g. restoring the background behind a moved
     // widget in buffered mode) would repaint the entire shape and overwrite
     // unrelated content.
-    if is_freeform_shape(widget.kind) {
+    if is_freeform_shape(kind) {
         for cr in clip.iter() {
             ctx.lcd.set_scissor(Some(*cr));
-            match widget.kind {
+            match kind {
                 KIND_CIRCLE => draw_circle_shape(&ctx.lcd, widget, abs, ext),
                 KIND_ELLIPSE => draw_ellipse_shape(&ctx.lcd, widget, abs, ext),
                 KIND_POLYGON => draw_polygon_shape(ctx, widget, abs, ext),
@@ -1183,11 +1190,13 @@ pub fn backdrop(tree: &ObjPool, w: &Widget, fallback: Color) -> Color {
 
 /// Circle/Polygon/Line draw their own fill + stroke and skip the default
 /// rectangular background/border. Rectangle keeps the default rect rendering.
+/// Without `widget-shapes` they are boxes like a base widget.
 fn is_freeform_shape(kind: u8) -> bool {
-    matches!(
-        kind,
-        KIND_CIRCLE | KIND_ELLIPSE | KIND_POLYGON | KIND_LINE
-    )
+    cfg!(feature = "widget-shapes")
+        && matches!(
+            kind,
+            KIND_CIRCLE | KIND_ELLIPSE | KIND_POLYGON | KIND_LINE
+        )
 }
 
 /// Stroke / line thickness for shape widgets: the border width (max edge),
@@ -1615,7 +1624,7 @@ pub fn field_contents<'a, P: Platform>(
     let has_text = ext.text_id != crate::pool::PTR_NONE && ext.font_id != 0xFF;
     let text: &'a [u8] = if has_text { ctx.objs.str_get(ext.text_id) } else { &[] };
 
-    if widget.kind == KIND_DROPDOWN {
+    if is_kind(widget.kind, KIND_DROPDOWN) {
         let arrow_w: u16 = 18;
         let text_w = cw.saturating_sub(arrow_w + 4);
         // The selected text whatever `font_id` says (a missing font was handled above).
@@ -2376,7 +2385,7 @@ fn draw_value_fill<B: LcdBackend>(lcd: &LcdImpl<B>, widget: &Widget, inner: &Rec
     }
 
     // Slider thumb
-    if widget.kind == KIND_SLIDER && inner.w > 0 {
+    if is_kind(widget.kind, KIND_SLIDER) && inner.w > 0 {
         let thumb_w: u16 = 6;
         let thumb_x = inner.x + fill_w as i16 - (thumb_w as i16 / 2);
         let thumb_x = thumb_x
@@ -2428,7 +2437,9 @@ fn draw_check_indicator<B: LcdBackend>(
         outline_color
     };
 
-    if widget.kind == KIND_CHECKBOX {
+    // Checkbox, else radio (the only other kind drawn here: when radios are
+    // left out of the build, only checkboxes reach this).
+    if !kind_built(KIND_RADIO) || is_kind(widget.kind, KIND_CHECKBOX) {
         if r > 0 {
             let br = r.min(s / 2);
             rounded_rect_screen(&lcd, Rect::new(cx, cy, s, s), br, outline_color);
