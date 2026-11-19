@@ -115,6 +115,9 @@ class Op:
     ARR_LOAD_V = 0x4C  # + u8 slot: pop index, push array(var)[index]
     STORE_OP   = 0x4D  # + u8 op + u8 slot: pop b; var = var <op> b
     FRAME_A    = 0x4E  # + u8 local_count + u8 nargs: FRAME, pop args into locals
+    # Libraries (image v6, devices with caps.libraries; ferrite-ui-xl docs/apps.md)
+    CALL_IMP   = 0x4F  # + u16 import index: call an imported library function
+    FN_REF     = 0x50  # + u16 func_id: push the id tagged with the running unit (libraries' @fn)
 
     # Builtins as first-class opcodes (all no-arg, operands on stack)
     FILL_RECT       = 0x80
@@ -494,6 +497,22 @@ IMAGE_FLAG_WIDE_ADDR = 0x04
 # Image header flags bit 3: portrait (screen rotated 90 degrees). Keep in sync
 # with IMAGE_FLAG_PORTRAIT in ferrite-core/src/vm.rs.
 IMAGE_FLAG_PORTRAIT = 0x08
+# Image header flags bit 4: a library (image v6). Keep in sync with
+# IMAGE_FLAG_LIBRARY in ferrite-core/src/vm.rs.
+IMAGE_FLAG_LIBRARY = 0x10
+# Type codes of library exports / imports (image v6 tables; vm.rs keeps the
+# return code only, to match imports against exports).
+TYPE_CODES = {'void': 0, 'int': 1, 'float': 2, 'string': 3, 'array': 4, 'widget': 5}
+TYPE_ANY = 6
+TYPE_NAMES = {v: k for k, v in TYPE_CODES.items()}
+TYPE_NAMES[TYPE_ANY] = 'any'
+
+
+def type_code(t):
+    """A compiler type name as an image v6 type code (classes and `any` are 6)."""
+    return TYPE_CODES.get(t, TYPE_ANY)
+
+
 # Largest bytecode a narrow (u16-target) image can address.
 NARROW_CODE_MAX = 0xFFFF
 
@@ -793,6 +812,16 @@ class Asm:
     def call(self, target):
         self._emit(Op.CALL)
         self._emit_addr(target)
+
+    def call_imp(self, index):
+        """CALL_IMP: imported library function `index` (image v6 import table)."""
+        self._emit(Op.CALL_IMP)
+        self._emit_u16(index)
+
+    def fn_ref(self, func_id):
+        """FN_REF: push `func_id` tagged with the running unit (a library's `@fn`)."""
+        self._emit(Op.FN_REF)
+        self._emit_u16(func_id)
 
     # --- Forward jump helpers ---
 
@@ -1231,6 +1260,7 @@ OP_NAMES = {
     0x45: 'JCMP', 0x46: 'JCMP_VI', 0x47: 'JCMP_VV',
     0x48: 'BIN_I', 0x49: 'BIN_I32', 0x4A: 'BIN_V', 0x4B: 'ADD_VI', 0x4C: 'ARR_LOAD_V', 0x4D: 'STORE_OP',
     0x4E: 'FRAME_A',
+    0x4F: 'CALL_IMP', 0x50: 'FN_REF',
 
     0x80: 'fillRect', 0x81: 'rect', 0x82: 'line', 0x83: 'circle',
     0x84: 'fillCircle', 0x85: 'drawImage', 0x86: 'drawTextLit',
@@ -1416,6 +1446,12 @@ def disassemble(data, labels=None, symbols=None, wide=False):
         elif op == Op.FRAME_A:
             count, nargs = data[pos], data[pos + 1]; pos += 2
             lines.append(f'{addr:04X}: FRAME_A {count} {nargs}')
+
+        elif op in (Op.CALL_IMP, Op.FN_REF):
+            val = struct.unpack_from('<H', data, pos)[0]
+            pos += 2
+            what = 'import' if op == Op.CALL_IMP else 'fn'
+            lines.append(f'{addr:04X}: {name} {what} {val}')
 
         # LOAD / STORE with u8 slot (bit 7 = local)
         elif op == Op.LOAD:
@@ -1926,7 +1962,7 @@ class Compiler:
         self._funcs[name] = (fid, kind, offset, length)
 
     def build_image_header(self, global_count=0, flags=0, widget_count=0, ext_count=0,
-                           var_slots=None):
+                           var_slots=None, libs=None):
         """Build VM image header binary.
 
         Format (v4):
@@ -1945,11 +1981,22 @@ class Compiler:
         ext_count: number of widgets expected to need WidgetExt (conservative = widget_count).
 
         Each function entry is 12 bytes.
+
+        v6 (libs given: a library, or a program calling one; caps.libraries):
+          v5 + lib_count(u8) + import_count(u16) + export_count(u16) + call_depth(u8);
+          after the function table: libs [u8 len, id, u8 major], imports
+          [u8 lib, u8 nargs, u8 ret, u8 len, name], exports [u16 func_id,
+          u8 nargs, u8 ret, nargs x u8 param type, u8 len, name] (type codes:
+          TYPE_CODES). `libs` = {'libs': [(id, major)], 'imports': [(lib, nargs,
+          ret, name)], 'exports': [(func_id, ret, [param types], name)],
+          'call_depth': n}.
         """
         func_list = list(self._funcs.values())
         buf = bytearray()
-        # version 4: adds widget_count + ext_count; 5: var_slots
-        buf.append(4 if var_slots is None else 5)
+        # version 4: adds widget_count + ext_count; 5: var_slots; 6: libraries
+        if libs is not None and var_slots is None:
+            raise ValueError("a v6 (library) image needs var_slots")
+        buf.append(4 if var_slots is None else 5 if libs is None else 6)
         buf.extend(struct.pack('<H', len(func_list)))
         buf.extend(struct.pack('<H', global_count))
         buf.extend(struct.pack('<H', flags))
@@ -1958,9 +2005,27 @@ class Compiler:
             if var_slots > 0xFFFF:
                 raise ValueError(f"program needs {var_slots} variable slots (max 65535)")
             buf.extend(struct.pack('<H', var_slots))
+        if libs is not None:
+            if len(libs['libs']) > 255 or len(libs['imports']) > 0xFFFF:
+                raise ValueError("too many libraries or imported functions")
+            buf.extend(struct.pack('<BHHB', len(libs['libs']), len(libs['imports']),
+                                   len(libs['exports']), min(libs.get('call_depth', 0), 255)))
         for func_id, kind, offset, length in func_list:
             buf.extend(struct.pack('<HBBI', func_id, kind, 0, offset))
             buf.extend(struct.pack('<I', length))
+        if libs is not None:
+            def name_bytes(n):
+                b = n.encode('ascii')
+                if not 0 < len(b) <= 255:
+                    raise ValueError(f"bad name '{n}'")
+                return bytes([len(b)]) + b
+            for lib_id, major in libs['libs']:
+                buf.extend(name_bytes(lib_id) + bytes([major]))
+            for lib, nargs, ret, name in libs['imports']:
+                buf.extend(bytes([lib, nargs, ret]) + name_bytes(name))
+            for func_id, ret, ptypes, name in libs['exports']:
+                buf.extend(struct.pack('<HBB', func_id, len(ptypes), ret) + bytes(ptypes)
+                           + name_bytes(name))
         return bytes(buf)
 
     def has_functions(self):

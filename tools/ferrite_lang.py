@@ -20,6 +20,7 @@ import struct
 import json
 from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
                         AddrOverflow, IMAGE_FLAG_WIDE_ADDR, IMAGE_FLAG_PORTRAIT, NARROW_CODE_MAX,
+                        IMAGE_FLAG_LIBRARY, TYPE_NAMES, type_code,
                         FunctionKind as CcFunctionKind,
                         SYSTEM_CALLBACK_KINDS,
                         disassemble, encode_svarint, decode_svarint,
@@ -178,7 +179,7 @@ def preprocess_map(source, filename="<input>", include_dirs=None, _included=None
 KEYWORDS = {
     'var', 'const', 'fn', 'if', 'else', 'while', 'for',
     'return', 'true', 'false', 'break', 'continue',
-    'not', 'class',
+    'not', 'class', 'export',
 }
 
 
@@ -625,6 +626,8 @@ class FnDef:
         self.return_type = return_type  # "int" | "float" | None (= "int")
         self.body = body
         self.line = line
+        # `export fn`: a library's function its importers call (ferrite-ui-xl docs/apps.md).
+        self.exported = False
 
 
 class ClassDef:
@@ -764,6 +767,13 @@ class Parser:
         while not self._at_end():
             if self._check('FN'):
                 functions.append(self._fn_def())
+            elif self._check('EXPORT'):
+                self._advance()
+                if not self._check('FN'):
+                    self._error("expected 'fn' after 'export'")
+                fn = self._fn_def()
+                fn.exported = True
+                functions.append(fn)
             elif self._check('CLASS'):
                 classes.append(self._class_def())
             elif self._widget_decl_at(self.pos):
@@ -1712,8 +1722,20 @@ class CodeGen:
     # opt into strict checking.
     T_ANY = "any"
 
-    def __init__(self, wide=False, superops=False, native_flex=False):
+    def __init__(self, wide=False, superops=False, native_flex=False, library=False,
+                 imports=None):
         self.asm = Asm(wide=wide)
+        # Compiling a library (image v6, IMAGE_FLAG_LIBRARY): `@fn` as FN_REF,
+        # no loop() or other lifecycle functions, `export fn` its interface.
+        self.library = library
+        # Functions of the libraries built against (name -> {'lib', 'major',
+        # 'params': [type], 'ret': type | 'void'}), called with CALL_IMP; the
+        # ones called, in import-table order, and their libraries' ids.
+        self.imports = imports or {}
+        self.import_list = []
+        self.import_libs = []
+        self.exported = set()
+        self.call_depth = 0
         # Emit superinstructions (device caps.superops; firmware `superops`).
         self.superops = superops
         # flexLayout(box) as the FLEX_LAYOUT opcode instead of a call to
@@ -1887,6 +1909,25 @@ class CodeGen:
         # Append lambda FnDefs so they're registered and emitted as regular functions
         program.functions.extend(self._lambda_fns)
 
+        self.exported = {fn.name for fn in program.functions if fn.exported}
+        if self.exported and not self.library:
+            fn = next(f for f in program.functions if f.exported)
+            raise CompileError("'export fn' is for libraries (project.json \"library_id\")",
+                               fn.line)
+        if self.library:
+            allowed = ('setup', '__on_click_dispatch', '__on_tap_dispatch', '__on_paint_dispatch')
+            for fn in program.functions:
+                if fn.name in SYSTEM_CALLBACKS and fn.name not in allowed:
+                    raise CompileError(f"a library has no {fn.name}(): only its importers' "
+                                       f"programs do", fn.line)
+            if not any(fn.name == 'setup' for fn in program.functions):
+                # Its globals' initializers go into setup(), run once per importing task.
+                program.functions.insert(0, FnDef('setup', [], [], 0))
+        for fn in program.functions:
+            if fn.name in self.imports:
+                raise CompileError(f"function '{fn.name}' has the name of a function of "
+                                   f"library {self.imports[fn.name]['lib']}", fn.line)
+
         # Phase 2: Register all functions and assign func_ids (1-based, source
         # order; kept ones keep theirs, lambdas are numbered after them)
         self.func_ids = {}
@@ -1912,8 +1953,10 @@ class CodeGen:
         # Validate: setup and loop must exist
         if 'setup' not in self.functions:
             raise CompileError("missing required function: fn setup()")
-        if 'loop' not in self.functions:
+        if 'loop' not in self.functions and not self.library:
             raise CompileError("missing required function: fn loop()")
+        if self.library and max(self.func_ids.values(), default=0) >= 4096:
+            raise CompileError("a library has at most 4095 functions (FN_REF ids)")
 
         if self.widget_page:
             self._init_only = _init_only_functions(program.functions)
@@ -2005,7 +2048,7 @@ class CodeGen:
         calls = {n: sorted(c for c in self._fn_calls.get(n, ()) if c in frame)
                  for n in frame}
 
-        def deepest(extra):
+        def deepest(extra, frame=frame):
             depth, active = {}, []
 
             def visit(n):
@@ -2026,6 +2069,12 @@ class CodeGen:
             return max((visit(n) for n in frame), default=0)
 
         chain = deepest(deepest(0))
+        if self.library:
+            # One call level: the importer's VM multiplies it by its callback
+            # levels; `call_depth` (frames) sizes its call stack the same way.
+            ones = {n: 1 for n in frame}
+            self.call_depth = deepest(deepest(0, ones), ones)
+            return len(self.global_vars) + chain
         return len(self.global_vars) + VM_CALL_LEVELS * chain
 
     # --- Lambda collection and capture detection ---
@@ -2312,6 +2361,14 @@ class CodeGen:
         self._note_ref(name)
         return self.func_ids[name]
 
+    def _push_fn_id(self, func_id):
+        """A function id as a value: in a library tagged with its unit at run
+        time (FN_REF), so its callbacks find its own function."""
+        if self.library:
+            self.asm.fn_ref(func_id)
+        else:
+            self.asm.push(func_id)
+
     def _note_ref(self, name):
         """The function being emitted calls `name` or takes its id."""
         self._fn_refs.setdefault(self._current_fn_name, set()).add(name)
@@ -2320,7 +2377,7 @@ class CodeGen:
         """Functions no system callback (what the VM calls) reaches through
         calls and function ids, after generate_image."""
         seen = set()
-        work = [n for n in self.functions if n in SYSTEM_CALLBACK_KINDS]
+        work = [n for n in self.functions if n in SYSTEM_CALLBACK_KINDS or n in self.exported]
         while work:
             n = work.pop()
             if n not in seen:
@@ -2484,6 +2541,9 @@ class CodeGen:
             info = self.functions.get(node.name)
             if info:
                 return info.get('return_type', self.T_INT)
+            spec = self.imports.get(node.name)
+            if spec:
+                return self.T_INT if spec['ret'] == 'void' else spec['ret']
             return self.T_INT
         if isinstance(node, ArrayLit):
             return self.T_ARRAY
@@ -3887,8 +3947,7 @@ class CodeGen:
         elif isinstance(node, BoolLit):
             self.asm.push(1 if node.value else 0)
         elif isinstance(node, FuncRef):
-            func_id = self._resolve_func_id(node.name, node.line)
-            self.asm.push(func_id)
+            self._push_fn_id(self._resolve_func_id(node.name, node.line))
         elif isinstance(node, VarRef):
             if node.name in self.array_vars:
                 raise CompileError(f"'{node.name}' is an array, use {node.name}[index]", node.line)
@@ -3966,8 +4025,7 @@ class CodeGen:
                     self._gen_expr(elem)
                     self.asm.arr_store()
         elif isinstance(node, LambdaExpr):
-            func_id = self._resolve_func_id(node.func_name, node.line)
-            self.asm.push(func_id)
+            self._push_fn_id(self._resolve_func_id(node.func_name, node.line))
         elif isinstance(node, WidgetExpr):
             raise CompileError(
                 f"{node.name}(...) creates a widget: inside a function, use it as a statement, "
@@ -5081,6 +5139,11 @@ class CodeGen:
             self._current_target = None
             return
 
+        # --- Imported library function ---
+        if name not in self.functions and name in self.imports:
+            self._gen_import_call(node)
+            return
+
         # --- User-defined function ---
         if name not in self.functions:
             raise CompileError(f"undefined function: {name}", node.line)
@@ -5120,6 +5183,36 @@ class CodeGen:
                     f"type mismatch: {name}() param "
                     f"'{info['params'][i]}' expects {pt} "
                     f"but arg {i+1} is {arg_type}", line)
+
+    def _gen_import_call(self, node):
+        """CALL_IMP of a library's exported function (args checked against
+        its parameter types, as for the program's own)."""
+        name = node.name
+        spec = self.imports[name]
+        params = spec['params']
+        if len(node.args) != len(params):
+            raise CompileError(f"{name}() expects {len(params)} args, got {len(node.args)}",
+                               node.line)
+        for i, arg in enumerate(node.args):
+            arg_type = self._infer_type(arg)
+            pt = params[i]
+            self._gen_expr(arg)
+            if pt == self.T_FLOAT and arg_type == self.T_INT:
+                self.asm.itof()
+            elif not self._types_compatible(pt, arg_type):
+                raise CompileError(f"type mismatch: {name}() arg {i + 1} expects {pt} "
+                                   f"but is {arg_type}", node.line)
+        if name not in self.import_list:
+            self.import_list.append(name)
+            if spec['lib'] not in self.import_libs:
+                self.import_libs.append(spec['lib'])
+        self.asm.call_imp(self.import_list.index(name))
+        self._current_target = None
+        if spec['ret'] == 'void':
+            if self._stmt_call is node:
+                self._stmt_call_void = True
+            else:
+                self.asm.push(0)
 
     def _emit_call(self, name):
         """CALL user function `name` (args already pushed)."""
@@ -5526,7 +5619,7 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
 
 def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty",
                 widget_page=False, portrait=False, superops=False, native_flex=False,
-                strip_unused=True, var_slots=False):
+                strip_unused=True, var_slots=False, library=False, libraries=None):
     """Compile source to VM image format (v4/v5 header + opcodes).
 
     Image format (v4):
@@ -5559,6 +5652,13 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
     slots the program needs (CodeGen._frame_layout), which the VM allocates
     exactly. Only for devices with caps.var_slots (ferrite-ui-xl).
 
+    library=True compiles a library (ferrite-ui-xl docs/apps.md "Step 3"): no
+    loop(), `export fn` its interface, a v6 header with the export table.
+    libraries: the library packages built against (read_library dicts); their
+    exported functions are called by name (CALL_IMP), and an image calling
+    one gets a v6 header with the library and import tables. Both need
+    var_slots (caps.libraries devices have caps.var_slots).
+
     strip_unused=True leaves out the #include'd functions no system callback
     reaches through calls or `@name` ids (a second compile pass; the first
     one still checks them). Function ids don't change, so there may be gaps.
@@ -5577,6 +5677,16 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
         if dispatchers:
             source = source + '\n\n' + dispatchers
 
+        imports = {}
+        for lib in libraries or ():
+            for fname, spec in lib['exports'].items():
+                if fname in imports:
+                    raise CompileError(f"libraries {imports[fname]['lib']} and {lib['id']} "
+                                       f"both export {fname}()")
+                imports[fname] = {'lib': lib['id'], 'major': lib['major'],
+                                  'params': spec['params'], 'ret': spec['ret']}
+        lib_majors = {lib['id']: lib['major'] for lib in libraries or ()}
+
         def parse_program():
             program = Parser(tokenize(source)).parse()
             # Validate system callback arg counts
@@ -5594,7 +5704,8 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
             the bytecode outgrows 64 KB; then regenerate from a fresh parse
             with u32 targets (wide-address image)."""
             for wide in (False, True):
-                codegen = CodeGen(wide=wide, superops=superops, native_flex=native_flex)
+                codegen = CodeGen(wide=wide, superops=superops, native_flex=native_flex,
+                                  library=library, imports=imports)
                 codegen.widget_page = widget_page
                 codegen.keep_functions = keep
                 try:
@@ -5644,6 +5755,29 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
             flags |= IMAGE_FLAG_WIDE_ADDR
         if portrait:
             flags |= IMAGE_FLAG_PORTRAIT
+        libs = None
+        if library or codegen.import_list:
+            if not var_slots:
+                raise CompileError("libraries need a device with caps.libraries")
+            if library:
+                flags |= IMAGE_FLAG_LIBRARY
+            exports = []
+            for n in sorted(codegen.exported):
+                info = codegen.functions[n]
+                if info['addr'] is None:
+                    continue
+                ret = 0 if n in codegen.void_fns else type_code(info['return_type'])
+                exports.append((codegen.func_ids[n], ret,
+                                [type_code(t) for t in info['param_types']], n))
+            imports_t = []
+            for n in codegen.import_list:
+                spec = imports[n]
+                ret = 0 if spec['ret'] == 'void' else type_code(spec['ret'])
+                imports_t.append((codegen.import_libs.index(spec['lib']), len(spec['params']),
+                                  ret, n))
+            libs = {'libs': [(i, lib_majors[i]) for i in codegen.import_libs],
+                    'imports': imports_t, 'exports': exports,
+                    'call_depth': codegen.call_depth}
         # Use #hint_widgets if provided; fall back to static alloc()-site count.
         auto_wc = codegen.next_widget_id - 1
         widget_count = hint_wc if hint_wc > 0 else auto_wc
@@ -5654,6 +5788,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
             widget_count=widget_count,
             ext_count=ext_count,
             var_slots=codegen.var_slots if var_slots else None,
+            libs=libs,
         )
         image = header + bytecode
 
@@ -5736,7 +5871,7 @@ def _looks_like_image(data):
     if len(data) < 5:
         return False
     version = data[0]
-    if version < 1 or version > 5:
+    if version < 1 or version > 6:
         return False
     try:
         func_count = struct.unpack_from('<H', data, 1)[0]
@@ -5767,8 +5902,11 @@ def _extract_labels(image, debug_symbols=None):
 
 
 def _image_header_size(version, func_count):
-    """Return header size in bytes for the given version."""
-    if version >= 5:
+    """Header size in bytes for the given version, up to the end of the
+    function table (a v6 image's library tables follow: image_code_start)."""
+    if version >= 6:
+        base = 17
+    elif version >= 5:
         base = 11
     elif version >= 4:
         base = 9
@@ -5838,13 +5976,57 @@ def disassemble_page_block(page, offset, symbols=None, addr=None):
     return lines
 
 
+def image_libraries(image):
+    """A v6 image's library tables: {'library': bool, 'call_depth', 'libs':
+    [(id, major)], 'imports': [(lib, nargs, ret, name)], 'exports': {name:
+    (func_id, ret, [param types])}, 'code_start'} (type codes: ferrite_cc
+    TYPE_CODES). None for older images."""
+    if len(image) < 17 or image[0] != 6:
+        return None
+    func_count = struct.unpack_from('<H', image, 1)[0]
+    flags = struct.unpack_from('<H', image, 5)[0]
+    lib_count, import_count, export_count, call_depth = struct.unpack_from('<BHHB', image, 11)
+    pos = _image_header_size(6, func_count)
+
+    def name():
+        nonlocal pos
+        n = image[pos]
+        s = bytes(image[pos + 1:pos + 1 + n]).decode('ascii')
+        pos += 1 + n
+        return s
+
+    libs, imports, exports = [], [], {}
+    for _ in range(lib_count):
+        lib_id = name()
+        libs.append((lib_id, image[pos]))
+        pos += 1
+    for _ in range(import_count):
+        lib, nargs, ret = image[pos:pos + 3]
+        pos += 3
+        imports.append((lib, nargs, ret, name()))
+    for _ in range(export_count):
+        fid, nargs, ret = struct.unpack_from('<HBB', image, pos)
+        pos += 4
+        ptypes = list(image[pos:pos + nargs])
+        pos += nargs
+        exports[name()] = (fid, ret, ptypes)
+    return {'library': bool(flags & IMAGE_FLAG_LIBRARY), 'call_depth': call_depth,
+            'libs': libs, 'imports': imports, 'exports': exports, 'code_start': pos}
+
+
+def image_code_start(image):
+    """Offset of the opcodes in a VM image."""
+    libs = image_libraries(image)
+    if libs is not None:
+        return libs['code_start']
+    return _image_header_size(image[0], struct.unpack_from('<H', image, 1)[0])
+
+
 def format_image(image, page=b'', symbols=None):
     """Header + disassembly of a VM image; each W_LOAD is followed by its
     widget page block (indented)."""
     image = _ImageBytes(image) if not hasattr(image, 'func_names') else image
-    version = image[0]
-    func_count = struct.unpack_from('<H', image, 1)[0]
-    code = image[_image_header_size(version, func_count):]
+    code = image[image_code_start(image):]
     out = _image_header_lines(image, symbols)
     text = disassemble(code, labels=_extract_labels(image, symbols), symbols=symbols,
                        wide=_image_is_wide(image))
@@ -5872,7 +6054,7 @@ def _image_header_lines(output, debug_symbols=None):
     func_count = struct.unpack_from('<H', output, 1)[0]
     global_count = struct.unpack_from('<H', output, 3)[0]
     hdr_base = _image_header_size(version, 0)  # fixed part only
-    opcode_start = hdr_base + func_count * 12
+    opcode_start = image_code_start(output)
 
     extra = ''
     if version >= 3:
@@ -5886,6 +6068,9 @@ def _image_header_lines(output, debug_symbols=None):
         extra += f', widgets={wc}, exts={ec}'
     if version >= 5:
         extra += f', var_slots={struct.unpack_from("<H", output, 9)[0]}'
+    libs = image_libraries(output)
+    if libs is not None:
+        extra += f', {"library" if libs["library"] else "program"}, call_depth={libs["call_depth"]}'
 
     lines.append(f'; image v{version}: {func_count} functions, {global_count} globals, opcodes={len(output) - opcode_start}B{extra}')
     for i in range(func_count):
@@ -5899,6 +6084,15 @@ def _image_header_lines(output, debug_symbols=None):
         else:
             name = _KIND_NAMES.get(kind, f'kind={kind}')
         lines.append(f';   #{fid} {name}  offset={offset} length={length}')
+    if libs is not None:
+        for lib_id, major in libs['libs']:
+            lines.append(f'; library {lib_id} {major}.x')
+        for i, (lib, nargs, ret, name) in enumerate(libs['imports']):
+            lines.append(f';   import {i}: {libs["libs"][lib][0]} {name}({nargs}) -> '
+                         f'{TYPE_NAMES.get(ret, ret)}')
+        for name, (fid, ret, ptypes) in libs['exports'].items():
+            params = ', '.join(TYPE_NAMES.get(t, str(t)) for t in ptypes)
+            lines.append(f'; export #{fid} {name}({params}) -> {TYPE_NAMES.get(ret, ret)}')
     return lines
 
 

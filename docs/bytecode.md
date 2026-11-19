@@ -23,7 +23,8 @@ inside the opcode stream, not the full image file.
 ## Image Format
 
 Current compiler output is image version 4, or 5 for devices with
-`caps.var_slots` (ferrite-ui-xl):
+`caps.var_slots` (ferrite-ui-xl), or 6 for a library or a program calling one
+(`caps.libraries`, ferrite-ui-xl; see "Libraries" below):
 
 ```text
 offset  size  field
@@ -50,6 +51,9 @@ Flags:
 | Bit | Meaning |
 | --- | --- |
 | `0` | Render mode: `0` = dirty, `1` = buffered |
+| `2` | Wide addresses: jump / call targets are u32 |
+| `3` | Portrait |
+| `4` | A library (v6) |
 
 Function table entry:
 
@@ -88,6 +92,26 @@ Older images are still parsed:
 - v3: adds `flags`.
 - v4: adds `widget_count` and `ext_count`.
 - v5: adds `var_slots`.
+
+### Libraries (v6)
+
+A v6 header is a v5 header followed by `lib_count` u8, `import_count` u16,
+`export_count` u16 and `call_depth` u8 (17 bytes). After the function table:
+
+```text
+libraries  lib_count x    u8 len, id bytes, u8 major
+imports    import_count x u8 lib (index above), u8 nargs, u8 ret, u8 len, name
+exports    export_count x u16 func_id, u8 nargs, u8 ret, nargs x u8 param type, u8 len, name
+```
+
+then the opcodes. Type codes: `0` void (returns only), `1` int, `2` float,
+`3` string, `4` array, `5` widget, `6` any (also class types). A program
+lists the libraries and the functions it calls (`CALL_IMP` indexes the
+import table); a library (flags bit 4) its exported functions, its
+`var_slots` being its globals plus its deepest locals along one call chain
+and `call_depth` its deepest chain in frames (the importer's VM adds them
+per callback level). The VM resolves imports by name and checks `nargs` and
+`ret` against the export (ferrite-ui-xl docs/apps.md "Step 3").
 
 ## Core Opcodes
 
@@ -233,6 +257,13 @@ Only in firmware built with the ferrite-core `superops` feature (`caps.superops`
 | `0x4C` | `ARR_LOAD_V` | `u8 slot` | `LOAD slot; <index>; ARR_LOAD` with a side-effect-free index: pop index, push element of the array in var |
 | `0x4D` | `STORE_OP` | `u8 op, u8 slot` | `LOAD x; <e>; <op>; STORE x` with a side-effect-free `e`: pop b; var = var op b |
 | `0x4E` | `FRAME_A` | `u8 local_count, u8 nargs` | the prologue `FRAME n; STORE nargs-1; …; STORE 0`: reserves the locals, then pops the arguments (last on top) into locals `nargs-1`…`0` (fault 18 past `var_slots`, 13 if `nargs > local_count`) |
+
+Library opcodes (v6 images, `caps.libraries`):
+
+| Opcode | Mnemonic | Operands | Stack effect / behavior |
+| --- | --- | --- | --- |
+| `0x4F` | `CALL_IMP` | `u16 import` | call imported function `import` (the import table) in its library's code; its `RET` comes back here |
+| `0x50` | `FN_REF` | `u16 func_id` | push `unit << 12 \| func_id`, the running unit's tag on a function id (a library's `@fn`), so a callback finds that library's function |
 
 The compiler also inverts loops for these devices (`JMP test; body: …; test: JCMP… body`), so an iteration runs one jump instead of two. On every device it folds integer constant expressions (`16 * 12`, `-(5 - 9)`, int `const`s) to one `PUSH`, with the VM's semantics: 32-bit wrap, division truncating toward zero, `x / 0` = `x % 0` = 0, `i32::MIN / -1` = `i32::MIN`, shifts by `b & 31`.
 

@@ -100,7 +100,7 @@ OPCODE_CATEGORIES = {
     Op.HALT: CATEGORY_CONTROL, Op.RET: CATEGORY_CONTROL,
     Op.YIELD: CATEGORY_CONTROL, Op.FRAME: CATEGORY_CONTROL, Op.FRAME_A: CATEGORY_CONTROL,
     Op.JMP: CATEGORY_CONTROL, Op.JZ: CATEGORY_CONTROL,
-    Op.JNZ: CATEGORY_CONTROL, Op.CALL: CATEGORY_CONTROL,
+    Op.JNZ: CATEGORY_CONTROL, Op.CALL: CATEGORY_CONTROL, Op.CALL_IMP: CATEGORY_CONTROL,
     # Variables
     Op.LOAD: CATEGORY_VARIABLE, Op.STORE: CATEGORY_VARIABLE,
     Op.LOAD_0: CATEGORY_VARIABLE, Op.LOAD_1: CATEGORY_VARIABLE,
@@ -186,14 +186,15 @@ def parse_image_header(data):
       v3: version(u8) + func_count(u16) + global_count(u16) + flags(u16) = 7 bytes
       v4: v3 + widget_count(u8) + ext_count(u8)             = 9 bytes
       v5: v4 + var_slots(u16)                               = 11 bytes
+      v6: v5 + library fields (6 bytes), library tables after the function table
     """
     if len(data) < 3:
         raise ValueError("Image too small for header (need at least 3 bytes)")
 
     version = data[0]
-    if version < 1 or version > 5:
+    if version < 1 or version > 6:
         raise ValueError(
-            f"Unsupported image version {version} (expected 1-5). "
+            f"Unsupported image version {version} (expected 1-6). "
             f"Is this a VM image binary? Flash dumps are not supported."
         )
 
@@ -209,7 +210,7 @@ def parse_image_header(data):
         widget_count = 0
         ext_count = 0
     else:  # version 3, 4 or 5
-        header_size = 11 if version >= 5 else 9 if version >= 4 else 7
+        header_size = 17 if version >= 6 else 11 if version >= 5 else 9 if version >= 4 else 7
 
     if len(data) < header_size:
         raise ValueError(
@@ -224,6 +225,9 @@ def parse_image_header(data):
 
     func_table_size = func_count * 12
     opcode_start = header_size + func_table_size
+    if version >= 6:
+        from ferrite_lang import image_code_start
+        opcode_start = image_code_start(data)
     if opcode_start > len(data):
         raise ValueError(
             f"Image header requires {opcode_start} bytes for {func_count} functions "
@@ -580,8 +584,8 @@ def walk_bytecode(data, start=0, end=None, wide=False):
             pos += 1  # u8 id
             yield addr, op, 2
 
-        elif op == Op.W_LOAD:
-            pos += 2  # u16 widget page offset
+        elif op in (Op.W_LOAD, Op.CALL_IMP, Op.FN_REF):
+            pos += 2  # u16 widget page offset / import index / func id
             yield addr, op, 3
 
         elif op in (Op.W_SET, Op.W_GET):

@@ -1812,6 +1812,54 @@ The app is a task of the program that started it, which gets
 
 Syscall ids 0x80–0x88 (handled by the VM itself, on every board).
 
+## Libraries
+
+On ferrite-ui-xl (`caps.libraries`) code can be shared as a library
+package: built once, installed on the board on its own (`ferrite_cli lib
+install`), its code in RAM once however many programs use it, each program
+with its own copy of its globals (ferrite-ui-xl `docs/apps.md` "Step 3").
+
+A library is a project with `"library_id"` (and `"name"`, `"app_version"`)
+and one program named `lib`. Its `export fn` functions are what other
+programs call; the rest are its own:
+
+```c
+// util.fl, the library's "lib" program
+var clicks = 0;
+var btn;
+fn on_btn(w) { clicks++; }
+
+export fn makeButton(x, y) {
+    btn = alloc();
+    target(btn);
+    set(location, x, y);
+    set(size, 200, 80);
+    set(clickable, ON);
+    parent(0);
+    btn.on_click = @on_btn;     // its own callback (file-scope widget variable)
+    return btn;
+}
+export fn clickCount() { return clicks; }
+```
+
+It may have globals (initialised by its `setup()`, which runs in each
+program that uses it, before that program's `setup()`), make widgets and
+take callbacks, but has no `loop()` or other lifecycle functions, no fonts,
+images or other resources (it uses its user's ids), and uses no library
+itself.
+
+A project lists the library packages it builds against, and calls their
+exported functions by name:
+
+```json
+"libraries": ["../util/util.bin"]
+```
+
+The program then records each library's id and major version; it runs with
+any installed version of that major whose exports still match (name,
+argument count, return kind). A missing or mismatched library stops the
+program from starting (VM fault 19 / 20).
+
 ## Gestures
 
 Devices with `caps.gestures` (the Exynos 4412 tablet and the sim, ferrite-ui-xl) recognize gestures the way Flutter does. `#include "gesture.fl"` for the constants. Building a program that calls these for a device without `caps.gestures` fails.

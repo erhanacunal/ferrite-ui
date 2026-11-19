@@ -46,7 +46,8 @@ JSON format:
       "eval_stack": 32, "call_stack": 12, "cb_queue": 16, "anim_slots": 8
     },
     "application_id": "com.acme.clock", "name": "Clock", "app_version": "1.2.3",
-    "entry": "main", "icon": "logo"
+    "entry": "main", "icon": "logo",
+    "libraries": ["../util/util.bin"]
   }
 
   "application_id" makes the image an app package (ferrite-ui-xl
@@ -57,6 +58,15 @@ JSON format:
   "main") and "icon" (an image resource name) are optional. An app's
   "memory" block is ignored on the board (the system image sizes the
   pools). Without "application_id" the image is a system image, as before.
+
+  "library_id" (with "name", "app_version") makes it a library package
+  instead (ferrite-ui-xl docs/apps.md "Step 3"; devices with
+  caps.libraries): one program, "lib", whose `export fn`s other projects
+  call; a RES_LIBINFO resource "libinfo" (the appinfo layout, magic "LI"),
+  no other resources. The board installs it under ferrite/libs/{id}/.
+  "libraries" lists the library packages a project builds against: their
+  exported functions are called by name, and the image records each
+  library's id and major version.
 
   "sounds" are PCM WAV files (8/16/24/32-bit, mono or stereo, any rate),
   stored as 16-bit PCM and played with playSound(name) on boards with
@@ -120,6 +130,12 @@ APPINFO_MAGIC = b"AI"
 APPINFO_VERSION = 1
 APPINFO_SIZE = 108
 APP_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
+# Library package manifest (fs.rs RES_LIBINFO): the appinfo layout, magic "LI".
+RES_LIBINFO = 9
+LIBINFO_NAME = "libinfo"
+LIBINFO_MAGIC = b"LI"
+# A library's one program.
+LIB_PROGRAM = "lib"
 # Device caps -> Platform::CAPS bits (ferrite-core platform.rs CAP_*; keep in
 # sync): the bits an app needs, checked by the board before it installs it.
 CAP_BITS = {"audio": 1 << 0, "video": 1 << 1, "jpeg": 1 << 2, "multi_program": 1 << 3,
@@ -130,7 +146,7 @@ RES_FLAG_FLASH_EXEC = 0x01
 
 KIND_NAMES = {RES_FONT: "FONT", RES_IMAGE: "IMAGE", RES_PROGRAM: "PROGRAM", RES_PAGE: "PAGE",
               RES_FILE: "FILE", RES_SYSCFG: "SYSCFG", RES_SOUND: "SOUND", RES_MESH: "MESH",
-              RES_APPINFO: "APPINFO"}
+              RES_APPINFO: "APPINFO", RES_LIBINFO: "LIBINFO"}
 
 # --- Image conversion (shared encoder in ferrite_img.py) ---
 
@@ -178,13 +194,15 @@ def _write_debug_sidecar(source_path: str, image: bytes) -> str | None:
 
 def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
                     widget_page=False, portrait=False, superops=False,
-                    native_flex=False, var_slots=False) -> bytes:
+                    native_flex=False, var_slots=False, library=False,
+                    libraries=None) -> bytes:
     """Ferrite lang source → VM image (header + opcodes). With widget_page,
     static widget setup moves to the image's `.page` (RES_PAGE contents).
     superops: emit superinstructions (the device's caps.superops).
     native_flex: flexLayout() as an opcode (the device's caps.native_flex).
     var_slots: a v5 image header with the variable slots the program needs
-    (the device's caps.var_slots)."""
+    (the device's caps.var_slots). library / libraries: a library's program,
+    or the library packages (read_library) a program calls (v6 header)."""
     try:
         from ferrite_lang import build_image, CompileError
     except ImportError:
@@ -197,7 +215,8 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
         image = build_image(source, filename=source_path, include_dirs=include_dirs,
                             render_mode=render_mode, widget_page=widget_page,
                             portrait=portrait, superops=superops,
-                            native_flex=native_flex, var_slots=var_slots)
+                            native_flex=native_flex, var_slots=var_slots,
+                            library=library, libraries=libraries)
         _write_debug_sidecar(source_path, image)
         return image
     except CompileError as e:
@@ -472,6 +491,59 @@ def parse_appinfo(rec: bytes) -> dict:
             "caps": struct.unpack_from("<I", rec, 104)[0]}
 
 
+def build_libinfo(project: dict, caps: dict | None) -> bytes:
+    """project.json library fields -> RES_LIBINFO: build_appinfo's record
+    with magic "LI", "library_id" as the id, entry "lib", no icon."""
+    fields = {"application_id": project["library_id"], "name": project.get("name"),
+              "app_version": project.get("app_version", "1.0.0"), "entry": LIB_PROGRAM}
+    fields = {k: v for k, v in fields.items() if v is not None}
+    return LIBINFO_MAGIC + build_appinfo(fields, {LIB_PROGRAM}, set(), caps)[2:]
+
+
+def parse_libinfo(rec: bytes) -> dict:
+    """RES_LIBINFO record -> dict (id, name, version, caps)."""
+    if rec[:2] != LIBINFO_MAGIC:
+        raise ValueError("not a libinfo record")
+    return parse_appinfo(APPINFO_MAGIC + rec[2:])
+
+
+def _resources(binary: bytes):
+    """An FS image's resources: (name, kind, data) each."""
+    if binary[:4] != MAGIC:
+        raise ValueError("not a ferrite FS image (missing FERR magic)")
+    count = struct.unpack_from("<H", binary, 10)[0]
+    base = None
+    for i in range(count):
+        e = binary[TABLE_OFFSET + i * ENTRY_SIZE:TABLE_OFFSET + (i + 1) * ENTRY_SIZE]
+        offset, size = struct.unpack_from("<II", e, 20)
+        if base is None:
+            base = offset - (TABLE_OFFSET + count * ENTRY_SIZE)
+        yield (e[:16].split(b"\0", 1)[0].decode("ascii", "replace"), e[16],
+               binary[offset - base:offset - base + size])
+
+
+def read_library(path) -> dict:
+    """A library package -> {'id', 'name', 'version', 'major', 'exports':
+    {name: {'params': [type], 'ret': type | 'void'}}}: what a project built
+    against it may call (ferrite_lang.build_image `libraries`)."""
+    from ferrite_lang import image_libraries, TYPE_NAMES
+    binary = Path(path).read_bytes()
+    info = program = None
+    for name, kind, data in _resources(binary):
+        if kind == RES_LIBINFO and name == LIBINFO_NAME:
+            info = parse_libinfo(data)
+        elif kind == RES_PROGRAM and name == LIB_PROGRAM:
+            program = data
+    libs = image_libraries(program) if program else None
+    if info is None or libs is None or not libs["library"]:
+        raise ValueError(f"{path}: not a library package")
+    exports = {n: {"params": [TYPE_NAMES.get(t, "any") for t in ptypes],
+                   "ret": TYPE_NAMES.get(ret, "any")}
+               for n, (_fid, ret, ptypes) in libs["exports"].items()}
+    return {"id": info["id"], "name": info["name"], "version": info["version"],
+            "major": int(info["version"].split(".")[0]), "exports": exports}
+
+
 def read_appinfo(binary: bytes) -> dict | None:
     """The app manifest of an FS image, or None for a system image."""
     if binary[:4] != MAGIC:
@@ -629,6 +701,26 @@ def build(project_path: str, output_path: str | None) -> dict:
 
     # Resolve include directories relative to project dir
     include_dirs = [str(project_dir / d) for d in project.get("include_dirs", [])]
+
+    # Libraries: a library package, or the ones this project calls.
+    library = "library_id" in project
+    lib_paths = project.get("libraries", [])
+    if (library or lib_paths) and not (device and device["caps"].get("libraries")):
+        raise ValueError("libraries need a device with caps.libraries (ferrite-ui-xl)")
+    if library:
+        if "application_id" in project:
+            raise ValueError("a project is an app or a library, not both")
+        if lib_paths:
+            raise ValueError("a library does not use other libraries")
+        progs = project.get("programs", [])
+        if len(progs) != 1 or progs[0].get("name") != LIB_PROGRAM:
+            raise ValueError(f'a library has one program, named "{LIB_PROGRAM}"')
+        for key in ("fonts", "images", "files", "sounds", "meshes", "memory"):
+            if project.get(key):
+                raise ValueError(f'a library has no "{key}" (it uses its importers\' resources)')
+    libraries = []
+    for p in lib_paths:
+        libraries.append(read_library(project_dir / p))
 
     resources = []  # (name, kind, data)
 
@@ -803,7 +895,8 @@ def build(project_path: str, output_path: str | None) -> dict:
                                      portrait=portrait,
                                      superops=bool(device and device["caps"].get("superops")),
                                      native_flex=bool(device and device["caps"].get("native_flex")),
-                                     var_slots=bool(device and device["caps"].get("var_slots")))
+                                     var_slots=bool(device and device["caps"].get("var_slots")),
+                                     library=library, libraries=libraries)
         exec_mode = prog.get("exec_mode", "ram")
         prog_flags = RES_FLAG_FLASH_EXEC if exec_mode == "flash" else 0
         resources.append((name, RES_PROGRAM, image_data, prog_flags))
@@ -873,6 +966,11 @@ def build(project_path: str, output_path: str | None) -> dict:
                             device["caps"] if device else None)
         resources.append((APPINFO_NAME, RES_APPINFO, rec, 0))
         app = parse_appinfo(rec)
+    lib = None
+    if library:
+        rec = build_libinfo(project, device["caps"] if device else None)
+        resources.append((LIBINFO_NAME, RES_LIBINFO, rec, 0))
+        lib = parse_libinfo(rec)
 
     # 7. Build flash binary
     fs_binary = build_fs(project, resources, fs_base)
@@ -897,6 +995,7 @@ def build(project_path: str, output_path: str | None) -> dict:
         "binary": fs_binary,
         "symbols": symbols,
         "app": app,
+        "lib": lib,
     }
 
 
@@ -990,6 +1089,12 @@ def dump_fs(binary: bytes, symbols: dict | None = None) -> str:
                        f"{frames} frames ({frames / max(rate, 1):.2f} s)")
         elif kind == RES_MESH and len(blob) >= 8:
             out.append(f"; {struct.unpack_from('<I', blob, 4)[0]} triangles")
+        elif kind == RES_LIBINFO:
+            try:
+                a = parse_libinfo(blob)
+                out.append(f"; library {a['id']} \"{a['name']}\" {a['version']}, caps 0x{a['caps']:X}")
+            except ValueError as e:
+                out.append(f"; {e}")
         elif kind == RES_APPINFO:
             try:
                 a = parse_appinfo(blob)
@@ -1084,8 +1189,9 @@ def main():
         return
 
     print(f"Built: {output_path}")
-    app = stats.get("app")
+    app, lib = stats.get("app"), stats.get("lib")
     print(f"  App:       {app['id']} {app['version']} (\"{app['name']}\")" if app
+          else f"  Library:   {lib['id']} {lib['version']} (\"{lib['name']}\")" if lib
           else "  System image (no application_id)")
     print(f"  Resources: {stats['resources']}")
     print(f"  Data size: {stats['data_size']} bytes")
