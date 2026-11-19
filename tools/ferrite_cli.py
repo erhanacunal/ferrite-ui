@@ -130,6 +130,7 @@ ERROR_DESCRIPTIONS = {
     17: "app: no such app",
     18: "app: the entry program is not in the image",
     19: "app: package too large",
+    20: "app: four apps already run",
 }
 
 # VM fault codes (error 6 detail) — keep in sync with `vm::fault` in vm.rs
