@@ -131,6 +131,8 @@ ERROR_DESCRIPTIONS = {
     18: "app: the entry program is not in the image",
     19: "app: package too large",
     20: "app: four apps already run",
+    21: "library: not installed (in that major version)",
+    22: "library: an installed version does not match",
 }
 
 # VM fault codes (error 6 detail) — keep in sync with `vm::fault` in vm.rs
@@ -153,6 +155,8 @@ VM_FAULT_NAMES = {
     16: "eeprom error",
     17: "pool full: array",
     18: "variable slots full",
+    19: "library missing",
+    20: "library mismatch",
 }
 
 
