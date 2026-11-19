@@ -30,6 +30,7 @@ exynos4412 (uart_boot loads FERRITE/FLASH.BIN into the flash shadow at boot):
 
 import argparse
 import http.client
+import json
 import os
 import socket
 import struct
@@ -70,6 +71,8 @@ TAG_PERF_RESP = (9 << 3) | 2  # 0x4A, payload: main-loop profile (protocol::send
 # WriteFs header flags (u32 after total_size + chunk_size) — FS_FLAG_* in protocol.rs
 FS_FLAG_CRC = 0x01  # chunks carry seq + CRC-32 and are retried
 FS_FLAG_SEQ_ACK = 0x02  # with CRC: every chunk answered by FsAck (next_seq + last_crc)
+FS_FLAG_APP = 0x04  # an app package: installed under ferrite/apps/{id}/ (ferrite-ui-xl apps.rs)
+FS_FLAG_RUN = 0x08  # with APP: run it once installed
 # Error code for a header/chunk that failed its CRC — ERR_TRANSFER_CRC in protocol.rs
 ERR_TRANSFER_CRC = 10
 # Attempts per chunk in CRC mode before writefs gives up.
@@ -117,6 +120,16 @@ ERROR_DESCRIPTIONS = {
     8: "invalid system config",
     9: "flash image corrupted",
     10: "transfer CRC mismatch (resent automatically by writefs)",
+    # App packages (ferrite-ui-xl ferrite-core apps.rs `err`, keep in sync)
+    11: "app: not a valid FS image (format or CRC)",
+    12: "app: no appinfo (a system image: build with application_id)",
+    13: "app: bad application_id",
+    14: "app: needs features this firmware lacks",
+    15: "app: no app storage on the device (needs the ext4 USERDATA)",
+    16: "app: writing to storage failed",
+    17: "app: no such app",
+    18: "app: the entry program is not in the image",
+    19: "app: package too large",
 }
 
 # VM fault codes (error 6 detail) — keep in sync with `vm::fault` in vm.rs
@@ -714,10 +727,13 @@ def cmd_writefs(ser: serial.Serial, path: str) -> bool:
     except FileNotFoundError:
         print(f"file not found: {path}", file=sys.stderr)
         return False
-    return writefs_data(ser, data)
+    ok = writefs_data(ser, data)
+    if ok:
+        print("writefs: the device runs the new image")
+    return ok
 
 
-def writefs_data(ser: serial.Serial, data: bytes, log=None) -> bool:
+def writefs_data(ser: serial.Serial, data: bytes, log=None, flags: int = 0) -> bool:
     """Send a flash filesystem image in chunks with flow control.
 
     Protocol (protocol.rs, "CRC chunks"):
@@ -732,18 +748,19 @@ def writefs_data(ser: serial.Serial, data: bytes, log=None) -> bool:
 
     `log(text)` gets progress lines (default: print). A plain-mode timeout
     restarts the transfer from the header once, after a resync pause.
+    `flags` adds header flags: FS_FLAG_APP (an app package), FS_FLAG_RUN.
     """
     log = log or (lambda text: print(text, flush=True))
-    result = _writefs_once(ser, data, log)
+    result = _writefs_once(ser, data, log, flags)
     if result == "timeout":
         log("retrying writefs from the header...")
         resync(ser)
-        result = _writefs_once(ser, data, log)
+        result = _writefs_once(ser, data, log, flags)
     return result == "ok"
 
 
-def _fs_header(total_size: int) -> bytes:
-    head = struct.pack("<III", total_size, CHUNK_SIZE, FS_FLAG_CRC | FS_FLAG_SEQ_ACK)
+def _fs_header(total_size: int, flags: int = 0) -> bytes:
+    head = struct.pack("<III", total_size, CHUNK_SIZE, FS_FLAG_CRC | FS_FLAG_SEQ_ACK | flags)
     return head + struct.pack("<I", zlib.crc32(head))
 
 
@@ -752,13 +769,20 @@ def _crc_chunk(seq: int, chunk: bytes) -> bytes:
     return seq_le + struct.pack("<I", zlib.crc32(chunk, zlib.crc32(seq_le))) + chunk
 
 
-def _send_header(ser: serial.Serial, total_size: int, log) -> str:
-    """Send the header until it is taken: "crc", "plain", "timeout" or "error"."""
+def _send_header(ser: serial.Serial, total_size: int, log, flags: int = 0) -> str:
+    """Send the header until it is taken: "crc", "plain", "timeout" or "error".
+    With FS_FLAG_APP the device must echo it (older firmware would write the
+    image over the system image): "error" otherwise."""
     for attempt in range(3):
         drain_input(ser)
-        ser.write(build_payload_msg(TAG_WRITEFS, _fs_header(total_size)))
+        ser.write(build_payload_msg(TAG_WRITEFS, _fs_header(total_size, flags)))
         ser.flush()
         resp_type, resp_val = read_response(ser)
+        if flags & FS_FLAG_APP and (resp_type == "pong" or
+                                    (resp_type == "fscaps" and not resp_val & FS_FLAG_APP)):
+            log("error: the device firmware has no app packages; nothing was sent "
+                "(it waits for the image: restart it)")
+            return "error"
         if resp_type == "fscaps":
             if resp_val & FS_FLAG_SEQ_ACK:
                 return "seq"
@@ -776,13 +800,13 @@ def _send_header(ser: serial.Serial, total_size: int, log) -> str:
     return "timeout"
 
 
-def _writefs_once(ser: serial.Serial, data: bytes, log) -> str:
+def _writefs_once(ser: serial.Serial, data: bytes, log, flags: int = 0) -> str:
     """One writefs transfer: "ok", "timeout" or "error"."""
     total_size = len(data)
     chunk_count = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
     log(f"writefs: {total_size} bytes, {chunk_count} chunks ({CHUNK_SIZE}B each)")
 
-    mode = _send_header(ser, total_size, log)
+    mode = _send_header(ser, total_size, log, flags)
     if mode == "timeout":
         log("no ACK for header (timeout)")
     if mode in ("timeout", "error"):
@@ -811,7 +835,7 @@ def _writefs_once(ser: serial.Serial, data: bytes, log) -> str:
         pct = (i + 1) * 100 // chunk_count
         print(f"\r  [{i + 1}/{chunk_count}] {pct}%", end="", flush=True)
 
-    log(" done (the device runs the new image)")
+    log(" done")
     return "ok"
 
 
@@ -923,7 +947,7 @@ def _send_seq_chunks(ser: serial.Serial, data: bytes, log) -> str:
         log(f"\n  seq {seq}: {why}, resending ({fails}/{tries})")
 
     note = f", {retries} resend(s), last chunk size {size} B" if retries else ""
-    log(f" done{note} (the device runs the new image)")
+    log(f" done{note}")
     return "ok"
 
 
@@ -1004,7 +1028,7 @@ def _send_crc_chunks(ser: serial.Serial, data: bytes, log) -> str:
         log(f"\n  seq {seq}: {why}, resending ({fails}/{tries})")
 
     note = f", {retries} resend(s), last chunk size {size} B" if retries else ""
-    log(f" done{note} (the device runs the new image)")
+    log(f" done{note}")
     return "ok"
 
 
@@ -1460,6 +1484,95 @@ def cmd_storage(host: str, migrate: bool, stress: str | None = None, check: bool
     return resp.status == 200
 
 
+def _read_package(path: str) -> tuple[bytes, dict] | None:
+    """An app package from ferrite_build (FS image with application_id) and its
+    manifest; None (printed why) for anything else."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ferrite_build
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        info = ferrite_build.read_appinfo(data)
+    except (OSError, ValueError) as e:
+        print(f"app: {e}", file=sys.stderr)
+        return None
+    if info is None:
+        print(f"app: {path} is a system image (no application_id in its project.json); "
+              f"use writefs / bootflash for it", file=sys.stderr)
+        return None
+    return data, info
+
+
+def _app_http(host: str, method: str, path: str, body: bytes | None = None):
+    """One request to the running ferrite's app API: (status, parsed JSON or text)."""
+    headers = {}
+    if body is not None:
+        headers = {"Content-Type": "application/octet-stream",
+                   "X-CRC32": f"{zlib.crc32(body) & 0xFFFFFFFF:08x}"}
+    conn = http.client.HTTPConnection(host, UB_HTTP_PORT, timeout=120)
+    conn.request(method, path, body=body, headers=headers)
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8", "replace")
+    try:
+        return resp.status, json.loads(text)
+    except ValueError:
+        return resp.status, text.strip()
+
+
+def cmd_app(args, ser: serial.Serial | None) -> bool:
+    """exynos4412 app packages (ferrite-ui-xl docs/apps.md): install / list /
+    remove, over HTTP with --host (install also over -p: writefs with
+    FS_FLAG_APP)."""
+    if args.app_command == "install":
+        pkg = _read_package(args.file)
+        if pkg is None:
+            return False
+        data, info = pkg
+        print(f"app: {info['id']} {info['version']} \"{info['name']}\", {len(data)} bytes")
+        if ser is not None:
+            ok = writefs_data(ser, data, flags=FS_FLAG_APP)
+            if ok:
+                print(f"app: installed {info['id']} {info['version']} (the system image runs again)")
+            return ok
+        try:
+            status, answer = _app_http(args.host, "POST", "/api/apps", data)
+        except (OSError, http.client.HTTPException) as e:
+            print(f"app: {e}", file=sys.stderr)
+            return False
+        if status == 200 and isinstance(answer, dict):
+            print(f"app: installed {answer['id']} {answer['version']}"
+                  f"{' (replaced the old version, data kept)' if answer.get('replaced') else ''}")
+            return True
+        print(f"app: {status}: {answer.get('error') if isinstance(answer, dict) else answer}",
+              file=sys.stderr)
+        return False
+    try:
+        if args.app_command == "list":
+            status, answer = _app_http(args.host, "GET", "/api/apps")
+            if status != 200 or not isinstance(answer, dict):
+                print(f"app: {status}: {answer}", file=sys.stderr)
+                return False
+            if not answer.get("storage"):
+                print("app: the device has no app storage (needs the ext4 USERDATA)")
+            for a in answer["apps"]:
+                print(f"{a['id']:<32} {a['version']:<10} {a['name']}")
+            if answer.get("storage") and not answer["apps"]:
+                print("(no apps installed)")
+            return True
+        if args.app_command == "remove":
+            status, answer = _app_http(args.host, "DELETE", f"/api/apps/{args.id}")
+            if status == 200:
+                print(f"app: removed {args.id} (with its data)")
+                return True
+            print(f"app: {status}: {answer.get('error') if isinstance(answer, dict) else answer}",
+                  file=sys.stderr)
+            return False
+    except (OSError, http.client.HTTPException) as e:
+        print(f"app: {e}", file=sys.stderr)
+        return False
+    return False
+
+
 def cmd_bootflash(ser: serial.Serial | None, path: str, host: str | None, fs_base: int,
                   wait: float, reset: bool, app: str | None, save: bool, run: bool) -> bool:
     """Saves an FS image as FERRITE/FLASH.BIN through uart_boot, then starts the
@@ -1584,6 +1697,16 @@ def main():
     p_sys.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
                        help="wait this long for the board's HTTP server")
 
+    p_app = sub.add_parser("app",
+                           help="exynos4412 app packages (ferrite_build with application_id): "
+                                "install / list / remove, --host (WiFi HTTP) or -p (writefs)")
+    app_sub = p_app.add_subparsers(dest="app_command", required=True)
+    p_ai = app_sub.add_parser("install", help="install (or update) a package under ferrite/apps/{id}/")
+    p_ai.add_argument("file", help="the package (.bin from ferrite_build)")
+    app_sub.add_parser("list", help="the installed apps (--host)")
+    p_ar = app_sub.add_parser("remove", help="remove an app and its data (--host)")
+    p_ar.add_argument("id", help="its application_id")
+
     p_st = sub.add_parser("storage",
                           help="exynos4412 over WiFi (--host): where the files are (USERDATA ext4 "
                                "or CACHE FAT32); --migrate moves them to USERDATA")
@@ -1603,6 +1726,13 @@ def main():
         if args.host is None:
             parser.error("storage needs --host (WiFi)")
         sys.exit(0 if cmd_storage(args.host, args.migrate, args.stress, args.check, args.cut) else 1)
+
+    if args.command == "app" and args.port is None:
+        if args.host is None:
+            parser.error("app needs --host (WiFi) or, for install, -p PORT")
+        sys.exit(0 if cmd_app(args, None) else 1)
+    if args.command == "app" and args.app_command != "install":
+        parser.error(f"app {args.app_command} needs --host (WiFi HTTP)")
 
     if args.command == "savefw":
         if args.host is None:
@@ -1658,6 +1788,8 @@ def main():
         elif args.command == "monitor":
             listen_serial(ser, hex_dump=args.hex, timestamps=not args.no_time)
             ok = True
+        elif args.command == "app":
+            ok = cmd_app(args, ser)
         else:
             ok = False
 
