@@ -1596,6 +1596,66 @@ def cmd_app(args, ser: serial.Serial | None) -> bool:
     return False
 
 
+def cmd_lib(args, ser: serial.Serial | None) -> bool:
+    """exynos4412 library packages (ferrite-ui-xl docs/apps.md "Step 3"):
+    install / list / remove, over HTTP with --host (install also over -p:
+    writefs with FS_FLAG_APP; the board tells the kinds apart)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ferrite_build
+    try:
+        if args.lib_command == "install":
+            try:
+                info = ferrite_build.read_library(args.file)
+                with open(args.file, "rb") as f:
+                    data = f.read()
+            except (OSError, ValueError) as e:
+                print(f"lib: {e}", file=sys.stderr)
+                return False
+            print(f"lib: {info['id']} {info['version']} \"{info['name']}\", {len(info['exports'])} exports, "
+                  f"{len(data)} bytes")
+            if ser is not None:
+                ok = writefs_data(ser, data, flags=FS_FLAG_APP)
+                if ok:
+                    print(f"lib: installed {info['id']} {info['version']}")
+                return ok
+            status, answer = _app_http(args.host, "POST", "/api/libs", data)
+            if status == 200 and isinstance(answer, dict):
+                print(f"lib: installed {answer['id']} {answer['version']}"
+                      f"{' (replaced the old version)' if answer.get('replaced') else ''}")
+                return True
+            print(f"lib: {status}: {answer.get('error') if isinstance(answer, dict) else answer}",
+                  file=sys.stderr)
+            return False
+        if args.lib_command == "list":
+            status, answer = _app_http(args.host, "GET", "/api/libs")
+            if status != 200 or not isinstance(answer, dict):
+                print(f"lib: {status}: {answer}", file=sys.stderr)
+                return False
+            if not answer.get("storage"):
+                print("lib: the device has no app storage (needs the ext4 USERDATA)")
+            loaded = {(l["id"], l["major"]): l["code"] for l in answer.get("loaded", [])}
+            for l in answer["libs"]:
+                major = int(l["version"].split(".")[0])
+                code = loaded.get((l["id"], major))
+                mark = f"  [loaded, {code} bytes]" if code is not None else ""
+                print(f"{l['id']:<32} {l['version']:<10} {l['name']}{mark}")
+            if answer.get("storage") and not answer["libs"]:
+                print("(no libraries installed)")
+            return True
+        if args.lib_command == "remove":
+            status, answer = _app_http(args.host, "DELETE", f"/api/libs/{args.id}")
+            if status == 200:
+                print(f"lib: removed {args.id}")
+                return True
+            print(f"lib: {status}: {answer.get('error') if isinstance(answer, dict) else answer}",
+                  file=sys.stderr)
+            return False
+    except (OSError, http.client.HTTPException) as e:
+        print(f"lib: {e}", file=sys.stderr)
+        return False
+    return False
+
+
 def cmd_bootflash(ser: serial.Serial | None, path: str, host: str | None, fs_base: int,
                   wait: float, reset: bool, app: str | None, save: bool, run: bool) -> bool:
     """Saves an FS image as FERRITE/FLASH.BIN through uart_boot, then starts the
@@ -1735,6 +1795,16 @@ def main():
     p_ar = app_sub.add_parser("remove", help="remove an app and its data (--host)")
     p_ar.add_argument("id", help="its application_id")
 
+    p_lib = sub.add_parser("lib",
+                           help="exynos4412 library packages (ferrite_build with library_id): "
+                                "install / list / remove, --host (WiFi HTTP) or -p (writefs)")
+    lib_sub = p_lib.add_subparsers(dest="lib_command", required=True)
+    p_li = lib_sub.add_parser("install", help="install (or update) a library under ferrite/libs/{id}/")
+    p_li.add_argument("file", help="the package (.bin from ferrite_build)")
+    lib_sub.add_parser("list", help="the installed libraries, which are loaded (--host)")
+    p_lr = lib_sub.add_parser("remove", help="remove a library (--host)")
+    p_lr.add_argument("id", help="its library_id")
+
     p_st = sub.add_parser("storage",
                           help="exynos4412 over WiFi (--host): where the files are (USERDATA ext4 "
                                "or CACHE FAT32); --migrate moves them to USERDATA")
@@ -1761,6 +1831,12 @@ def main():
         sys.exit(0 if cmd_app(args, None) else 1)
     if args.command == "app" and args.app_command != "install":
         parser.error(f"app {args.app_command} needs --host (WiFi HTTP)")
+    if args.command == "lib" and args.port is None:
+        if args.host is None:
+            parser.error("lib needs --host (WiFi) or, for install, -p PORT")
+        sys.exit(0 if cmd_lib(args, None) else 1)
+    if args.command == "lib" and args.lib_command != "install":
+        parser.error(f"lib {args.lib_command} needs --host (WiFi HTTP)")
 
     if args.command == "savefw":
         if args.host is None:
@@ -1818,6 +1894,8 @@ def main():
             ok = True
         elif args.command == "app":
             ok = cmd_app(args, ser)
+        elif args.command == "lib":
+            ok = cmd_lib(args, ser)
         else:
             ok = False
 
