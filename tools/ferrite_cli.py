@@ -1530,18 +1530,20 @@ def cmd_app(args, ser: serial.Serial | None) -> bool:
         data, info = pkg
         print(f"app: {info['id']} {info['version']} \"{info['name']}\", {len(data)} bytes")
         if ser is not None:
-            ok = writefs_data(ser, data, flags=FS_FLAG_APP)
+            ok = writefs_data(ser, data, flags=FS_FLAG_APP | (FS_FLAG_RUN if args.run else 0))
             if ok:
-                print(f"app: installed {info['id']} {info['version']} (the system image runs again)")
+                print(f"app: installed {info['id']} {info['version']}"
+                      f"{', running it' if args.run else ''}")
             return ok
         try:
-            status, answer = _app_http(args.host, "POST", "/api/apps", data)
+            status, answer = _app_http(args.host, "POST", "/api/apps?run=1" if args.run else "/api/apps", data)
         except (OSError, http.client.HTTPException) as e:
             print(f"app: {e}", file=sys.stderr)
             return False
         if status == 200 and isinstance(answer, dict):
             print(f"app: installed {answer['id']} {answer['version']}"
-                  f"{' (replaced the old version, data kept)' if answer.get('replaced') else ''}")
+                  f"{' (replaced the old version, data kept)' if answer.get('replaced') else ''}"
+                  f"{', running it' if answer.get('run') else ''}")
             return True
         print(f"app: {status}: {answer.get('error') if isinstance(answer, dict) else answer}",
               file=sys.stderr)
@@ -1554,11 +1556,25 @@ def cmd_app(args, ser: serial.Serial | None) -> bool:
                 return False
             if not answer.get("storage"):
                 print("app: the device has no app storage (needs the ext4 USERDATA)")
+            running, boot = answer.get("running", ""), answer.get("boot", "")
             for a in answer["apps"]:
-                print(f"{a['id']:<32} {a['version']:<10} {a['name']}")
+                marks = " ".join(m for m, on in (("[running]", a["id"] == running),
+                                                 ("[boot]", a["id"] == boot)) if on)
+                print(f"{a['id']:<32} {a['version']:<10} {a['name']}  {marks}".rstrip())
             if answer.get("storage") and not answer["apps"]:
                 print("(no apps installed)")
             return True
+        if args.app_command in ("run", "boot"):
+            target = args.id or ""
+            status, answer = _app_http(args.host, "POST", f"/api/apps/{args.app_command}?id={target}")
+            if status == 200:
+                what = target or "the system image"
+                print(f"app: running {what}" if args.app_command == "run"
+                      else f"app: {what} starts at boot")
+                return True
+            print(f"app: {status}: {answer.get('error') if isinstance(answer, dict) else answer}",
+                  file=sys.stderr)
+            return False
         if args.app_command == "remove":
             status, answer = _app_http(args.host, "DELETE", f"/api/apps/{args.id}")
             if status == 200:
@@ -1703,7 +1719,12 @@ def main():
     app_sub = p_app.add_subparsers(dest="app_command", required=True)
     p_ai = app_sub.add_parser("install", help="install (or update) a package under ferrite/apps/{id}/")
     p_ai.add_argument("file", help="the package (.bin from ferrite_build)")
-    app_sub.add_parser("list", help="the installed apps (--host)")
+    p_ai.add_argument("--run", action="store_true", help="run it once installed")
+    app_sub.add_parser("list", help="the installed apps, which one runs and which starts at boot (--host)")
+    p_arun = app_sub.add_parser("run", help="run an installed app now (no ID: the system image) (--host)")
+    p_arun.add_argument("id", nargs="?", help="its application_id")
+    p_aboot = app_sub.add_parser("boot", help="the app to start at boot (no ID: the system image) (--host)")
+    p_aboot.add_argument("id", nargs="?", help="its application_id")
     p_ar = app_sub.add_parser("remove", help="remove an app and its data (--host)")
     p_ar.add_argument("id", help="its application_id")
 

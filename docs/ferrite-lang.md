@@ -1782,6 +1782,24 @@ fn list(dir) {
 
 On the tablet the EEPROM builtins (`eepromRead` / `eepromWrite`…) work too: 4096 bytes kept in `FERRITE/EEPROM.BIN`, saved about 0.5 s after the last write and before a restart.
 
+## Apps (`#include "apps.fl"`)
+
+ferrite-ui-xl runs installed app packages (projects built with
+`application_id`, installed with `ferrite_cli app install`; ferrite-ui-xl
+`docs/apps.md`) in place of the system image. An app has its own programs
+and resources, its own files (`disk*`) and EEPROM. Boards without app
+storage report no apps.
+
+| Function | Returns |
+| --- | --- |
+| `appCount()` | number of installed apps |
+| `appId(i)` | app `i`'s id (sorted by id), `""` past the end |
+| `appName(i)` | app `i`'s display name |
+| `runApp(id)` | ends every program and runs app `id` from the next frame (`""` = the system image), like `runProgram`; returns `0` (and the caller goes on) if `id` is not installed |
+| `currentApp()` | the running app's id, `""` for the system image |
+
+Syscall ids 0x80–0x84 (handled by the VM itself, on every board).
+
 ## Gestures
 
 Devices with `caps.gestures` (the Exynos 4412 tablet and the sim, ferrite-ui-xl) recognize gestures the way Flutter does. `#include "gesture.fl"` for the constants. Building a program that calls these for a device without `caps.gestures` fails.
