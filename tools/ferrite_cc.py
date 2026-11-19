@@ -1350,10 +1350,12 @@ _NO_ARG_OPS = (
     {0x42, 0x43} |                     # W_TARGET_S, W_PARENT_S
     {op for op in range(0x80, 0xA9)    # 0x80-0xA8 except 0x86, 0x88
      if op not in (0x86, 0x88)} |
+    {0xAA, 0xAC} |                     # fileSeek, strCmp
     {0xAD, 0xAE, 0xAF} |               # animate, stopAnim, stopAnimProp
     {0xB0, 0xB1, 0xB2} |               # pinMode, pinWrite, pinRead
     set(range(0xB3, 0xC0)) |           # eepromSize .. strByte, playSound .. soundPlaying, runProgram .. programName
     set(range(0xC0, 0xCD)) |           # 0xC0-0xCC
+    set(range(0xCD, 0xD4)) |           # fsin, fcos, fsqrt, fabs, fatan2, ffloor, fceil
     set(range(0xD4, 0xE8))             # spawnProgram .. foregroundTask, flexLayout, diskOpen .. fileReadArr, onGesture, gestureInfo
 )
 
