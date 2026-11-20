@@ -1857,8 +1857,10 @@ The app is a task of the program that started it, which gets
 | `showApp(task)` | shows the app whose task `task` is (`0` = the launcher); `0` if it is no app's |
 | `appTask(id)` | the started app's task id, `-1` if it does not run |
 | `exitApp()` | ends the calling app (all its programs); one run with `runApp` goes back to the system image; `0` and nothing in the system image |
+| `bootApp()` | the app the board starts at boot (`system/settings.txt` `app=`), `""` = the system image |
+| `setBootApp(id)` | makes installed app `id` (`""` = the system image) the one started from the next boot, saved with the board's settings; `1`, or `0` if `id` is not installed or the board keeps no settings (the sim keeps it for the run) |
 
-Syscall ids 0x80–0x88 (handled by the VM itself, on every board).
+Syscall ids 0x80–0x8A (handled by the VM itself, on every board).
 
 ## Libraries
 

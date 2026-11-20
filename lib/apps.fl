@@ -25,6 +25,8 @@ const SYS_APP_START   = 0x85;  // (id: str_id) -> task id; -1 not installed, -2 
 const SYS_APP_SHOW    = 0x86;  // (task) -> 1, or 0 if task is no app's; 0 = the launcher
 const SYS_APP_TASK    = 0x87;  // (id: str_id) -> the app's task, -1 if it does not run
 const SYS_APP_EXIT    = 0x88;  // () -> ends the calling app; 0 in the system image
+const SYS_APP_BOOT    = 0x89;  // () -> string: the app started at boot, "" = the system image
+const SYS_APP_SET_BOOT = 0x8A; // (id: str_id) -> 1 set; 0 not installed / no settings
 
 fn appCount() { return syscall(SYS_APP_COUNT); }
 fn appId(i) -> string { return syscallStr(SYS_APP_ID, i); }
@@ -52,3 +54,12 @@ fn appTask(id: string) { return syscall(SYS_APP_TASK, id); }
 // Ends the calling app (all its programs); the launcher shows again. An app run
 // with runApp goes back to the system image. In the system image: 0, nothing.
 fn exitApp() { return syscall(SYS_APP_EXIT); }
+
+// The app the board starts at boot (system/settings.txt app=), "" for the
+// system image.
+fn bootApp() -> string { return syscallStr(SYS_APP_BOOT); }
+
+// Makes installed app `id` ("" = the system image) the one started at boot,
+// from the next start (saved with the board's settings). Returns 1, or 0 if
+// `id` is not installed or the board keeps no settings.
+fn setBootApp(id: string) { return syscall(SYS_APP_SET_BOOT, id); }
