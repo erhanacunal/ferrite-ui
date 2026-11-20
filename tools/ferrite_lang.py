@@ -2039,14 +2039,20 @@ class CodeGen:
             if stmt.array_size is not None:
                 self.array_vars.add(stmt.name)
             # Infer global variable type from initializer, validate against declaration
-            declared = getattr(stmt, 'var_type', None) or 'int'
+            declared = getattr(stmt, 'var_type', None)
             if stmt.init is not None:
                 vtype = self._infer_type(stmt.init)
+                declared = declared or 'int'
+                if vtype == self.T_ARRAY and declared == self.T_ANY:
+                    declared = self.T_ARRAY
                 self._check_type_match(declared, vtype,
                     f"'{stmt.name}' declared {declared} but initialized with {vtype}",
                     getattr(stmt, 'line', 0))
             else:
+                declared = declared or 'int'
                 vtype = self.T_INT
+            if declared == self.T_ARRAY:
+                self.array_vars.add(stmt.name)
             # widget is stored as int on the stack; string/array keep their type
             stored_type = self._stored_type(declared, vtype)
             if stmt.array_size is not None:
@@ -2541,6 +2547,8 @@ class CodeGen:
         if isinstance(node, FuncRef):
             return self.T_INT  # func_id
         if isinstance(node, VarRef):
+            if node.name in self.array_vars:
+                return self.T_ARRAY
             return self.var_types.get(node.name, self.T_INT)
         if isinstance(node, IndexExpr):
             return self.T_INT  # array elements are untyped
@@ -2584,6 +2592,8 @@ class CodeGen:
                 return self.functions[self._method_name(node)].get('return_type', self.T_INT)
             if node.name in self._STRING_RETURNING:
                 return self.T_STRING
+            if node.name in _ARRAY_RETURNING_BUILTINS:
+                return self.T_ARRAY
             if node.name in self._FLOAT_RETURNING:
                 return self.T_FLOAT
             if node.name in self._INT_RETURNING:
@@ -3043,7 +3053,7 @@ class CodeGen:
                 f"'{self._lv_name(t)}' is {ft} but assigned {vt} value", t.line)
             base()
             index()
-            self._gen_expr(value)
+            self._gen_value(value, ft)
             if ft == self.T_FLOAT and vt == self.T_INT:
                 self.asm.itof()
             self.asm.arr_store()
@@ -3486,11 +3496,15 @@ class CodeGen:
             if node.init is not None:
                 vtype = self._infer_type(node.init)
                 declared = node.var_type or 'int'
+                if vtype == self.T_ARRAY and declared == self.T_ANY:
+                    declared = self.T_ARRAY  # unannotated: `var a = arr;`, `var a = f();`
                 self._check_type_match(declared, vtype,
                     f"'{node.name}' declared {declared} but initialized with {vtype}",
                     node.line)
                 # widget is stored as int on the stack; string/array keep their type
                 self.var_types[node.name] = self._stored_type(declared, vtype)
+                if declared == self.T_ARRAY:
+                    self.array_vars.add(node.name)  # another name for an array: `a[i]`
                 if declared == 'widget':
                     self.widget_ids.setdefault(node.name, -1)  # e.g. = get(first_child)
                 if isinstance(node.init, CallExpr) and node.init.name == 'alloc':
@@ -3505,7 +3519,7 @@ class CodeGen:
                 if (isinstance(node.init, DotExpr) and vtype == self.T_ARRAY
                         and self._class_of_var(node.init.obj) is not None):
                     self.array_vars.add(node.name)  # an array field: `x[i]`
-                self._gen_expr(node.init)
+                self._gen_value(node.init, declared)
                 # Auto-promote int→float if variable is typed float
                 if declared == self.T_FLOAT and vtype == self.T_INT:
                     self.asm.itof()
@@ -3514,6 +3528,8 @@ class CodeGen:
                 self.var_types[node.name] = declared if declared != 'widget' else self.T_INT
                 if declared == 'widget':
                     self.widget_ids.setdefault(node.name, -1)
+                if declared == self.T_ARRAY:
+                    self.array_vars.add(node.name)  # set later: `a = f();`
                 self.asm.push(0)
         self.asm.store(slot)
 
@@ -3550,7 +3566,7 @@ class CodeGen:
                 if isinstance(node.init, CallExpr) and node.init.name == 'alloc':
                     self.widget_ids[node.name] = self.next_widget_id
                     self.next_widget_id += 1
-                self._gen_expr(node.init)
+                self._gen_value(node.init, self.var_types.get(node.name))
             else:
                 self.asm.push(0)
         self.asm.store(slot)
@@ -3645,8 +3661,8 @@ class CodeGen:
                     self._gen_expr(other)
                     self.asm.store_op(op, self._var_slot(node.name, node.line))
                     return
-            self._gen_expr(node.value)
-            var_type = self.var_types.get(node.name, self.T_INT)
+            var_type = self._infer_type(VarRef(node.name, node.line))
+            self._gen_value(node.value, var_type)
             val_type = self._infer_type(node.value)
             self._check_type_match(var_type, val_type,
                 f"'{node.name}' is {var_type} but assigned {val_type} value",
@@ -3930,9 +3946,9 @@ class CodeGen:
 
     def _gen_return(self, node):
         if node.value:
-            self._gen_expr(node.value)
-            # Validate return type against declared return type
             rt = self._current_fn_return_type
+            self._gen_value(node.value, rt)
+            # Validate return type against declared return type
             val_type = self._infer_type(node.value)
             self._check_type_match(rt, val_type,
                 f"function returns {rt} but return expression is {val_type}",
@@ -4005,7 +4021,10 @@ class CodeGen:
             self._push_fn_id(self._resolve_func_id(node.name, node.line))
         elif isinstance(node, VarRef):
             if node.name in self.array_vars:
-                raise CompileError(f"'{node.name}' is an array, use {node.name}[index]", node.line)
+                raise CompileError(
+                    f"'{node.name}' is an array, use {node.name}[index] (an array goes as a "
+                    f"whole only where one is expected: a `: array` parameter, a `-> array` "
+                    f"return, an array variable or field)", node.line)
             # Inline const: emit PUSH instead of LOAD
             if node.name in self.const_values:
                 val, vtype = self.const_values[node.name]
@@ -5215,6 +5234,17 @@ class CodeGen:
             else:
                 self.asm.push(0)              # its value is 0, as before
 
+    def _gen_value(self, expr, expected):
+        """Push `expr` for a slot of type `expected`. An array variable's
+        bare name is its id, accepted only where an array is expected (a
+        parameter, return, variable or field typed array); elsewhere it is
+        the error that catches a missing `[index]`."""
+        if (expected == self.T_ARRAY and isinstance(expr, VarRef)
+                and expr.name in self.array_vars):
+            self.asm.load(self._var_slot(expr.name, expr.line))
+        else:
+            self._gen_expr(expr)
+
     def _gen_args(self, name, args, line, first=0):
         """Push `args[first:]` for user function `name`, left to right,
         checking them against its parameter types."""
@@ -5226,7 +5256,7 @@ class CodeGen:
                 continue
             arg_type = self._infer_type(arg)
             pt = param_types[i] if i < len(param_types) else 'int'
-            self._gen_expr(arg)
+            self._gen_value(arg, pt)
             # Auto-promote int→float where param expects float
             if pt == self.T_FLOAT and arg_type == self.T_INT:
                 self.asm.itof()
@@ -5251,7 +5281,7 @@ class CodeGen:
         for i, arg in enumerate(node.args):
             arg_type = self._infer_type(arg)
             pt = params[i]
-            self._gen_expr(arg)
+            self._gen_value(arg, pt)
             if pt == self.T_FLOAT and arg_type == self.T_INT:
                 self.asm.itof()
             elif not self._types_compatible(pt, arg_type):

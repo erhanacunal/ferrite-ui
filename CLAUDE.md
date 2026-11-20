@@ -37,5 +37,5 @@ Cargo virtual workspace. `ferrite-core` = HAL backend traits + generic `*Impl<B>
 
 ## `.fl` pitfalls
 
-- A generated `on_click` dispatcher calls every handler registered for a widget; arrays can't be passed to functions; a global may not share a name with any function's param/local.
+- A generated `on_click` dispatcher calls every handler registered for a widget; arrays go to functions only as `: array` parameters (an array's bare name is accepted only where an array is expected; since 2026-11-20); a global may not share a name with any function's param/local.
 - `fileOpen` returns `0xFF` on error and every later file call on that handle faults: always check.

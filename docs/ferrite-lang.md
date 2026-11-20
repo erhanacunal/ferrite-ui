@@ -111,6 +111,30 @@ var first = colors[0];
 colors[2] = 0xFFFF;
 ```
 
+An array lives in the object pool; its variable holds its id. The bare name (no `[index]`) passes that id on, but only where an array is expected, so a forgotten `[index]` stays a compile error (`'colors' is an array, use colors[index]`):
+
+```c
+fn sum(a: array) {                 // a `: array` parameter can be indexed
+    var s = 0;
+    for (var i = 0; i < arrLen(a); i++) { s += a[i]; }
+    return s;
+}
+
+fn make(n) -> array {              // a function returning an array
+    var l[3];
+    l[0] = n;
+    return l;
+}
+
+var total = sum(colors);           // the array itself, not a copy
+var m = make(5);                   // m is an array: m[0]
+var same = colors;                 // another name for colors
+var later: array;                  // an array variable set later
+later = make(1);
+```
+
+Arrays are shared, not copied: writes through a parameter or another name change the one array. Freeing is manual (`arrFree`): a local `var l[N]` is not freed when its function returns, so `make` above hands its array to the caller, who frees it. A class field typed `array` (`var items: array;`) holds one the same way.
+
 ## Data Types
 
 Two value types: **int** (signed 32-bit integer) and **float** (IEEE 754 f32, stored as bit pattern in i32). The compiler infers types at compile time — no runtime overhead.
