@@ -3853,6 +3853,10 @@ class CodeGen:
         if node.else_body:
             else_patch = self.asm.jmp_fwd()
             self.asm.patch(exit_patch)
+            # The else body is reached from the condition's jump, not from the
+            # then body: the target the then body left is not current there.
+            self._current_target = None
+            self._last_alltar_var = None
             for stmt in node.else_body:
                 self._gen_stmt(stmt)
             self.asm.patch(else_patch)
@@ -4124,6 +4128,7 @@ class CodeGen:
 
     def _gen_binop(self, node):
         # Short-circuit logical operators — always int
+        # The right side may not run: the target it leaves is unknown after.
         if node.op == '&&':
             self._gen_expr(node.left)
             self.asm.dup()
@@ -4131,6 +4136,7 @@ class CodeGen:
             self.asm.pop()
             self._gen_expr(node.right)
             self.asm.patch(patch)
+            self._current_target = None
             return
         if node.op == '||':
             self._gen_expr(node.left)
@@ -4139,6 +4145,7 @@ class CodeGen:
             self.asm.pop()
             self._gen_expr(node.right)
             self.asm.patch(patch)
+            self._current_target = None
             return
 
         # Bitwise/shift — always int, no float promotion
@@ -4308,8 +4315,12 @@ class CodeGen:
         self._gen_expr(node.then_expr)
         end_patch = self.asm.jmp_fwd()
         self.asm.patch(else_patch)
+        # Reached from the condition, not from then_expr (see _gen_if); after
+        # the join either branch may have run.
+        self._current_target = None
         self._gen_expr(node.else_expr)
         self.asm.patch(end_patch)
+        self._current_target = None
 
     def _gen_call(self, node):
         name = node.name
