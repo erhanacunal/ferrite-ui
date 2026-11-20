@@ -118,6 +118,9 @@ class Op:
     # Libraries (image v6, devices with caps.libraries; ferrite-ui-xl docs/apps.md)
     CALL_IMP   = 0x4F  # + u16 import index: call an imported library function
     FN_REF     = 0x50  # + u16 func_id: push the id tagged with the running unit (libraries' @fn)
+    # Widget build (caps.superops): varint length + fields, each a varint key
+    # (prop << 3 | wire type, WT_*) and its value; see setall_fields()
+    W_SETALL   = 0x51
 
     # Builtins as first-class opcodes (all no-arg, operands on stack)
     FILL_RECT       = 0x80
@@ -385,6 +388,8 @@ class Prop:
     LAYER_ALPHA = 0x37     # layer root: plane alpha 0-255 (fades without redrawing)
     # Rich text (caps.rich_text; ferrite-ui-xl rich.rs): text read as an HTML subset
     RICH_TEXT = 0x38       # label/button: 0=plain 1=<b> <i> <u> <font color> <br> &...;
+    # Grid layout (lib/flex.fl FLEX_GRID; ferrite-core vm_flex.rs): columns, 0 reads as 1
+    GRID_COLS = 0x39
     # Compound (LEN wire type)
     LOCATION = 0x40
     SIZE = 0x41
@@ -453,6 +458,47 @@ def decode_svarint(data, pos=0):
     """Signed varint decode. Returns (value, bytes_consumed)."""
     raw, consumed = decode_varint(data, pos)
     return zigzag_decode(raw), consumed
+
+
+# W_SETALL wire types (ferrite-core proto.rs WT_*): a zigzag varint, a varint
+# length + payload (as W_SET_LEN's), or a value popped from the stack (pushed
+# in reverse field order).
+WT_VARINT = 0
+WT_LEN = 2
+WT_STACK = 3
+
+
+def setall_field(prop, wire, value=b''):
+    """One W_SETALL field: varint key + value bytes."""
+    return encode_varint(prop << 3 | wire) + bytes(value)
+
+
+def setall_fields(data, pos):
+    """W_SETALL operands at `pos` (after the opcode) → ([(prop, wire,
+    value)], end): value is the int (WT_VARINT), the payload (WT_LEN) or
+    None (WT_STACK)."""
+    length, n = decode_varint(data, pos)
+    pos += n
+    end = pos + length
+    fields = []
+    while pos < end:
+        key, n = decode_varint(data, pos)
+        pos += n
+        prop, wire = key >> 3, key & 7
+        if wire == WT_VARINT:
+            val, n = decode_svarint(data, pos)
+            pos += n
+        elif wire == WT_LEN:
+            size, n = decode_varint(data, pos)
+            pos += n
+            val = bytes(data[pos:pos + size])
+            pos += size
+        elif wire == WT_STACK:
+            val = None
+        else:
+            raise ValueError(f"W_SETALL: wire type {wire}")
+        fields.append((prop, wire, val))
+    return fields, end
 
 
 # Alias for disassembler internal use
@@ -812,6 +858,12 @@ class Asm:
     def call(self, target):
         self._emit(Op.CALL)
         self._emit_addr(target)
+
+    def w_setall(self, fields):
+        """W_SETALL with `fields` (setall_field() bytes, in order)."""
+        self._emit(Op.W_SETALL)
+        self._emit(encode_varint(len(fields)))
+        self._emit(bytes(fields))
 
     def call_imp(self, index):
         """CALL_IMP: imported library function `index` (image v6 import table)."""
@@ -1260,7 +1312,7 @@ OP_NAMES = {
     0x45: 'JCMP', 0x46: 'JCMP_VI', 0x47: 'JCMP_VV',
     0x48: 'BIN_I', 0x49: 'BIN_I32', 0x4A: 'BIN_V', 0x4B: 'ADD_VI', 0x4C: 'ARR_LOAD_V', 0x4D: 'STORE_OP',
     0x4E: 'FRAME_A',
-    0x4F: 'CALL_IMP', 0x50: 'FN_REF',
+    0x4F: 'CALL_IMP', 0x50: 'FN_REF', 0x51: 'W_SETALL',
 
     0x80: 'fillRect', 0x81: 'rect', 0x82: 'line', 0x83: 'circle',
     0x84: 'fillCircle', 0x85: 'drawImage', 0x86: 'drawTextLit',
@@ -1319,7 +1371,7 @@ PROP_NAMES = {
     0x2D: 'GRAPH_ARR', 0x2E: 'GRAPH_COUNT', 0x2F: 'GRAPH_FLAGS',
     0x30: 'MULTI_LINE', 0x31: 'ALPHA', 0x32: 'GROUP_ID',
     0x33: 'FLEX', 0x34: 'FLEX_GAP', 0x35: 'FLEX_GROW',
-    0x36: 'LAYER', 0x37: 'LAYER_ALPHA', 0x38: 'RICH_TEXT',
+    0x36: 'LAYER', 0x37: 'LAYER_ALPHA', 0x38: 'RICH_TEXT', 0x39: 'GRID_COLS',
     0x40: 'LOCATION', 0x41: 'SIZE',
     0x43: 'BORDER_EDGES', 0x44: 'PADDING', 0x45: 'TEXT',
 }
@@ -1448,6 +1500,26 @@ def disassemble(data, labels=None, symbols=None, wide=False):
         elif op == Op.FRAME_A:
             count, nargs = data[pos], data[pos + 1]; pos += 2
             lines.append(f'{addr:04X}: FRAME_A {count} {nargs}')
+
+        elif op == Op.W_SETALL:
+            fields, pos = setall_fields(data, pos)
+            parts = []
+            for prop, wire, val in fields:
+                pname = PROP_NAMES.get(prop, f'0x{prop:02X}')
+                if wire == WT_STACK:
+                    parts.append(f'{pname}=pop')
+                elif wire == WT_VARINT:
+                    parts.append(f'{pname}={val}')
+                elif prop == Prop.TEXT:
+                    parts.append(f'{pname}="{val.decode("utf-8", "replace")}"')
+                else:
+                    vals, p = [], 0
+                    while p < len(val):
+                        v, c = _decode_svarint(val, p)
+                        vals.append(str(v))
+                        p += c
+                    parts.append(f'{pname}=({", ".join(vals)})')
+            lines.append(f'{addr:04X}: W_SETALL {" ".join(parts)}')
 
         elif op in (Op.CALL_IMP, Op.FN_REF):
             val = struct.unpack_from('<H', data, pos)[0]
@@ -1678,6 +1750,7 @@ PROP_MAP = {
     'layer': (Prop.LAYER, False),
     'layer_alpha': (Prop.LAYER_ALPHA, False),
     'rich_text': (Prop.RICH_TEXT, False),
+    'grid_cols': (Prop.GRID_COLS, False),
     # Tree links, read-only (get() only): widget id, or -1 = none
     'parent': (Prop.PARENT, False),
     'first_child': (Prop.FIRST_CHILD, False),

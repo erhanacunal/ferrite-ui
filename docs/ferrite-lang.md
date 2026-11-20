@@ -859,9 +859,10 @@ flexLayout(row);
 
 | Property | On | Value |
 | --- | --- | --- |
-| `flex` | container | `FLEX_ROW` or `FLEX_COLUMN`, OR'd with one `JUSTIFY_*` and one `ITEMS_*`. `0` = not a flex container |
-| `flex_gap` | container | gap between children, px (0–255) |
-| `flex_grow` | child | share of the leftover main-axis space (0 = keep own size) |
+| `flex` | container | `FLEX_ROW`, `FLEX_COLUMN` or `FLEX_GRID`, OR'd with one `JUSTIFY_*` and one `ITEMS_*`. `0` = not a flex container |
+| `flex_gap` | container | gap between children, px (0–255); in a grid between columns and between rows |
+| `flex_grow` | child | share of the leftover main-axis space (0 = keep own size; ignored in a grid) |
+| `grid_cols` | container | `FLEX_GRID`: columns (0 reads as 1) |
 
 - **Main axis** (x for a row, y for a column): `JUSTIFY_START`, `JUSTIFY_CENTER`, `JUSTIFY_END`, `JUSTIFY_SPACE_BETWEEN`, `JUSTIFY_STRETCH`. Children with `flex_grow` share the leftover space in proportion to it, and their own main size is ignored (like CSS `flex: 1`). When any child grows there is no leftover space, so `JUSTIFY_*` has no effect. `JUSTIFY_STRETCH` gives every child without its own `flex_grow` a grow of 1, so all children end up the same size.
 - **Cross axis**: `ITEMS_START`, `ITEMS_CENTER`, `ITEMS_END`, `ITEMS_STRETCH` (child fills the container's cross size). These are named `ITEMS_*` because `ALIGN_*` is text alignment.
@@ -869,6 +870,29 @@ flexLayout(row);
 - Layout is not automatic. Call `flexLayout` again after changing sizes, visibility or children. Growing and stretched sizes overwrite the child's size, so set it again before switching away from `JUSTIFY_STRETCH` / `ITEMS_STRETCH`.
 
 See `examples/nextion/flex_demo`.
+
+#### Grid (`FLEX_GRID`, `GridView`)
+
+`FLEX_GRID` places the visible children in rows of `grid_cols` cells, in tree order, left to right. The content width minus the gaps is split into equal columns (the first columns get the rounding rest). A row is as tall as its tallest child; rows are `flex_gap` apart, as are columns. `JUSTIFY_*` places a child in its cell's width (`JUSTIFY_STRETCH`: the cell's width; `SPACE_BETWEEN` acts as `START`) and `ITEMS_*` in its row's height (`ITEMS_STRETCH`: the row's height). A grid with `clip_children` keeps 10 px on the right for the scrollbar. Rows may go past the box: in a scroll container they scroll.
+
+`GridView` (lib/flex.fl) is such a scroll container: `flex: FLEX_GRID | JUSTIFY_STRETCH | FLEX_AUTO`, `grid_cols: 3`, `clip_children: 1`. Drag, fling and the scrollbar work as in any scroll container, and with `FLEX_AUTO` (ferrite-ui-xl) the grid lays itself out again when cells are added, removed, resized or hidden, or when `grid_cols`, `flex_gap`, its size or padding change. Elsewhere call `flexLayout(grid)` after such changes.
+
+```c
+#include "core.fl"
+#include "flex.fl"
+
+var grid;
+
+fn setup() {
+    grid = GridView(parent: 0, location: [40, 80], size: [900, 690], grid_cols: 4,
+                    flex_gap: 12, padding: [12, 12, 12, 12]);
+    for (var i = 0; i < 60; i++) {
+        Button(parent: grid, size: [0, 100], clickable: 1);   // width: the grid's column
+    }
+}
+```
+
+Children are real widgets, so a grid holds what the object pool and the 16-bit positions allow (up to ~32 767 px of rows). See `examples/exynos4412/grid` (ferrite-ui-xl): 60 tiles, `grid_cols` and the alignment switched at run time, `onGesture` taps on the tiles.
 
 ### Widget constructors
 
@@ -900,9 +924,9 @@ fn setup() {
 - **`parent: w`** attaches the widget to `w` (`parent: 0` = the root).
 - **Where:** inside a function, as a statement, in `var x = ...`, `x = ...`, `return ...` or in `children`. Not in other expressions or global initializers.
 - **`on_click`/`on_tap`/`on_paint`/`on_change`** need a named widget held in a global (`ok = Button(on_click: @h)` with `var ok;` at the top level), like `ok.on_click = @h`.
-- **Cost:** none. The compiler expands the expression into the `alloc()`, `parent()` and `w.prop = ...` statements you would write by hand, so the widget page and target tracking apply as usual. Unnamed widgets use hidden locals, one per nesting depth.
+- **Cost:** none. The compiler expands the expression into the `alloc()`, `parent()` and `w.prop = ...` statements you would write by hand, so the widget page and target tracking apply as usual. Unnamed widgets use hidden locals, one per nesting depth. On devices with `caps.superops` the property writes become one `W_SETALL` instruction per run (constant values inline, variables and arithmetic on them from the stack; a call in between stays a plain write), as do runs of `set(...)` statements and of `w.prop = ...` on one widget written by hand, see `docs/bytecode.md`.
 
-Constructors are declared with `widget`. `lib/core.fl` declares `Box`, `Label`, `Button`, `Progress`, `Slider`, `Checkbox`, `Radio`, `Input`, `Gauge`, `Dropdown`, `Graph`, `Image` and `ButtonGroup` (each sets `kind`); `lib/flex.fl` declares `Row` and `Column` (each sets `flex`). A declaration lists default properties; the call's own arguments override them, so a `flex:` argument on `Column` names the direction too. A declaration may build on another one:
+Constructors are declared with `widget`. `lib/core.fl` declares `Box`, `Label`, `Button`, `Progress`, `Slider`, `Checkbox`, `Radio`, `Input`, `Gauge`, `Dropdown`, `Graph`, `Image` and `ButtonGroup` (each sets `kind`); `lib/flex.fl` declares `Row`, `Column` and `GridView` (each sets `flex`). A declaration lists default properties; the call's own arguments override them, so a `flex:` argument on `Column` names the direction too. A declaration may build on another one:
 
 ```c
 widget Primary : Button(bg_color: 0x001F, text_color: 0xFFFF);

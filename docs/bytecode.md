@@ -257,6 +257,37 @@ Only in firmware built with the ferrite-core `superops` feature (`caps.superops`
 | `0x4C` | `ARR_LOAD_V` | `u8 slot` | `LOAD slot; <index>; ARR_LOAD` with a side-effect-free index: pop index, push element of the array in var |
 | `0x4D` | `STORE_OP` | `u8 op, u8 slot` | `LOAD x; <e>; <op>; STORE x` with a side-effect-free `e`: pop b; var = var op b |
 | `0x4E` | `FRAME_A` | `u8 local_count, u8 nargs` | the prologue `FRAME n; STORE nargs-1; …; STORE 0`: reserves the locals, then pops the arguments (last on top) into locals `nargs-1`…`0` (fault 18 past `var_slots`, 13 if `nargs > local_count`) |
+| `0x51` | `W_SETALL` | `varint len, fields` | a run of `W_SET` / `W_SET_LEN` on the target, see below |
+
+`W_SETALL` is encoded like a protobuf message: an unsigned varint length,
+then that many bytes of fields, each a varint key `prop_id << 3 | wire_type`
+and its value:
+
+```text
+wire  value                                   bytecode equivalent
+0     ZigZag varint                           PUSH value; W_SET prop
+2     varint len, payload (as W_SET_LEN's)    W_SET_LEN prop len payload
+3     none: popped from the stack             W_SET prop (value pushed earlier)
+```
+
+The fields run in order, each exactly as its equivalent (dirty marking, font /
+image id mapping, flex re-layout). Wire-3 values are pushed before the
+`W_SETALL` in reverse field order (the first field's value on top). The
+compiler looks at runs of consecutive property-write statements: `set(prop,
+...)` statements (the current target), or `w.prop = ...` on the same `w`
+(widget constructors lower to these). Each stretch of at least two fields
+becomes one `W_SETALL`: constant values (literals, int `const`s and constant expressions;
+a compound with constant parts as one wire-2 field) inline, variables and
+arithmetic on them (no calls, no property reads, so when they are evaluated
+doesn't matter) on the stack, split per scalar for compounds (`set(location,
+x, 10)` = `LOC_X` wire 3, `LOC_Y` wire 0). Any other value (a call, a
+non-literal `text`, `@fn`, `graph_arr`) is a plain write between two stretches,
+so the order of the writes is kept. For example
+`set(kind, KIND_LABEL); set(location, x, y); set(size, CARD_W, CARD_H); set(text, mark);`
+is `LOAD y; LOAD x; W_SETALL KIND=1 LOC_X=pop LOC_Y=pop SIZE=(128, 176)` and
+then the text's own `setText`. Not in functions whose setup goes to the widget page (that takes the
+plain forms). A truncated field is fault 1, an unknown wire type or a key past
+`0xFF << 3` fault 13, a wire-3 field on an empty stack fault 4.
 
 Library opcodes (v6 images, `caps.libraries`):
 
@@ -453,11 +484,13 @@ Scalar properties are used by `W_SET` and `W_GET`.
 | `0x2B` | `GRADIENT_COLOR` | RGB565 gradient end color |
 | `0x2C` | `GRADIENT_DIR` | `0=none`, `1=horizontal`, `2=vertical` |
 | `0x32` | `GROUP_ID` | Button Group selection group (u8) |
-| `0x33` | `FLEX` | `lib/flex.fl` container mode (u8): bits 0-1 direction, 2-4 justify, 5-6 align |
+| `0x33` | `FLEX` | `lib/flex.fl` container mode (u8): bits 0-1 direction (1 row, 2 column, 3 grid), 2-4 justify, 5-6 align, 7 `FLEX_AUTO` |
 | `0x34` | `FLEX_GAP` | `lib/flex.fl` gap between children, px (u8) |
 | `0x35` | `FLEX_GROW` | `lib/flex.fl` grow factor of a child (u8) |
 | `0x36` | `LAYER` | retained layer (1-4) a subtree root is drawn into, 0 = none (firmware `layers` feature; elsewhere ignored, reads 0) |
 | `0x37` | `LAYER_ALPHA` | a layer root's plane alpha, 0-255 (elsewhere ignored, reads 255) |
+| `0x38` | `RICH_TEXT` | label/button text read as an HTML subset (ferrite-ui-xl `caps.rich_text`) |
+| `0x39` | `GRID_COLS` | `lib/flex.fl` `FLEX_GRID` columns (u8, 0 reads as 1) |
 
 Compound properties are used by `W_SET_LEN`:
 

@@ -25,7 +25,7 @@ import os
 # Add tools directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ferrite_cc import Op, OP_NAMES, PROP_NAMES, _NO_ARG_OPS, IMAGE_FLAG_WIDE_ADDR, superop_size
+from ferrite_cc import Op, OP_NAMES, PROP_NAMES, _NO_ARG_OPS, IMAGE_FLAG_WIDE_ADDR, superop_size, setall_fields
 
 
 # ============================================================
@@ -113,7 +113,7 @@ OPCODE_CATEGORIES = {
     Op.W_ALLOC: CATEGORY_WIDGET, Op.W_ALLTAR: CATEGORY_WIDGET,
     Op.W_TARGET: CATEGORY_WIDGET, Op.W_SET: CATEGORY_WIDGET,
     Op.W_GET: CATEGORY_WIDGET, Op.W_PARENT: CATEGORY_WIDGET,
-    Op.W_SET_LEN: CATEGORY_WIDGET, Op.W_LOAD: CATEGORY_WIDGET,
+    Op.W_SET_LEN: CATEGORY_WIDGET, Op.W_LOAD: CATEGORY_WIDGET, Op.W_SETALL: CATEGORY_WIDGET,
     Op.W_DIRTY: CATEGORY_WIDGET, Op.W_RENDER: CATEGORY_WIDGET,
     # Array
     Op.ARR_ALLOC: CATEGORY_ARRAY, Op.ARR_ALLOC_S: CATEGORY_ARRAY, Op.ARR_INIT: CATEGORY_ARRAY,
@@ -598,6 +598,11 @@ def walk_bytecode(data, start=0, end=None, wide=False):
             pos += length
             yield addr, op, 3 + length
 
+        elif op == Op.W_SETALL:
+            _, nxt = setall_fields(data, pos)
+            pos = nxt
+            yield addr, op, nxt - addr
+
         elif op == Op.ARR_ALLOC:
             pos += 1  # u8 size
             yield addr, op, 2
@@ -783,6 +788,10 @@ def analyze_bytecode(data, opcode_start=0, opcode_end=None, wide=False):
             prop = data[addr + 1]
             if prop in _EXT_COMPOUND_PROPS and current_target >= 0:
                 result._ext_widget_targets.add(current_target)
+        if op == Op.W_SETALL and current_target >= 0:
+            for prop, _, _ in setall_fields(data, addr + 1)[0]:
+                if prop in _EXT_SCALAR_PROPS or prop in _EXT_COMPOUND_PROPS:
+                    result._ext_widget_targets.add(current_target)
 
         # Variable slots: globals (no high bit) vs locals (0x80+)
         if op == Op.STORE or op == Op.LOAD:

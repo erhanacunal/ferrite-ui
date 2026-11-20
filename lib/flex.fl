@@ -28,6 +28,19 @@
 //
 // The ITEMS_* names avoid core.fl's ALIGN_* (text alignment).
 //
+// FLEX_GRID: the visible children in rows of `grid_cols` cells (0 reads as 1),
+// in tree order, left to right. The content width minus the gaps is split
+// into equal columns (the first columns get the rounding rest); a row is as
+// tall as its tallest child, and rows are flex_gap apart, as are columns.
+// JUSTIFY_* places a child in its cell's width (JUSTIFY_STRETCH: the cell's
+// width), ITEMS_* in its row's height (ITEMS_STRETCH: the row's height);
+// flex_grow is ignored. A grid that clips its children (a scroll container)
+// keeps GRID_SCROLLBAR_W px on the right for the scrollbar. Rows can go past
+// the box: in a scroll container they scroll (GridView below).
+//
+//   var g = GridView(size: [600, 400], grid_cols: 4, flex_gap: 8);
+//   Button(text: "A", size: [0, 80], parent: g);   // width set by the grid
+//
 // FLEX_AUTO (ferrite-ui-xl, boards with caps.native_flex): the firmware lays
 // the container out by itself whenever its box, a child's size / visibility /
 // flex_grow or its children change, before the next render and before a
@@ -38,6 +51,7 @@
 // Direction (bits 0-1). 0 = not a flex container.
 const FLEX_ROW    = 1;
 const FLEX_COLUMN = 2;
+const FLEX_GRID   = 3;
 
 // Main-axis justify (bits 2-4)
 const JUSTIFY_START         = 0;
@@ -55,11 +69,19 @@ const ITEMS_STRETCH = 96;
 // Automatic layout (bit 7; see above)
 const FLEX_AUTO = 128;
 
+// Room a scrolling FLEX_GRID keeps for the scrollbar (render.rs SCROLLBAR_W).
+const GRID_SCROLLBAR_W = 10;
+
 // Flex containers as widget constructors (lib/core.fl). A `flex:` argument
 // replaces the default, so it names the direction too:
 //   Column(flex: FLEX_COLUMN | ITEMS_STRETCH, children: [...])
 widget Row(flex: FLEX_ROW);
 widget Column(flex: FLEX_COLUMN);
+// A scrolling grid: drag / fling and the scrollbar come with clip_children.
+// Without caps.native_flex (no FLEX_AUTO) call flexLayout(g) after adding
+// the cells.
+widget GridView(flex: FLEX_GRID | JUSTIFY_STRETCH | FLEX_AUTO, grid_cols: 3,
+                clip_children: 1);
 
 fn flexLayout(box: widget) {
     // Lays out `box`, then the flex containers below it in tree order: a
@@ -126,6 +148,9 @@ fn flexPlace(box: widget) -> int {
              - get(padding_left) - get(padding_right);
     var ch = get(size_h) - get(border_top) - get(border_bottom)
              - get(padding_top) - get(padding_bottom);
+    if (dir == FLEX_GRID) {
+        return gridPlace(box, cw, gap, justify, items);
+    }
     var main_len = cw;
     var cross_len = ch;
     if (dir == FLEX_COLUMN) {
@@ -228,4 +253,82 @@ fn flexPlace(box: widget) -> int {
     target(box);
     dirty();
     return 1;
+}
+
+// flexPlace for FLEX_GRID: `cw` = the content width; the target is `box`.
+fn gridPlace(box: widget, cw, gap, justify, items) -> int {
+    if (get(clip_children)) {
+        cw -= GRID_SCROLLBAR_W;
+    }
+    var grid_n = get(grid_cols);
+    if (grid_n < 1) {
+        grid_n = 1;
+    }
+    var grid_avail = cw - gap * (grid_n - 1);   // the columns' widths together
+    if (grid_avail < 0) {
+        grid_avail = 0;
+    }
+    var grid_placed = 0;
+    var grid_col = 0;
+    var grid_y = 0;
+    var grid_row_h = 0;
+    var c: widget = get(first_child);
+    while (c >= 0) {
+        target(c);
+        if (get(visible)) {
+            if (grid_col == 0) {
+                // Row height: the tallest of the row's children.
+                grid_row_h = 0;
+                var grid_scan: widget = c;
+                var grid_seen = 0;
+                while (grid_scan >= 0 && grid_seen < grid_n) {
+                    target(grid_scan);
+                    if (get(visible)) {
+                        if (get(size_h) > grid_row_h) {
+                            grid_row_h = get(size_h);
+                        }
+                        grid_seen++;
+                    }
+                    grid_scan = get(next_sibling);
+                }
+                target(c);
+            }
+            var grid_cell_x = grid_avail * grid_col / grid_n;
+            var grid_cell_w = grid_avail * (grid_col + 1) / grid_n - grid_cell_x;
+            grid_cell_x += gap * grid_col;
+            var grid_item_w = get(size_w);
+            var grid_item_h = get(size_h);
+            var grid_item_x = grid_cell_x;
+            var grid_item_y = grid_y;
+            if (justify == JUSTIFY_STRETCH) {
+                grid_item_w = grid_cell_w;
+            } else if (justify == JUSTIFY_CENTER) {
+                grid_item_x = grid_cell_x + (grid_cell_w - grid_item_w) / 2;
+            } else if (justify == JUSTIFY_END) {
+                grid_item_x = grid_cell_x + grid_cell_w - grid_item_w;
+            }
+            if (items == ITEMS_STRETCH) {
+                grid_item_h = grid_row_h;
+            } else if (items == ITEMS_CENTER) {
+                grid_item_y = grid_y + (grid_row_h - grid_item_h) / 2;
+            } else if (items == ITEMS_END) {
+                grid_item_y = grid_y + grid_row_h - grid_item_h;
+            }
+            set(loc_x, grid_item_x);
+            set(loc_y, grid_item_y);
+            set(size_w, grid_item_w);
+            set(size_h, grid_item_h);
+            grid_placed = 1;
+            grid_col++;
+            if (grid_col == grid_n) {
+                grid_col = 0;
+                grid_y += grid_row_h + gap;
+            }
+        }
+        c = get(next_sibling);
+    }
+    // Children moved: repaint the container so their old spots are cleared.
+    target(box);
+    dirty();
+    return grid_placed;
 }

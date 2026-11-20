@@ -23,7 +23,8 @@ from ferrite_cc import (Asm, Op, Prop, Builtin, Compiler as CcCompiler,
                         IMAGE_FLAG_LIBRARY, TYPE_NAMES, type_code,
                         FunctionKind as CcFunctionKind,
                         SYSTEM_CALLBACK_KINDS,
-                        disassemble, encode_svarint, decode_svarint,
+                        disassemble, encode_svarint, decode_svarint, encode_varint,
+                        setall_field, WT_VARINT, WT_LEN, WT_STACK,
                         PROP_NAMES, _slot_name,
                         _resolve_prop, PROP_MAP, pack_pair, float_bits)
 
@@ -1624,6 +1625,48 @@ def _page_candidate(stmt):
     return False
 
 
+def _setall_kind(stmt):
+    """What a statement may join in a W_SETALL run: ('set',) for a
+    `set(prop, ...)` statement (the VM's current target), ('dot', w) for
+    `w.prop = ...`, else None."""
+    if isinstance(stmt, DotAssign):
+        return ('dot', stmt.obj)
+    if (isinstance(stmt, ExprStmt) and isinstance(stmt.expr, CallExpr)
+            and stmt.expr.name == 'set'):
+        return ('set',)
+    return None
+
+
+def _mark_setall_runs(root):
+    """Mark runs of property writes in every statement list under `root`:
+    consecutive `set(...)` statements, or consecutive `w.prop = ...` on the
+    same `w` (widget constructors lower to these). The first statement of a
+    run of two or more gets `setall`, the run as a tuple (AST walkers don't
+    descend into tuples; the nodes are statements of the list too).
+    CodeGen decides which of them become a W_SETALL."""
+    seen = set()
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, list):
+            i = 0
+            while i < len(n):
+                kind = _setall_kind(n[i])
+                j = i + 1
+                if kind is not None:
+                    while j < len(n) and _setall_kind(n[j]) == kind:
+                        j += 1
+                    if j - i >= 2:
+                        n[i].setall = tuple(n[i:j])
+                i = j
+            stack.extend(n)
+        elif hasattr(n, '__dict__') and id(n) not in seen:
+            seen.add(id(n))
+            for v in vars(n).values():
+                if isinstance(v, list) or hasattr(v, '__dict__'):
+                    stack.append(v)
+
+
 def _walk_ast(node):
     """Yield every AST node under `node`, not descending into lambdas (their
     bodies are compiled as functions of their own)."""
@@ -1753,6 +1796,12 @@ class CodeGen:
         self._loop_stack = []   # {continue_target, continue_patches, break_patches}
         self._fn_base = 0       # function vars start here
         self._last_alltar_var = None  # peephole: skip target() after alloc+target+store
+        # W_SETALL (superops): property writes already emitted with the first
+        # of their run (ids, see _mark_setall_runs), and whether the function being emitted
+        # goes to the widget page (which takes plain W_SETs only).
+        self._setall_done = set()
+        self._no_setall = False
+        self._in_setall = False
         self._current_target = None  # track targeted widget for dot-access optimization
         self.array_vars = set() # names that hold array_ids
         self.classes = {}       # class name -> layout (see _register_classes)
@@ -1794,6 +1843,7 @@ class CodeGen:
         Used for page bytecode and legacy compilation.
         Top-level statements are compiled as before.
         """
+        _mark_setall_runs(program)
         # Phase 1: Pre-allocate main variable slots (count only)
         main_slots = self._count_var_slots(program.statements)
         self._fn_base = main_slots
@@ -1858,6 +1908,7 @@ class CodeGen:
         become global variables accessible from all functions.
         Top-level imperative statements are not allowed.
         """
+        _mark_setall_runs(program)
         # Functions a previous pass found unused (build_image) are left out.
         # The others keep that pass's ids: a program may use a function's id
         # as a number (`set(on_click, 1)`), and the VM finds functions by id
@@ -3244,6 +3295,8 @@ class CodeGen:
             for slot in reversed(param_slots):
                 self.asm.store(slot)
 
+        saved_no_setall = self._no_setall
+        self._no_setall = self.widget_page and fn.name in self._init_only
         if self.widget_page and fn.name in self._init_only:
             def emit(stmt, gen, global_init=False):
                 self._gen_paged(stmt, gen, global_init)
@@ -3280,6 +3333,7 @@ class CodeGen:
         self.debug_functions[fn.name]['length'] = info['end_addr'] - info['addr']
 
         # Restore
+        self._no_setall = saved_no_setall
         self.vars = saved_vars
         self.var_types = saved_types
         self.next_slot = saved_slot
@@ -3353,7 +3407,7 @@ class CodeGen:
         elif isinstance(node, DotAssign):
             if self._class_of_var(node.obj) is not None:
                 self._gen_field_assign(node)
-            else:
+            elif not self._setall_take(node):
                 self._gen_dot_assign(node)
         elif isinstance(node, CompoundAssign):
             self._gen_compound_assign(node)
@@ -3377,7 +3431,8 @@ class CodeGen:
         elif isinstance(node, ContinueStmt):
             self._gen_continue(node)
         elif isinstance(node, ExprStmt):
-            self._gen_expr_stmt(node)
+            if not self._setall_take(node):
+                self._gen_expr_stmt(node)
         else:
             raise CompileError(f"unknown statement: {type(node).__name__}")
         # After a branch or loop the body may or may not have run, so the
@@ -5319,6 +5374,7 @@ class CodeGen:
             else:
                 # Expression (str_id) → STR_SET_TEXT builtin
                 self._gen_expr(val)
+                self._retarget(node)
                 self.asm.str_set_text()
             return
 
@@ -5338,10 +5394,144 @@ class CodeGen:
                         node.line)
                 for scalar_id, val_expr in zip(scalars, elements):
                     self._gen_expr(val_expr)
+                    self._retarget(node)
                     self.asm.w_set(scalar_id)
         else:
             self._gen_expr(node.value)
+            self._retarget(node)
             self.asm.w_set(prop_id)
+
+    def _retarget(self, node):
+        """`w.prop = value` after the value: if evaluating it may have moved
+        the target (a `x.prop` read, a function call), target `w` again (the
+        value stays on the stack under the widget id W_TARGET_S pops)."""
+        if self._current_target != node.obj:
+            self._emit_target(node.obj, node.line)
+
+    # --- W_SETALL (widget build superinstruction) ---
+
+    def _setall_scalar(self, prop_id, expr):
+        """A W_SETALL field for scalar `prop_id` = `expr`: (field bytes,
+        expr to push or None), or None if `expr` must stay a plain W_SET (it
+        may have side effects or depend on when it runs)."""
+        c = self._const_int(expr)
+        if c is not None:
+            return setall_field(prop_id, WT_VARINT, encode_svarint(self._wrap32(c))), None
+        if self._is_pure(expr):
+            return setall_field(prop_id, WT_STACK), expr
+        return None
+
+    def _setall_take(self, node):
+        """Handle `node` as part of a W_SETALL run: True if it is emitted
+        (now, with its whole run) or was already, with the first of its run."""
+        if id(node) in self._setall_done:
+            return True
+        if (self._in_setall or not getattr(node, 'setall', None)
+                or not self.superops or self._no_setall):
+            return False
+        self._gen_setall(node.setall)
+        return True
+
+    def _setall_value(self, prop_id, is_compound, values):
+        """W_SETALL fields for `prop_id` = `values` (a compound's parts or
+        one value): [(bytes, expr)], or None for a plain write."""
+        if prop_id == Prop.TEXT:
+            if len(values) != 1:
+                return None
+            val = values[0]
+            if isinstance(val, StrLit):
+                text = val.value
+            elif (isinstance(val, CallExpr) and val.name == 'str'
+                    and len(val.args) == 1 and isinstance(val.args[0], StrLit)):
+                text = val.args[0].value
+            else:
+                return None
+            data = text.encode('utf-8') if isinstance(text, str) else bytes(text)
+            if len(data) > 255:
+                return None
+            return [(setall_field(prop_id, WT_LEN, encode_varint(len(data)) + data), None)]
+        if is_compound:
+            consts = [self._const_int(e) for e in values]
+            if all(c is not None for c in consts):
+                payload = b''.join(encode_svarint(self._wrap32(c)) for c in consts)
+                return [(setall_field(prop_id, WT_LEN, encode_varint(len(payload)) + payload), None)]
+            scalars = COMPOUND_SCALARS.get(prop_id)
+            if scalars is None or len(values) != len(scalars):
+                return None
+            fields = [self._setall_scalar(sid, e) for sid, e in zip(scalars, values)]
+            return None if None in fields else fields
+        if len(values) != 1 or prop_id == Prop.GRAPH_ARR:
+            return None
+        f = self._setall_scalar(prop_id, values[0])
+        return None if f is None else [f]
+
+    def _setall_member(self, node):
+        """The W_SETALL fields of a run member ([(bytes, expr)]), or None if
+        it is emitted as a plain statement (which also reports its errors)."""
+        if isinstance(node, DotAssign):
+            if self._class_of_var(node.obj) is not None or node.obj not in self.widget_ids:
+                return None
+            name = node.prop
+        else:
+            args = node.expr.args
+            if len(args) < 2 or not isinstance(args[0], VarRef):
+                return None
+            name = args[0].name
+        try:
+            prop_id, is_compound = _resolve_prop(name)
+        except ValueError:
+            return None
+        if isinstance(node, DotAssign):
+            if is_compound and prop_id != Prop.TEXT:
+                if not isinstance(node.value, ArrayLit):
+                    return None
+                values = node.value.elements
+            else:
+                values = [node.value]
+        else:
+            values = node.expr.args[1:]
+        _check_writable(prop_id, name, node.line)
+        return self._setall_value(prop_id, is_compound, values)
+
+    def _gen_setall(self, run):
+        """A run of property writes on one widget (_mark_setall_runs): runs
+        of two or more fields as W_SETALL, the rest as plain statements, in
+        order. Values that aren't constants are pushed before the W_SETALL
+        in reverse field order; only pure ones (variables and arithmetic on
+        them) are, so when they are evaluated doesn't matter."""
+        pending = []
+
+        def plain(m):
+            self._in_setall = True
+            try:
+                self._gen_stmt(m)
+            finally:
+                self._in_setall = False
+
+        def flush():
+            fields = [f for _, fs in pending for f in fs]
+            if len(fields) < 2:
+                for m, _ in pending:
+                    plain(m)
+            else:
+                first = pending[0][0]
+                if isinstance(first, DotAssign):
+                    self._emit_target(first.obj, first.line)
+                for _, expr in reversed(fields):
+                    if expr is not None:
+                        self._gen_expr(expr)
+                self.asm.w_setall(b''.join(b for b, _ in fields))
+            pending.clear()
+
+        for m in run:
+            fields = self._setall_member(m)
+            if fields is None:
+                flush()
+                plain(m)
+            else:
+                pending.append((m, fields))
+        flush()
+        self._setall_done.update(id(m) for m in run)
 
     def _gen_dot_read(self, node):
         """Compile widget.prop read → W_TARGET + W_GET."""
