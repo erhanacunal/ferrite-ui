@@ -1489,6 +1489,55 @@ def cmd_storage(host: str, migrate: bool, stress: str | None = None, check: bool
     return resp.status == 200
 
 
+def cmd_status(host: str, raw: bool) -> bool:
+    """exynos4412 (running ferrite): GET /api/status, a summary (or the JSON with
+    `raw`). `images`: images programs set that did not load because the list was
+    full or the image has no such id (a widget showing one draws nothing)."""
+    try:
+        conn = http.client.HTTPConnection(host, UB_HTTP_PORT, timeout=15)
+        conn.request("GET", "/api/status")
+        resp = conn.getresponse()
+        text = resp.read().decode("utf-8", "replace")
+    except (OSError, http.client.HTTPException) as e:
+        print(f"status: {e}", file=sys.stderr)
+        return False
+    if resp.status != 200:
+        print(f"status: {resp.status} {resp.reason}", file=sys.stderr)
+        return False
+    if raw:
+        print(text.rstrip())
+        return True
+    try:
+        st = json.loads(text)
+    except ValueError as e:
+        print(f"status: not JSON: {e}", file=sys.stderr)
+        return False
+    up = st.get("uptime_s", 0)
+    print(f"state     {st.get('state', '?')}, app {st.get('app') or '(system image)'}, "
+          f"up {up // 3600}h{up // 60 % 60:02d}m{up % 60:02d}s")
+    if "heap_used" in st:
+        print(f"heap      {st['heap_used'] / 2**20:.1f} / {st.get('heap_size', 0) / 2**20:.1f} MiB")
+    cpu = st.get("cpu", {})
+    if cpu:
+        print(f"cpu       {cpu.get('mhz', '?')} MHz, {cpu.get('temp_c', '?')} C")
+    bat = st.get("battery", {})
+    if bat:
+        print(f"battery   {bat.get('percent', '?')} %, {bat.get('mv', '?')} mV")
+    jpeg = st.get("jpeg")
+    if jpeg is not None:
+        print(f"jpeg      decoded {jpeg.get('decoded', 0)}, failed {jpeg.get('failed', 0)}")
+    img = st.get("images")
+    if img is not None:
+        line = (f"images    held at most {img.get('peak', 0)} / {img.get('max', '?')}, "
+                f"refused (list full) {img.get('full', 0)}, missing {img.get('missing', 0)}")
+        if img.get("full", 0) or img.get("missing", 0):
+            line += f", last id {img.get('last_id', 0)}"
+        print(line)
+    else:
+        print("images    (no stats in this firmware)")
+    return True
+
+
 def _read_package(path: str) -> tuple[bytes, dict] | None:
     """An app package from ferrite_build (FS image with application_id) and its
     manifest; None (printed why) for anything else."""
@@ -1818,7 +1867,17 @@ def main():
                       help="write cut.bin, commit it to the journal only and reset the board; "
                            "then --check must find it (replayed)")
 
+    p_status = sub.add_parser("status",
+                              help="exynos4412 over WiFi (--host): a summary of /api/status "
+                                   "(app, heap, CPU, battery, JPEG, images that did not load)")
+    p_status.add_argument("--json", action="store_true", help="print the whole JSON instead")
+
     args = parser.parse_args()
+
+    if args.command == "status":
+        if args.host is None:
+            parser.error("status needs --host (WiFi)")
+        sys.exit(0 if cmd_status(args.host, args.json) else 1)
 
     if args.command == "storage":
         if args.host is None:
