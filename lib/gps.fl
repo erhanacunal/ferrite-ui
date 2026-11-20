@@ -1,0 +1,55 @@
+// gps.fl — the GPS receiver (ferrite-ui-xl, exynos4412: the u-blox G6010 on
+// UART1; sim: none, unless FERRITE_SIM_GPS=LAT,LON[,ALT_M] fakes a fix).
+//
+// Off at boot: gpsPower(1) turns it on, gpsPower(0) off (it draws power while
+// on). A program that ends leaves it as it was. After power-on the receiver
+// needs from ~30 s (open sky) to minutes to find a position, and none indoors;
+// it says the time and date before that, often. Positions are degrees x 10^7
+// (an int), valid while gpsState() == GPS_FIX; gpsText gives them as text.
+//
+// Ids and codes are duplicated in ferrite-ui-xl ferrite-core/src/gps.rs and
+// the BSPs' platform.rs — keep them in sync. Other boards don't answer them:
+// the call stops the program with a VM error.
+
+const SYS_GPS_POWER = 0x90;  // (on) -> 1 done, -1 no receiver / it failed
+const SYS_GPS_STATE = 0x91;  // () -> GPS_*
+const SYS_GPS_GET   = 0x92;  // (field) -> int, GPS_LAT.. below; 0 when unknown
+const SYS_GPS_TIME  = 0x93;  // () -> UTC Unix seconds from the receiver, 0 none yet
+const SYS_GPS_TEXT  = 0x94;  // (field) -> string (syscallStr), GPS_TEXT_*; "" without a fix
+
+const GPS_OFF       = 0;  // the receiver is off
+const GPS_NO_DATA   = 1;  // on, but silent for 3 s (just powered, or broken)
+const GPS_SEARCHING = 2;  // talking, no valid position (yet)
+const GPS_FIX       = 3;  // a valid position, at most 3 s old
+
+const GPS_LAT       = 0;  // latitude, degrees x 10^7, north positive
+const GPS_LON       = 1;  // longitude, degrees x 10^7, east positive
+const GPS_ALT       = 2;  // altitude above sea level, decimetres
+const GPS_SPEED     = 3;  // ground speed, km/h x 10
+const GPS_COURSE    = 4;  // course over ground, degrees x 100 from true north
+const GPS_SATS_USED = 5;  // satellites used in the fix
+const GPS_SATS_VIEW = 6;  // satellites in view
+const GPS_HDOP      = 7;  // horizontal dilution of precision x 100 (9999 = none)
+const GPS_FIX_AGE   = 8;  // ms since the last valid position, -1 none since power-on
+const GPS_QUALITY   = 9;  // 0 none, 1 GPS, 2 differential, 6 estimated
+
+const GPS_TEXT_LAT      = 0;  // "41.0123456"
+const GPS_TEXT_LON      = 1;  // "28.9876543"
+const GPS_TEXT_POSITION = 2;  // "41.0123456, 28.9876543"
+
+fn gpsPower(gps_on) { return syscall(SYS_GPS_POWER, gps_on); }
+fn gpsState() { return syscall(SYS_GPS_STATE); }
+fn gpsGet(gps_field) { return syscall(SYS_GPS_GET, gps_field); }
+fn gpsTime() { return syscall(SYS_GPS_TIME); }
+fn gpsText(gps_field) -> string { return syscallStr(SYS_GPS_TEXT, gps_field); }
+
+fn gpsLat() { return syscall(SYS_GPS_GET, GPS_LAT); }
+fn gpsLon() { return syscall(SYS_GPS_GET, GPS_LON); }
+
+// A word for a GPS_* state.
+fn gpsStateText(gps_state) -> string {
+    if (gps_state == GPS_FIX) { return "fix"; }
+    if (gps_state == GPS_SEARCHING) { return "searching"; }
+    if (gps_state == GPS_NO_DATA) { return "no data"; }
+    return "off";
+}
