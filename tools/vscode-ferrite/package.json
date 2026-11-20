@@ -2,11 +2,11 @@
     "name": "ferrite-lang",
     "displayName": "Ferrite Language Support",
     "description": "Language support for ferrite-lang (.fl) — syntax highlighting, diagnostics, completions, and more.",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "publisher": "ferrite-ui",
     "license": "MIT",
     "engines": {
-        "vscode": "^1.75.0"
+        "vscode": "^1.82.0"
     },
     "categories": [
         "Programming Languages"
@@ -15,6 +15,12 @@
         "onLanguage:ferrite"
     ],
     "main": "./extension.js",
+    "scripts": {
+        "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license"
+    },
+    "dependencies": {
+        "vscode-languageclient": "^9.0.1"
+    },
     "contributes": {
         "languages": [
             {
@@ -53,7 +59,7 @@
                 "ferrite.server.path": {
                     "type": "string",
                     "default": "",
-                    "description": "Path to ferrite_lsp.py. If empty, looks in the workspace tools/ directory."
+                    "description": "Path to ferrite_lsp.py. If empty: <workspace>/tools/ferrite_lsp.py, then $FERRITE_UI/tools/ferrite_lsp.py, then next to the extension (when run from the repo)."
                 },
                 "ferrite.server.includeDirs": {
                     "type": "array",
@@ -61,9 +67,15 @@
                         "type": "string"
                     },
                     "default": [],
-                    "description": "Additional include directories passed to the compiler."
+                    "description": "Extra include directories, added after the ones from the nearest project.json (or the file's dir + ferrite-ui lib/). Restart the server after changing."
                 }
             }
-        }
+        },
+        "commands": [
+            {
+                "command": "ferrite.restartServer",
+                "title": "Ferrite: Restart Language Server"
+            }
+        ]
     }
 }

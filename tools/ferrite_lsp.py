@@ -74,12 +74,14 @@ class Server:
     def __init__(self):
         self.documents = {}  # uri -> {"text": str, "version": int}
         self.analyzers = {}  # uri -> ferrite_analysis.Document
+        self.extra_includes = []  # initializationOptions.includeDirs (client setting)
 
     def _analyzer(self, uri):
         a = self.analyzers.get(uri)
         if a is None:
             path = _uri_to_path(uri)
             dirs, superops, native_flex = project_settings(path)
+            dirs = list(dirs) + [d for d in self.extra_includes if d not in dirs]
             a = self.analyzers[uri] = Document(path, dirs, superops, native_flex)
         return a
 
@@ -133,6 +135,8 @@ class Server:
 
     def _initialize(self, msg_id, params):
         caps = params.get('capabilities', {})
+        opts = params.get('initializationOptions') or {}
+        self.extra_includes = [d for d in opts.get('includeDirs', []) if isinstance(d, str) and d]
         return self._respond(msg_id, {
             'capabilities': {
                 'textDocumentSync': {
