@@ -296,7 +296,7 @@ Library opcodes (v6 images, `caps.libraries`):
 | `0x4F` | `CALL_IMP` | `u16 import` | call imported function `import` (the import table) in its library's code; its `RET` comes back here |
 | `0x50` | `FN_REF` | `u16 func_id` | push `unit << 12 \| func_id`, the running unit's tag on a function id (a library's `@fn`), so a callback finds that library's function |
 
-**`0x60`–`0x7F` are reserved, VM-internal.** The ferrite-ui-xl VM rewrites a superinstruction it runs into a quickened form there (one opcode per cond / op, e.g. `JCMP_VI` + `NE`; `vm.rs` `QUICK`), with the same length and operands; the form ignores the cond / op byte. The compiler never emits them.
+**`0x58`–`0x7F` are reserved, VM-internal.** The ferrite-ui-xl VM rewrites an instruction it runs into a quickened form there (`vm.rs` `QUICK`): a superinstruction by its cond / op (e.g. `JCMP_VI` + `NE`), `LOAD` / `STORE` / `ADD_VI` by their slot's kind (local or global). Same length and operands; the form ignores the cond / op byte and forces the slot kind. The compiler never emits them.
 
 The compiler also inverts loops for these devices (`JMP test; body: …; test: JCMP… body`), so an iteration runs one jump instead of two. On every device it folds integer constant expressions (`16 * 12`, `-(5 - 9)`, int `const`s) to one `PUSH`, with the VM's semantics: 32-bit wrap, division truncating toward zero, `x / 0` = `x % 0` = 0, `i32::MIN / -1` = `i32::MIN`, shifts by `b & 31`.
 

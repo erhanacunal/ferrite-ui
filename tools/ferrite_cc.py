@@ -121,8 +121,8 @@ class Op:
     # Widget build (caps.superops): varint length + fields, each a varint key
     # (prop << 3 | wire type, WT_*) and its value; see setall_fields()
     W_SETALL   = 0x51
-    # 0x60..0x7F: reserved, VM-internal (ferrite-ui-xl's quickened
-    # superinstructions, vm.rs QUICK). Never emit an opcode in this range.
+    # 0x58..0x7F: reserved, VM-internal (ferrite-ui-xl's quickened
+    # forms, vm.rs QUICK). Never emit an opcode in this range.
 
     # Builtins as first-class opcodes (all no-arg, operands on stack)
     FILL_RECT       = 0x80
