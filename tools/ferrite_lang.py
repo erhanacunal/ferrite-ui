@@ -5874,7 +5874,8 @@ def compile_with_meta(source, filename="<input>", include_dirs=None):
 
 def build_image(source, filename="<input>", include_dirs=None, render_mode="dirty",
                 widget_page=False, portrait=False, superops=False, native_flex=False,
-                strip_unused=True, var_slots=False, library=False, libraries=None):
+                strip_unused=True, var_slots=False, library=False, libraries=None,
+                wide=False):
     """Compile source to VM image format (v4/v5 header + opcodes).
 
     Image format (v4):
@@ -5907,6 +5908,10 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
     slots the program needs (CodeGen._frame_layout), which the VM allocates
     exactly. Only for devices with caps.var_slots (ferrite-ui-xl).
 
+    wide=True always writes a wide-address image (u32 jump/call targets),
+    however small: devices with caps.wide_addr (ferrite-ui-xl), whose VM
+    reads no other kind. Otherwise u16 targets unless the code outgrows 64 KB.
+
     library=True compiles a library (ferrite-ui-xl docs/apps.md "Step 3"): no
     loop(), `export fn` its interface, a v6 header with the export table.
     libraries: the library packages built against (read_library dicts); their
@@ -5918,6 +5923,7 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
     reaches through calls or `@name` ids (a second compile pass; the first
     one still checks them). Function ids don't change, so there may be gaps.
     """
+    force_wide = wide
     line_map = []
     try:
         # Extract #hint_widgets from raw source before preprocessing strips the directive.
@@ -5956,9 +5962,10 @@ def build_image(source, filename="<input>", include_dirs=None, render_mode="dirt
 
         def generate(keep):
             """(codegen, bytecode, wide). Compact u16 jump targets unless
-            the bytecode outgrows 64 KB; then regenerate from a fresh parse
-            with u32 targets (wide-address image)."""
-            for wide in (False, True):
+            the bytecode outgrows 64 KB (or `wide` asks for u32 ones); then
+            regenerate from a fresh parse with u32 targets (wide-address
+            image)."""
+            for wide in ((True,) if force_wide else (False, True)):
                 codegen = CodeGen(wide=wide, superops=superops, native_flex=native_flex,
                                   library=library, imports=imports)
                 codegen.widget_page = widget_page

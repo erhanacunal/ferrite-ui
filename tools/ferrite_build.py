@@ -195,14 +195,15 @@ def _write_debug_sidecar(source_path: str, image: bytes) -> str | None:
 def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
                     widget_page=False, portrait=False, superops=False,
                     native_flex=False, var_slots=False, library=False,
-                    libraries=None) -> bytes:
+                    libraries=None, wide=False) -> bytes:
     """Ferrite lang source → VM image (header + opcodes). With widget_page,
     static widget setup moves to the image's `.page` (RES_PAGE contents).
     superops: emit superinstructions (the device's caps.superops).
     native_flex: flexLayout() as an opcode (the device's caps.native_flex).
     var_slots: a v5 image header with the variable slots the program needs
     (the device's caps.var_slots). library / libraries: a library's program,
-    or the library packages (read_library) a program calls (v6 header)."""
+    or the library packages (read_library) a program calls (v6 header).
+    wide: u32 jump/call targets however small the code (caps.wide_addr)."""
     try:
         from ferrite_lang import build_image, CompileError
     except ImportError:
@@ -216,7 +217,7 @@ def compile_program(source_path: str, include_dirs=None, render_mode="dirty",
                             render_mode=render_mode, widget_page=widget_page,
                             portrait=portrait, superops=superops,
                             native_flex=native_flex, var_slots=var_slots,
-                            library=library, libraries=libraries)
+                            library=library, libraries=libraries, wide=wide)
         _write_debug_sidecar(source_path, image)
         return image
     except CompileError as e:
@@ -896,6 +897,7 @@ def build(project_path: str, output_path: str | None) -> dict:
                                      superops=bool(device and device["caps"].get("superops")),
                                      native_flex=bool(device and device["caps"].get("native_flex")),
                                      var_slots=bool(device and device["caps"].get("var_slots")),
+                                     wide=bool(device and device["caps"].get("wide_addr")),
                                      library=library, libraries=libraries)
         exec_mode = prog.get("exec_mode", "ram")
         prog_flags = RES_FLAG_FLASH_EXEC if exec_mode == "flash" else 0

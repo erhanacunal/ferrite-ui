@@ -28,7 +28,9 @@ in sync by hand:
     ferrite_build repacks every font as V3, the Designer generates V3;
     caps.rich_text (ferrite-ui-xl rich.rs, build-time only) <-> the rich_text
     property (FLAG_RICH_TEXT: text as an HTML subset; font families need
-    font_v3). A missing
+    font_v3); caps.wide_addr (ferrite-ui-xl, build-time only) <-> the VM
+    reading only wide-address images (u32 jump/call targets, vm.rs
+    `parse_image_header`): ferrite_build compiles every program wide. A missing
     cap reads as false, so the fallback boards below leave it out.
 """
 

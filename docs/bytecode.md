@@ -51,7 +51,7 @@ Flags:
 | Bit | Meaning |
 | --- | --- |
 | `0` | Render mode: `0` = dirty, `1` = buffered |
-| `2` | Wide addresses: jump / call targets are u32 |
+| `2` | Wide addresses: jump / call targets are u32 (set when the code passes 64 KB; always for `caps.wide_addr` devices, ferrite-ui-xl, whose VM loads no image without it) |
 | `3` | Portrait |
 | `4` | A library (v6) |
 
