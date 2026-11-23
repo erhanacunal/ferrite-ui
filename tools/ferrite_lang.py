@@ -3790,13 +3790,37 @@ class CodeGen:
 
     def _gen_cond_jz_fwd(self, cond):
         """Evaluate `cond` and jump forward when it is false. Returns the
-        patch position."""
+        patch positions (`_patch_all`)."""
         return self._gen_cond_jump(cond, False)
+
+    def _patch_all(self, patches, target=None):
+        for p in patches:
+            self.asm.patch(p, target)
 
     def _gen_cond_jump(self, cond, when):
         """Evaluate `cond` and jump when it is `when` (true/false); returns
-        the patch position of the jump target. Int comparisons become one
-        compare-and-branch superinstruction."""
+        the patch positions of the jumps to the target (`_patch_all`). Int
+        comparisons become one compare-and-branch superinstruction; with
+        superops, `&&` / `||` / `!` become branches (no 0/1 value: no DUP /
+        POP, no second test of the value), each side a condition itself."""
+        if self.superops:
+            if isinstance(cond, UnaryOp) and cond.op == '!':
+                return self._gen_cond_jump(cond.operand, not when)
+            if isinstance(cond, BinOp) and cond.op in ('&&', '||'):
+                if (cond.op == '&&') != when:
+                    # `a && b` false / `a || b` true: either side decides.
+                    patches = self._gen_cond_jump(cond.left, when)
+                    patches += self._gen_cond_jump(cond.right, when)
+                else:
+                    # `a && b` true / `a || b` false: past b unless a allows.
+                    skip = self._gen_cond_jump(cond.left, not when)
+                    patches = self._gen_cond_jump(cond.right, when)
+                    self._patch_all(skip)
+                # The right side may not run: the target it leaves is unknown
+                # after (as in `_gen_binop`).
+                self._current_target = None
+                self._last_alltar_var = None
+                return patches
         neg = (lambda c: c) if when else (lambda c: self._NEG_COND[c])
         if (self.superops and isinstance(cond, BinOp) and cond.op in self._CMP_OPS
                 and self._const_int(cond) is None
@@ -3807,16 +3831,16 @@ class CodeGen:
             lslot, rslot = self._int_var_slot(l), self._int_var_slot(r)
             lc, rc = self._const_int(l), self._const_int(r)
             if lslot is not None and rc is not None and -32768 <= rc <= 32767:
-                return self.asm.jcmp_vi_fwd(neg(cc), lslot, rc)
+                return [self.asm.jcmp_vi_fwd(neg(cc), lslot, rc)]
             if rslot is not None and lc is not None and -32768 <= lc <= 32767:
-                return self.asm.jcmp_vi_fwd(neg(self._SWAP_COND[cc]), rslot, lc)
+                return [self.asm.jcmp_vi_fwd(neg(self._SWAP_COND[cc]), rslot, lc)]
             if lslot is not None and rslot is not None:
-                return self.asm.jcmp_vv_fwd(neg(cc), lslot, rslot)
+                return [self.asm.jcmp_vv_fwd(neg(cc), lslot, rslot)]
             self._gen_expr(l)
             self._gen_expr(r)
-            return self.asm.jcmp_fwd(neg(cc))
+            return [self.asm.jcmp_fwd(neg(cc))]
         self._gen_expr(cond)
-        return self.asm.jnz_fwd() if when else self.asm.jz_fwd()
+        return [self.asm.jnz_fwd() if when else self.asm.jz_fwd()]
 
     def _gen_store_op(self, name, value, line):
         """`name = name op value` / `name op= value` for an int variable and
@@ -3832,7 +3856,7 @@ class CodeGen:
         assumes nothing about the current target."""
         self._current_target = None
         self._last_alltar_var = None
-        self.asm.patch(self._gen_cond_jump(cond, True), body_start)
+        self._patch_all(self._gen_cond_jump(cond, True), body_start)
 
     def _add_imm_target(self, name, value, op='+'):
         """The i16 to add for `name = name op value` / `name op= value` on an
@@ -3852,7 +3876,7 @@ class CodeGen:
             self._gen_stmt(stmt)
         if node.else_body:
             else_patch = self.asm.jmp_fwd()
-            self.asm.patch(exit_patch)
+            self._patch_all(exit_patch)
             # The else body is reached from the condition's jump, not from the
             # then body: the target the then body left is not current there.
             self._current_target = None
@@ -3861,7 +3885,7 @@ class CodeGen:
                 self._gen_stmt(stmt)
             self.asm.patch(else_patch)
         else:
-            self.asm.patch(exit_patch)
+            self._patch_all(exit_patch)
 
     def _gen_while(self, node):
         if self.superops:
@@ -3890,7 +3914,7 @@ class CodeGen:
             self._gen_stmt(stmt)
 
         self.asm.jmp(start)
-        self.asm.patch(exit_patch)
+        self._patch_all(exit_patch)
 
         for p in ctx['break_patches']:
             self.asm.patch(p)
@@ -3942,7 +3966,7 @@ class CodeGen:
             self._gen_stmt(node.update)
 
         self.asm.jmp(loop_start)
-        self.asm.patch(exit_patch)
+        self._patch_all(exit_patch)
 
         for p in ctx['break_patches']:
             self.asm.patch(p)
@@ -4314,7 +4338,7 @@ class CodeGen:
         else_patch = self._gen_cond_jz_fwd(node.cond)
         self._gen_expr(node.then_expr)
         end_patch = self.asm.jmp_fwd()
-        self.asm.patch(else_patch)
+        self._patch_all(else_patch)
         # Reached from the condition, not from then_expr (see _gen_if); after
         # the join either branch may have run.
         self._current_target = None
