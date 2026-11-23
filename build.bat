@@ -2,11 +2,15 @@
 setlocal
 
 set TARGET=thumbv7m-none-eabi
+REM thumbv7m-none-eabi with "frame-pointer": "may-omit" (bsp\nextion\thumbv7m-none-eabi.json);
+REM a custom spec has no prebuilt core/alloc, hence -Zbuild-std (nightly + rust-src).
+set SPEC=bsp\nextion\%TARGET%.json
+set ZFLAGS=-Zjson-target-spec -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
 set BIN=ferrite-ui
 set OBJCOPY=D:\armeabi_none_toolchain\bin\arm-none-eabi-objcopy.exe
 set ELF=target\%TARGET%\release\%BIN%
 
-cargo build -p bsp-nextion --release --no-default-features --bin %BIN% --target %TARGET%
+cargo build -p bsp-nextion --release --no-default-features --bin %BIN% --target %SPEC% %ZFLAGS%
 if errorlevel 1 (
     echo Build failed.
     exit /b 1

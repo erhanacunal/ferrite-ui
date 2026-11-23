@@ -57,7 +57,7 @@ end_frame()   → CMD4 (front ← back, FPGA swap)
 - `cortex-m-rt` crate — startup, interrupt table, `#[entry]` macro
 - Custom panic handler — displays error on LCD + sends via USART (no heap, ROM font only)
 - No newlib, no hidden runtime, RAM fully owned by user
-- Target: `thumbv7m-none-eabi`
+- Target: `thumbv7m-none-eabi`, built through the custom spec `bsp/nextion/thumbv7m-none-eabi.json` (`"frame-pointer": "may-omit"`, −4 KB; `-Cforce-frame-pointers=no` can't lower a built-in target's "always") with `-Zbuild-std` (`build.bat`, CI). The n32903 / tdo_y13 specs are may-omit too, and their build-std division is replaced by assembly (`ferrite-core` feature `arm_div`); Cortex-M3 divides in hardware.
 
 ## External Flash (W25Q256, 32MB)
 - **Pin assignment:** PA4=CS, PA5=CLK, PA6=MISO, PA7=MOSI (bit-bang SPI)

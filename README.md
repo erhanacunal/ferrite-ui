@@ -261,10 +261,14 @@ Requires Rust 1.85+ (2024 edition).
 ### GD32F103 (Nextion / firmware)
 
 ```bash
-rustup target add thumbv7m-none-eabi
+rustup component add rust-src --toolchain nightly
 
-# from the workspace root (the default target is thumbv7m, linked with gd32-link.x)
-cargo build -p bsp-nextion --release
+# from the workspace root (linked with gd32-link.x). The custom spec is
+# thumbv7m-none-eabi without forced frame pointers (~6.5 KB less flash), so
+# core/alloc are built from source.
+cargo +nightly build -p bsp-nextion --release \
+  --target bsp/nextion/thumbv7m-none-eabi.json -Zjson-target-spec \
+  -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
 arm-none-eabi-objcopy -O binary target/thumbv7m-none-eabi/release/ferrite-ui firmware.bin
 
 # flash to device

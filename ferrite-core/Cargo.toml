@@ -79,6 +79,11 @@ jpeg = []
 sdcard = []
 # Boot-time SD actions (`sdboot`: EMPTY.BIN → recovery, PROGRAM.BIN → flash).
 sdboot = ["sdcard"]
+# Selected by the ARMv5TE BSPs (`bsp-n32903`, `bsp-tdo-y13`): assembly
+# __aeabi_uidiv(mod) / __aeabi_idiv(mod) / __udivsi3 / __divsi3 replacing
+# build-std compiler_builtins' slow Rust division (`arm_div.rs`). Only for
+# ARM-state cores without hardware divide; Cortex-M3 has `udiv`/`sdiv`.
+arm_div = []
 
 [dependencies]
 libm = "0.2"

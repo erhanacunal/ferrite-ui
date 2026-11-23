@@ -7,7 +7,7 @@
   "env": "",
   "executables": true,
   "features": "+v5te,+strict-align",
-  "frame-pointer": "always",
+  "frame-pointer": "may-omit",
   "linker": "arm-none-eabi-gcc",
   "linker-flavor": "gnu-cc",
   "llvm-floatabi": "soft",

@@ -14,7 +14,7 @@
   "data-layout": "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64",
   "emit-debug-gdb-scripts": false,
   "features": "+soft-float,+strict-align",
-  "frame-pointer": "always",
+  "frame-pointer": "may-omit",
   "has-thumb-interworking": false,
   "linker": "D:/armeabi_none_toolchain/bin/arm-none-eabi-ld.exe",
   "linker-flavor": "ld",

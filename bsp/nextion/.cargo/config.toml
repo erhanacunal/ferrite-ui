@@ -1,5 +1,17 @@
+# Building from this directory. thumbv7m-none-eabi with "frame-pointer":
+# "may-omit" (the built-in target forces "always"); a custom spec has no
+# prebuilt core/alloc, hence build-std (nightly + rust-src). The spec is
+# `rustc -Z unstable-options --print target-spec-json --target
+# thumbv7m-none-eabi` of the pinned nightly with that field changed; re-check
+# it when the toolchain changes. Its name must stay thumbv7m-none-eabi:
+# cortex-m's build.rs keys on the target name.
 [build]
-target = "thumbv7m-none-eabi"
+target = "thumbv7m-none-eabi.json"
 
 [target.thumbv7m-none-eabi]
 rustflags = ["-C", "link-arg=-Tlink.x"]
+
+[unstable]
+json-target-spec = true
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]

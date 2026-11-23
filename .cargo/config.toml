@@ -1,5 +1,16 @@
-# Default target is the GD32 (nextion). Build it from the workspace root with:
-#   cargo build -p bsp-nextion --release
+# Default target is the GD32 (nextion). Release firmware is built with the
+# custom spec bsp/nextion/thumbv7m-none-eabi.json ("frame-pointer": "may-omit";
+# `-Cforce-frame-pointers=no` can't lower the built-in target's "always"),
+# which needs build-std, so pass the flags explicitly (build.bat does this):
+#   cargo +nightly build -p bsp-nextion --release \
+#     --target bsp/nextion/thumbv7m-none-eabi.json -Zjson-target-spec \
+#     -Zbuild-std=core,compiler_builtins,alloc \
+#     -Zbuild-std-features=compiler-builtins-mem
+# The spec is named after the built-in target on purpose: cortex-m's build.rs
+# keys on the target name, and [target.thumbv7m-none-eabi] below still
+# applies. `[unstable] build-std` is not set here because it would also hit
+# the host test builds. A plain `cargo build -p bsp-nextion --release` still
+# works, with frame pointers (~6.5 KB larger).
 [build]
 target = "thumbv7m-none-eabi"
 

@@ -7,6 +7,8 @@ extern crate std;
 
 // --- HAL backend traits + generic wrappers + Platform ---
 
+#[cfg(all(feature = "arm_div", target_arch = "arm"))]
+mod arm_div;
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod backlight;
