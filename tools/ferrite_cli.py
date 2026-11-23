@@ -255,10 +255,11 @@ PERF_PHASES = {
     14: "  timer reads",
     15: "  G2D/GPU drawing",
     16: "  sprite drawing",
+    18: "  frame handoff",
 }
 # Sub-phases: already inside the step phases above.
 # (13 runs on another core, in parallel with the step.)
-PERF_SUB_PHASES = (10, 11, 12, 13, 14, 15, 16)
+PERF_SUB_PHASES = (10, 11, 12, 13, 14, 15, 16, 18)
 # Event counts (plain numbers, not microseconds): perf::count in perf.rs.
 PERF_COUNTS = {0x81: "draw_widget calls", 0x82: "pixel primitive calls",
                0x83: "presents", 0x84: "present KiB", 0x85: "timer reads",
